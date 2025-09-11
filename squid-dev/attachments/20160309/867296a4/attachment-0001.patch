@@ -1,0 +1,365 @@
+Added shared_memory_locking configuration directive to control mlock(2).
+
+Locking shared memory at startup avoids SIGBUS crashes when kernel runs
+out of RAM during runtime. Why not enable it by default? Unfortunately,
+locking requires privileges and/or much-higher-than-default
+RLIMIT_MEMLOCK limits. Thus, requiring locked memory by default is
+likely to cause too many complaints, especially since Squid has not
+required that before. The default is off, at least for now.
+
+As we gain more experience, we may try to enable locking by default
+while making default locking failures non-fatal and warning about
+significant [accumulated] locking delays.
+
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2016-01-15 06:47:59 +0000
++++ src/SquidConfig.h	2016-03-01 05:22:45 +0000
+@@ -55,40 +55,41 @@ public:
+     int n_configured;
+     /// number of disk processes required to support all cache_dirs
+     int n_strands;
+ };
+ #define INDEXSD(i) (Config.cacheSwap.swapDirs[i].getRaw())
+ }
+ 
+ /// the representation of the configuration. POD.
+ class SquidConfig
+ {
+ public:
+     struct {
+         /* These should be for the Store::Root instance.
+         * this needs pluggable parsing to be done smoothly.
+         */
+         int highWaterMark;
+         int lowWaterMark;
+     } Swap;
+ 
+     YesNoNone memShared; ///< whether the memory cache is shared among workers
++    YesNoNone shmLocking; ///< shared_memory_locking
+     size_t memMaxSize;
+ 
+     struct {
+         int64_t min;
+         int pct;
+         int64_t max;
+     } quickAbort;
+     int64_t readAheadGap;
+     RemovalPolicySettings *replPolicy;
+     RemovalPolicySettings *memPolicy;
+ #if USE_HTTP_VIOLATIONS
+     time_t negativeTtl;
+ #endif
+     time_t maxStale;
+     time_t negativeDnsTtl;
+     time_t positiveDnsTtl;
+     time_t shutdownLifetime;
+     time_t backgroundPingRate;
+ 
+     struct {
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2016-02-19 17:19:25 +0000
++++ src/cf.data.pre	2016-03-09 21:34:21 +0000
+@@ -402,40 +402,73 @@ LOC: Config.cpuAffinityMap
+ DEFAULT: none
+ DEFAULT_DOC: Let operating system decide.
+ DOC_START
+ 	Usage: cpu_affinity_map process_numbers=P1,P2,... cores=C1,C2,...
+ 
+ 	Sets 1:1 mapping between Squid processes and CPU cores. For example,
+ 
+ 	    cpu_affinity_map process_numbers=1,2,3,4 cores=1,3,5,7
+ 
+ 	affects processes 1 through 4 only and places them on the first
+ 	four even cores, starting with core #1.
+ 
+ 	CPU cores are numbered starting from 1. Requires support for
+ 	sched_getaffinity(2) and sched_setaffinity(2) system calls.
+ 
+ 	Multiple cpu_affinity_map options are merged.
+ 
+ 	See also: workers
+ DOC_END
+ 
++NAME: shared_memory_locking
++TYPE: YesNoNone
++COMMENT: on|off
++LOC: Config.shmLocking
++DEFAULT: off
++DOC_START
++	Whether to ensure that all required shared memory is available by
++	"locking" that shared memory into RAM when Squid starts. The
++	alternative is faster startup time followed by slightly slower
++	performance and, if not enough RAM is actually available during
++	runtime, mysterious crashes.
++
++	SMP Squid uses many shared memory segments. These segments are
++	brought into Squid memory space using an mmap(2) system call. During
++	Squid startup, the mmap() call often succeeds regardless of whether
++	the system has enough RAM. In general, Squid cannot tell whether the
++	kernel applies this "optimistic" memory allocation policy (but
++	popular modern kernels usually use it).
++
++	Later, if Squid attempts to actually access the mapped memory
++	regions beyond what the kernel is willing to allocate, the
++	"optimistic" kernel simply kills Squid kid with a SIGBUS signal.
++	Some of the memory limits enforced by the kernel are currently
++	poorly understood: We do not know how to detect and check them. This
++	option ensures that the mapped memory will be available. 
++
++	This option may have a positive performance side-effect: Locking
++	memory at start avoids runtime paging I/O. Paging slows Squid down.
++
++	Locking memory may require a large enough RLIMIT_MEMLOCK OS limit,
++	CAP_IPC_LOCK capability, or equivalent.
++DOC_END
++
+ COMMENT_START
+  OPTIONS FOR AUTHENTICATION
+  -----------------------------------------------------------------------------
+ COMMENT_END
+ 
+ NAME: auth_param
+ TYPE: authparam
+ IFDEF: USE_AUTH
+ LOC: Auth::TheConfig
+ DEFAULT: none
+ DOC_START
+ 	This is used to define parameters for the various authentication
+ 	schemes supported by Squid.
+ 
+ 		format: auth_param scheme parameter [setting]
+ 
+ 	The order in which authentication schemes are presented to the client is
+ 	dependent on the order the scheme first appears in config file. IE
+ 	has a bug (it's not RFC 2617 compliant) in that it will use the basic
+ 	scheme if basic is the first entry presented, even if more secure
+
+=== modified file 'src/ipc/mem/Segment.cc'
+--- src/ipc/mem/Segment.cc	2016-02-23 08:51:22 +0000
++++ src/ipc/mem/Segment.cc	2016-03-09 21:43:15 +0000
+@@ -1,37 +1,38 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 54    Interprocess Communication */
+ 
+ #include "squid.h"
+ #include "base/TextException.h"
+ #include "compat/shm.h"
+ #include "Debug.h"
+ #include "fatal.h"
+ #include "ipc/mem/Segment.h"
+ #include "sbuf/SBuf.h"
++#include "SquidConfig.h"
+ #include "tools.h"
+ 
+ #if HAVE_FCNTL_H
+ #include <fcntl.h>
+ #endif
+ #if HAVE_SYS_MMAN_H
+ #include <sys/mman.h>
+ #endif
+ #if HAVE_SYS_STAT_H
+ #include <sys/stat.h>
+ #endif
+ #if HAVE_UNISTD_H
+ #include <unistd.h>
+ #endif
+ 
+ // test cases change this
+ const char *Ipc::Mem::Segment::BasePath = DEFAULT_STATEDIR;
+ 
+ void *
+ Ipc::Mem::Segment::reserve(size_t chunkSize)
+@@ -157,57 +158,92 @@ Ipc::Mem::Segment::createFresh()
+ 
+ /// Map the shared memory segment to the process memory space.
+ void
+ Ipc::Mem::Segment::attach()
+ {
+     assert(theFD >= 0);
+     assert(!theMem);
+ 
+     // mmap() accepts size_t for the size; we give it off_t which might
+     // be bigger; assert overflows until we support multiple mmap()s?
+     assert(theSize == static_cast<off_t>(static_cast<size_t>(theSize)));
+ 
+     void *const p =
+         mmap(NULL, theSize, PROT_READ | PROT_WRITE, MAP_SHARED, theFD, 0);
+     if (p == MAP_FAILED) {
+         debugs(54, 5, HERE << "mmap " << theName << ": " << xstrerror());
+         fatalf("Ipc::Mem::Segment::attach failed to mmap(%s): %s\n",
+                theName.termedBuf(), xstrerror());
+     }
+     theMem = p;
++
++    lock();
+ }
+ 
+ /// Unmap the shared memory segment from the process memory space.
+ void
+ Ipc::Mem::Segment::detach()
+ {
+     if (!theMem)
+         return;
+ 
+     if (munmap(theMem, theSize)) {
+         debugs(54, 5, HERE << "munmap " << theName << ": " << xstrerror());
+         fatalf("Ipc::Mem::Segment::detach failed to munmap(%s): %s\n",
+                theName.termedBuf(), xstrerror());
+     }
+     theMem = 0;
+ }
+ 
++/// Unmap the shared memory segment from the process memory space.
++void
++Ipc::Mem::Segment::lock()
++{
++    if (!Config.shmLocking) {
++        debugs(54, 5, "mlock(2)-ing disabled");
++        return;
++    }
++
++#ifdef _POSIX_MEMLOCK_RANGE
++    debugs(54, 7, "mlock(" << theName << ',' << theSize << ") starts");
++    if (mlock(theMem, theSize) != 0) {
++        const int savedError = errno;
++        debugs(54, DBG_IMPORTANT, "ERROR: shared_memory_locking enabled but mlock(" << theName << ',' << theSize << ") failed: " << xstrerr(savedError));
++        fatalf("shared_memory_locking on but failed to mlock(%s, %" PRId64 "): %s\n",
++               theName.termedBuf(), theSize, xstrerr(savedError));
++    }
++    // TODO: Warn if it took too long.
++    debugs(54, 7, "mlock(" << theName << ',' << theSize << ") OK");
++#else
++    debugs(54, 5, "insufficient mlock(2) support");
++    if (Config.shmLocking.configured()) { // set explicitly
++        static bool warnedOnce = false;
++        if (!warnedOnce) {
++            debugs(54, DBG_IMPORTANT, "ERROR: insufficient mlock(2) support prevents " <<
++                   "honoring `shared_memory_locking on`. " <<
++                   "If you lack RAM, kernel will kill Squid later.");
++            warnedOnce = true;
++        }
++    }
++#endif
++}
++
+ void
+ Ipc::Mem::Segment::unlink()
+ {
+     if (shm_unlink(theName.termedBuf()) != 0)
+         debugs(54, 5, HERE << "shm_unlink(" << theName << "): " << xstrerror());
+     else
+         debugs(54, 3, HERE << "unlinked " << theName << " segment");
+ }
+ 
+ /// determines the size of the underlying "file"
+ off_t
+ Ipc::Mem::Segment::statSize(const char *context) const
+ {
+     Must(theFD >= 0);
+ 
+     struct stat s;
+     memset(&s, 0, sizeof(s));
+ 
+     if (fstat(theFD, &s) != 0) {
+         debugs(54, 5, HERE << context << " fstat " << theName << ": " << xstrerror());
+
+=== modified file 'src/ipc/mem/Segment.h'
+--- src/ipc/mem/Segment.h	2016-01-28 01:30:37 +0000
++++ src/ipc/mem/Segment.h	2016-03-01 05:14:59 +0000
+@@ -40,40 +40,41 @@ public:
+     void *mem() { return reserve(0); } ///< pointer to the next chunk
+     void *reserve(size_t chunkSize); ///< reserve and return the next chunk
+ 
+     /// common path of all segment names in path-based environments
+     static const char *BasePath;
+ 
+     /// concatenates parts of a name to form a complete name (or its prefix)
+     static SBuf Name(const SBuf &prefix, const char *suffix);
+ 
+ private:
+ 
+     // not implemented
+     Segment(const Segment &);
+     Segment &operator =(const Segment &);
+ 
+ #if HAVE_SHM
+ 
+     bool createFresh();
+     void attach();
+     void detach();
++    void lock();
+     void unlink(); ///< unlink the segment
+     off_t statSize(const char *context) const;
+ 
+     static String GenerateName(const char *id);
+ 
+     int theFD; ///< shared memory segment file descriptor
+ 
+ #else // HAVE_SHM
+ 
+     void checkSupport(const char *const context);
+ 
+ #endif // HAVE_SHM
+ 
+     const String theName; ///< shared memory segment file name
+     void *theMem; ///< pointer to mmapped shared memory segment
+     off_t theSize; ///< shared memory segment size
+     off_t theReserved; ///< the total number of reserve()d bytes
+     bool doUnlink; ///< whether the segment should be unlinked on destruction
+ };
+ 
+
+=== modified file 'src/tests/testRock.cc'
+--- src/tests/testRock.cc	2016-02-21 08:53:50 +0000
++++ src/tests/testRock.cc	2016-03-09 21:31:54 +0000
+@@ -41,40 +41,41 @@ extern REMOVALPOLICYCREATE createRemoval
+ 
+ static char cwd[MAXPATHLEN];
+ 
+ static void
+ addSwapDir(testRock::SwapDirPointer aStore)
+ {
+     allocate_new_swapdir(&Config.cacheSwap);
+     Config.cacheSwap.swapDirs[Config.cacheSwap.n_configured] = aStore.getRaw();
+     ++Config.cacheSwap.n_configured;
+ }
+ 
+ void
+ testRock::setUp()
+ {
+     CPPUNIT_NS::TestFixture::setUp();
+ 
+     if (0 > system ("rm -rf " TESTDIR))
+         throw std::runtime_error("Failed to clean test work directory");
+ 
+     Config.memShared.defaultTo(false);
++    Config.shmLocking.defaultTo(false);
+ 
+     // use current directory for shared segments (on path-based OSes)
+     Ipc::Mem::Segment::BasePath = getcwd(cwd,MAXPATHLEN);
+     if (Ipc::Mem::Segment::BasePath == NULL)
+         Ipc::Mem::Segment::BasePath = ".";
+ 
+     Store::Init();
+ 
+     store = new Rock::SwapDir();
+ 
+     addSwapDir(store);
+ 
+     commonInit();
+ 
+     char *path=xstrdup(TESTDIR);
+ 
+     char *config_line=xstrdup("10 max-size=16384");
+ 
+     ConfigParser::SetCfgLine(config_line);
+ 
+

@@ -1,0 +1,117 @@
+Fix HttpStateData::readReply to retry read from server in the case of EINPROGRESS, EAGAIN or similar errors
+
+This bug mostly affects SSL bumped connections.
+The HttpStateData::readReply will not retry read from server in the case of an
+EINPROGRESS or similar comm errors and the connection will hang, until the
+timeout handler called.
+
+The Comm::ReadNow method calls ignoreErrno function to test if the comm error
+should be ignored and in this case return Comm::INPROGRESS value.
+In this case we need to set flags.do_next_read to true to force
+HttpStateData::maybeReadVirginBody() method retry read.
+
+
+This is a Measurement Factory project
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2015-03-28 13:20:21 +0000
++++ src/http.cc	2015-04-06 14:26:11 +0000
+@@ -1175,40 +1175,41 @@
+         assert(entry->mem_obj);
+ 
+         /* read ahead limit */
+         /* Perhaps these two calls should both live in MemObject */
+         AsyncCall::Pointer nilCall;
+         if (!entry->mem_obj->readAheadPolicyCanRead()) {
+             entry->mem_obj->delayRead(DeferredRead(readDelayed, this, CommRead(io.conn, NULL, 0, nilCall)));
+             return;
+         }
+ 
+         /* delay id limit */
+         entry->mem_obj->mostBytesAllowed().delayRead(DeferredRead(readDelayed, this, CommRead(io.conn, NULL, 0, nilCall)));
+         return;
+     }
+ #endif
+ 
+     switch (Comm::ReadNow(rd, inBuf)) {
+     case Comm::INPROGRESS:
+         if (inBuf.isEmpty())
+             debugs(33, 2, io.conn << ": no data to process, " << xstrerr(rd.xerrno));
++        flags.do_next_read = true;
+         maybeReadVirginBody();
+         return;
+ 
+     case Comm::OK:
+     {
+         payloadSeen += rd.size;
+ #if USE_DELAY_POOLS
+         DelayId delayId = entry->mem_obj->mostBytesAllowed();
+         delayId.bytesIn(rd.size);
+ #endif
+ 
+         kb_incr(&(statCounter.server.all.kbytes_in), rd.size);
+         kb_incr(&(statCounter.server.http.kbytes_in), rd.size);
+         ++ IOStats.Http.reads;
+ 
+         int bin = 0;
+         for (int clen = rd.size - 1; clen; ++bin)
+             clen >>= 1;
+ 
+         ++ IOStats.Http.read_hist[bin];
+@@ -1217,50 +1218,45 @@
+         const timeval &sent = request->hier.peer_http_request_sent;
+         if (sent.tv_sec)
+             tvSub(request->hier.peer_response_time, sent, current_time);
+         else
+             request->hier.peer_response_time.tv_sec = -1;
+     }
+ 
+         /* Continue to process previously read data */
+     break;
+ 
+     case Comm::ENDFILE: // close detected by 0-byte read
+         eof = 1;
+         flags.do_next_read = false;
+ 
+         /* Continue to process previously read data */
+         break;
+ 
+     // case Comm::COMM_ERROR:
+     default: // no other flags should ever occur
+         debugs(11, 2, io.conn << ": read failure: " << xstrerr(rd.xerrno));
+-
+-        if (ignoreErrno(rd.xerrno)) {
+-            flags.do_next_read = true;
+-        } else {
+-            ErrorState *err = new ErrorState(ERR_READ_ERROR, Http::scBadGateway, fwd->request);
+-            err->xerrno = rd.xerrno;
+-            fwd->fail(err);
+-            flags.do_next_read = false;
+-            io.conn->close();
+-        }
++        ErrorState *err = new ErrorState(ERR_READ_ERROR, Http::scBadGateway, fwd->request);
++        err->xerrno = rd.xerrno;
++        fwd->fail(err);
++        flags.do_next_read = false;
++        io.conn->close();
+ 
+         return;
+     }
+ 
+     /* Process next response from buffer */
+     processReply();
+ }
+ 
+ /// processes the already read and buffered response data, possibly after
+ /// waiting for asynchronous 1xx control message processing
+ void
+ HttpStateData::processReply()
+ {
+ 
+     if (flags.handling1xx) { // we came back after handling a 1xx response
+         debugs(11, 5, HERE << "done with 1xx handling");
+         flags.handling1xx = false;
+         Must(!flags.headers_parsed);
+     }
+ 
+

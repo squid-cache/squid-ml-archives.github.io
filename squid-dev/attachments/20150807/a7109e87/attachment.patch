@@ -1,0 +1,441 @@
+Reject non-chunked HTTP responses with conflicting Content-Length values.
+
+Squid used to trust and forward the largest Content-Length header. This
+behavior violated an RFC 7230 MUST in Section 3.3.3 item #4. It also confused
+some ICAP services and probably some HTTP clients. Squid now refuses to
+forward the message to the ICAP service and HTTP client, responding with an
+HTTP 502 error instead.
+
+This is a quick-and-dirty implementation. A polished version should reject
+responses with invalid Content-Length values as well (per RFC 7230 MUST),
+should return 502 even with a strict parser (this is not a header parsing
+issue), and should probably not warn the admin when all values actually match.
+
+=== modified file 'src/HttpHeader.cc'
+--- src/HttpHeader.cc	2015-08-05 16:30:48 +0000
++++ src/HttpHeader.cc	2015-08-06 21:46:19 +0000
+@@ -271,139 +271,141 @@
+     httpHeaderMaskInit(&ListHeadersMask, 0);
+     httpHeaderCalcMask(&ListHeadersMask, ListHeadersArr, countof(ListHeadersArr));
+ 
+     httpHeaderMaskInit(&ReplyHeadersMask, 0);
+     httpHeaderCalcMask(&ReplyHeadersMask, ReplyHeadersArr, countof(ReplyHeadersArr));
+     httpHeaderCalcMask(&ReplyHeadersMask, GeneralHeadersArr, countof(GeneralHeadersArr));
+     httpHeaderCalcMask(&ReplyHeadersMask, EntityHeadersArr, countof(EntityHeadersArr));
+ 
+     httpHeaderMaskInit(&RequestHeadersMask, 0);
+     httpHeaderCalcMask(&RequestHeadersMask, RequestHeadersArr, countof(RequestHeadersArr));
+     httpHeaderCalcMask(&RequestHeadersMask, GeneralHeadersArr, countof(GeneralHeadersArr));
+     httpHeaderCalcMask(&RequestHeadersMask, EntityHeadersArr, countof(EntityHeadersArr));
+ 
+     httpHeaderMaskInit(&HopByHopHeadersMask, 0);
+     httpHeaderCalcMask(&HopByHopHeadersMask, HopByHopHeadersArr, countof(HopByHopHeadersArr));
+ 
+     /* header stats initialized by class constructor */
+     assert(HttpHeaderStatCount == hoReply + 1);
+ 
+     /* init dependent modules */
+     httpHdrCcInitModule();
+     httpHdrScInitModule();
+ 
+     httpHeaderRegisterWithCacheManager();
+ }
+ 
+ /*
+  * HttpHeader Implementation
+  */
+ 
+-HttpHeader::HttpHeader() : owner (hoNone), len (0)
++HttpHeader::HttpHeader() : owner (hoNone), len (0), conflictingContentLength_(false)
+ {
+     httpHeaderMaskInit(&mask, 0);
+ }
+ 
+-HttpHeader::HttpHeader(const http_hdr_owner_type anOwner): owner(anOwner), len(0)
++HttpHeader::HttpHeader(const http_hdr_owner_type anOwner): owner(anOwner), len(0), conflictingContentLength_(false)
+ {
+     assert(anOwner > hoNone && anOwner < hoEnd);
+     debugs(55, 7, "init-ing hdr: " << this << " owner: " << owner);
+     httpHeaderMaskInit(&mask, 0);
+ }
+ 
+-HttpHeader::HttpHeader(const HttpHeader &other): owner(other.owner), len(other.len)
++HttpHeader::HttpHeader(const HttpHeader &other): owner(other.owner), len(other.len), conflictingContentLength_(false)
+ {
+     httpHeaderMaskInit(&mask, 0);
+     update(&other, NULL); // will update the mask as well
+ }
+ 
+ HttpHeader::~HttpHeader()
+ {
+     clean();
+ }
+ 
+ HttpHeader &
+ HttpHeader::operator =(const HttpHeader &other)
+ {
+     if (this != &other) {
+         // we do not really care, but the caller probably does
+         assert(owner == other.owner);
+         clean();
+         update(&other, NULL); // will update the mask as well
+         len = other.len;
++        conflictingContentLength_ = other.conflictingContentLength_;
+     }
+     return *this;
+ }
+ 
+ void
+ HttpHeader::clean()
+ {
+ 
+     assert(owner > hoNone && owner < hoEnd);
+     debugs(55, 7, "cleaning hdr: " << this << " owner: " << owner);
+ 
+     PROF_start(HttpHeaderClean);
+ 
+     if (owner <= hoReply) {
+         /*
+          * An unfortunate bug.  The entries array is initialized
+          * such that count is set to zero.  httpHeaderClean() seems to
+          * be called both when 'hdr' is created, and destroyed.  Thus,
+          * we accumulate a large number of zero counts for 'hdr' before
+          * it is ever used.  Can't think of a good way to fix it, except
+          * adding a state variable that indicates whether or not 'hdr'
+          * has been used.  As a hack, just never count zero-sized header
+          * arrays.
+          */
+         if (!entries.empty())
+             HttpHeaderStats[owner].hdrUCountDistr.count(entries.size());
+ 
+         ++ HttpHeaderStats[owner].destroyedCount;
+ 
+         HttpHeaderStats[owner].busyDestroyedCount += entries.size() > 0;
+     } // if (owner <= hoReply)
+ 
+     for(HttpHeaderEntry *e : entries) {
+         if (e == nullptr)
+             continue;
+         if (!Http::any_valid_header(e->id)) {
+             debugs(55, DBG_CRITICAL, "BUG: invalid entry (" << e->id << "). Ignored.");
+         } else {
+             if (owner <= hoReply)
+                 HttpHeaderStats[owner].fieldTypeDistr.count(e->id);
+             delete e;
+         }
+     }
+ 
+     entries.clear();
+     httpHeaderMaskInit(&mask, 0);
+     len = 0;
++    conflictingContentLength_ = false;
+     PROF_stop(HttpHeaderClean);
+ }
+ 
+ /* append entries (also see httpHeaderUpdate) */
+ void
+ HttpHeader::append(const HttpHeader * src)
+ {
+     const HttpHeaderEntry *e;
+     HttpHeaderPos pos = HttpHeaderInitPos;
+     assert(src);
+     assert(src != this);
+     debugs(55, 7, "appending hdr: " << this << " += " << src);
+ 
+     while ((e = src->getEntry(&pos))) {
+         addEntry(e->clone());
+     }
+ }
+ 
+ /* use fresh entries to replace old ones */
+ void
+ httpHeaderUpdate(HttpHeader * old, const HttpHeader * fresh, const HttpHeaderMask * denied_mask)
+ {
+     assert (old);
+     old->update (fresh, denied_mask);
+ }
+ 
+ void
+ HttpHeader::update (HttpHeader const *fresh, HttpHeaderMask const *denied_mask)
+ {
+     const HttpHeaderEntry *e;
+@@ -546,95 +548,100 @@
+             debugs(55, warnOnError, "WARNING: unparseable HTTP header field {" <<
+                    getStringPrefix(field_start, field_end-field_start) << "}");
+             debugs(55, warnOnError, " in {" << getStringPrefix(header_start, hdrLen) << "}");
+ 
+             if (Config.onoff.relaxed_header_parser)
+                 continue;
+ 
+             PROF_stop(HttpHeaderParse);
+             return reset();
+         }
+ 
+         if (e->id == Http::HdrType::CONTENT_LENGTH && (e2 = findEntry(e->id)) != nullptr) {
+             if (e->value != e2->value) {
+                 int64_t l1, l2;
+                 debugs(55, warnOnError, "WARNING: found two conflicting content-length headers in {" <<
+                        getStringPrefix(header_start, hdrLen) << "}");
+ 
+                 if (!Config.onoff.relaxed_header_parser) {
+                     delete e;
+                     PROF_stop(HttpHeaderParse);
+                     return reset();
+                 }
+ 
+                 if (!httpHeaderParseOffset(e->value.termedBuf(), &l1)) {
+                     debugs(55, DBG_IMPORTANT, "WARNING: Unparseable content-length '" << e->value << "'");
+                     delete e;
+                     continue;
+                 } else if (!httpHeaderParseOffset(e2->value.termedBuf(), &l2)) {
+                     debugs(55, DBG_IMPORTANT, "WARNING: Unparseable content-length '" << e2->value << "'");
+                     delById(e2->id);
+-                } else if (l1 > l2) {
+-                    delById(e2->id);
+-                } else {
++                } else if (l1 != l2) {
++                    conflictingContentLength_ = true;
+                     delete e;
+                     continue;
+                 }
+             } else {
+                 debugs(55, warnOnError, "NOTICE: found double content-length header");
+                 delete e;
+ 
+                 if (Config.onoff.relaxed_header_parser)
+                     continue;
+ 
+                 PROF_stop(HttpHeaderParse);
+                 return reset();
+             }
+         }
+ 
+         if (e->id == Http::HdrType::OTHER && stringHasWhitespace(e->name.termedBuf())) {
+             debugs(55, warnOnError, "WARNING: found whitespace in HTTP header name {" <<
+                    getStringPrefix(field_start, field_end-field_start) << "}");
+ 
+             if (!Config.onoff.relaxed_header_parser) {
+                 delete e;
+                 PROF_stop(HttpHeaderParse);
+                 return reset();
+             }
+         }
+ 
+         addEntry(e);
+     }
+ 
+     if (chunked()) {
+         // RFC 2616 section 4.4: ignore Content-Length with Transfer-Encoding
+         delById(Http::HdrType::CONTENT_LENGTH);
++        // RFC 7230 section 3.3.3 #4: ignore Content-Length conflicts with Transfer-Encoding
++        conflictingContentLength_ = false;
++    } else
++    if (conflictingContentLength_) {
++        // ensure our callers do not see the conflicting Content-Length value
++        delById(Http::HdrType::CONTENT_LENGTH);
+     }
+ 
+     PROF_stop(HttpHeaderParse);
+     return 1;           /* even if no fields where found, it is a valid header */
+ }
+ 
+ /* packs all the entries using supplied packer */
+ void
+ HttpHeader::packInto(Packable * p, bool mask_sensitive_info) const
+ {
+     HttpHeaderPos pos = HttpHeaderInitPos;
+     const HttpHeaderEntry *e;
+     assert(p);
+     debugs(55, 7, this << " into " << p <<
+            (mask_sensitive_info ? " while masking" : ""));
+     /* pack all entries one by one */
+     while ((e = getEntry(&pos))) {
+         if (!mask_sensitive_info) {
+             e->packInto(p);
+             continue;
+         }
+ 
+         bool maskThisEntry = false;
+         switch (e->id) {
+         case Http::HdrType::AUTHORIZATION:
+         case Http::HdrType::PROXY_AUTHORIZATION:
+             maskThisEntry = true;
+             break;
+ 
+         case Http::HdrType::FTP_ARGUMENTS:
+
+=== modified file 'src/HttpHeader.h'
+--- src/HttpHeader.h	2015-08-05 13:47:19 +0000
++++ src/HttpHeader.h	2015-08-06 21:22:14 +0000
+@@ -69,100 +69,102 @@
+ 
+ class HttpHeader
+ {
+ 
+ public:
+     HttpHeader();
+     explicit HttpHeader(const http_hdr_owner_type owner);
+     HttpHeader(const HttpHeader &other);
+     ~HttpHeader();
+ 
+     HttpHeader &operator =(const HttpHeader &other);
+ 
+     /* Interface functions */
+     void clean();
+     void append(const HttpHeader * src);
+     void update (HttpHeader const *fresh, HttpHeaderMask const *denied_mask);
+     void compact();
+     int reset();
+     int parse(const char *header_start, size_t len);
+     void packInto(Packable * p, bool mask_sensitive_info=false) const;
+     HttpHeaderEntry *getEntry(HttpHeaderPos * pos) const;
+     HttpHeaderEntry *findEntry(Http::HdrType id) const;
+     int delByName(const char *name);
+     int delById(Http::HdrType id);
+     void delAt(HttpHeaderPos pos, int &headers_deleted);
+     void refreshMask();
+     void addEntry(HttpHeaderEntry * e);
+     void insertEntry(HttpHeaderEntry * e);
+     String getList(Http::HdrType id) const;
+     bool getList(Http::HdrType id, String *s) const;
++    bool conflictingContentLength() const { return conflictingContentLength_; }
+     String getStrOrList(Http::HdrType id) const;
+     String getByName(const char *name) const;
+     /// sets value and returns true iff a [possibly empty] named field is there
+     bool getByNameIfPresent(const char *name, String &value) const;
+     String getByNameListMember(const char *name, const char *member, const char separator) const;
+     String getListMember(Http::HdrType id, const char *member, const char separator) const;
+     int has(Http::HdrType id) const;
+     void putInt(Http::HdrType id, int number);
+     void putInt64(Http::HdrType id, int64_t number);
+     void putTime(Http::HdrType id, time_t htime);
+     void insertTime(Http::HdrType id, time_t htime);
+     void putStr(Http::HdrType id, const char *str);
+     void putAuth(const char *auth_scheme, const char *realm);
+     void putCc(const HttpHdrCc * cc);
+     void putContRange(const HttpHdrContRange * cr);
+     void putRange(const HttpHdrRange * range);
+     void putSc(HttpHdrSc *sc);
+     void putWarning(const int code, const char *const text); ///< add a Warning header
+     void putExt(const char *name, const char *value);
+     int getInt(Http::HdrType id) const;
+     int64_t getInt64(Http::HdrType id) const;
+     time_t getTime(Http::HdrType id) const;
+     const char *getStr(Http::HdrType id) const;
+     const char *getLastStr(Http::HdrType id) const;
+     HttpHdrCc *getCc() const;
+     HttpHdrRange *getRange() const;
+     HttpHdrSc *getSc() const;
+     HttpHdrContRange *getContRange() const;
+     const char *getAuth(Http::HdrType id, const char *auth_scheme) const;
+     ETag getETag(Http::HdrType id) const;
+     TimeOrTag getTimeOrTag(Http::HdrType id) const;
+     int hasListMember(Http::HdrType id, const char *member, const char separator) const;
+     int hasByNameListMember(const char *name, const char *member, const char separator) const;
+     void removeHopByHopEntries();
+     inline bool chunked() const; ///< whether message uses chunked Transfer-Encoding
+ 
+     /* protected, do not use these, use interface functions instead */
+     std::vector<HttpHeaderEntry *> entries;     /**< parsed fields in raw format */
+     HttpHeaderMask mask;    /**< bit set <=> entry present */
+     http_hdr_owner_type owner;  /**< request or reply */
+     int len;            /**< length when packed, not counting terminating null-byte */
+ 
+ protected:
+     /** \deprecated Public access replaced by removeHopByHopEntries() */
+     void removeConnectionHeaderEntries();
+ 
+ private:
+     HttpHeaderEntry *findLastEntry(Http::HdrType id) const;
++    bool conflictingContentLength_;
+ };
+ 
+ int httpHeaderParseQuotedString(const char *start, const int len, String *val);
+ 
+ /// quotes string using RFC 7230 quoted-string rules
+ SBuf httpHeaderQuoteString(const char *raw);
+ 
+ int httpHeaderHasByNameListMember(const HttpHeader * hdr, const char *name, const char *member, const char separator);
+ void httpHeaderUpdate(HttpHeader * old, const HttpHeader * fresh, const HttpHeaderMask * denied_mask);
+ void httpHeaderCalcMask(HttpHeaderMask * mask, Http::HdrType http_hdr_type_enums[], size_t count);
+ 
+ inline bool
+ HttpHeader::chunked() const
+ {
+     return has(Http::HdrType::TRANSFER_ENCODING) &&
+            hasListMember(Http::HdrType::TRANSFER_ENCODING, "chunked", ',');
+ }
+ 
+ void httpHeaderInitModule(void);
+ 
+ #endif /* SQUID_HTTPHEADER_H */
+ 
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2015-08-05 13:47:19 +0000
++++ src/http.cc	2015-08-06 21:45:24 +0000
+@@ -1287,60 +1287,63 @@
+         debugs(11, 5, HERE << "wait for 1xx handling");
+         Must(!flags.headers_parsed);
+         return false;
+     }
+ 
+     if (!flags.headers_parsed && !eof) {
+         debugs(11, 9, "needs more at " << inBuf.length());
+         flags.do_next_read = true;
+         /** \retval false If we have not finished parsing the headers and may get more data.
+          *                Schedules more reads to retrieve the missing data.
+          */
+         maybeReadVirginBody(); // schedules all kinds of reads; TODO: rename
+         return false;
+     }
+ 
+     /** If we are done with parsing, check for errors */
+ 
+     err_type error = ERR_NONE;
+ 
+     if (flags.headers_parsed) { // parsed headers, possibly with errors
+         // check for header parsing errors
+         if (HttpReply *vrep = virginReply()) {
+             const Http::StatusCode s = vrep->sline.status();
+             const AnyP::ProtocolVersion &v = vrep->sline.version;
+             if (s == Http::scInvalidHeader && v != Http::ProtocolVersion(0,9)) {
+                 debugs(11, DBG_IMPORTANT, "WARNING: HTTP: Invalid Response: Bad header encountered from " << entry->url() << " AKA " << request->url);
+                 error = ERR_INVALID_RESP;
+             } else if (s == Http::scHeaderTooLarge) {
+                 fwd->dontRetry(true);
+                 error = ERR_TOO_BIG;
++            } else if (vrep->header.conflictingContentLength()) {
++                fwd->dontRetry(true);
++                error = ERR_INVALID_RESP;
+             } else {
+                 return true; // done parsing, got reply, and no error
+             }
+         } else {
+             // parsed headers but got no reply
+             debugs(11, DBG_IMPORTANT, "WARNING: HTTP: Invalid Response: No reply at all for " << entry->url() << " AKA " << request->url);
+             error = ERR_INVALID_RESP;
+         }
+     } else {
+         assert(eof);
+         if (inBuf.length()) {
+             error = ERR_INVALID_RESP;
+             debugs(11, DBG_IMPORTANT, "WARNING: HTTP: Invalid Response: Headers did not parse at all for " << entry->url() << " AKA " << request->url);
+         } else {
+             error = ERR_ZERO_SIZE_OBJECT;
+             debugs(11, (request->flags.accelerated?DBG_IMPORTANT:2), "WARNING: HTTP: Invalid Response: No object data received for " << entry->url() << " AKA " << request->url);
+         }
+     }
+ 
+     assert(error != ERR_NONE);
+     entry->reset();
+     fwd->fail(new ErrorState(error, Http::scBadGateway, fwd->request));
+     flags.do_next_read = false;
+     serverConnection->close();
+     return false; // quit on error
+ }
+ 
+ /** truncate what we read if we read too much so that writeReplyBody()
+     writes no more than what we should have read */
+ void
+

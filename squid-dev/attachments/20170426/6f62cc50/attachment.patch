@@ -1,0 +1,213 @@
+Fixed xstrndup() documentation, callers. Disclosed implementation bugs.
+
+xstrndup() does not work like strndup(3), and some callers got confused:
+
+1. When n is the str length or less, standard strndup(str,n) copies all
+   n bytes but our xstrndup(str,n) drops the last one. Thus, all callers
+   must add one to the desired result length when calling xstrndup().
+   Most already do, but it is often hard to see due to low code quality
+   (e.g., one must remember that MAX_URL is not the maximum URL length).
+
+2. xstrndup() also assumes that the source string is 0-terminated. This
+   dangerous assumption does not contradict many official strndup(3)
+   descriptions, but that lack of contradiction is actually a recently
+   fixed POSIX documentation bug (i.e., correct implementations must not
+   assume 0-termination): http://austingroupbugs.net/view.php?id=1019
+
+The OutOfBoundsException bug led to truncated exception messages.
+
+The ESI bug led to truncated 'literal strings', but I do not know what
+that means in terms of user impact. That ESI fix is untested.
+
+cachemgr.cc bug was masked by the fact that the buffer ends with \n
+that is unused and stripped by the custom xstrtok() implementation.
+
+TODO. Fix xstrndup() implementation (and rename the function so that
+fixed callers do not misbehave if carelessly ported to older Squids).
+
+=== modified file 'compat/xstring.h'
+--- compat/xstring.h	2017-01-01 00:12:22 +0000
++++ compat/xstring.h	2017-04-26 20:43:53 +0000
+@@ -24,41 +24,44 @@ extern "C" {
+  * Sets errno to EINVAL if a NULL pointer is passed.
+  *
+  * Define failure_notify to receive error message.
+  * otherwise perror() is used to display it.
+  */
+ char *xstrdup(const char *s);
+ 
+ #ifdef strdup
+ #undef strdup
+ #endif
+ #define strdup(X) xstrdup((X))
+ 
+ /*
+  *  xstrncpy() - similar to strncpy(3) but terminates string
+  *  always with '\0' if (n != 0 and dst != NULL),
+  *  and doesn't do padding
+  */
+ char *xstrncpy(char *dst, const char *src, size_t n);
+ 
+ /**
+- * xstrndup() - same as strndup(3).  Used for portability.
++ * xstrndup() - Somewhat similar(XXX) to strndup(3): Allocates up to n bytes,
++ * while strndup(3) copies up to n bytes and allocates up to n+1 bytes
++ * to fit the terminating character. Assumes s is 0-terminated (another XXX).
++ *
+  * Never returns NULL; fatal on error.
+  *
+  * Sets errno to EINVAL if a NULL pointer or negative
+  * length is passed.
+  *
+  * Define failure_notify to receive error message.
+  * otherwise perror() is used to display it.
+  */
+ char *xstrndup(const char *s, size_t n);
+ 
+ #ifdef strndup
+ #undef strndup
+ #endif
+ #define strndup(X) xstrndup((X))
+ 
+ #ifdef __cplusplus
+ }
+ #endif
+ 
+ #endif /* SQUID_COMPAT_XSTRING_H */
+
+=== modified file 'src/esi/Expression.cc'
+--- src/esi/Expression.cc	2017-01-01 00:12:22 +0000
++++ src/esi/Expression.cc	2017-04-26 22:20:01 +0000
+@@ -726,41 +726,41 @@ getsymbol(const char *s, char const **en
+             *endptr = s + 1;
+             rv.valuetype = ESI_EXPR_NOT;
+             rv.precedence = 4;
+             rv.eval = evalnegate;
+         }
+     } else if ('\'' == *s) {
+         char const *t = s + 1;
+         debugs(86, 6, "found \'");
+ 
+         while (*t != '\'' && *t)
+             ++t;
+ 
+         if (!*t) {
+             debugs(86, DBG_IMPORTANT, "missing end \' in '" << s << "'");
+             *endptr = origs;
+         } else {
+             *endptr = t + 1;
+             /* Special case for zero length strings */
+ 
+             if (t - s - 1)
+-                rv.value.string = xstrndup(s + 1, t - s - 1);
++                rv.value.string = xstrndup(s + 1, t - (s + 1) + 1);
+             else
+                 rv.value.string = static_cast<char *>(xcalloc(1,1));
+ 
+             rv.eval = evalliteral;
+ 
+             rv.valuestored = ESI_LITERAL_STRING;
+ 
+             rv.valuetype = ESI_EXPR_LITERAL;
+ 
+             rv.precedence = 1;
+ 
+             debugs(86, 6, "found  string '" << rv.value.string << "'");
+         }
+     } else if ('(' == *s) {
+         debugs(86, 6, "found subexpr start");
+         *endptr = s + 1;
+         rv.valuetype = ESI_EXPR_START;
+         rv.precedence = 5;
+         rv.eval = evalstartexpr;
+     } else if (')' == *s) {
+
+=== modified file 'src/sbuf/Exceptions.cc'
+--- src/sbuf/Exceptions.cc	2017-01-01 00:12:22 +0000
++++ src/sbuf/Exceptions.cc	2017-04-26 20:44:17 +0000
+@@ -8,36 +8,34 @@
+ 
+ #include "squid.h"
+ #include "sbuf/Exceptions.h"
+ #include "sbuf/OutOfBoundsException.h"
+ #include "sbuf/SBuf.h"
+ 
+ OutOfBoundsException::OutOfBoundsException(const SBuf &throwingBuf,
+         SBuf::size_type &pos,
+         const char *aFileName, int aLineNo)
+     : TextException(NULL, aFileName, aLineNo),
+       theThrowingBuf(throwingBuf),
+       accessedPosition(pos)
+ {
+     SBuf explanatoryText("OutOfBoundsException");
+     if (aLineNo != -1)
+         explanatoryText.appendf(" at line %d", aLineNo);
+     if (aFileName != NULL)
+         explanatoryText.appendf(" in file %s", aFileName);
+     explanatoryText.appendf(" while accessing position %d in a SBuf long %d",
+                             pos, throwingBuf.length());
+-    // we can safely alias c_str as both are local to the object
+-    //  and will not further manipulated.
+-    message = xstrndup(explanatoryText.c_str(),explanatoryText.length());
++    message = xstrdup(explanatoryText.c_str());
+ }
+ 
+ OutOfBoundsException::~OutOfBoundsException() throw()
+ { }
+ 
+ InvalidParamException::InvalidParamException(const char *aFilename, int aLineNo)
+     : TextException("Invalid parameter", aFilename, aLineNo)
+ { }
+ 
+ SBufTooBigException::SBufTooBigException(const char *aFilename, int aLineNo)
+     : TextException("Trying to create an oversize SBuf", aFilename, aLineNo)
+ { }
+ 
+
+=== modified file 'tools/cachemgr.cc'
+--- tools/cachemgr.cc	2017-01-01 00:12:22 +0000
++++ tools/cachemgr.cc	2017-04-26 21:28:11 +0000
+@@ -423,41 +423,41 @@ menu_url(cachemgr_request * req, const c
+              safe_str(req->pub_auth));
+     return url;
+ }
+ 
+ static void
+ munge_menu_line(MemBuf &out, const char *buf, cachemgr_request * req)
+ {
+     char *x;
+     const char *a;
+     const char *d;
+     const char *p;
+     char *a_url;
+     char *buf_copy;
+ 
+     const char bufLen = strlen(buf);
+     if (bufLen < 1 || *buf != ' ') {
+         out.append(buf, bufLen);
+         return;
+     }
+ 
+-    buf_copy = x = xstrndup(buf, bufLen);
++    buf_copy = x = xstrndup(buf, bufLen+1);
+ 
+     a = xstrtok(&x, '\t');
+ 
+     d = xstrtok(&x, '\t');
+ 
+     p = xstrtok(&x, '\t');
+ 
+     a_url = xstrdup(menu_url(req, a));
+ 
+     /* no reason to give a url for a disabled action */
+     if (!strcmp(p, "disabled"))
+         out.appendf("<LI type=\"circle\">%s (disabled)<A HREF=\"%s\">.</A>\n", d, a_url);
+     else
+         /* disable a hidden action (requires a password, but password is not in squid.conf) */
+         if (!strcmp(p, "hidden"))
+             out.appendf("<LI type=\"circle\">%s (hidden)<A HREF=\"%s\">.</A>\n", d, a_url);
+         else
+             /* disable link if authentication is required and we have no password */
+             if (!strcmp(p, "protected") && !req->passwd)
+                 out.appendf("<LI type=\"circle\">%s (requires <a href=\"%s\">authentication</a>)<A HREF=\"%s\">.</A>\n",
+

@@ -1,0 +1,128 @@
+Reduce crashes due to unexpected ClientHttpRequest termination.
+
+The underlying problem has been known since r13480: If a
+ClientHttpRequest job ends without Http::Stream (and ConnStateData)
+knowledge, then Squid is likely to segfault or assert. This patch does
+not resolve the underlying issue (a proper fix would require
+architectural changes in a consensus-lacking area) but makes an
+unexpected ClientHttpRequest job destruction less likely.
+
+BodyPipe and Adaptation-related exceptions are the major causes of
+unexpected ClientHttpRequest job destruction. This patch handles them by
+closing the client connection. Connection closure should trigger an
+orderly top-down cleanup, including Http::Stream, ConnStateData, and
+ClientHttpRequest destruction.
+
+If there is no connection to close, then the exception is essentially
+ignored with a level-1 error message disclosing the problem. The side
+effects of ignoring such exceptions are unknown, but without a client
+connection, it is our hope that they would be relatively benign.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/client_side_request.cc'
+--- src/client_side_request.cc	2016-12-22 04:08:55 +0000
++++ src/client_side_request.cc	2017-01-10 21:59:46 +0000
+@@ -2052,40 +2052,55 @@ ClientHttpRequest::handleAdaptationFailu
+ 
+     if (bypassable && !usedStore && !usedPipe) {
+         debugs(85,3, HERE << "ICAP REQMOD callout failed, bypassing: " << calloutContext);
+         if (calloutContext)
+             doCallouts();
+         return;
+     }
+ 
+     debugs(85,3, HERE << "ICAP REQMOD callout failed, responding with error");
+ 
+     clientStreamNode *node = (clientStreamNode *)client_stream.tail->prev->data;
+     clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+     assert(repContext);
+ 
+     calloutsError(ERR_ICAP_FAILURE, errDetail);
+ 
+     if (calloutContext)
+         doCallouts();
+ }
+ 
++void
++ClientHttpRequest::callException(const std::exception &ex)
++{
++    if (const auto clientConnection = getConn() ? getConn()->clientConnection : nullptr)
++        if (Comm::IsConnOpen(clientConnection)) {
++            debugs(85, 3, "closing after exception: " << ex.what());
++            clientConnection->close(); // initiate orderly top-to-bottom cleanup
++            return;
++        }
++    }
++    debugs(85, DBG_IMPORTANT, "ERROR: ClientHttpRequest exception without connection. Ignoring " << ex.what());
++    // XXX: Normally, we mustStop() but we cannot do that here because it is
++    // likely to leave Http::Stream and ConnStateData with a dangling http
++    // pointer. See r13480 or XXX in Http::Stream class description.
++}
+ #endif
+ 
+ // XXX: modify and use with ClientRequestContext::clientAccessCheckDone too.
+ void
+ ClientHttpRequest::calloutsError(const err_type error, const int errDetail)
+ {
+     // The original author of the code also wanted to pass an errno to
+     // setReplyToError, but it seems unlikely that the errno reflects the
+     // true cause of the error at this point, so I did not pass it.
+     if (calloutContext) {
+         Ip::Address noAddr;
+         noAddr.setNoAddr();
+         ConnStateData * c = getConn();
+         calloutContext->error = clientBuildError(error, Http::scInternalServerError,
+                                 NULL,
+                                 c != NULL ? c->clientConnection->remote : noAddr,
+                                 request
+                                                 );
+ #if USE_AUTH
+         calloutContext->error->auth_user_request =
+
+=== modified file 'src/client_side_request.h'
+--- src/client_side_request.h	2016-08-15 14:44:43 +0000
++++ src/client_side_request.h	2017-01-10 21:58:05 +0000
+@@ -104,40 +104,41 @@ public:
+         Http::StatusCode status;
+         char *location;
+     } redirect;
+ 
+     dlink_node active;
+     dlink_list client_stream;
+     int mRangeCLen();
+ 
+     ClientRequestContext *calloutContext;
+     void doCallouts();
+ 
+     /// Build an error reply. For use with the callouts.
+     void calloutsError(const err_type error, const int errDetail);
+ 
+ #if USE_ADAPTATION
+     // AsyncJob virtual methods
+     virtual bool doneAll() const {
+         return Initiator::doneAll() &&
+                BodyConsumer::doneAll() && false;
+     }
++    virtual void callException(const std::exception &ex);
+ #endif
+ 
+ private:
+     int64_t maxReplyBodySize_;
+     StoreEntry *entry_;
+     StoreEntry *loggingEntry_;
+     ConnStateData * conn_;
+ 
+ #if USE_OPENSSL
+     /// whether (and how) the request needs to be bumped
+     Ssl::BumpMode sslBumpNeed_;
+ 
+ public:
+     /// returns raw sslBump mode value
+     Ssl::BumpMode sslBumpNeed() const { return sslBumpNeed_; }
+     /// returns true if and only if the request needs to be bumped
+     bool sslBumpNeeded() const { return sslBumpNeed_ == Ssl::bumpServerFirst || sslBumpNeed_ == Ssl::bumpClientFirst || sslBumpNeed_ == Ssl::bumpBump || sslBumpNeed_ == Ssl::bumpPeek || sslBumpNeed_ == Ssl::bumpStare; }
+     /// set the sslBumpNeeded state
+     void sslBumpNeed(Ssl::BumpMode mode);
+     void sslBumpStart();
+

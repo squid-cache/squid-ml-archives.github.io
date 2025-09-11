@@ -1,0 +1,326 @@
+Fix external_acl problems after trunk r14351
+(Support logformat %macros in external_acl_type format).
+
+The above changes created the following problems:
+ - external_acl requires AccessLogEntry but ALE is not available
+   in many cases such as ssl_bump ACLs.
+ - The %<cert_subject stopped working because it was supported by
+   external_acl code and not by logformat code.
+
+This patch:
+  - Passes AccessLogEntry in most cases.
+    For example, PeerConnector-related classes are now covered.
+  - Implements the %<cert_subject formating code for logformat.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2016-01-11 14:56:01 +0000
++++ src/FwdState.cc	2016-01-28 15:39:53 +0000
+@@ -702,9 +702,9 @@
+             const time_t sslNegotiationTimeout = max(static_cast<time_t>(1), timeLeft());
+             Ssl::PeerConnector *connector = NULL;
+             if (request->flags.sslPeek)
+-                connector = new Ssl::PeekingPeerConnector(requestPointer, serverConnection(), clientConn, callback, sslNegotiationTimeout);
++                connector = new Ssl::PeekingPeerConnector(requestPointer, serverConnection(), clientConn, callback, al, sslNegotiationTimeout);
+             else
+-                connector = new Ssl::BlindPeerConnector(requestPointer, serverConnection(), callback, sslNegotiationTimeout);
++                connector = new Ssl::BlindPeerConnector(requestPointer, serverConnection(), callback, al, sslNegotiationTimeout);
+             AsyncJob::Start(connector); // will call our callback
+             return;
+         }
+
+=== modified file 'src/PeerPoolMgr.cc'
+--- src/PeerPoolMgr.cc	2016-01-01 00:12:18 +0000
++++ src/PeerPoolMgr.cc	2016-01-28 15:39:53 +0000
+@@ -130,7 +130,7 @@
+         // Use positive timeout when less than one second is left for conn.
+         const int timeLeft = max(1, (peerTimeout - timeUsed));
+         Ssl::BlindPeerConnector *connector =
+-            new Ssl::BlindPeerConnector(request, params.conn, securer, timeLeft);
++            new Ssl::BlindPeerConnector(request, params.conn, securer, NULL, timeLeft);
+         AsyncJob::Start(connector); // will call our callback
+         return;
+     }
+
+=== modified file 'src/adaptation/icap/ModXact.h'
+--- src/adaptation/icap/ModXact.h	2016-01-01 00:12:18 +0000
++++ src/adaptation/icap/ModXact.h	2016-01-28 16:12:53 +0000
+@@ -144,6 +144,8 @@
+     virtual void detailError(int errDetail);
+     // Icap::Xaction API
+     virtual void clearError();
++    /// The master transaction log entry
++    virtual AccessLogEntry::Pointer masterLogEntry() { return alMaster; }
+ 
+ private:
+     virtual void start();
+
+=== modified file 'src/adaptation/icap/Xaction.cc'
+--- src/adaptation/icap/Xaction.cc	2016-01-11 14:56:01 +0000
++++ src/adaptation/icap/Xaction.cc	2016-01-28 18:06:03 +0000
+@@ -55,9 +55,11 @@
+     IcapPeerConnector(
+         Adaptation::Icap::ServiceRep::Pointer &service,
+         const Comm::ConnectionPointer &aServerConn,
+-        AsyncCall::Pointer &aCallback, const time_t timeout = 0):
++        AsyncCall::Pointer &aCallback,
++        AccessLogEntry::Pointer const &alp,
++        const time_t timeout = 0):
+         AsyncJob("Ssl::IcapPeerConnector"),
+-        PeerConnector(aServerConn, aCallback, timeout), icapService(service) {}
++        PeerConnector(aServerConn, aCallback, alp, timeout), icapService(service) {}
+ 
+     /* PeerConnector API */
+     virtual Security::SessionPointer initializeSsl();
+@@ -110,6 +112,13 @@
+     HTTPMSGUNLOCK(icapRequest);
+ }
+ 
++AccessLogEntry::Pointer
++Adaptation::Icap::Xaction::masterLogEntry()
++{
++    AccessLogEntry::Pointer nil;
++    return nil;
++}
++
+ Adaptation::Icap::ServiceRep &
+ Adaptation::Icap::Xaction::service()
+ {
+@@ -304,7 +313,7 @@
+ 
+         Ssl::PeerConnector::HttpRequestPointer tmpReq(NULL);
+         Ssl::IcapPeerConnector *sslConnector =
+-            new Ssl::IcapPeerConnector(theService, io.conn, securer, TheConfig.connect_timeout(service().cfg().bypass));
++            new Ssl::IcapPeerConnector(theService, io.conn, securer, masterLogEntry(), TheConfig.connect_timeout(service().cfg().bypass));
+         AsyncJob::Start(sslConnector); // will call our callback
+         return;
+     }
+
+=== modified file 'src/adaptation/icap/Xaction.h'
+--- src/adaptation/icap/Xaction.h	2016-01-11 14:56:01 +0000
++++ src/adaptation/icap/Xaction.h	2016-01-28 16:11:30 +0000
+@@ -114,6 +114,7 @@
+     virtual void callEnd();
+     /// clear stored error details, if any; used for retries/repeats
+     virtual void clearError() {}
++    virtual AccessLogEntry::Pointer masterLogEntry();
+     void dnsLookupDone(const ipcache_addrs *ia);
+ 
+ protected:
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-01-11 14:56:01 +0000
++++ src/client_side.cc	2016-01-29 19:30:26 +0000
+@@ -3481,7 +3481,6 @@
+     if (s->tcp_keepalive.enabled) {
+         commSetTcpKeepalive(params.conn->fd, s->tcp_keepalive.idle, s->tcp_keepalive.interval, s->tcp_keepalive.timeout);
+     }
+-
+     ++incoming_sockets_accepted;
+ 
+     // Socket is ready, setup the connection manager to start using it
+@@ -3512,6 +3511,14 @@
+         ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(Config.accessList.ssl_bump, request, NULL);
+         acl_checklist->src_addr = clientConnection->remote;
+         acl_checklist->my_addr = port->s;
++        // Build a local AccessLogEntry to allow requiresAle() acls work
++        acl_checklist->al = new AccessLogEntry;
++        acl_checklist->al->cache.start_time = current_time;
++        acl_checklist->al->tcpClient = clientConnection;
++        acl_checklist->al->cache.port = port;
++        acl_checklist->al->cache.caddr = log_addr;
++        acl_checklist->al->request = request;
++        HTTPMSGLOCK(acl_checklist->al->request);
+         acl_checklist->nonBlockingCheck(httpsSslBumpAccessCheckDone, this);
+         return;
+     } else {
+@@ -3979,11 +3986,15 @@
+ {
+     // This is the Step2 of the SSL bumping
+     assert(sslServerBump);
++    ClientSocketContext::Pointer context = pipeline.front();
++    ClientHttpRequest *http = context ? context->http : NULL;
++
+     if (sslServerBump->step == Ssl::bumpStep1) {
+         sslServerBump->step = Ssl::bumpStep2;
+         // Run a accessList check to check if want to splice or continue bumping
+ 
+         ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(Config.accessList.ssl_bump, sslServerBump->request.getRaw(), NULL);
++        acl_checklist->al = http ? http->al : NULL;
+         //acl_checklist->src_addr = params.conn->remote;
+         //acl_checklist->my_addr = s->s;
+         acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpNone));
+@@ -3993,7 +4004,7 @@
+         return;
+     }
+ 
+-    FwdState::fwdStart(clientConnection, sslServerBump->entry, sslServerBump->request.getRaw());
++    FwdState::Start(clientConnection, sslServerBump->entry, sslServerBump->request.getRaw(), http ? http->al : NULL);
+ }
+ 
+ void
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2016-01-01 00:12:18 +0000
++++ src/format/Format.cc	2016-01-28 15:39:53 +0000
+@@ -1262,7 +1262,16 @@
+ 
+         case LFT_SSL_SERVER_CERT_ISSUER:
+         case LFT_SSL_SERVER_CERT_SUBJECT:
+-            // Not implemented
++            if (al->request && al->request->clientConnectionManager.valid()) {
++                if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
++                    if (X509 *serverCert = srvBump->serverCert.get()) {
++                        if (fmt->type == LFT_SSL_SERVER_CERT_SUBJECT)
++                            out = Ssl::GetX509UserAttribute(serverCert, "DN");
++                        else
++                            out = Ssl::GetX509CAAttribute(serverCert, "DN");
++                    }
++                }
++            }
+             break;
+ 
+         case LFT_TLS_CLIENT_NEGOTIATED_VERSION:
+
+=== modified file 'src/format/Token.cc'
+--- src/format/Token.cc	2016-01-01 00:12:18 +0000
++++ src/format/Token.cc	2016-01-28 15:39:53 +0000
+@@ -216,8 +216,8 @@
+     TokenTableEntry(">cert_subject", LFT_SSL_USER_CERT_SUBJECT),
+     TokenTableEntry(">cert_issuer", LFT_SSL_USER_CERT_ISSUER),
+     TokenTableEntry(">sni", LFT_SSL_CLIENT_SNI),
+-    /*TokenTableEntry("<cert_subject", LFT_SSL_SERVER_CERT_SUBJECT), */
+-    /*TokenTableEntry("<cert_issuer", LFT_SSL_SERVER_CERT_ISSUER), */
++    TokenTableEntry("<cert_subject", LFT_SSL_SERVER_CERT_SUBJECT),
++    TokenTableEntry("<cert_issuer", LFT_SSL_SERVER_CERT_ISSUER),
+     TokenTableEntry("<cert_errors", LFT_SSL_SERVER_CERT_ERRORS),
+     TokenTableEntry(">negotiated_version", LFT_TLS_CLIENT_NEGOTIATED_VERSION),
+     TokenTableEntry("<negotiated_version", LFT_TLS_SERVER_NEGOTIATED_VERSION),
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2016-01-11 14:56:01 +0000
++++ src/ssl/PeerConnector.cc	2016-01-28 15:39:53 +0000
+@@ -35,10 +35,11 @@
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, BlindPeerConnector);
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeekingPeerConnector);
+ 
+-Ssl::PeerConnector::PeerConnector(const Comm::ConnectionPointer &aServerConn, AsyncCall::Pointer &aCallback, const time_t timeout) :
++Ssl::PeerConnector::PeerConnector(const Comm::ConnectionPointer &aServerConn, AsyncCall::Pointer &aCallback, const AccessLogEntryPointer &alp, const time_t timeout) :
+     AsyncJob("Ssl::PeerConnector"),
+     serverConn(aServerConn),
+     certErrors(NULL),
++    al(alp),
+     callback(aCallback),
+     negotiationTimeout(timeout),
+     startTime(squid_curtime),
+@@ -125,6 +126,7 @@
+         // The list is used in ssl_verify_cb() and is freed in ssl_free().
+         if (acl_access *acl = ::Config.ssl_client.cert_error) {
+             ACLFilledChecklist *check = new ACLFilledChecklist(acl, request.getRaw(), dash_str);
++            check->al = al;
+             // check->fd(fd); XXX: need client FD here
+             SSL_set_ex_data(ssl, ssl_ex_index_cert_error_check, check);
+         }
+@@ -243,6 +245,7 @@
+     ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(
+         ::Config.accessList.ssl_bump,
+         request.getRaw(), NULL);
++    acl_checklist->al = al;
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpNone));
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpPeek));
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpStare));
+@@ -365,8 +368,10 @@
+     Ssl::CertErrors *errs = NULL;
+ 
+     ACLFilledChecklist *check = NULL;
+-    if (acl_access *acl = ::Config.ssl_client.cert_error)
++    if (acl_access *acl = ::Config.ssl_client.cert_error) {
+         check = new ACLFilledChecklist(acl, request.getRaw(), dash_str);
++        check->al = al;
++    }
+ 
+     SSL *ssl = fd_table[serverConnection()->fd].ssl;
+     typedef Ssl::CertValidationResponse::RecvdErrors::const_iterator SVCRECI;
+
+=== modified file 'src/ssl/PeerConnector.h'
+--- src/ssl/PeerConnector.h	2016-01-01 00:12:18 +0000
++++ src/ssl/PeerConnector.h	2016-01-28 15:39:53 +0000
+@@ -19,6 +19,8 @@
+ 
+ class HttpRequest;
+ class ErrorState;
++class AccessLogEntry;
++typedef RefCount<AccessLogEntry> AccessLogEntryPointer;
+ 
+ namespace Ssl
+ {
+@@ -74,7 +76,9 @@
+ 
+ public:
+     PeerConnector(const Comm::ConnectionPointer &aServerConn,
+-                  AsyncCall::Pointer &aCallback, const time_t timeout = 0);
++                  AsyncCall::Pointer &aCallback,
++                  const AccessLogEntryPointer &alp,
++                  const time_t timeout = 0);
+     virtual ~PeerConnector();
+ 
+ protected:
+@@ -153,6 +157,7 @@
+     /// Certificate errors found from SSL validation procedure or from cert
+     /// validator
+     Ssl::CertErrors *certErrors;
++    AccessLogEntryPointer al; ///< info for the future access.log entry
+ private:
+     PeerConnector(const PeerConnector &); // not implemented
+     PeerConnector &operator =(const PeerConnector &); // not implemented
+@@ -182,9 +187,11 @@
+ public:
+     BlindPeerConnector(HttpRequestPointer &aRequest,
+                        const Comm::ConnectionPointer &aServerConn,
+-                       AsyncCall::Pointer &aCallback, const time_t timeout = 0) :
++                       AsyncCall::Pointer &aCallback,
++                       const AccessLogEntryPointer &alp,
++                       const time_t timeout = 0) :
+         AsyncJob("Ssl::BlindPeerConnector"),
+-        PeerConnector(aServerConn, aCallback, timeout)
++            PeerConnector(aServerConn, aCallback, alp, timeout)
+     {
+         request = aRequest;
+     }
+@@ -210,9 +217,11 @@
+     PeekingPeerConnector(HttpRequestPointer &aRequest,
+                          const Comm::ConnectionPointer &aServerConn,
+                          const Comm::ConnectionPointer &aClientConn,
+-                         AsyncCall::Pointer &aCallback, const time_t timeout = 0) :
++                         AsyncCall::Pointer &aCallback,
++                         const AccessLogEntryPointer &alp,
++                         const time_t timeout = 0) :
+         AsyncJob("Ssl::PeekingPeerConnector"),
+-        PeerConnector(aServerConn, aCallback, timeout),
++            PeerConnector(aServerConn, aCallback, alp, timeout),
+         clientConn(aClientConn),
+         splice(false),
+         resumingSession(false),
+
+=== modified file 'src/tunnel.cc'
+--- src/tunnel.cc	2016-01-01 00:12:18 +0000
++++ src/tunnel.cc	2016-01-28 17:42:20 +0000
+@@ -1103,7 +1103,7 @@
+                                                     "TunnelStateData::ConnectedToPeer",
+                                                     MyAnswerDialer(&TunnelStateData::connectedToPeer, this));
+             Ssl::BlindPeerConnector *connector =
+-                new Ssl::BlindPeerConnector(request, server.conn, callback);
++                new Ssl::BlindPeerConnector(request, server.conn, callback, al);
+             AsyncJob::Start(connector); // will call our callback
+             return;
+         }
+@@ -1253,6 +1253,7 @@
+         if (context != nullptr && context->http != nullptr) {
+             tunnelState->logTag_ptr = &context->http->logType;
+             tunnelState->server.size_ptr = &context->http->out.size;
++            tunnelState->al = context->http->al;
+ 
+ #if USE_DELAY_POOLS
+             /* no point using the delayIsNoDelay stuff since tunnel is nice and simple */
+

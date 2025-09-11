@@ -1,0 +1,233 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-users] ICAP Persistent Connections vs Retries (with code	review)
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20ICAP%20Persistent%20Connections%20vs%20Retries%20%28with%20code%0A%09review%29&In-Reply-To=%3CCAEK0aNvx7oRuP7yqaS-ar2aFRThvTs7TahBfV0Ef8eF-VLs3QA%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015238.html">
+   <LINK REL="Next"  HREF="015244.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-users] ICAP Persistent Connections vs Retries (with code	review)</H1>
+    <B>Juan Ram&#237;rez</B> 
+    <A HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20ICAP%20Persistent%20Connections%20vs%20Retries%20%28with%20code%0A%09review%29&In-Reply-To=%3CCAEK0aNvx7oRuP7yqaS-ar2aFRThvTs7TahBfV0Ef8eF-VLs3QA%40mail.gmail.com%3E"
+       TITLE="[squid-users] ICAP Persistent Connections vs Retries (with code	review)">jramirez.uy at gmail.com
+       </A><BR>
+    <I>Fri May 12 19:17:57 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="015238.html">[squid-users] ICAP Persistent Connections vs Retries (with code review)
+</A></li>
+        <LI>Next message (by thread): <A HREF="015244.html">[squid-users] ICAP Persistent Connections vs Retries (with code review)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15243">[ date ]</a>
+              <a href="thread.html#15243">[ thread ]</a>
+              <a href="subject.html#15243">[ subject ]</a>
+              <a href="author.html#15243">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi,
+
+Thank you all for such detailed responses.
+
+I still don't understand whether it is possible to reuse ICAP connections
+for cases other than retries.
+
+As far as I know, Squid is able to save connections in a pool called
+`theIdleConns`.
+Can these connection be reused for other transactions in the future?
+
+The flow I am trying to accomplish is the following:
+
+1. Client performs a requests and a response arrives
+2. Squid catches the response and invokes the ICAP adaptation routine
+3. A new connection the the ICAP server is created
+4. The RESPMOD transaction is issued successfully
+5. The connection is returned to the pool
+6. The response is then sent to the client
+
+... Moments later:
+
+7. Another client performs a request a a response arrives
+8. Squid catches the response and invokes the ICAP adaptation routine
+9. Squid reuses the connection which was created previously
+10. The RESPMOD transaction is issued successfully
+11. The connection is returned to the pool
+12. The response is then sent to the client
+
+That behavior does not happen, going back to this code:
+
+    if (retriableXact)
+        connection = theIdleConns-&gt;pop();
+    else
+        theIdleConns-&gt;closeN(1);
+
+The line `theIdleConns-&gt;closeN(1);` is the one that gets executed all the
+time with no exception. Well, it is actually an exception to the case, and
+I'll explain it later. Have in mind that I modified the code in order to
+prove that:
+
+    if (retriableXact) {
+        debugs(93, 1, HERE &lt;&lt; &quot;Calling theIdleConns-&gt;pop()&quot;);
+        connection = theIdleConns-&gt;pop();
+    } else {
+        debugs(93, 1, HERE &lt;&lt; &quot;Calling theIdleConns-&gt;closeN(1)&quot;);
+        theIdleConns-&gt;closeN(1);
+    }
+
+
+Based on that log, I could confirm that connections are reused properly
+only for small response sizes.
+Digging a little bit into the source code I finally understood what Alex
+mean with &quot;Squid can buffer the entire HTTP message body.&quot;:
+  Retries are disabled if the message body is to big, this is a protective
+measure which prevents from using to much RAM, it is clearly documented and
+I understand it.
+
+For those curious enough, the file in question is `ModXact.cc` (functions `
+decideOnRetries()` and `canBackupEverything()`).
+
+Wrapping up:
+
+* Why does disabling retries in a connection dooms the connection?
+* Why does the size of the payload affect the way connections are reused
+* Does Squid need a finer control on this matter in order to ensure
+connection reusability is not affected by the size of the payload?
+
+In the first response, Amos wrote the following:
+
+&gt;&gt;<i> Requests which are not retriable are not able to be re-sent if it turns
+</I>out
+&gt;&gt;<i> they got even partially delivered on a pre-opened persistent connection
+</I>&gt;&gt;<i> which happened to be in the process of closing by the other endpoint
+</I>&gt;&gt;<i> unknown to Squid. For example if the timing of the write to deliver the
+</I>&gt;&gt;<i> ICAP RESPMOD headers overlapped with the TCP FIN/RST packets
+</I>&gt;&gt;<i> coming from a router along the network path, or the ICAP service itself.
+</I>
+&gt;&gt;<i> As such those requests need a new TCP connection to be opened to
+</I>&gt;&gt;<i> guarantee the absence of immediate closure. When they complete with
+</I>&gt;&gt;<i> their transaction it gets added to the pool for other traffic to use if
+</I>they can.
+
+
+This allows me to possibly answer the questions above and create new ones
+(a clever reader may notice I understand much more now than when I started
+writing this message).
+
++ Squid uses a self-defense mechanisms which allows to do two things:
+  1. Use a fresh connection for non-retriable transactions, minimizing the
+possibility of using a connection which may be in the process of being
+closed.
+  2. Control the number of open connections so it doesn't go out of bounds.
+This is a little redundant because `ServiceRep::putConnection()` is already
+taken care of that.
++ I am working with payloads that have more than 64K in size, which makes
+me fall in the conditions stated above.
++ I am not sure if it needs finer control, but the fact that is closing
+connections in advance seems dangerous.
++ It also seems dangerous to me this protection mechanism given the fact
+that opening/closing TCP connections everytime can become a bottleneck.
+
+So, and this is the final question, I promise:
+
+I disabled the call to `theIdleConns-&gt;closeN(1);` and it seems to work
+well.
+The pool doesn't go out of bounds because the connection is closed inside
+`ServiceRep::putConnection()` whenever `ServiceRep::excessConnections()`
+returns true.
+
+Do you think there would be any issues with this change?
+
+
+Thanks in advance
+
+Juan
+
+
+
+On Fri, May 12, 2017 at 11:08 AM, Alex Rousskov &lt;
+<A HREF="https://lists.squid-cache.org/listinfo/squid-users">rousskov at measurement-factory.com</A>&gt; wrote:
+
+&gt;<i> On 05/11/2017 07:30 PM, Amos Jeffries wrote:
+</I>&gt;<i>
+</I>&gt;<i> &gt; Requests which are not retriable are not able to be re-sent [...]
+</I>&gt;<i> &gt; As such those requests need a new TCP connection to be opened to
+</I>&gt;<i> &gt; guarantee the absence of immediate closure. When they complete with
+</I>&gt;<i> &gt; their transaction it gets added to the pool for other traffic to use if
+</I>&gt;<i> &gt; they can.
+</I>&gt;<i>
+</I>&gt;<i> The above is accurate, including the snipped parts documenting the
+</I>&gt;<i> rationale. BTW, since HTTP and ICAP share the same basic connection
+</I>&gt;<i> persistency model, you may find more information reading about these
+</I>&gt;<i> general problems in HTTP-related documents.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> &gt; As far as I know RESPMOD transactions should all be retriable unless the
+</I>&gt;<i> &gt; body payload length is unknown at the HTTP level (lack of Content-Length
+</I>&gt;<i> &gt; header).
+</I>&gt;<i>
+</I>&gt;<i> This is inaccurate. A REQMOD or RESPMOD transaction is deemed retriable
+</I>&gt;<i> at the time when a connection is chosen/open if:
+</I>&gt;<i>
+</I>&gt;<i> * Squid can send a preview or
+</I>&gt;<i> * Squid can buffer the entire HTTP message body.
+</I>&gt;<i>
+</I>&gt;<i> The &quot;known length&quot; aspect affects the second bullet, but that bullet
+</I>&gt;<i> covers more cases than just messages with Content-Length. And there may
+</I>&gt;<i> be more conditions in the code than the bullets cover -- I have not
+</I>&gt;<i> checked.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> &gt; They can also become non-retriable when the response from the ICAP
+</I>&gt;<i> &gt; server has been received by Squid and already started delivery to the
+</I>&gt;<i> &gt; HTTP client.
+</I>&gt;<i>
+</I>&gt;<i> This is accurate (including the snipped part about the irrelevance to
+</I>&gt;<i> the connection choice).
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> HTH,
+</I>&gt;<i>
+</I>&gt;<i> Alex.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>
+
+-- 
+Juan
+:<i>wq
+</I>-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-users/attachments/20170512/56b48745/attachment.htm">http://lists.squid-cache.org/pipermail/squid-users/attachments/20170512/56b48745/attachment.htm</A>&gt;
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="015238.html">[squid-users] ICAP Persistent Connections vs Retries (with code review)
+</A></li>
+	<LI>Next message (by thread): <A HREF="015244.html">[squid-users] ICAP Persistent Connections vs Retries (with code review)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15243">[ date ]</a>
+              <a href="thread.html#15243">[ thread ]</a>
+              <a href="subject.html#15243">[ subject ]</a>
+              <a href="author.html#15243">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.squid-cache.org/listinfo/squid-users">More information about the squid-users
+mailing list</a><br>
+</body></html>

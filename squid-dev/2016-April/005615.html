@@ -1,0 +1,243 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] helpers queue update
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20helpers%20queue%20update&In-Reply-To=%3C571B6AEB.7010409%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005598.html">
+   <LINK REL="Next"  HREF="005616.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] helpers queue update</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20helpers%20queue%20update&In-Reply-To=%3C571B6AEB.7010409%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] helpers queue update">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Sat Apr 23 12:30:35 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005598.html">[squid-dev] [PATCH] Http::Stream ID numbering
+</A></li>
+        <LI>Next message: <A HREF="005616.html">[squid-dev] [PATCH] helpers queue update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5615">[ date ]</a>
+              <a href="thread.html#5615">[ thread ]</a>
+              <a href="subject.html#5615">[ subject ]</a>
+              <a href="author.html#5615">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>This is a hopefully minor update to the helper lookup queueing.
+
+It removes the only use of MEM_DLINK_NODE for custom link-list
+implementation and replaces it all with a std::queue.
+
+Also, de-duplicates the *Dequeue() functions by merging them into helper
+class as a single nextRequest() getter method.
+
+This has had some basic testing and seems to work so far. Though I have
+added one TODO where I think we have some potential for a memory leak
+and/or hung transactions if helpers are constantly dying but not also
+killing Squid.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/helper.cc'
+--- src/helper.cc	2016-01-01 00:12:18 +0000
++++ src/helper.cc	2016-04-22 20:07:50 +0000
+@@ -54,8 +54,6 @@
+ static void helperServerFree(helper_server *srv);
+ static void helperStatefulServerFree(helper_stateful_server *srv);
+ static void Enqueue(helper * hlp, Helper::Request *);
+-static Helper::Request *Dequeue(helper * hlp);
+-static Helper::Request *StatefulDequeue(statefulhelper * hlp);
+ static helper_server *GetFirstAvailable(helper * hlp);
+ static helper_stateful_server *StatefulGetFirstAvailable(statefulhelper * hlp);
+ static void helperDispatch(helper_server * srv, Helper::Request * r);
+@@ -667,7 +665,8 @@
+ {
+     /* note, don't free id_name, it probably points to static memory */
+ 
+-    if (queue.head)
++    // TODO: if the queue is not empty it will leak Helper::Request's
++    if (!queue.empty())
+         debugs(84, DBG_CRITICAL, &quot;WARNING: freeing &quot; &lt;&lt; id_name &lt;&lt; &quot; helper with &quot; &lt;&lt; stats.queue_size &lt;&lt; &quot; requests queued&quot;);
+ }
+ 
+@@ -1102,8 +1101,7 @@
+ static void
+ Enqueue(helper * hlp, Helper::Request * r)
+ {
+-    dlink_node *link = (dlink_node *)memAllocate(MEM_DLINK_NODE);
+-    dlinkAddTail(r, link, &amp;hlp-&gt;queue);
++    hlp-&gt;queue.push(r);
+     ++ hlp-&gt;stats.queue_size;
+ 
+     /* do this first so idle=N has a chance to grow the child pool before it hits critical. */
+@@ -1132,8 +1130,7 @@
+ static void
+ StatefulEnqueue(statefulhelper * hlp, Helper::Request * r)
+ {
+-    dlink_node *link = (dlink_node *)memAllocate(MEM_DLINK_NODE);
+-    dlinkAddTail(r, link, &amp;hlp-&gt;queue);
++    hlp-&gt;queue.push(r);
+     ++ hlp-&gt;stats.queue_size;
+ 
+     /* do this first so idle=N has a chance to grow the child pool before it hits critical. */
+@@ -1159,35 +1156,15 @@
+     debugs(84, DBG_CRITICAL, &quot;WARNING: Consider increasing the number of &quot; &lt;&lt; hlp-&gt;id_name &lt;&lt; &quot; processes in your config file.&quot;);
+ }
+ 
+-static Helper::Request *
+-Dequeue(helper * hlp)
+-{
+-    dlink_node *link;
+-    Helper::Request *r = NULL;
+-
+-    if ((link = hlp-&gt;queue.head)) {
+-        r = (Helper::Request *)link-&gt;data;
+-        dlinkDelete(link, &amp;hlp-&gt;queue);
+-        memFree(link, MEM_DLINK_NODE);
+-        -- hlp-&gt;stats.queue_size;
+-    }
+-
+-    return r;
+-}
+-
+-static Helper::Request *
+-StatefulDequeue(statefulhelper * hlp)
+-{
+-    dlink_node *link;
+-    Helper::Request *r = NULL;
+-
+-    if ((link = hlp-&gt;queue.head)) {
+-        r = (Helper::Request *)link-&gt;data;
+-        dlinkDelete(link, &amp;hlp-&gt;queue);
+-        memFree(link, MEM_DLINK_NODE);
+-        -- hlp-&gt;stats.queue_size;
+-    }
+-
++Helper::Request *
++helper::nextRequest()
++{
++    if (queue.empty())
++        return nullptr;
++
++    auto *r = queue.front();
++    queue.pop();
++    --stats.queue_size;
+     return r;
+ }
+ 
+@@ -1394,7 +1371,7 @@
+     Helper::Request *r;
+     helper_server *srv;
+ 
+-    while ((srv = GetFirstAvailable(hlp)) &amp;&amp; (r = Dequeue(hlp)))
++    while ((srv = GetFirstAvailable(hlp)) &amp;&amp; (r = hlp-&gt;nextRequest()))
+         helperDispatch(srv, r);
+ }
+ 
+@@ -1404,7 +1381,7 @@
+     Helper::Request *r;
+     helper_stateful_server *srv;
+ 
+-    while ((srv = StatefulGetFirstAvailable(hlp)) &amp;&amp; (r = StatefulDequeue(hlp)))
++    while ((srv = StatefulGetFirstAvailable(hlp)) &amp;&amp; (r = hlp-&gt;nextRequest()))
+         helperStatefulDispatch(srv, r);
+ }
+ 
+
+=== modified file 'src/helper.h'
+--- src/helper.h	2016-02-23 08:51:22 +0000
++++ src/helper.h	2016-04-23 03:08:48 +0000
+@@ -23,6 +23,7 @@
+ 
+ #include &lt;list&gt;
+ #include &lt;map&gt;
++#include &lt;queue&gt;
+ 
+ class Packable;
+ class wordlist;
+@@ -62,9 +63,12 @@
+     }
+     ~helper();
+ 
+-    ///&lt; whether at least one more request can be successfully submitted
++    /// whether at least one more request can be successfully submitted
+     bool queueFull() const;
+ 
++    /// \returns next request in the queue, or nil.
++    Helper::Request *nextRequest();
++
+     ///&lt; If not full, submit request. Otherwise, either kill Squid or return false.
+     bool trySubmit(const char *buf, HLPCB * callback, void *data);
+ 
+@@ -78,7 +82,7 @@
+ public:
+     wordlist *cmdline;
+     dlink_list servers;
+-    dlink_list queue;
++    std::queue&lt;Helper::Request *&gt; queue;
+     const char *id_name;
+     Helper::ChildConfig childs;    ///&lt; Configuration settings for number running.
+     int ipc_type;
+
+=== modified file 'src/mem/forward.h'
+--- src/mem/forward.h	2016-04-22 19:16:04 +0000
++++ src/mem/forward.h	2016-04-22 19:55:34 +0000
+@@ -46,7 +46,6 @@
+     MEM_64K_BUF,
+     MEM_ACL_DENY_INFO_LIST,
+     MEM_ACL_NAME_LIST,
+-    MEM_DLINK_NODE,
+     MEM_DREAD_CTRL,
+     MEM_DWRITE_Q,
+     MEM_MD5_DIGEST,
+
+=== modified file 'src/mem/old_api.cc'
+--- src/mem/old_api.cc	2016-04-22 19:16:04 +0000
++++ src/mem/old_api.cc	2016-04-22 19:55:37 +0000
+@@ -444,7 +444,6 @@
+     memDataInit(MEM_ACL_DENY_INFO_LIST, &quot;AclDenyInfoList&quot;,
+                 sizeof(AclDenyInfoList), 0);
+     memDataInit(MEM_ACL_NAME_LIST, &quot;acl_name_list&quot;, sizeof(AclNameList), 0);
+-    memDataInit(MEM_DLINK_NODE, &quot;dlink_node&quot;, sizeof(dlink_node), 10);
+     memDataInit(MEM_DREAD_CTRL, &quot;dread_ctrl&quot;, sizeof(dread_ctrl), 0);
+     memDataInit(MEM_DWRITE_Q, &quot;dwrite_q&quot;, sizeof(dwrite_q), 0);
+     memDataInit(MEM_NETDBENTRY, &quot;netdbEntry&quot;, sizeof(netdbEntry), 0);
+
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005598.html">[squid-dev] [PATCH] Http::Stream ID numbering
+</A></li>
+	<LI>Next message: <A HREF="005616.html">[squid-dev] [PATCH] helpers queue update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5615">[ date ]</a>
+              <a href="thread.html#5615">[ thread ]</a>
+              <a href="subject.html#5615">[ subject ]</a>
+              <a href="author.html#5615">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

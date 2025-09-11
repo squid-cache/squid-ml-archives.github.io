@@ -1,0 +1,166 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [RFC] Happy Eyeballs: Parallel TCP connection attempts
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BRFC%5D%20Happy%20Eyeballs%3A%20Parallel%20TCP%20connection%20attempts&In-Reply-To=%3Cd33824c4-a91b-6ebd-e7cd-cef1e0bd908c%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="009254.html">
+   <LINK REL="Next"  HREF="009256.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [RFC] Happy Eyeballs: Parallel TCP connection attempts</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BRFC%5D%20Happy%20Eyeballs%3A%20Parallel%20TCP%20connection%20attempts&In-Reply-To=%3Cd33824c4-a91b-6ebd-e7cd-cef1e0bd908c%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [RFC] Happy Eyeballs: Parallel TCP connection attempts">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Wed Aug  9 01:14:37 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009254.html">[squid-dev] [PATCH] Reuse reserved Negotiate and NTLM helpers after an idle timeout.
+</A></li>
+        <LI>Next message: <A HREF="009256.html">[squid-dev] [RFC] http(s)_port TLS/SSL config redesign
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9255">[ date ]</a>
+              <a href="thread.html#9255">[ thread ]</a>
+              <a href="subject.html#9255">[ subject ]</a>
+              <a href="author.html#9255">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+    Since r15240, Squid forwarding code gets a concurrently growing list
+of destinations to forward the request to, but it only tries to
+establish a connection to one destination at a time, going to the next
+one only if the previous connection attempt has failed. Many admins
+disable IPv6 because that previous (IPv6) attempt may fail very &quot;slowly&quot;
+while it is possible to &quot;quickly&quot; establish a matching (IPv4) connection
+instead. Users complain, and IPv6 gets turned off.
+
+To combat this IPv6 adoption barrier, Happy Eyeballs (RFC 6555) suggests
+to start establishing a second TCP connection if the first one appears
+to be stuck while trying to connect(2). For example, if an IPv6
+connect(2) does not succeed in 300ms, Chrome starts an IPv4 connect(2).
+A &quot;dumb&quot; implementation of that algorithm is problematic for a proxy
+because it can lead to excessive number of connections (in various
+states) and might even resemble traffic amplification attacks in extreme
+cases.
+
+I propose to implement the following algorithm that follows the Happy
+Eyeballs principles while limiting &quot;environmental impact&quot; of opening and
+discarding lots of proxy-to-server connections:
+
+
+* Bootstrapping:
+
+When a new destination is received by FwdState::noteDestination():
+
+0. If there are no in-use destinations, then proceed to use the new
+destination as usual. No changes here.
+
+1. If there is one in-use destination, then run the &quot;Spare Connect&quot;
+algorithm described below. This is new.
+
+2. If there are two in-use destinations, then add the new destination to
+the list as usual. No changes here.
+
+There is no item #3 because there cannot be more than two in-use
+destinations at any given time.
+
+
+* Spare Connect:
+
+If/when allowed (see below), start a second or &quot;spare&quot; TCP connect()
+attempt to race against the already in-progress attempt. The first
+connect() to succeed wins. The loser is immediately discarded (its
+socket is closed) and treated as connect() failure. For example, its
+destination is marked as &quot;bad&quot; in the IP cache to prevent subsequent
+slow connect() attempts.
+
+Here are the preconditions for the &quot;If/when allowed&quot; part:
+
+0. Both the IP address used by the in-progress connect() and the new
+destination IP originate from the same domain name[0] but their address
+families differ.
+
+1. The other in-use destination is still in the &quot;TCP connecting&quot; state.
+This algorithm works around IP connectivity problems, not slow HTTP(S)
+servers.
+
+2. Squid can open new connections and the total number of in-progress
+spare connect() attempts (across all same-worker FwdStates) is below the
+happy_eyeballs_connect_limit[1]. Please note that this precondition
+changes as other spare connect() attempts end. However, I believe we can
+ignore (i.e., do not monitor/wait for) such changes for the initial
+implementation, for simplicity sake.
+
+3. The last spare connect() attempt (across all same-worker FwdStates)
+started at least happy_eyeballs_connect_gap[2] milliseconds ago. Please
+note that this precondition changes with time. However, I believe we can
+ignore (i.e., do not monitor/wait for) such changes for the initial
+implementation, for simplicity sake.
+
+4. The in-progress connect() attempt (for this FwdState object) started
+at least happy_eyeballs_connect_timeout[3] milliseconds ago. Please note
+that this precondition changes with time. FwdState may need to schedule
+a timeout to comply (and re-evaluate preconditions #1-3 after that
+timeout). The destination of the spare connect() is considered to be &quot;in
+use&quot; while we wait for this timeout to expire.
+
+Here are all the configurable checks and their intended purpose:
+
+  happy_eyeballs_connect_limit: Do not consume too much over time.
+  happy_eyeballs_connect_gap: Do not amplify flash crowds (rate limit).
+  happy_eyeballs_connect_timeout: Do not try to fix fast-enough cases.
+
+
+Did I miss any preconditions? Any better ideas?
+
+
+Footnotes:
+
+[0] The &quot;same domain name&quot; restriction ensures that the &quot;preferred&quot;
+destination choices (e.g., cache_peer foo) are still always tried before
+the &quot;secondary&quot; ones (e.g., DIRECT).
+
+[1,2,3] The exact names, structure, and the defaults of the new
+squid.conf directive(s) are to be determined. Suggestions welcomed. And
+if we can hard-code something reasonable for some of them, that is even
+better for the initial implementation!
+
+
+Thank you,
+
+Alex.
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009254.html">[squid-dev] [PATCH] Reuse reserved Negotiate and NTLM helpers after an idle timeout.
+</A></li>
+	<LI>Next message: <A HREF="009256.html">[squid-dev] [RFC] http(s)_port TLS/SSL config redesign
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9255">[ date ]</a>
+              <a href="thread.html#9255">[ thread ]</a>
+              <a href="subject.html#9255">[ subject ]</a>
+              <a href="author.html#9255">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

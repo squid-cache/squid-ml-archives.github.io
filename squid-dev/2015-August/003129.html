@@ -1,0 +1,1377 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Parser-NG conversion of ICAP pt2
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Parser-NG%20conversion%20of%20ICAP%20pt2&In-Reply-To=%3C55DA2FC2.7020808%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="003125.html">
+   <LINK REL="Next"  HREF="003132.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Parser-NG conversion of ICAP pt2</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Parser-NG%20conversion%20of%20ICAP%20pt2&In-Reply-To=%3C55DA2FC2.7020808%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] Parser-NG conversion of ICAP pt2">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Sun Aug 23 20:40:34 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003125.html">[squid-dev] FYI: changes to trunk Release Notes
+</A></li>
+        <LI>Next message: <A HREF="003132.html">[squid-dev] Script to remove HERE
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3129">[ date ]</a>
+              <a href="thread.html#3129">[ thread ]</a>
+              <a href="subject.html#3129">[ subject ]</a>
+              <a href="author.html#3129">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>It turns out that ICAP implements has three distinct protocol parsers.
+
+I begin the ICAP parser conversion to the Parser-NG model with
+ModXact::parseHeaders() - which was conflating both ICAP and HTTP, and
+the HTTP directional parsers.
+
+
+* splits the exiting parse method into 3 distinct stages; ICAP-reply,
+HTTP-request, HTTP-reply. Each stage is sequential and controlled by the
+Encapsulated header contents.
+
+I'm not sure yet if we need to be tolerant of out-of-order segments in
+the payload. The spec is pretty clear that order is explicit and
+specific. But the old parser actually ignored the Encapsulated header
+byte offsets (!!).
+
+
+* adds &quot;ICAP&quot; / &quot;icap&quot; to the registered protocol types and scheme
+names, and associated Icap::ProtocolVersion() infrastructure.
+
+* adds Adaptation::Icap::ResponseParser class extending
+Http1::ResponseParser with ICAP related details and first-line parser.
+
+* documented some security and performance improvements that can be made
+as a followup in ModXact::parseHeaders()
+
+
+
+There is some weird race behaviour I still want to verify if trunk has
+too. But have gone with PATCH instead of PREVIEW since this seems like a
+good place to pause. Leaving most polish and some major bug fixes to
+followups. That includes the other two parsers in adaptation/icap/.
+
+Amos
+
+-------------- next part --------------
+=== modified file 'src/adaptation/icap/Makefile.am'
+--- src/adaptation/icap/Makefile.am	2015-01-13 07:25:36 +0000
++++ src/adaptation/icap/Makefile.am	2015-03-01 02:01:34 +0000
+@@ -1,36 +1,39 @@
+ ## Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+ ##
+ ## Squid software is distributed under GPLv2+ license and includes
+ ## contributions from numerous individuals and organizations.
+ ## Please see the COPYING and CONTRIBUTORS files for details.
+ ##
+ 
+ include $(top_srcdir)/src/Common.am
+ include $(top_srcdir)/src/TestHeaders.am
+ 
+ noinst_LTLIBRARIES = libicap.la
+ 
+ libicap_la_SOURCES = \
+ 	Client.cc \
+ 	Client.h \
+-	InOut.h \
+ 	Config.cc \
+ 	Config.h \
+ 	Elements.cc \
+ 	Elements.h \
+-	Options.cc \
+-	Options.h \
+-	ServiceRep.cc \
+-	ServiceRep.h \
++	History.cc \
++	History.h \
++	icap_log.cc \
++	icap_log.h \
++	InOut.h \
+ 	Launcher.cc \
+ 	Launcher.h \
++	ModXact.cc \
++	ModXact.h \
++	Options.cc \
++	Options.h \
+ 	OptXact.cc \
+ 	OptXact.h \
++	ProtocolVersion.h \
++	ResponseParser.cc \
++	ResponseParser.h \
++	ServiceRep.cc \
++	ServiceRep.h \
+ 	Xaction.cc \
+-	Xaction.h \
+-	ModXact.cc \
+-	ModXact.h \
+-	icap_log.cc \
+-	icap_log.h \
+-	History.cc \
+-	History.h
++	Xaction.h
+
+=== modified file 'src/adaptation/icap/ModXact.cc'
+--- src/adaptation/icap/ModXact.cc	2015-08-04 19:57:07 +0000
++++ src/adaptation/icap/ModXact.cc	2015-08-23 17:15:21 +0000
+@@ -1,50 +1,52 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 93    ICAP (RFC 3507) Client */
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;AccessLogEntry.h&quot;
+ #include &quot;adaptation/Answer.h&quot;
+ #include &quot;adaptation/History.h&quot;
+ #include &quot;adaptation/icap/Client.h&quot;
+ #include &quot;adaptation/icap/Config.h&quot;
+ #include &quot;adaptation/icap/History.h&quot;
+ #include &quot;adaptation/icap/Launcher.h&quot;
+ #include &quot;adaptation/icap/ModXact.h&quot;
++#include &quot;adaptation/icap/ProtocolVersion.h&quot;
+ #include &quot;adaptation/icap/ServiceRep.h&quot;
+ #include &quot;adaptation/Initiator.h&quot;
+ #include &quot;auth/UserRequest.h&quot;
+ #include &quot;base/TextException.h&quot;
+ #include &quot;base64.h&quot;
+ #include &quot;comm.h&quot;
+ #include &quot;comm/Connection.h&quot;
+ #include &quot;err_detail_type.h&quot;
++#include &quot;http/one/RequestParser.h&quot;
++#include &quot;http/one/ResponseParser.h&quot;
+ #include &quot;http/one/TeChunkedParser.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+-#include &quot;HttpMsg.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;SquidTime.h&quot;
+ #include &quot;URL.h&quot;
+ 
+ // flow and terminology:
+ //     HTTP| --&gt; receive --&gt; encode --&gt; write --&gt; |network
+ //     end | &lt;-- send    &lt;-- parse  &lt;-- read  &lt;-- |end
+ 
+ // TODO: replace gotEncapsulated() with something faster; we call it often
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Adaptation::Icap, ModXact);
+ CBDATA_NAMESPACED_CLASS_INIT(Adaptation::Icap, ModXactLauncher);
+ 
+ static const size_t TheBackupLimit = BodyPipe::MaxCapacity;
+ 
+ Adaptation::Icap::ModXact::State::State()
+ {
+     memset(this, 0, sizeof(*this));
+ }
+@@ -57,44 +59,40 @@
+     bodyParser(NULL),
+     canStartBypass(false), // too early
+     protectGroupBypass(true),
+     replyHttpHeaderSize(-1),
+     replyHttpBodySize(-1),
+     adaptHistoryId(-1),
+     alMaster(alp)
+ {
+     assert(virginHeader);
+ 
+     virgin.setHeader(virginHeader); // sets virgin.body_pipe if needed
+     virgin.setCause(virginCause); // may be NULL
+ 
+     // adapted header and body are initialized when we parse them
+ 
+     // writing and reading ends are handled by Adaptation::Icap::Xaction
+ 
+     // encoding
+     // nothing to do because we are using temporary buffers
+ 
+-    // parsing; TODO: do not set until we parse, see ICAPOptXact
+-    icapReply = new HttpReply;
+-    icapReply-&gt;protoPrefix = &quot;ICAP/&quot;; // TODO: make an IcapReply class?
+-
+     debugs(93,7, HERE &lt;&lt; &quot;initialized.&quot; &lt;&lt; status());
+ }
+ 
+ // initiator wants us to start
+ void Adaptation::Icap::ModXact::start()
+ {
+     Adaptation::Icap::Xaction::start();
+ 
+     // reserve an adaptation history slot (attempts are known at this time)
+     Adaptation::History::Pointer ah = virginRequest().adaptLogHistory();
+     if (ah != NULL)
+         adaptHistoryId = ah-&gt;recordXactStart(service().cfg().key, icap_tr_start, attempts &gt; 1);
+ 
+     estimateVirginBody(); // before virgin disappears!
+ 
+     canStartBypass = service().cfg().bypass;
+ 
+     // it is an ICAP violation to send request to a service w/o known OPTIONS
+     // and the service may is too busy for us: honor Max-Connections and such
+     if (service().up() &amp;&amp; service().availableForNew())
+@@ -732,209 +730,282 @@
+     if (gotEncapsulated(&quot;res-hdr&quot;)) {
+         adapted.setHeader(new HttpReply);
+         setOutcome(service().cfg().method == ICAP::methodReqmod ?
+                    xoSatisfied : xoModified);
+     } else if (gotEncapsulated(&quot;req-hdr&quot;)) {
+         adapted.setHeader(new HttpRequest);
+         setOutcome(xoModified);
+     } else
+         throw TexcHere(&quot;Neither res-hdr nor req-hdr in maybeAllocateHttpMsg()&quot;);
+ }
+ 
+ void Adaptation::Icap::ModXact::parseHeaders()
+ {
+     Must(state.parsingHeaders());
+ 
+     if (state.parsing == State::psIcapHeader) {
+         debugs(93, 5, HERE &lt;&lt; &quot;parse ICAP headers&quot;);
+         parseIcapHead();
+     }
+ 
+-    if (state.parsing == State::psHttpHeader) {
+-        debugs(93, 5, HERE &lt;&lt; &quot;parse HTTP headers&quot;);
+-        parseHttpHead();
++    /* TODO: we do not need to rely on readBuf anymore for the parser logic.
++     * ICAP header parse does not share the HTTP segment code, and
++     * Encapsulated: tells us how many bytes and where each payload segment is.
++     * We can pull N bytes into a child SBuf for parsing.
++     *
++     * 1) if there are not enough bytes we need more before even attempting the parse
++     *
++     * 2) after parse we can verify that it consumed all of the child buf.
++     *    if there are leftovers ... smuggling attack from the ICAP server?
++     */
++
++    if (state.parsing == State::psHttpRequestHeader) {
++        debugs(93, 5, &quot;parse HTTP request headers&quot;);
++        parseHttpRequestHead();
++    }
++
++    if (state.parsing == State::psHttpResponseHeader) {
++        debugs(93, 5, &quot;parse HTTP response headers&quot;);
++        parseHttpResponseHead();
+     }
+ 
+     if (state.parsingHeaders()) { // need more data
+         Must(mayReadMore());
+         return;
+     }
+ 
+     startSending();
+ }
+ 
+ // called after parsing all headers or when bypassing an exception
+ void Adaptation::Icap::ModXact::startSending()
+ {
+     disableRepeats(&quot;sent headers&quot;);
+     disableBypass(&quot;sent headers&quot;, true);
+     sendAnswer(Answer::Forward(adapted.header));
+ 
+     if (state.sending == State::sendingVirgin)
+         echoMore();
+ }
+ 
+ void Adaptation::Icap::ModXact::parseIcapHead()
+ {
+     Must(state.sending == State::sendingUndecided);
+ 
+-    if (!parseHead(icapReply.getRaw()))
++    /* Attempt to parse the ICAP message */
++    {
++        if (!hp)
++            hp = new Icap::ResponseParser;
++
++        bool parsedOk = hp-&gt;parse(readBuf);
++
++        // sync the buffers after parsing.
++        readBuf = hp-&gt;remaining();
++
++        if (hp-&gt;needsMoreData()) {
++            debugs(93, 5, &quot;Incomplete response, waiting for end of response headers&quot;);
++            return;
++        }
++
++        if (!parsedOk) {
++            // unrecoverable parsing error
++            debugs(93, 3, &quot;error parsing ICAP header:\n---------\n&quot; &lt;&lt; readBuf &lt;&lt; &quot;\n----------&quot;);
++            icapReply = new HttpReply;
++            icapReply-&gt;sline.set(hp-&gt;messageProtocol(), hp-&gt;parseStatusCode);
++            icapReply-&gt;sline.protocol = AnyP::PROTO_ICAP;
++            reuseConnection = false;
++            connection-&gt;close();
++            hp = nullptr;
++            return;
++        }
++    }
++
++    /* We know the whole response is in parser now */
++    debugs(93, 2, &quot;ICAP Server &quot; &lt;&lt; connection);
++    debugs(93, 2, &quot;ICAP Server RESPONSE:\n---------\n&quot; &lt;&lt;
++           hp-&gt;messageProtocol() &lt;&lt; &quot; &quot; &lt;&lt; hp-&gt;messageStatus() &lt;&lt; &quot; &quot; &lt;&lt; hp-&gt;reasonPhrase() &lt;&lt; &quot;\n&quot; &lt;&lt;
++           hp-&gt;mimeHeader() &lt;&lt;
++           &quot;----------&quot;);
++
++    // Generate the IcapReply object from parser results
++    // TODO: use an IcapReply class specific to ICAP
++    icapReply = new HttpReply;
++    // XXX: performance regression. SBuf::c_str() reallocates
++    SBuf tmpPhrase(hp-&gt;reasonPhrase());
++    icapReply-&gt;sline.set(hp-&gt;messageProtocol(), hp-&gt;messageStatus(), tmpPhrase.c_str());
++    icapReply-&gt;sline.protocol = AnyP::PROTO_ICAP;
++
++    // parse headers
++    icapReply-&gt;pstate = psReadyToParseHeaders;
++    if (icapReply-&gt;httpMsgParseStep(hp-&gt;mimeHeader().rawContent(), hp-&gt;mimeHeader().length(), true) &lt; 0) {
++        icapReply-&gt;sline.set(hp-&gt;messageProtocol(), Http::scInvalidHeader);
++        icapReply-&gt;sline.protocol = AnyP::PROTO_ICAP;
++        debugs(93, 2, &quot;error parsing response headers mime block&quot;);
++        reuseConnection = false;
++        connection-&gt;close();
++        hp = nullptr;
+         return;
++    }
+ 
+     if (httpHeaderHasConnDir(&amp;icapReply-&gt;header, &quot;close&quot;)) {
+         debugs(93, 5, HERE &lt;&lt; &quot;found connection close&quot;);
+         reuseConnection = false;
+     }
+ 
+-    switch (icapReply-&gt;sline.status()) {
++    switch (hp-&gt;messageStatus()) {
+ 
+     case Http::scContinue:
+         handle100Continue();
+         break;
+ 
+     case Http::scOkay:
+     case Http::scCreated: // Symantec Scan Engine 5.0 and later when modifying HTTP msg
+ 
+         if (!validate200Ok()) {
+             throw TexcHere(&quot;Invalid ICAP Response&quot;);
+         } else {
+             handle200Ok();
+         }
+ 
+         break;
+ 
+     case Http::scNoContent:
+         handle204NoContent();
+         break;
+ 
+     case Http::scPartialContent:
+         handle206PartialContent();
+         break;
+ 
+     default:
+-        debugs(93, 5, &quot;ICAP status &quot; &lt;&lt; icapReply-&gt;sline.status());
++        debugs(93, 5, &quot;ICAP status &quot; &lt;&lt; hp-&gt;messageStatus() &lt;&lt; &quot; &quot; &lt;&lt; hp-&gt;reasonPhrase());
+         handleUnknownScode();
+         break;
+     }
+ 
+     const HttpRequest *request = dynamic_cast&lt;HttpRequest*&gt;(adapted.header);
+     if (!request)
+         request = &amp;virginRequest();
+ 
+     // update the cross-transactional database if needed (all status codes!)
+     if (const char *xxName = Adaptation::Config::masterx_shared_name) {
+         Adaptation::History::Pointer ah = request-&gt;adaptHistory(true);
+         if (ah != NULL) { // TODO: reorder checks to avoid creating history
+             const String val = icapReply-&gt;header.getByName(xxName);
+             if (val.size() &gt; 0) // XXX: HttpHeader lacks empty value detection
+                 ah-&gt;updateXxRecord(xxName, val);
+         }
+     }
+ 
+     // update the adaptation plan if needed (all status codes!)
+     if (service().cfg().routing) {
+         String services;
+         if (icapReply-&gt;header.getList(Http::HdrType::X_NEXT_SERVICES, &amp;services)) {
+             Adaptation::History::Pointer ah = request-&gt;adaptHistory(true);
+             if (ah != NULL)
+                 ah-&gt;updateNextServices(services);
+         }
+     } // TODO: else warn (occasionally!) if we got Http::HdrType::X_NEXT_SERVICES
+ 
+     // We need to store received ICAP headers for &lt;icapLastHeader logformat option.
+     // If we already have stored headers from previous ICAP transaction related to this
+     // request, old headers will be replaced with the new one.
+ 
+     Adaptation::History::Pointer ah = request-&gt;adaptLogHistory();
+     if (ah != NULL)
+-        ah-&gt;recordMeta(&amp;icapReply-&gt;header);
++        ah-&gt;recordMeta(&amp;icapReply-&gt;header); // TODO: use parser objects copy now.
+ 
+     // handle100Continue() manages state.writing on its own.
+     // Non-100 status means the server needs no postPreview data from us.
+     if (state.writing == State::writingPaused)
+         stopWriting(true);
++
++    // done with parser, reset for next message
++    hp = nullptr;
+ }
+ 
+ bool Adaptation::Icap::ModXact::validate200Ok()
+ {
+     if (ICAP::methodRespmod == service().cfg().method) {
+         if (!gotEncapsulated(&quot;res-hdr&quot;))
+             return false;
+ 
+         return true;
+     }
+ 
+     if (ICAP::methodReqmod == service().cfg().method) {
+         if (!gotEncapsulated(&quot;res-hdr&quot;) &amp;&amp; !gotEncapsulated(&quot;req-hdr&quot;))
+             return false;
+ 
+         return true;
+     }
+ 
+     return false;
+ }
+ 
+ void Adaptation::Icap::ModXact::handle100Continue()
+ {
+     Must(state.writing == State::writingPaused);
+     // server must not respond before the end of preview: we may send ieof
+     Must(preview.enabled() &amp;&amp; preview.done() &amp;&amp; !preview.ieof());
+ 
+     // 100 &quot;Continue&quot; cancels our Preview commitment,
+     // but not commitment to handle 204 or 206 outside Preview
+     if (!state.allowedPostview204 &amp;&amp; !state.allowedPostview206)
+         stopBackup();
+ 
++    // reset the parsing state for next message
+     state.parsing = State::psIcapHeader; // eventually
+-    icapReply-&gt;reset();
++    hp = nullptr; // ref-counted
++    icapReply = nullptr; // ref-counted
+ 
+     state.writing = State::writingPrime;
+ 
+     writeMore();
+ }
+ 
+ void Adaptation::Icap::ModXact::handle200Ok()
+ {
+-    state.parsing = State::psHttpHeader;
++    state.parsing = State::psHttpRequestHeader; // 'reqhdr' segment maybe first
+     state.sending = State::sendingAdapted;
+     stopBackup();
+     checkConsuming();
+ }
+ 
+ void Adaptation::Icap::ModXact::handle204NoContent()
+ {
+     stopParsing();
+     prepEchoing();
+ }
+ 
+ void Adaptation::Icap::ModXact::handle206PartialContent()
+ {
+     if (state.writing == State::writingPaused) {
+         Must(preview.enabled());
+         Must(state.allowedPreview206);
+         debugs(93, 7, HERE &lt;&lt; &quot;206 inside preview&quot;);
+     } else {
+         Must(state.writing &gt; State::writingPaused);
+         Must(state.allowedPostview206);
+         debugs(93, 7, HERE &lt;&lt; &quot;206 outside preview&quot;);
+     }
+-    state.parsing = State::psHttpHeader;
++    state.parsing = State::psHttpRequestHeader; // 'reqhdr' segment maybe first
+     state.sending = State::sendingAdapted;
+     state.readyForUob = true;
+     checkConsuming();
+ }
+ 
+ // Called when we receive a 204 No Content response and
+ // when we are trying to bypass a service failure.
+ // We actually start sending (echoig or not) in startSending.
+ void Adaptation::Icap::ModXact::prepEchoing()
+ {
+     disableRepeats(&quot;preparing to echo content&quot;);
+     disableBypass(&quot;preparing to echo content&quot;, true);
+     setOutcome(xoEcho);
+ 
+     // We want to clone the HTTP message, but we do not want
+     // to copy some non-HTTP state parts that HttpMsg kids carry in them.
+     // Thus, we cannot use a smart pointer, copy constructor, or equivalent.
+     // Instead, we simply write the HTTP message and &quot;clone&quot; it by parsing.
+     // TODO: use HttpMsg::clone()!
+ 
+@@ -1021,91 +1092,175 @@
+     if (virgin.header-&gt;body_pipe-&gt;bodySizeKnown())
+         adapted.body_pipe-&gt;expectProductionEndAfter(virgin.header-&gt;body_pipe-&gt;bodySize() - pos);
+ 
+     debugs(93, 7, HERE &lt;&lt; &quot;will echo virgin body suffix to &quot; &lt;&lt;
+            adapted.body_pipe);
+ 
+     // Start echoing data
+     echoMore();
+ }
+ 
+ void Adaptation::Icap::ModXact::handleUnknownScode()
+ {
+     stopParsing();
+     stopBackup();
+     // TODO: mark connection as &quot;bad&quot;
+ 
+     // Terminate the transaction; we do not know how to handle this response.
+     throw TexcHere(&quot;Unsupported ICAP status code&quot;);
+ }
+ 
+-void Adaptation::Icap::ModXact::parseHttpHead()
++void Adaptation::Icap::ModXact::parseHttpRequestHead()
+ {
+-    if (gotEncapsulated(&quot;res-hdr&quot;) || gotEncapsulated(&quot;req-hdr&quot;)) {
+-        replyHttpHeaderSize = 0;
+-        maybeAllocateHttpMsg();
++    if (gotEncapsulated(&quot;req-hdr&quot;)) {
+ 
+-        if (!parseHead(adapted.header))
+-            return; // need more header data
++        /* Attempt to parse the embeded HTTP request message */
+ 
+-        if (adapted.header)
+-            replyHttpHeaderSize = adapted.header-&gt;hdr_sz;
++        if (!httpReqParser)
++            httpReqParser = new Http1::RequestParser;
++
++        bool parsedOk = httpReqParser-&gt;parse(readBuf);
++
++        // sync the buffers after parsing.
++        readBuf = httpReqParser-&gt;remaining();
+ 
+-        if (dynamic_cast&lt;HttpRequest*&gt;(adapted.header)) {
+-            const HttpRequest *oldR = dynamic_cast&lt;const HttpRequest*&gt;(virgin.header);
+-            Must(oldR);
+-            // TODO: the adapted request did not really originate from the
+-            // client; give proxy admin an option to prevent copying of
+-            // sensitive client information here. See the following thread:
+-            // <A HREF="http://www.squid-cache.org/mail-archive/squid-dev/200703/0040.html">http://www.squid-cache.org/mail-archive/squid-dev/200703/0040.html</A>
++        if (httpReqParser-&gt;needsMoreData()) {
++            debugs(93, 5, &quot;Incomplete payload segment, waiting for end of HTTP message headers&quot;);
++            return;
+         }
+ 
+-        // Maybe adapted.header==NULL if HttpReply and have Http 0.9 ....
+-        if (adapted.header)
+-            adapted.header-&gt;inheritProperties(virgin.header);
++        if (!parsedOk) {
++            // unrecoverable parsing error
++            debugs(93, 3, &quot;error parsing ICAP payload embeded HTTP header:\n---------\n&quot; &lt;&lt; readBuf &lt;&lt; &quot;\n----------&quot;);
++            icapReply = new HttpReply;
++            icapReply-&gt;sline.set(httpReqParser-&gt;messageProtocol(), httpReqParser-&gt;parseStatusCode);
++            icapReply-&gt;sline.protocol = httpReqParser-&gt;messageProtocol().protocol;
++            reuseConnection = false;
++            connection-&gt;close();
++            httpReqParser = nullptr;
++            return;
++        }
++
++        /* We know the whole response is in parser now */
++        debugs(11, 2, &quot;ICAP Server &quot; &lt;&lt; connection);
++        debugs(11, 2, &quot;HTTP ICAP-Adapted REQUEST:\n---------\n&quot; &lt;&lt;
++               httpReqParser-&gt;method() &lt;&lt; &quot; &quot; &lt;&lt; httpReqParser-&gt;requestUri() &lt;&lt; &quot; &quot; &lt;&lt; httpReqParser-&gt;messageProtocol() &lt;&lt; &quot;\n&quot; &lt;&lt;
++               httpReqParser-&gt;mimeHeader() &lt;&lt;
++               &quot;----------&quot;);
++
++        // Generate the HttpRequest object from parser results
++        adapted.setHeader(new HttpRequest(httpReqParser-&gt;method(), httpReqParser-&gt;messageProtocol().protocol, NULL));
++        // XXX: performance regression. SBuf::c_str() reallocates
++        SBuf tmpUri(httpReqParser-&gt;requestUri());
++        // const_cast is okay, the buffer area behind the c_str will not be used again by this xaction
++        // and that will only change when urlParse() starts taking the requestUri() SBuf directly
++        Must(urlParse(httpReqParser-&gt;method(), const_cast&lt;char*&gt;(tmpUri.c_str()), static_cast&lt;HttpRequest*&gt;(adapted.header)));
++
++        // parse headers
++        adapted.header-&gt;pstate = psReadyToParseHeaders;
++        Must(adapted.header-&gt;httpMsgParseStep(httpReqParser-&gt;mimeHeader().rawContent(), httpReqParser-&gt;mimeHeader().length(), true) &gt;= 0);
++
++        setOutcome(xoModified);
++
++        // XXX: replyHttpHeaderSize used to account how many ICAP body bytes are processed
++        // but ICAP can present two header segments and only the second gets counted.
++        // Worse; the second in that case is HTTP reply message and smaller of the two.
++        replyHttpHeaderSize = httpReqParser-&gt;messageHeaderSize();
++
++        const HttpRequest *oldR = dynamic_cast&lt;const HttpRequest*&gt;(virgin.header);
++        Must(oldR);
++        // TODO: the adapted request did not really originate from the
++        // client; give proxy admin an option to prevent copying of
++        // sensitive client information here. See the following thread:
++        // <A HREF="http://www.squid-cache.org/mail-archive/squid-dev/200703/0040.html">http://www.squid-cache.org/mail-archive/squid-dev/200703/0040.html</A>
++
++        adapted.header-&gt;inheritProperties(virgin.header);
+     }
+ 
+-    decideOnParsingBody();
++    // done the 'reqhdr' segment, maybe a 'reshdr' segment following.
++    state.parsing = State::psHttpResponseHeader;
+ }
+ 
+-// parses both HTTP and ICAP headers
+-bool Adaptation::Icap::ModXact::parseHead(HttpMsg *head)
++void Adaptation::Icap::ModXact::parseHttpResponseHead()
+ {
+-    Must(head);
+-    debugs(93, 5, &quot;have &quot; &lt;&lt; readBuf.length() &lt;&lt; &quot; head bytes to parse; state: &quot; &lt;&lt; state.parsing);
++    if (gotEncapsulated(&quot;res-hdr&quot;)) {
+ 
+-    Http::StatusCode error = Http::scNone;
+-    // XXX: performance regression. c_str() data copies
+-    // XXX: HttpMsg::parse requires a terminated string buffer
+-    const char *tmpBuf = readBuf.c_str();
+-    const bool parsed = head-&gt;parse(tmpBuf, readBuf.length(), commEof, &amp;error);
+-    Must(parsed || !error); // success or need more data
+-
+-    if (!parsed) { // need more data
+-        debugs(93, 5, HERE &lt;&lt; &quot;parse failed, need more data, return false&quot;);
+-        head-&gt;reset();
+-        return false;
++        /* Attempt to parse the embeded HTTP message */
++
++        if (!httpRespParser)
++            httpRespParser = new Http1::ResponseParser;
++
++        bool parsedOk = httpRespParser-&gt;parse(readBuf);
++
++        // sync the buffers after parsing.
++        readBuf = httpRespParser-&gt;remaining();
++
++        if (httpRespParser-&gt;needsMoreData()) {
++            debugs(93, 5, &quot;Incomplete payload segment, waiting for end of HTTP message headers&quot;);
++            return;
++        }
++
++        if (!parsedOk) {
++            // unrecoverable parsing error
++            debugs(93, 3, &quot;error parsing ICAP payload embeded HTTP header:\n---------\n&quot; &lt;&lt; readBuf &lt;&lt; &quot;\n----------&quot;);
++            icapReply = new HttpReply;
++            icapReply-&gt;sline.set(httpRespParser-&gt;messageProtocol(), httpRespParser-&gt;parseStatusCode);
++            icapReply-&gt;sline.protocol = httpRespParser-&gt;messageProtocol().protocol;
++            reuseConnection = false;
++            connection-&gt;close();
++            httpRespParser = nullptr;
++            return;
++        }
++
++        /* We know the whole response is in parser now */
++        debugs(11, 2, &quot;ICAP Server &quot; &lt;&lt; connection);
++        debugs(11, 2, &quot;HTTP ICAP-Adapted RESPONSE:\n---------\n&quot; &lt;&lt;
++               httpRespParser-&gt;messageProtocol() &lt;&lt; &quot; &quot; &lt;&lt; httpRespParser-&gt;messageStatus() &lt;&lt; &quot; &quot; &lt;&lt; httpRespParser-&gt;reasonPhrase() &lt;&lt; &quot;\n&quot; &lt;&lt;
++               httpRespParser-&gt;mimeHeader() &lt;&lt;
++               &quot;----------&quot;);
++
++        // Generate the HttpReply object from parser results
++        HttpReply *rep = new HttpReply;
++        adapted.setHeader(rep);
++        // XXX: performance regression. SBuf::c_str() reallocates
++        SBuf tmpPhrase(httpRespParser-&gt;reasonPhrase());
++        rep-&gt;sline.set(httpRespParser-&gt;messageProtocol(), httpRespParser-&gt;messageStatus(), tmpPhrase.c_str());
++        rep-&gt;sline.protocol = httpRespParser-&gt;messageProtocol().protocol;
++
++        // parse headers
++        rep-&gt;pstate = psReadyToParseHeaders;
++        Must(rep-&gt;httpMsgParseStep(httpRespParser-&gt;mimeHeader().rawContent(), httpRespParser-&gt;mimeHeader().length(), true) &gt;= 0);
++
++        setOutcome(service().cfg().method == ICAP::methodReqmod ?
++                   xoSatisfied : xoModified);
++
++        // XXX: replyHttpHeaderSize used to account how many ICAP body bytes are processed
++        // but ICAP can present two header segments and only the second gets counted.
++        // Worse; the second in that case is HTTP reply message and smaller of the two.
++        replyHttpHeaderSize = httpRespParser-&gt;messageHeaderSize();
++
++        // Maybe adapted.header==nullptr if HttpReply and have Http 0.9 ....
++        if (adapted.header)
++            adapted.header-&gt;inheritProperties(virgin.header);
+     }
+ 
+-    debugs(93, 5, HERE &lt;&lt; &quot;parse success, consume &quot; &lt;&lt; head-&gt;hdr_sz &lt;&lt; &quot; bytes, return true&quot;);
+-    readBuf.consume(head-&gt;hdr_sz);
+-    return true;
++    decideOnParsingBody();
+ }
+ 
+ void Adaptation::Icap::ModXact::decideOnParsingBody()
+ {
+     if (gotEncapsulated(&quot;res-body&quot;) || gotEncapsulated(&quot;req-body&quot;)) {
+         debugs(93, 5, HERE &lt;&lt; &quot;expecting a body&quot;);
+         state.parsing = State::psBody;
+         replyHttpBodySize = 0;
+         bodyParser = new Http1::TeChunkedParser;
+         makeAdaptedBodyPipe(&quot;adapted response from the ICAP server&quot;);
+         Must(state.sending == State::sendingAdapted);
+     } else {
+         debugs(93, 5, HERE &lt;&lt; &quot;not expecting a body&quot;);
+         stopParsing();
+         stopSending(true);
+     }
+ }
+ 
+ void Adaptation::Icap::ModXact::parseBody()
+ {
+
+=== modified file 'src/adaptation/icap/ModXact.h'
+--- src/adaptation/icap/ModXact.h	2015-06-01 21:41:37 +0000
++++ src/adaptation/icap/ModXact.h	2015-08-11 09:24:03 +0000
+@@ -182,42 +182,42 @@
+     void openChunk(MemBuf &amp;buf, size_t chunkSize, bool ieof);
+     void closeChunk(MemBuf &amp;buf);
+     void virginConsume();
+     void finishNullOrEmptyBodyPreview(MemBuf &amp;buf);
+ 
+     void decideOnPreview();
+     void decideOnRetries();
+     bool shouldAllow204();
+     bool shouldAllow206any();
+     bool shouldAllow206in();
+     bool shouldAllow206out();
+     bool canBackupEverything() const;
+ 
+     void prepBackup(size_t expectedSize);
+     void backup(const MemBuf &amp;buf);
+ 
+     void parseMore();
+ 
+     void parseHeaders();
+     void parseIcapHead();
+-    void parseHttpHead();
+-    bool parseHead(HttpMsg *head);
++    void parseHttpRequestHead();
++    void parseHttpResponseHead();
+ 
+     void decideOnParsingBody();
+     void parseBody();
+     void maybeAllocateHttpMsg();
+ 
+     void handle100Continue();
+     bool validate200Ok();
+     void handle200Ok();
+     void handle204NoContent();
+     void handle206PartialContent();
+     void handleUnknownScode();
+ 
+     void bypassFailure();
+ 
+     void startSending();
+     void disableBypass(const char *reason, bool includeGroupBypass);
+ 
+     void prepEchoing();
+     void prepPartialBodyEchoing(uint64_t pos);
+     void echoMore();
+@@ -232,40 +232,42 @@
+     void stopBackup();
+ 
+     virtual void fillPendingStatus(MemBuf &amp;buf) const;
+     virtual void fillDoneStatus(MemBuf &amp;buf) const;
+     virtual bool fillVirginHttpHeader(MemBuf&amp;) const;
+ 
+ private:
+     void packHead(MemBuf &amp;httpBuf, const HttpMsg *head);
+     void encapsulateHead(MemBuf &amp;icapBuf, const char *section, MemBuf &amp;httpBuf, const HttpMsg *head);
+     bool gotEncapsulated(const char *section) const;
+     void checkConsuming();
+ 
+     virtual void finalizeLogInfo();
+ 
+     SizedEstimate virginBody;
+     VirginBodyAct virginBodyWriting; // virgin body writing state
+     VirginBodyAct virginBodySending;  // virgin body sending state
+     uint64_t virginConsumed;        // virgin data consumed so far
+     Preview preview; // use for creating (writing) the preview
+ 
++    Http1::RequestParserPointer httpReqParser; ///&lt; parser for current embeded HTTP request message payload (if any)
++    Http1::ResponseParserPointer httpRespParser; ///&lt; parser for current embeded HTTP response message payload (if any)
+     Http1::TeChunkedParser *bodyParser; // ICAP response body parser
+ 
+     bool canStartBypass; // enables bypass of transaction failures
+     bool protectGroupBypass; // protects ServiceGroup-wide bypass of failures
+ 
+     /**
+      * size of HTTP header in ICAP reply or -1 if there is not any encapsulated
+      * message data
+      */
+     int64_t replyHttpHeaderSize;
+     /**
+      * size of dechunked HTTP body in ICAP reply or -1 if there is not any
+      * encapsulated message data
+      */
+     int64_t replyHttpBodySize;
+ 
+     int adaptHistoryId; ///&lt; adaptation history slot reservation
+ 
+     class State
+     {
+@@ -281,44 +283,45 @@
+         bool allowedPreview206; // must handle 206 Partial Content inside preview
+         bool readyForUob; ///&lt; got a 206 response and expect a use-origin-body
+         bool waitedForService; ///&lt; true if was queued at least once
+ 
+         // will not write anything [else] to the ICAP server connection
+         bool doneWriting() const { return writing == writingReallyDone; }
+ 
+         // will not use virgin.body_pipe
+         bool doneConsumingVirgin() const {
+             return writing &gt;= writingAlmostDone
+                    &amp;&amp; ((sending == sendingAdapted &amp;&amp; !readyForUob) ||
+                        sending == sendingDone);
+         }
+ 
+         // parsed entire ICAP response from the ICAP server
+         bool doneParsing() const { return parsing == psDone; }
+ 
+         // is parsing ICAP or HTTP headers read from the ICAP server
+         bool parsingHeaders() const {
+             return parsing == psIcapHeader ||
+-                   parsing == psHttpHeader;
++                   parsing == psHttpRequestHeader ||
++                   parsing == psHttpResponseHeader;
+         }
+ 
+-        enum Parsing { psIcapHeader, psHttpHeader, psBody, psDone } parsing;
++        enum Parsing { psIcapHeader, psHttpRequestHeader, psHttpResponseHeader, psBody, psDone } parsing;
+ 
+         // measures ICAP request writing progress
+         enum Writing { writingInit, writingConnect, writingHeaders,
+                        writingPreview, writingPaused, writingPrime,
+                        writingAlmostDone, // waiting for the last write() call to finish
+                        writingReallyDone
+                      } writing;
+ 
+         enum Sending { sendingUndecided, sendingVirgin, sendingAdapted,
+                        sendingDone
+                      } sending;
+     } state;
+ 
+     AccessLogEntry::Pointer alMaster; ///&lt; Master transaction AccessLogEntry
+ };
+ 
+ // An Launcher that stores ModXact construction info and
+ // creates ModXact when needed
+ class ModXactLauncher: public Launcher
+ {
+
+=== added file 'src/adaptation/icap/ProtocolVersion.h'
+--- src/adaptation/icap/ProtocolVersion.h	1970-01-01 00:00:00 +0000
++++ src/adaptation/icap/ProtocolVersion.h	2015-03-01 01:57:46 +0000
+@@ -0,0 +1,41 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_ADAPTATION_ICAP_PROTOCOLVERSION_H
++#define SQUID_ADAPTATION_ICAP_PROTOCOLVERSION_H
++
++#include &quot;anyp/ProtocolVersion.h&quot;
++
++namespace Adaptation
++{
++namespace Icap
++{
++
++/// ICAP version label information
++inline AnyP::ProtocolVersion
++ProtocolVersion(unsigned int aMajor, unsigned int aMinor)
++{
++    return AnyP::ProtocolVersion(AnyP::PROTO_ICAP,aMajor,aMinor);
++}
++
++/**
++ * ICAP version label information.
++ *
++ * Squid implements RFC 3507 section 4.3.2.
++ * On both client and  server connections the default value is ICAP/1.0.
++ */
++inline AnyP::ProtocolVersion
++ProtocolVersion()
++{
++    return AnyP::ProtocolVersion(AnyP::PROTO_ICAP,1,0);
++}
++
++}; // namespace Icap
++}; // namespace Adaptation
++
++#endif /* SQUID_ADAPTATION_ICAP_PROTOCOLVERSION_H */
+
+=== added file 'src/adaptation/icap/ResponseParser.cc'
+--- src/adaptation/icap/ResponseParser.cc	1970-01-01 00:00:00 +0000
++++ src/adaptation/icap/ResponseParser.cc	2015-08-11 13:52:07 +0000
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include &quot;squid.h&quot;
++#include &quot;adaptation/icap/ResponseParser.h&quot;
++#include &quot;adaptation/icap/ProtocolVersion.h&quot;
++#include &quot;Debug.h&quot;
++#include &quot;http/one/Tokenizer.h&quot;
++#include &quot;profiler/Profiler.h&quot;
++#include &quot;SquidConfig.h&quot;
++
++const SBuf Adaptation::Icap::ResponseParser::IcapMagic(&quot;ICAP/1.0 &quot;);
++
++Http1::Parser::size_type
++Adaptation::Icap::ResponseParser::firstLineSize() const
++{
++    return IcapMagic.length() +
++           4 + /* status SP */
++           reasonPhrase().length() +
++           2; /* CRLF terminator */
++}
++
++/**
++ * Attempt to parse the fields out of an ICAP message status-line.
++ *
++ * Governed by:
++ *  RFC 3507 section 4
++ *  RFC 5322 section 2.1 and 3.5
++ *
++ * and by inference:
++ *  RFC 7230 section 2.6, 3.1 and 3.5
++ *
++ * Parsing state is stored between calls. The current implementation uses
++ * checkpoints after each successful status-line field.
++ * The return value tells you whether the parsing is completed or not.
++ *
++ * \retval -1  an error occurred.
++ * \retval  1  successful parse. statusCode_ and maybe reasonPhrase_ are filled and buffer consumed including first delimiter.
++ * \retval  0  more data is needed to complete the parse
++ */
++int
++Adaptation::Icap::ResponseParser::parseResponseFirstLine()
++{
++    Http1::Tokenizer tok(buf_);
++
++    CharacterSet WspDelim = CharacterSet::SP; // strict parse only accepts SP
++
++    // NOTE: RFC 3507 does not define extended whitespace characters to be tolerated
++    //       like RFC 7230. Being strict leads to fewer problems in the long term.
++
++    if (msgProtocol_.protocol != AnyP::PROTO_NONE) {
++        debugs(74, 6, &quot;continue incremental parse for &quot; &lt;&lt; msgProtocol_);
++        debugs(74, DBG_DATA, &quot;parse remaining buf={length=&quot; &lt;&lt; tok.remaining().length() &lt;&lt; &quot;, data='&quot; &lt;&lt; tok.remaining() &lt;&lt; &quot;'}&quot;);
++        // we already found the magic, but not the full line. keep going.
++        return parseResponseStatusAndReason(tok, WspDelim);
++
++    } else if (tok.skip(IcapMagic)) {
++        debugs(74, 6, &quot;found prefix magic &quot; &lt;&lt; IcapMagic);
++        // ICAP/1.0 Response status-line parse
++        msgProtocol_ = Adaptation::Icap::ProtocolVersion();
++        debugs(74, DBG_DATA, &quot;parse remaining buf={length=&quot; &lt;&lt; tok.remaining().length() &lt;&lt; &quot;, data='&quot; &lt;&lt; tok.remaining() &lt;&lt; &quot;'}&quot;);
++        buf_ = tok.remaining(); // resume checkpoint
++        return parseResponseStatusAndReason(tok, WspDelim);
++
++    } else {
++        debugs(74, 6, &quot;found invalid ICAP response&quot;);
++        debugs(74, DBG_DATA, &quot;parse remaining buf={length=&quot; &lt;&lt; tok.remaining().length() &lt;&lt; &quot;, data='&quot; &lt;&lt; tok.remaining() &lt;&lt; &quot;'}&quot;);
++        return -1; // no more parsing
++    }
++
++    return 0; // need more to parse anything.
++}
++
+
+=== added file 'src/adaptation/icap/ResponseParser.h'
+--- src/adaptation/icap/ResponseParser.h	1970-01-01 00:00:00 +0000
++++ src/adaptation/icap/ResponseParser.h	2015-03-01 10:40:28 +0000
+@@ -0,0 +1,49 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef _SQUID_SRC_ADAPTATION_ICAP_RESPONSEPARSER_H
++#define _SQUID_SRC_ADAPTATION_ICAP_RESPONSEPARSER_H
++
++#include &quot;base/RefCount.h&quot;
++#include &quot;http/one/ResponseParser.h&quot;
++
++namespace Adaptation {
++namespace Icap {
++
++class ResponseParser;
++typedef RefCount&lt;Adaptation::Icap::ResponseParser&gt; ResponseParserPointer;
++
++/** ICAP/1.0  protocol response parser
++ *
++ * Works on a raw character I/O buffer and tokenizes the content into
++ * the major CRLF delimited segments of an ICAP/1.0 respone message:
++ *
++ * \item status-line (version SP status SP reash-phrase)
++ * \item mime-header (set of RFC 3507 syntax header fields)
++ */
++class ResponseParser : public Http1::ResponseParser
++{
++public:
++    ResponseParser() : ::Http1::ResponseParser() {}
++    virtual ~ResponseParser() {}
++
++    /* Http::One::Parser API */
++    virtual Http1::Parser::size_type firstLineSize() const;
++
++private:
++    virtual int parseResponseFirstLine();
++
++    /// magic prefix for identifying ICAP response messages
++    static const SBuf IcapMagic;
++};
++
++} // namespace Icap
++} // namespace Adaptation
++
++#endif /* _SQUID_SRC_ADAPTATION_ICAP_RESPONSEPARSER_H */
++
+
+=== modified file 'src/adaptation/icap/Xaction.h'
+--- src/adaptation/icap/Xaction.h	2015-05-23 03:16:46 +0000
++++ src/adaptation/icap/Xaction.h	2015-08-11 09:22:50 +0000
+@@ -1,32 +1,33 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ICAPXACTION_H
+ #define SQUID_ICAPXACTION_H
+ 
+ #include &quot;AccessLogEntry.h&quot;
++#include &quot;adaptation/icap/ResponseParser.h&quot;
+ #include &quot;adaptation/icap/ServiceRep.h&quot;
+ #include &quot;adaptation/Initiate.h&quot;
+ #include &quot;comm/ConnOpener.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;ipcache.h&quot;
+ #include &quot;SBuf.h&quot;
+ #if USE_OPENSSL
+ #include &quot;ssl/PeerConnector.h&quot;
+ #endif
+ 
+ class MemBuf;
+ 
+ namespace Adaptation
+ {
+ namespace Icap
+ {
+ 
+ /*
+  * The ICAP Xaction implements common tasks for ICAP OPTIONS, REQMOD, and
+  * RESPMOD transactions. It is started by an Initiator. It terminates
+@@ -42,40 +43,41 @@
+ 
+ public:
+     Xaction(const char *aTypeName, ServiceRep::Pointer &amp;aService);
+     virtual ~Xaction();
+ 
+     void disableRetries();
+     void disableRepeats(const char *reason);
+     bool retriable() const { return isRetriable; }
+     bool repeatable() const { return isRepeatable; }
+ 
+     // comm handler wrappers, treat as private
+     void noteCommConnected(const CommConnectCbParams &amp;io);
+     void noteCommWrote(const CommIoCbParams &amp;io);
+     void noteCommRead(const CommIoCbParams &amp;io);
+     void noteCommTimedout(const CommTimeoutCbParams &amp;io);
+     void noteCommClosed(const CommCloseCbParams &amp;io);
+ 
+     // TODO: create these only when actually sending/receiving
+     HttpRequest *icapRequest; ///&lt; sent (or at least created) ICAP request
+     HttpReply::Pointer icapReply; ///&lt; received ICAP reply, if any
++    Icap::ResponseParserPointer hp;  ///&lt; parser for current ICAP protocol message (if any)
+ 
+     /// the number of times we tried to get to the service, including this time
+     int attempts;
+ 
+ protected:
+     virtual void start();
+     virtual void noteInitiatorAborted(); // TODO: move to Adaptation::Initiate
+ 
+     // comm hanndlers; called by comm handler wrappers
+     virtual void handleCommConnected() = 0;
+     virtual void handleCommWrote(size_t sz) = 0;
+     virtual void handleCommRead(size_t sz) = 0;
+     virtual void handleCommTimedout();
+     virtual void handleCommClosed();
+ 
+     void handleSecuredPeer(Security::EncryptorAnswer &amp;answer);
+     /// record error detail if possible
+     virtual void detailError(int) {}
+ 
+     void openConnection();
+
+=== modified file 'src/anyp/ProtocolType.h'
+--- src/anyp/ProtocolType.h	2015-01-13 07:25:36 +0000
++++ src/anyp/ProtocolType.h	2015-03-01 01:59:53 +0000
+@@ -7,40 +7,41 @@
+  */
+ 
+ #ifndef _SQUID_SRC_ANYP_PROTOCOLTYPE_H
+ #define _SQUID_SRC_ANYP_PROTOCOLTYPE_H
+ 
+ #include &lt;ostream&gt;
+ 
+ namespace AnyP
+ {
+ 
+ /**
+  * List of all protocols known and supported.
+  * This is a combined list. It is used as type-codes where needed and
+  * the AnyP::ProtocolType_Str array of strings may be used for display
+  */
+ typedef enum {
+     PROTO_NONE = 0,
+     PROTO_HTTP,
+     PROTO_FTP,
+     PROTO_HTTPS,
++    PROTO_ICAP,
+     PROTO_COAP,
+     PROTO_COAPS,
+     PROTO_GOPHER,
+     PROTO_WAIS,
+     PROTO_CACHE_OBJECT,
+     PROTO_ICP,
+ #if USE_HTCP
+     PROTO_HTCP,
+ #endif
+     PROTO_URN,
+     PROTO_WHOIS,
+     PROTO_ICY,
+     PROTO_UNKNOWN,
+     PROTO_MAX
+ } ProtocolType;
+ 
+ extern const char *ProtocolType_str[];
+ 
+ /** Display the registered Protocol Type (in upper case).
+  *  If the protocol is not a registered AnyP::ProtocolType nothing will be displayed.
+
+=== modified file 'src/http/one/Parser.cc'
+--- src/http/one/Parser.cc	2015-07-29 00:41:57 +0000
++++ src/http/one/Parser.cc	2015-08-11 09:24:26 +0000
+@@ -24,43 +24,44 @@
+     msgProtocol_ = AnyP::ProtocolVersion();
+     mimeHeaderBlock_.clear();
+ }
+ 
+ bool
+ Http::One::Parser::skipLineTerminator(Http1::Tokenizer &amp;tok) const
+ {
+     static const SBuf crlf(&quot;\r\n&quot;);
+     if (tok.skip(crlf))
+         return true;
+ 
+     if (Config.onoff.relaxed_header_parser &amp;&amp; tok.skipOne(CharacterSet::LF))
+         return true;
+ 
+     return false;
+ }
+ 
+ bool
+ Http::One::Parser::grabMimeBlock(const char *which, const size_t limit)
+ {
+-    // MIME headers block exist in (only) HTTP/1.x and ICY
++    // MIME headers block exist in HTTP/1.x, ICY, and ICAP
+     const bool expectMime = (msgProtocol_.protocol == AnyP::PROTO_HTTP &amp;&amp; msgProtocol_.major == 1) ||
+                             msgProtocol_.protocol == AnyP::PROTO_ICY ||
++                            msgProtocol_.protocol == AnyP::PROTO_ICAP ||
+                             hackExpectsMime_;
+ 
+     if (expectMime) {
+         /* NOTE: HTTP/0.9 messages do not have a mime header block.
+          *       So the rest of the code will need to deal with '0'-byte headers
+          *       (ie, none, so don't try parsing em)
+          */
+         // XXX: c_str() reallocates. performance regression.
+         if (SBuf::size_type mimeHeaderBytes = headersEnd(buf_.c_str(), buf_.length())) {
+ 
+             // Squid could handle these headers, but admin does not want to
+             if (firstLineSize() + mimeHeaderBytes &gt;= limit) {
+                 debugs(33, 5, &quot;Too large &quot; &lt;&lt; which);
+                 parseStatusCode = Http::scHeaderTooLarge;
+                 buf_.consume(mimeHeaderBytes);
+                 parsingStage_ = HTTP_PARSE_DONE;
+                 return false;
+             }
+ 
+             mimeHeaderBlock_ = buf_.consume(mimeHeaderBytes);
+
+=== modified file 'src/http/one/ResponseParser.h'
+--- src/http/one/ResponseParser.h	2015-04-10 11:02:44 +0000
++++ src/http/one/ResponseParser.h	2015-08-11 09:25:44 +0000
+@@ -24,43 +24,44 @@
+  * the major CRLF delimited segments of an HTTP/1 respone message:
+  *
+  * \item status-line (version SP status SP reash-phrase)
+  * \item mime-header (set of RFC2616 syntax header fields)
+  */
+ class ResponseParser : public Http1::Parser
+ {
+ public:
+     ResponseParser() : Parser(), completedStatus_(false), statusCode_(Http::scNone) {}
+     virtual ~ResponseParser() {}
+ 
+     /* Http::One::Parser API */
+     virtual void clear() {*this=ResponseParser();}
+     virtual Http1::Parser::size_type firstLineSize() const;
+     virtual bool parse(const SBuf &amp;aBuf);
+ 
+     /* respone specific fields, read-only */
+     Http::StatusCode messageStatus() const { return statusCode_;}
+     SBuf reasonPhrase() const { return reasonPhrase_;}
+ 
+-private:
+-    int parseResponseFirstLine();
++protected:
++    virtual int parseResponseFirstLine();
+     int parseResponseStatusAndReason(Http1::Tokenizer&amp;, const CharacterSet &amp;);
+ 
++private:
+     /// magic prefix for identifying ICY response messages
+     static const SBuf IcyMagic;
+ 
+     /// Whether we found the status code yet.
+     /// We cannot rely on status value because server may send &quot;000&quot;.
+     bool completedStatus_;
+ 
+     /// HTTP/1 status-line status code
+     Http::StatusCode statusCode_;
+ 
+     /// HTTP/1 status-line reason phrase
+     SBuf reasonPhrase_;
+ };
+ 
+ } // namespace One
+ } // namespace Http
+ 
+ #endif /* _SQUID_SRC_HTTP_ONE_RESPONSEPARSER_H */
+ 
+
+=== modified file 'src/url.cc'
+--- src/url.cc	2015-08-04 19:57:07 +0000
++++ src/url.cc	2015-08-12 13:39:53 +0000
+@@ -116,40 +116,43 @@
+  * The string must be 0-terminated.
+  */
+ AnyP::ProtocolType
+ urlParseProtocol(const char *b)
+ {
+     // make e point to the ':' character
+     const char *e = b + strcspn(b, &quot;:&quot;);
+     int len = e - b;
+ 
+     /* test common stuff first */
+ 
+     if (strncasecmp(b, &quot;http&quot;, len) == 0)
+         return AnyP::PROTO_HTTP;
+ 
+     if (strncasecmp(b, &quot;ftp&quot;, len) == 0)
+         return AnyP::PROTO_FTP;
+ 
+     if (strncasecmp(b, &quot;https&quot;, len) == 0)
+         return AnyP::PROTO_HTTPS;
+ 
++    if (strncasecmp(b, &quot;icap&quot;, len) == 0)
++        return AnyP::PROTO_ICAP;
++
+     if (strncasecmp(b, &quot;file&quot;, len) == 0)
+         return AnyP::PROTO_FTP;
+ 
+     if (strncasecmp(b, &quot;coap&quot;, len) == 0)
+         return AnyP::PROTO_COAP;
+ 
+     if (strncasecmp(b, &quot;coaps&quot;, len) == 0)
+         return AnyP::PROTO_COAPS;
+ 
+     if (strncasecmp(b, &quot;gopher&quot;, len) == 0)
+         return AnyP::PROTO_GOPHER;
+ 
+     if (strncasecmp(b, &quot;wais&quot;, len) == 0)
+         return AnyP::PROTO_WAIS;
+ 
+     if (strncasecmp(b, &quot;cache_object&quot;, len) == 0)
+         return AnyP::PROTO_CACHE_OBJECT;
+ 
+     if (strncasecmp(b, &quot;urn&quot;, len) == 0)
+         return AnyP::PROTO_URN;
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003125.html">[squid-dev] FYI: changes to trunk Release Notes
+</A></li>
+	<LI>Next message: <A HREF="003132.html">[squid-dev] Script to remove HERE
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3129">[ date ]</a>
+              <a href="thread.html#3129">[ thread ]</a>
+              <a href="subject.html#3129">[ subject ]</a>
+              <a href="author.html#3129">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

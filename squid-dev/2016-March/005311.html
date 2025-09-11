@@ -1,0 +1,177 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20assertion%20failed%3A%20Write.cc%3A41%3A%0A%20%22%21ccb-%3Eactive%28%29%22&In-Reply-To=%3C56E72F40.7030508%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005310.html">
+   <LINK REL="Next"  HREF="005302.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20assertion%20failed%3A%20Write.cc%3A41%3A%0A%20%22%21ccb-%3Eactive%28%29%22&In-Reply-To=%3C56E72F40.7030508%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Mon Mar 14 21:38:08 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005310.html">[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;
+</A></li>
+        <LI>Next message: <A HREF="005302.html">[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5311">[ date ]</a>
+              <a href="thread.html#5311">[ thread ]</a>
+              <a href="subject.html#5311">[ subject ]</a>
+              <a href="author.html#5311">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 03/14/2016 02:58 PM, Christos Tsantilas wrote:
+&gt;<i> On 03/14/2016 06:33 PM, Alex Rousskov wrote:
+</I>&gt;&gt;<i> The only remaining doubt in my mind is the combination of delayedReply
+</I>&gt;&gt;<i> and fssHandleDataRequest state. The above code appears to assume that,
+</I>&gt;&gt;<i> in fssHandleDataRequest, delayedReply is either always nil or never
+</I>&gt;&gt;<i> important. Is that really true? delayedReply is set in
+</I>&gt;&gt;<i> Ftp::Server::writeForwardedReply() which is called from lots of places,
+</I>&gt;&gt;<i> including Ftp::Server::handleDataReply(). May it be set in
+</I>&gt;&gt;<i> fssHandleDataRequest?
+</I>
+
+&gt;<i> Good question.
+</I>&gt;<i> 
+</I>&gt;<i> The writeForwardedReply inside Ftp::Server::handleDataReply is called
+</I>&gt;<i> only if the transfer of the file on server side did not started ,
+</I>&gt;<i> because of an error.
+</I>
+You are probably right, but I would not be surprised if there are (or
+will be) other conditions (e.g., the error reply coming from the ICAP
+service rather than Ftp::Client itself). My point is not that we should
+research and enumerate all possible cases, but that the code should
+handle all of them (whatever they are) in a general fashion. Take3 does
+not quite do that as discussed above.
+
+To avoid snowballing this into an endless Ftp::* rewrite, I would limit
+related changes to making Ftp::Server::stopWaitingForOrigin() do the
+right thing unless you know of other _specific_ methods/cases where our
+code should be changed to accommodate the new delayedReply mechanism.
+
+
+&gt;<i> In this case the server reply forwarded as is.
+</I>&gt;<i> In this case the waitingForOrigin is not clear that it will be always
+</I>&gt;<i> false or not, and it is possible that the delayedReply used here too.
+</I>&gt;<i> (now the watingForOrigin is false because of the order the asyncCals are
+</I>&gt;<i> called)
+</I>
+... which is something too fragile to rely on, as you seem to be
+implying as well.
+
+
+&gt;<i> The delayedReply can not be ignored because at least must be set to null.
+</I>
+To avoid Must() failures later? Glad I asked then.
+
+
+&gt;<i> Moreover In this case it is not bad idea to forward the server reply as
+</I>&gt;<i> is (eg &quot;the file does not exist on server&quot; error).
+</I>
+In general, forwarding the _first_ [error] response is the best strategy
+if we might be dealing with multiple error sources/responses.
+
+
+&gt;<i> I have to admit that your proposal to forward the delayedReply if it is
+</I>&gt;<i> set, else use completeDataExhange is the correct solution for this.
+</I>
+Perhaps we can do that before the fssHandleDataRequest check? Like this:
+
+Ftp::Server::stopWaitingForOrigin(int originStatus)
+{
+   Must(waitingForOrigin);
+   waitingForOrigin = false;
+
+   // if we have already decided how to respond, respond now
+   if (delayedReply) {
+       writeForwardedReply(delayedReply.getRaw());
+       delayedReply = nullptr;
+       return; // do not completeDataExchange() after an earlier response
+   }
+
+   if (master-&gt;serverState != fssHandleDataRequest)
+       return;
+
+   ... our fssHandleDataRequest handling code here ...
+   ... including a conditional completeDataExchange() call ...
+
+
+BTW, I would recommend resetting this-&gt;delayedReply _before_ calling
+writeForwardedReply() with that reply object for the fear of reentrant
+calls discovering this-&gt;delayedReply still set... You will need a
+temporary/local HttpReply::Pointer (not a raw pointer!) for that to work.
+
+
+&gt;<i> But we must check if we are in fssHandleDataRequest state before call
+</I>&gt;<i> the completeDataExchange.
+</I>
+
+Yes, that does not change.
+
+
+&gt;&gt;&gt;<i> Probably the completeDataExchange should be renamed to
+</I>&gt;&gt;&gt;<i> completeDataDownload. It is used only while we are downloading objects
+</I>&gt;&gt;&gt;<i> (not uploading).
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> Agreed.
+</I>&gt;<i> 
+</I>&gt;<i> Should I do it in this patch commit?
+</I>
+Sure. It clarifies our code quite a bit IMO. Please commit ASAP, when
+you are comfortable with the result.
+
+
+Thank you,
+
+Alex.
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005310.html">[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;
+</A></li>
+	<LI>Next message: <A HREF="005302.html">[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5311">[ date ]</a>
+              <a href="thread.html#5311">[ thread ]</a>
+              <a href="subject.html#5311">[ subject ]</a>
+              <a href="author.html#5311">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

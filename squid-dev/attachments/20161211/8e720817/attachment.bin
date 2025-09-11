@@ -1,0 +1,300 @@
+A linker fix for building pinger, caused by r14973.
+
+Jenkins revealed an linker error when building pinger (--enable-icmp
+option is on).  Before this patch, SquidConfig had a dependency
+on vector<SchemesConfigs> which required additional libraries at linker
+stage, e.g., libsbuf.  The suggested solution is to get rid of such
+dependency using vector<SchemesConfigs> * instead.
+
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2016-12-10 04:48:25 +0000
++++ src/SquidConfig.h	2016-12-11 08:27:58 +0000
+@@ -518,54 +518,54 @@
+ #endif
+     } ssl_client;
+ 
+     char *accept_filter;
+     int umask;
+     int max_filedescriptors;
+     int workers;
+     CpuAffinityMap *cpuAffinityMap;
+ 
+ #if USE_LOADABLE_MODULES
+     wordlist *loadable_module_names;
+ #endif
+ 
+     int client_ip_max_connections;
+ 
+     char *redirector_extras;
+ 
+     struct UrlHelperTimeout {
+         int action;
+         char *response;
+     } onUrlRewriteTimeout;
+ 
+     char *storeId_extras;
+ 
+     struct {
+         int v4_first;       ///< Place IPv4 first in the order of DNS results.
+         ssize_t packet_max; ///< maximum size EDNS advertised for DNS replies.
+     } dns;
+ 
+ #if USE_AUTH
+-    Auth::SchemesConfigs authSchemesConfigs;
++    Auth::SchemesConfigs *authSchemesConfigs;
+ #endif
+ };
+ 
+ extern SquidConfig Config;
+ 
+ class SquidConfig2
+ {
+ public:
+     void clear() {
+         *this = SquidConfig2();
+     }
+ 
+     struct {
+         int enable_purge = 0;
+     } onoff;
+     uid_t effectiveUserID = 0;
+     gid_t effectiveGroupID = 0;
+ };
+ 
+ extern SquidConfig2 Config2;
+ 
+ #endif /* SQUID_SQUIDCONFIG_H_ */
+ 
+
+=== modified file 'src/auth/UserRequest.cc'
+--- src/auth/UserRequest.cc	2016-12-10 04:48:25 +0000
++++ src/auth/UserRequest.cc	2016-12-11 08:20:38 +0000
+@@ -446,61 +446,61 @@
+         if (*aUR == NULL)
+             *aUR = t;
+ 
+         if (request->auth_user_request == NULL && t->lastReply == AUTH_AUTHENTICATED) {
+             request->auth_user_request = t;
+         }
+         return t->lastReply;
+     }
+ 
+     // ok, call the actual authenticator routine.
+     AuthAclState result = authenticate(aUR, headertype, request, conn, src_addr, al);
+ 
+     // auth process may have changed the UserRequest we are dealing with
+     t = authTryGetUser(*aUR, conn, request);
+ 
+     if (t != NULL && result != AUTH_ACL_CANNOT_AUTHENTICATE && result != AUTH_ACL_HELPER)
+         t->lastReply = result;
+ 
+     return result;
+ }
+ 
+ static Auth::ConfigVector &
+ schemesConfig(HttpRequest *request, HttpReply *rep)
+ {
+     if (::Config.accessList.authSchemes) {
+         ACLFilledChecklist ch(NULL, request, NULL);
+         ch.reply = rep;
+         HTTPMSGLOCK(ch.reply);
+         const allow_t answer = ch.fastCheck(::Config.accessList.authSchemes);
+         if (answer == ACCESS_ALLOWED)
+-            return ::Config.authSchemesConfigs.at(answer.kind).authConfigs;
++            return ::Config.authSchemesConfigs->at(answer.kind).authConfigs;
+     }
+     return Auth::TheConfig;
+ }
+ 
+ void
+ Auth::UserRequest::addReplyAuthHeader(HttpReply * rep, Auth::UserRequest::Pointer auth_user_request, HttpRequest * request, int accelerated, int internal)
+ /* send the auth types we are configured to support (and have compiled in!) */
+ {
+     Http::HdrType type;
+ 
+     switch (rep->sline.status()) {
+ 
+     case Http::scProxyAuthenticationRequired:
+         /* Proxy authorisation needed */
+         type = Http::HdrType::PROXY_AUTHENTICATE;
+         break;
+ 
+     case Http::scUnauthorized:
+         /* WWW Authorisation needed */
+         type = Http::HdrType::WWW_AUTHENTICATE;
+         break;
+ 
+     default:
+         /* Keep GCC happy */
+         /* some other HTTP status */
+         type = Http::HdrType::BAD_HDR;
+         break;
+     }
+ 
+     debugs(29, 9, "headertype:" << type << " authuser:" << auth_user_request);
+
+=== modified file 'src/cache_cf.cc'
+--- src/cache_cf.cc	2016-12-10 16:27:09 +0000
++++ src/cache_cf.cc	2016-12-11 09:20:44 +0000
+@@ -919,65 +919,67 @@
+                (uint32_t)Config.maxRequestBufferSize, (uint32_t)Config.maxRequestHeaderSize);
+     }
+ 
+     /*
+      * Disable client side request pipelining if client_persistent_connections OFF.
+      * Waste of resources queueing any pipelined requests when the first will close the connection.
+      */
+     if (Config.pipeline_max_prefetch > 0 && !Config.onoff.client_pconns) {
+         debugs(3, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: pipeline_prefetch " << Config.pipeline_max_prefetch <<
+                " requires client_persistent_connections ON. Forced pipeline_prefetch 0.");
+         Config.pipeline_max_prefetch = 0;
+     }
+ 
+ #if USE_AUTH
+     /*
+      * disable client side request pipelining. There is a race with
+      * Negotiate and NTLM when the client sends a second request on an
+      * connection before the authenticate challenge is sent. With
+      * pipelining OFF, the client may fail to authenticate, but squid's
+      * state will be preserved.
+      */
+     if (Config.pipeline_max_prefetch > 0) {
+         Auth::Config *nego = Auth::Config::Find("Negotiate");
+         Auth::Config *ntlm = Auth::Config::Find("NTLM");
+         if ((nego && nego->active()) || (ntlm && ntlm->active())) {
+             debugs(3, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: pipeline_prefetch breaks NTLM and Negotiate authentication. Forced pipeline_prefetch 0.");
+             Config.pipeline_max_prefetch = 0;
+         }
+     }
+ 
+-    for (auto &authSchemes: Config.authSchemesConfigs) {
+-        authSchemes.expand();
+-        if (authSchemes.authConfigs.empty()) {
+-            debugs(3, DBG_CRITICAL, "auth_schemes: at least one scheme name is required; got: " << authSchemes.rawSchemes);
+-            self_destruct();
++    if (Config.authSchemesConfigs) {
++        for (auto &authSchemes: *Config.authSchemesConfigs) {
++            authSchemes.expand();
++            if (authSchemes.authConfigs.empty()) {
++                debugs(3, DBG_CRITICAL, "auth_schemes: at least one scheme name is required; got: " << authSchemes.rawSchemes);
++                self_destruct();
++            }
+         }
+     }
+ #endif
+ }
+ 
+ /** Parse a line containing an obsolete directive.
+  * To upgrade it where possible instead of just "Bungled config" for
+  * directives which cannot be marked as simply aliases of the some name.
+  * For example if the parameter order and content has changed.
+  * Or if the directive has been completely removed.
+  */
+ void
+ parse_obsolete(const char *name)
+ {
+     // Directives which have been radically changed rather than removed
+     if (!strcmp(name, "url_rewrite_concurrency")) {
+         int cval;
+         parse_int(&cval);
+         debugs(3, DBG_CRITICAL, "WARNING: url_rewrite_concurrency upgrade overriding url_rewrite_children settings.");
+         Config.redirectChildren.concurrency = cval;
+     }
+ 
+     if (!strcmp(name, "log_access")) {
+         self_destruct();
+         return;
+     }
+ 
+     if (!strcmp(name, "log_icap")) {
+         self_destruct();
+         return;
+@@ -1817,78 +1819,82 @@
+ }
+ 
+ static void
+ free_authparam(Auth::ConfigVector * cfg)
+ {
+     /* Wipe the Auth globals and Detach/Destruct component config + state. */
+     cfg->clear();
+ 
+     /* on reconfigure initialize new auth schemes for the new config. */
+     if (reconfiguring) {
+         Auth::Init();
+     }
+ }
+ 
+ static void
+ dump_authparam(StoreEntry * entry, const char *name, Auth::ConfigVector cfg)
+ {
+     for (Auth::ConfigVector::iterator  i = cfg.begin(); i != cfg.end(); ++i)
+         (*i)->dump(entry, name, (*i));
+ }
+ 
+ static void
+ parse_AuthSchemes(acl_access **authSchemes)
+ {
+     const char *tok = ConfigParser::NextQuotedToken();
+     if (!tok) {
+         debugs(29, DBG_CRITICAL, "FATAL: auth_schemes missing the parameter");
+         self_destruct();
+         return;
+     }
+-    Config.authSchemesConfigs.push_back(Auth::SchemesConfig(tok, ConfigParser::LastTokenWasQuoted()));
+-    const allow_t action = allow_t(ACCESS_ALLOWED, Config.authSchemesConfigs.size() - 1);
++    if (!Config.authSchemesConfigs)
++        Config.authSchemesConfigs = new Auth::SchemesConfigs;
++    Config.authSchemesConfigs->push_back(Auth::SchemesConfig(tok, ConfigParser::LastTokenWasQuoted()));
++    const allow_t action = allow_t(ACCESS_ALLOWED, Config.authSchemesConfigs->size() - 1);
+     ParseAclWithAction(authSchemes, action, "auth_schemes");
+ }
+ 
+ static void
+ free_AuthSchemes(acl_access **authSchemes)
+ {
+-    Config.authSchemesConfigs.clear();
+-    free_acl_access(authSchemes);
++    if (Config.authSchemesConfigs) {
++        Config.authSchemesConfigs->clear();
++        free_acl_access(authSchemes);
++    }
+ }
+ 
+ static void
+ dump_AuthSchemes(StoreEntry *entry, const char *name, acl_access *authSchemes)
+ {
+     if (authSchemes)
+         dump_SBufList(entry, authSchemes->treeDump(name, [](const allow_t &action) {
+-        return Config.authSchemesConfigs.at(action.kind).rawSchemes;
++        return Config.authSchemesConfigs->at(action.kind).rawSchemes;
+     }));
+ }
+ 
+ #endif /* USE_AUTH */
+ 
+ static void
+ ParseAclWithAction(acl_access **access, const allow_t &action, const char *desc, ACL *acl)
+ {
+     assert(access);
+     SBuf name;
+     if (!*access) {
+         *access = new Acl::Tree;
+         name.Printf("(%s rules)", desc);
+         (*access)->context(name.c_str(), config_input_line);
+     }
+     Acl::AndNode *rule = new Acl::AndNode;
+     name.Printf("(%s rule)", desc);
+     rule->context(name.c_str(), config_input_line);
+     acl ? rule->add(acl) : rule->lineParse();
+     (*access)->add(rule, action);
+ }
+ 
+ /* TODO: just return the object, the # is irrelevant */
+ static int
+ find_fstype(char *type)
+ {
+     for (size_t i = 0; i < StoreFileSystem::FileSystems().size(); ++i)
+         if (strcasecmp(type, StoreFileSystem::FileSystems().at(i)->type()) == 0)
+             return (int)i;
+ 
+

@@ -1,0 +1,2641 @@
+Non-HTTP bypass
+
+Intercepting proxies often receive non-HTTP connections. Squid cannot currently
+deal with such connections well because it assumes that a given port receives
+HTTP, FTP, or HTTPS traffic exclusively. This patch allows Squid to tunnel
+unexpected connections instead of terminating them with an error.
+
+In this project, we define an unexpected connection as a connection that
+resulted in a Squid error during first request parsing. Which errors trigger
+tunneling behavior is configurable by the admin using ACLs.
+
+Here is a configuration sketch:
+
+  # define what Squid errors indicate receiving non-HTTP traffic:
+  acl foreignProtocol squid_error ERR_PROTOCOL_UNKNOWN ERR_TOO_BIG
+
+  # define what Squid errors indicate receiving nothing:
+  acl serverTalksFirstProtocol squid_error ERR_REQUEST_START_TIMEOUT
+
+  # tunnel everything that does not look like HTTP:
+  on_first_request_error tunnel foreignProtocol
+
+  # tunnel if we think the client waits for the server to talk first:
+  on_first_request_error tunnel serverTalksFirstProtocol
+
+  # in all other error cases, just send an HTTP "error page" response:
+  on_first_request_error respond all
+
+  # Configure how long to wait for the first byte on the incoming
+  # connection before raising an ERR_REQUEST_START_TIMEOUT error.
+  request_start_timeout 5 seconds
+
+The overall intent of this TCP tunnel is to get Squid out of the communication
+loop to the extent possible. Once the decision to tunnel is made, no Squid
+errors are going to be sent to the client and tunneled traffic is not going to
+be sent to Squid adaptation services or logged to access.log (except for a
+single summary line at the end of the transaction). Connection closure at the
+server (or client) end of the tunnel is propagated to the other end by closing
+the corresponding connection.
+
+This patch also:
+
+ Add "on_first_request_error", a new ACL-driven squid.conf directive that can
+be used to establish a blind TCP tunnel which relays all bytes from/to the
+intercepted connection to/from the intended destination address. See the sketch
+above.
+The on_first_request_error directive supports fast ACLs only.
+
+ Add "squid_error", a new ACL type to match transactions that triggered a given
+Squid error. Squid error IDs are used to configure one or more errors to match.
+This is similar to the existing ssl_error ACL type but works with
+Squid-generated errors rather than SSL library errors.
+
+ Add "ERR_PROTOCOL_UNKNOWN", a Squid error triggered for http_port connections
+that start with something that lacks even basic HTTP request structure. This
+error is triggered by the HTTP request parser, and probably only when/after the
+current parsing code detects an error. That is, we do not want to introduce
+new error conditions, but we want to treat some of the currently triggered
+parsing errors as a "wrong protocol" error, possibly after checking the parsing
+state or the input buffer for some clues. There is no known way to reliably
+distinguish malformed HTTP requests from non-HTTP traffic so the parser has
+to use some imprecise heuristics to make a decision in some cases.
+In the future, it would be possible to add code to reliably detect some popular
+non-HTTP protocols, but adding such code is outside this project scope.
+
+ Add "request_start_timeout", a new squid.conf directive to trigger a new
+Squid ERR_REQUEST_START_TIMEOUT error if no bytes are received from the
+client on a newly established http_port connection during the configured
+time period. Applies to all http_ports (for now).
+
+No support for tunneling through cache_peers is included. Configurations
+that direct outgoing traffic through a peer may break Squid.
+
+This is a Measurement Factory project
+=== modified file 'errors/template.list'
+--- errors/template.list	2015-01-13 12:12:06 +0000
++++ errors/template.list	2015-01-13 16:36:36 +0000
+@@ -30,21 +30,22 @@
+     templates/ERR_FTP_UNAVAILABLE \
+     templates/ERR_GATEWAY_FAILURE \
+     templates/ERR_ICAP_FAILURE \
+     templates/ERR_INVALID_REQ \
+     templates/ERR_INVALID_RESP \
+     templates/ERR_INVALID_URL \
+     templates/ERR_LIFETIME_EXP \
+     templates/ERR_NO_RELAY \
+     templates/ERR_ONLY_IF_CACHED_MISS \
+     templates/ERR_PRECONDITION_FAILED \
+     templates/ERR_READ_ERROR \
+     templates/ERR_READ_TIMEOUT \
+     templates/ERR_SECURE_CONNECT_FAIL \
+     templates/ERR_SHUTTING_DOWN \
+     templates/ERR_SOCKET_FAILURE \
+     templates/ERR_TOO_BIG \
+     templates/ERR_UNSUP_HTTPVERSION \
+     templates/ERR_UNSUP_REQ \
+     templates/ERR_URN_RESOLVE \
+     templates/ERR_WRITE_ERROR \
+-    templates/ERR_ZERO_SIZE_OBJECT 
++    templates/ERR_ZERO_SIZE_OBJECT \
++    templates/ERR_PROTOCOL_UNKNOWN
+
+=== added file 'errors/templates/ERR_PROTOCOL_UNKNOWN'
+--- errors/templates/ERR_PROTOCOL_UNKNOWN	1970-01-01 00:00:00 +0000
++++ errors/templates/ERR_PROTOCOL_UNKNOWN	2015-01-13 09:42:11 +0000
+@@ -0,0 +1,38 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
++<html><head>
++<meta type="copyright" content="Copyright (C) 1996-2014 The Squid Software Foundation and contributors">
++<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
++<title>ERROR: The requested URL could not be retrieved</title>
++<style type="text/css"><!-- 
++ %l
++
++body
++:lang(fa) { direction: rtl; font-size: 100%; font-family: Tahoma, Roya, sans-serif; float: right; }
++:lang(he) { direction: rtl; }
++ --></style>
++</head><body id=%c>
++<div id="titles">
++<h1>ERROR</h1>
++<h2>The requested URL could not be retrieved</h2>
++</div>
++<hr>
++
++<div id="content">
++<p>The following error was encountered while trying to retrieve the URL: <a href="%U">%U</a></p>
++
++<blockquote id="error">
++<p><b>Unsupported Protocol</b></p>
++</blockquote>
++
++<p>Squid does not support some access protocols. For example, the SSH protocol is currently not supported.</p>
++
++<p>Your cache administrator is <a href="mailto:%w%W">%w</a>.</p>
++<br>
++</div>
++
++<hr>
++<div id="footer">
++<p>Generated %T by %h (%s)</p>
++<!-- %c -->
++</div>
++</body></html>
+
+=== modified file 'src/AclRegs.cc'
+--- src/AclRegs.cc	2015-01-13 07:25:36 +0000
++++ src/AclRegs.cc	2015-01-13 16:36:36 +0000
+@@ -52,40 +52,42 @@
+ #include "acl/LocalPort.h"
+ #include "acl/MaxConnection.h"
+ #include "acl/Method.h"
+ #include "acl/MethodData.h"
+ #include "acl/MyPortName.h"
+ #include "acl/Note.h"
+ #include "acl/NoteData.h"
+ #include "acl/PeerName.h"
+ #include "acl/Protocol.h"
+ #include "acl/ProtocolData.h"
+ #include "acl/Random.h"
+ #include "acl/Referer.h"
+ #include "acl/RegexData.h"
+ #include "acl/ReplyHeaderStrategy.h"
+ #include "acl/ReplyMimeType.h"
+ #include "acl/RequestHeaderStrategy.h"
+ #include "acl/RequestMimeType.h"
+ #include "acl/SourceAsn.h"
+ #include "acl/SourceDomain.h"
+ #include "acl/SourceIp.h"
++#include "acl/SquidError.h"
++#include "acl/SquidErrorData.h"
+ #if USE_OPENSSL
+ #include "acl/Certificate.h"
+ #include "acl/CertificateData.h"
+ #include "acl/SslError.h"
+ #include "acl/SslErrorData.h"
+ #endif
+ #include "acl/Strategised.h"
+ #include "acl/Strategy.h"
+ #include "acl/StringData.h"
+ #if USE_OPENSSL
+ #include "acl/ServerCertificate.h"
+ #endif
+ #include "acl/Tag.h"
+ #include "acl/Time.h"
+ #include "acl/TimeData.h"
+ #include "acl/Url.h"
+ #include "acl/UrlLogin.h"
+ #include "acl/UrlPath.h"
+ #include "acl/UrlPort.h"
+ #include "acl/UserData.h"
+@@ -201,20 +203,22 @@
+ ACLMaxUserIP ACLMaxUserIP::RegistryEntry_("max_user_ip");
+ #endif
+ 
+ ACL::Prototype ACLTag::RegistryProtoype(&ACLTag::RegistryEntry_, "tag");
+ ACLStrategised<const char *> ACLTag::RegistryEntry_(new ACLStringData, ACLTagStrategy::Instance(), "tag");
+ 
+ ACL::Prototype Acl::AnyOf::RegistryProtoype(&Acl::AnyOf::RegistryEntry_, "any-of");
+ Acl::AnyOf Acl::AnyOf::RegistryEntry_;
+ 
+ ACL::Prototype Acl::AllOf::RegistryProtoype(&Acl::AllOf::RegistryEntry_, "all-of");
+ Acl::AllOf Acl::AllOf::RegistryEntry_;
+ 
+ ACL::Prototype ACLNote::RegistryProtoype(&ACLNote::RegistryEntry_, "note");
+ ACLStrategised<HttpRequest *> ACLNote::RegistryEntry_(new ACLNoteData, ACLNoteStrategy::Instance(), "note");
+ 
+ #if USE_ADAPTATION
+ ACL::Prototype ACLAdaptationService::RegistryProtoype(&ACLAdaptationService::RegistryEntry_, "adaptation_service");
+ ACLStrategised<const char *> ACLAdaptationService::RegistryEntry_(new ACLAdaptationServiceData, ACLAdaptationServiceStrategy::Instance(), "adaptation_service");
+ #endif
+ 
++ACL::Prototype ACLSquidError::RegistryProtoype(&ACLSquidError::RegistryEntry_, "squid_error");
++ACLStrategised<err_type> ACLSquidError::RegistryEntry_(new ACLSquidErrorData, ACLSquidErrorStrategy::Instance(), "squid_error");
+
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2015-01-13 07:25:36 +0000
++++ src/SquidConfig.h	2015-01-13 16:36:36 +0000
+@@ -75,40 +75,41 @@
+     time_t maxStale;
+     time_t negativeDnsTtl;
+     time_t positiveDnsTtl;
+     time_t shutdownLifetime;
+     time_t backgroundPingRate;
+ 
+     struct {
+         time_t read;
+         time_t write;
+         time_t lifetime;
+         time_t connect;
+         time_t forward;
+         time_t peer_connect;
+         time_t request;
+         time_t clientIdlePconn;
+         time_t serverIdlePconn;
+         time_t ftpClientIdle;
+         time_t pconnLifetime; ///< pconn_lifetime in squid.conf
+         time_t siteSelect;
+         time_t deadPeer;
++        time_t request_start_timeout;
+         int icp_query;      /* msec */
+         int icp_query_max;  /* msec */
+         int icp_query_min;  /* msec */
+         int mcast_icp_query;    /* msec */
+         time_msec_t idns_retransmit;
+         time_msec_t idns_query;
+         time_t urlRewrite;
+     } Timeout;
+     size_t maxRequestHeaderSize;
+     int64_t maxRequestBodySize;
+     int64_t maxChunkedRequestBodySize;
+     size_t maxRequestBufferSize;
+     size_t maxReplyHeaderSize;
+     AclSizeLimit *ReplyBodySize;
+ 
+     struct {
+         unsigned short icp;
+ #if USE_HTCP
+ 
+         unsigned short htcp;
+@@ -360,40 +361,41 @@
+         AclAddress *outgoing_address;
+ #if USE_HTCP
+ 
+         acl_access *htcp;
+         acl_access *htcp_clr;
+ #endif
+ 
+ #if USE_OPENSSL
+         acl_access *ssl_bump;
+ #endif
+ #if FOLLOW_X_FORWARDED_FOR
+         acl_access *followXFF;
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+ 
+         /// acceptible PROXY protocol clients
+         acl_access *proxyProtocol;
+ 
+         /// spoof_client_ip squid.conf acl.
+         /// nil unless configured
+         acl_access* spoof_client_ip;
++        acl_access *on_first_request_error;
+ 
+         acl_access *ftp_epsv;
+ 
+         acl_access *forceRequestBodyContinuation;
+     } accessList;
+     AclDenyInfoList *denyInfoList;
+ 
+     struct {
+         size_t list_width;
+         int list_wrap;
+         char *anon_user;
+         int passive;
+         int epsv_all;
+         int epsv;
+         int eprt;
+         int sanitycheck;
+         int telnet;
+     } Ftp;
+     RefreshPattern *Refresh;
+ 
+
+=== modified file 'src/acl/FilledChecklist.cc'
+--- src/acl/FilledChecklist.cc	2015-01-13 07:25:36 +0000
++++ src/acl/FilledChecklist.cc	2015-01-13 16:36:36 +0000
+@@ -19,40 +19,41 @@
+ #include "auth/AclProxyAuth.h"
+ #include "auth/UserRequest.h"
+ #endif
+ 
+ CBDATA_CLASS_INIT(ACLFilledChecklist);
+ 
+ ACLFilledChecklist::ACLFilledChecklist() :
+     dst_peer(NULL),
+     dst_rdns(NULL),
+     request (NULL),
+     reply (NULL),
+ #if USE_AUTH
+     auth_user_request (NULL),
+ #endif
+ #if SQUID_SNMP
+     snmp_community(NULL),
+ #endif
+ #if USE_OPENSSL
+     sslErrors(NULL),
+ #endif
++    requestErrorType(ERR_MAX),
+     conn_(NULL),
+     fd_(-1),
+     destinationDomainChecked_(false),
+     sourceDomainChecked_(false)
+ {
+     my_addr.setEmpty();
+     src_addr.setEmpty();
+     dst_addr.setEmpty();
+     rfc931[0] = '\0';
+ }
+ 
+ ACLFilledChecklist::~ACLFilledChecklist()
+ {
+     assert (!asyncInProgress());
+ 
+     safe_free(dst_rdns); // created by xstrdup().
+ 
+     HTTPMSGUNLOCK(request);
+ 
+     HTTPMSGUNLOCK(reply);
+
+=== modified file 'src/acl/FilledChecklist.h'
+--- src/acl/FilledChecklist.h	2015-01-13 07:25:36 +0000
++++ src/acl/FilledChecklist.h	2015-01-13 16:36:36 +0000
+@@ -1,35 +1,36 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ACLFILLED_CHECKLIST_H
+ #define SQUID_ACLFILLED_CHECKLIST_H
+ 
+ #include "AccessLogEntry.h"
+ #include "acl/Checklist.h"
+ #include "acl/forward.h"
+ #include "base/CbcPointer.h"
++#include "err_type.h"
+ #include "ip/Address.h"
+ #if USE_AUTH
+ #include "auth/UserRequest.h"
+ #endif
+ #if USE_OPENSSL
+ #include "ssl/support.h"
+ #endif
+ 
+ class CachePeer;
+ class ConnStateData;
+ class HttpRequest;
+ class HttpReply;
+ 
+ /** \ingroup ACLAPI
+     ACLChecklist filled with specific data, representing Squid and transaction
+     state for access checks along with some data-specific checking methods
+  */
+ class ACLFilledChecklist: public ACLChecklist
+ {
+     CBDATA_CLASS(ACLFilledChecklist);
+@@ -74,40 +75,42 @@
+ 
+     char rfc931[USER_IDENT_SZ];
+ #if USE_AUTH
+     Auth::UserRequest::Pointer auth_user_request;
+ #endif
+ #if SQUID_SNMP
+     char *snmp_community;
+ #endif
+ 
+ #if USE_OPENSSL
+     /// SSL [certificate validation] errors, in undefined order
+     Ssl::CertErrors *sslErrors;
+     /// The peer certificate
+     Ssl::X509_Pointer serverCert;
+ #endif
+ 
+     AccessLogEntry::Pointer al; ///< info for the future access.log entry
+ 
+     ExternalACLEntryPointer extacl_entry;
+ 
++    err_type requestErrorType;
++
+ private:
+     ConnStateData * conn_;          /**< hack for ident and NTLM */
+     int fd_;                        /**< may be available when conn_ is not */
+     bool destinationDomainChecked_;
+     bool sourceDomainChecked_;
+     /// not implemented; will cause link failures if used
+     ACLFilledChecklist(const ACLFilledChecklist &);
+     /// not implemented; will cause link failures if used
+     ACLFilledChecklist &operator=(const ACLFilledChecklist &);
+ };
+ 
+ /// convenience and safety wrapper for dynamic_cast<ACLFilledChecklist*>
+ inline
+ ACLFilledChecklist *Filled(ACLChecklist *checklist)
+ {
+     // this should always be safe because ACLChecklist is an abstract class
+     // and ACLFilledChecklist is its only [concrete] child
+     return dynamic_cast<ACLFilledChecklist*>(checklist);
+ }
+ 
+
+=== modified file 'src/acl/Makefile.am'
+--- src/acl/Makefile.am	2015-01-13 07:25:36 +0000
++++ src/acl/Makefile.am	2015-01-13 16:36:36 +0000
+@@ -99,40 +99,44 @@
+ 	PeerName.h \
+ 	Protocol.cc \
+ 	ProtocolData.cc \
+ 	ProtocolData.h \
+ 	Protocol.h \
+ 	Random.cc \
+ 	Random.h \
+ 	Referer.cc \
+ 	Referer.h \
+ 	ReplyHeaderStrategy.h \
+ 	ReplyMimeType.cc \
+ 	ReplyMimeType.h \
+ 	RequestHeaderStrategy.h \
+ 	RequestMimeType.cc \
+ 	RequestMimeType.h \
+ 	SourceAsn.h \
+ 	SourceDomain.cc \
+ 	SourceDomain.h \
+ 	SourceIp.cc \
+ 	SourceIp.h \
++	SquidError.h \
++	SquidError.cc \
++	SquidErrorData.cc \
++	SquidErrorData.h \
+ 	Tag.cc \
+ 	Tag.h \
+ 	Url.cc \
+ 	Url.h \
+ 	UrlLogin.cc \
+ 	UrlLogin.h \
+ 	UrlPath.cc \
+ 	UrlPath.h \
+ 	UrlPort.cc \
+ 	UrlPort.h \
+ 	UserData.cc \
+ 	UserData.h \
+ 	AclNameList.h \
+ 	AclDenyInfoList.h \
+ 	Gadgets.cc \
+ 	Gadgets.h \
+ 	AclSizeLimit.h
+ 
+ ## Add conditional sources
+ ## TODO: move these to their respectful dirs when those dirs are created
+
+=== added file 'src/acl/SquidError.cc'
+--- src/acl/SquidError.cc	1970-01-01 00:00:00 +0000
++++ src/acl/SquidError.cc	2015-01-13 09:38:55 +0000
+@@ -0,0 +1,30 @@
++/*
++ * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "acl/Checklist.h"
++#include "acl/SquidError.h"
++#include "HttpRequest.h"
++
++int
++ACLSquidErrorStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
++{
++    if (checklist->requestErrorType != ERR_MAX)
++        return data->match(checklist->requestErrorType);
++    else if (checklist->request)
++        return data->match(checklist->request->errType);
++    return 0;
++}
++
++ACLSquidErrorStrategy *
++ACLSquidErrorStrategy::Instance()
++{
++    return &Instance_;
++}
++
++ACLSquidErrorStrategy ACLSquidErrorStrategy::Instance_;
+
+=== added file 'src/acl/SquidError.h'
+--- src/acl/SquidError.h	1970-01-01 00:00:00 +0000
++++ src/acl/SquidError.h	2015-01-13 09:42:45 +0000
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_ACLSQUIDERROR_H
++#define SQUID_ACLSQUIDERROR_H
++
++#include "acl/Strategised.h"
++#include "acl/Strategy.h"
++#include "err_type.h"
++
++class ACLSquidErrorStrategy : public ACLStrategy<err_type>
++{
++
++public:
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
++
++    static ACLSquidErrorStrategy *Instance();
++    /* Not implemented to prevent copies of the instance. */
++    /* Not private to prevent brain dead g+++ warnings about
++     * private constructors with no friends */
++    ACLSquidErrorStrategy(ACLSquidErrorStrategy const &);
++
++private:
++    static ACLSquidErrorStrategy Instance_;
++    ACLSquidErrorStrategy() {}
++
++    ACLSquidErrorStrategy&operator=(ACLSquidErrorStrategy const &);
++};
++
++class ACLSquidError
++{
++
++private:
++    static ACL::Prototype RegistryProtoype;
++    static ACLStrategised<err_type> RegistryEntry_;
++};
++
++#endif /* SQUID_ACLSQUIDERROR_H */
+
+=== added file 'src/acl/SquidErrorData.cc'
+--- src/acl/SquidErrorData.cc	1970-01-01 00:00:00 +0000
++++ src/acl/SquidErrorData.cc	2015-01-13 16:52:44 +0000
+@@ -0,0 +1,77 @@
++/*
++ * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "acl/Data.h"
++#include "acl/SquidErrorData.h"
++#include "cache_cf.h"
++#include "ConfigParser.h"
++#include "Debug.h"
++#include "err_type.h"
++#include "fatal.h"
++#include "wordlist.h"
++
++bool
++ACLSquidErrorData::match(err_type err)
++{
++    CbDataListIterator<err_type> iter(errors);
++    while (!iter.end()) {
++        err_type localErr = iter.next();
++        debugs(28, 4, "check (" << err << "):"  << errorTypeName(err) << " against " <<  errorTypeName(localErr));
++        if (err == localErr)
++            return true;
++    }
++
++    return false;
++}
++
++SBufList
++ACLSquidErrorData::dump() const
++{
++    SBufList sl;
++    CbDataListIterator<err_type> iter(errors);
++    while (!iter.end()) {
++        err_type err = iter.next();
++        const char *errName = errorTypeName(err);
++        sl.push_back(SBuf(errName));
++    }
++
++    return sl;
++}
++
++void
++ACLSquidErrorData::parse()
++{
++    while (char *token = ConfigParser::NextToken()) {
++        err_type err = errorTypeByName(token);
++
++        if (err < ERR_MAX)
++            errors.push_back(err);
++        else {
++            debugs(28, DBG_CRITICAL, "FATAL: Invalid squid error name");
++            if (!opt_parse_cfg_only)
++                self_destruct();
++        }
++    }
++}
++
++bool
++ACLSquidErrorData::empty() const
++{
++    return errors.empty();
++}
++
++ACLData<err_type> *
++ACLSquidErrorData::clone() const
++{
++    if (!errors.empty())
++        fatal("ACLSquidError::clone: attempt to clone used ACL");
++
++    return new ACLSquidErrorData (*this);
++}
++
+
+=== added file 'src/acl/SquidErrorData.h'
+--- src/acl/SquidErrorData.h	1970-01-01 00:00:00 +0000
++++ src/acl/SquidErrorData.h	2015-01-13 09:39:06 +0000
+@@ -0,0 +1,34 @@
++/*
++ * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_ACLSQUIDERRORDATA_H
++#define SQUID_ACLSQUIDERRORDATA_H
++
++#include "acl/Data.h"
++#include "base/CbDataList.h"
++#include "err_type.h"
++
++/// \ingroup ACLAPI
++class ACLSquidErrorData : public ACLData<err_type>
++{
++
++public:
++    ACLSquidErrorData(): ACLData<err_type>() {};
++
++    virtual ~ACLSquidErrorData() {}
++    virtual bool match(err_type err);
++    virtual SBufList dump() const;
++    virtual void parse();
++    virtual bool empty() const;
++    virtual ACLData<err_type> *clone() const;
++
++private:
++    CbDataListContainer <err_type> errors;
++};
++
++#endif //SQUID_ACLSQUIDERRORDATA_H
+
+=== modified file 'src/cache_cf.cc'
+--- src/cache_cf.cc	2015-01-13 07:25:36 +0000
++++ src/cache_cf.cc	2015-01-13 16:36:36 +0000
+@@ -229,40 +229,43 @@
+ static void free_ftp_epsv(acl_access **ftp_epsv);
+ 
+ static void parse_b_size_t(size_t * var);
+ static void parse_b_int64_t(int64_t * var);
+ 
+ static bool parseNamedIntList(const char *data, const String &name, std::vector<int> &list);
+ 
+ static void parse_CpuAffinityMap(CpuAffinityMap **const cpuAffinityMap);
+ static void dump_CpuAffinityMap(StoreEntry *const entry, const char *const name, const CpuAffinityMap *const cpuAffinityMap);
+ static void free_CpuAffinityMap(CpuAffinityMap **const cpuAffinityMap);
+ 
+ static void parse_UrlHelperTimeout(SquidConfig::UrlHelperTimeout *);
+ static void dump_UrlHelperTimeout(StoreEntry *, const char *, SquidConfig::UrlHelperTimeout &);
+ static void free_UrlHelperTimeout(SquidConfig::UrlHelperTimeout *);
+ 
+ static int parseOneConfigFile(const char *file_name, unsigned int depth);
+ 
+ static void parse_configuration_includes_quoted_values(bool *recognizeQuotedValues);
+ static void dump_configuration_includes_quoted_values(StoreEntry *const entry, const char *const name, bool recognizeQuotedValues);
+ static void free_configuration_includes_quoted_values(bool *recognizeQuotedValues);
++static void parse_on_first_request_error(acl_access **access);
++static void dump_on_first_request_error(StoreEntry *entry, const char *name, acl_access *access);
++static void free_on_first_request_error(acl_access **access);
+ 
+ /*
+  * LegacyParser is a parser for legacy code that uses the global
+  * approach.  This is static so that it is only exposed to cache_cf.
+  * Other modules needing access to a ConfigParser should have it
+  * provided to them in their parserFOO methods.
+  */
+ static ConfigParser LegacyParser = ConfigParser();
+ 
+ void
+ self_destruct(void)
+ {
+     LegacyParser.destruct();
+ }
+ 
+ static void
+ SetConfigFilename(char const *file_name, bool is_pipe)
+ {
+     if (is_pipe)
+         cfg_filename = file_name + 1;
+@@ -4986,20 +4989,74 @@
+     } else {
+         ConfigParser::RecognizeQuotedValues = false;
+         ConfigParser::StrictMode = false;
+     }
+ }
+ 
+ static void
+ dump_configuration_includes_quoted_values(StoreEntry *const entry, const char *const name, bool)
+ {
+     int val = ConfigParser::RecognizeQuotedValues ? 1 : 0;
+     dump_onoff(entry, name, val);
+ }
+ 
+ static void
+ free_configuration_includes_quoted_values(bool *)
+ {
+     ConfigParser::RecognizeQuotedValues = false;
+     ConfigParser::StrictMode = false;
+ }
+ 
++static void
++parse_on_first_request_error(acl_access **access)
++{
++   char *tm;
++    if ((tm = ConfigParser::NextToken()) == NULL) {
++        self_destruct();
++        return;
++    }
++
++    allow_t action = allow_t(ACCESS_ALLOWED);
++    if (strcmp(tm, "tunnel") == 0)
++        action.kind = 1;
++    else if (strcmp(tm, "respond") == 0)
++        action.kind = 2;
++    else {
++        debugs(3, DBG_CRITICAL, "FATAL: unknown on_first_request_error mode: " << tm);
++        self_destruct();
++        return;
++    }
++
++    Acl::AndNode *rule = new Acl::AndNode;
++    rule->context("(on_first_request_error rule)", config_input_line);
++    rule->lineParse();
++    // empty rule OK
++
++    assert(access);
++    if (!*access) {
++        *access = new Acl::Tree;
++        (*access)->context("(on_first_request_error rules)", config_input_line);
++    }
++
++    (*access)->add(rule, action);
++}
++
++static void
++dump_on_first_request_error(StoreEntry *entry, const char *name, acl_access *access)
++{
++    const char *on_error_tunnel_mode_str[] = {
++        "none",
++        "tunnel",
++        "respond",
++        NULL
++    };
++    if (access) {
++        SBufList lines = access->treeDump(name, on_error_tunnel_mode_str);
++        dump_SBufList(entry, lines);
++    }
++}
++
++static void
++free_on_first_request_error(acl_access **access)
++{
++    free_acl_access(access);
++}
+
+=== modified file 'src/cf.data.depend'
+--- src/cf.data.depend	2015-01-13 07:25:36 +0000
++++ src/cf.data.depend	2015-01-13 16:36:36 +0000
+@@ -41,40 +41,41 @@
+ http_header_access	acl
+ http_header_replace
+ HeaderWithAclList	acl
+ adaptation_access_type	adaptation_service_set adaptation_service_chain acl icap_service icap_class
+ adaptation_service_set_type	icap_service ecap_service
+ adaptation_service_chain_type	icap_service ecap_service
+ icap_access_type	icap_class acl
+ icap_class_type		icap_service
+ icap_service_type
+ icap_service_failure_limit
+ ecap_service_type
+ int
+ kb_int64_t
+ kb_size_t
+ logformat
+ YesNoNone
+ memcachemode
+ note			acl
+ obsolete
+ onoff
++on_first_request_error	acl
+ peer
+ peer_access		cache_peer acl
+ pipelinePrefetch
+ PortCfg
+ QosConfig
+ TokenOrQuotedString
+ refreshpattern
+ removalpolicy
+ size_t
+ IpAddress_list
+ string
+ string
+ time_msec
+ time_t
+ tristate
+ uri_whitespace
+ UrlHelperTimeout	acl
+ u_short
+ wccp2_method
+ wccp2_amethod
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2015-01-13 07:25:36 +0000
++++ src/cf.data.pre	2015-01-13 16:36:36 +0000
+@@ -1599,40 +1599,84 @@
+ 	WARNING: downstream caches probably can not detect a partial reply
+ 	if there is no content-length header, so they will cache
+ 	partial responses and give them out as hits.  You should NOT
+ 	use this option if you have downstream caches.
+ 
+ 	WARNING: A maximum size smaller than the size of squid's error messages
+ 	will cause an infinite loop and crash squid. Ensure that the smallest
+ 	non-zero value you use is greater that the maximum header size plus
+ 	the size of your largest error page.
+ 
+ 	If you set this parameter none (the default), there will be
+ 	no limit imposed.
+ 
+ 	Configuration Format is:
+ 		reply_body_max_size SIZE UNITS [acl ...]
+ 	ie.
+ 		reply_body_max_size 10 MB
+ 
+ DOC_END
+ 
++NAME: on_first_request_error
++TYPE: on_first_request_error
++LOC: Config.accessList.on_first_request_error
++DEFAULT: none
++DEFAULT_DOC: Respond with an error message to unidentifiable traffic
++DOC_START
++	Determines Squid behavior when encountering strange requests at the
++	beginning of an accepted TCP connection. This is especially useful in
++	interception environments where Squid is likely to see connections for
++	unsupported protocols that Squid should either terminate or tunnel at
++	TCP level.
++ 
++		on_first_request_error <action> [!]acl ...
++ 
++	The first matching action wins.
++
++	Supported actions are:
++ 
++	tunnel: Establish a TCP connection with the intended server and
++		blindly shovel TCP packets between the client and server.
++
++	respond: Respond with an error message, using the transfer protocol
++		for the Squid port that received the request (e.g., HTTP
++		for connections intercepted at the http_port). This is the
++		default.
++ 
++	Currently, this directive is ignored for non-intercepted connections
++	because Squid cannot know what their intended destination is.
++
++	For example:
++	  # define what Squid errors indicate receiving non-HTTP traffic:
++	  acl foreignProtocol squid_error ERR_PROTOCOL_UNKNOWN ERR_TOO_BIG
++	  # define what Squid errors indicate receiving nothing:
++	  acl serverTalksFirstProtocol squid_error ERR_REQUEST_START_TIMEOUT
++	  # tunnel everything that does not look like HTTP:
++          on_first_request_error tunnel foreignProtocol
++	  # tunnel if we think the client waits for the server to talk first:
++	  on_first_request_error tunnel serverTalksFirstProtocol
++	  # in all other error cases, just send an HTTP "error page" response:
++	  on_first_request_error respond all
++
++	See also: squid_error ACL
++DOC_END
++
+ COMMENT_START
+  NETWORK OPTIONS
+  -----------------------------------------------------------------------------
+ COMMENT_END
+ 
+ NAME: http_port ascii_port
+ TYPE: PortCfg
+ DEFAULT: none
+ LOC: HttpPortList
+ DOC_START
+ 	Usage:	port [mode] [options]
+ 		hostname:port [mode] [options]
+ 		1.2.3.4:port [mode] [options]
+ 
+ 	The socket addresses where Squid will listen for HTTP client
+ 	requests.  You may specify multiple socket addresses.
+ 	There are three forms: port alone, hostname with port, and
+ 	IP address with port.  If you specify a hostname or IP
+ 	address, Squid binds the socket to that specific
+ 	address. Most likely, you do not need to bind to a specific
+@@ -6066,40 +6110,49 @@
+ DEFAULT: 15 minutes
+ DOC_START
+ 	This timeout is tracked for all connections that have data
+ 	available for writing and are waiting for the socket to become
+ 	ready. After each successful write, the timeout is extended by
+ 	the configured amount. If Squid has data to write but the
+ 	connection is not ready for the configured duration, the
+ 	transaction associated with the connection is terminated. The
+ 	default is 15 minutes.
+ DOC_END
+ 
+ NAME: request_timeout
+ TYPE: time_t
+ LOC: Config.Timeout.request
+ DEFAULT: 5 minutes
+ DOC_START
+ 	How long to wait for complete HTTP request headers after initial
+ 	connection establishment.
+ DOC_END
+ 
++NAME: request_start_timeout
++TYPE: time_t
++LOC: Config.Timeout.request_start_timeout
++DEFAULT: 5 minutes
++DOC_START
++	How long to wait for the first request byte after initial
++	connection establishment.
++DOC_END
++
+ NAME: client_idle_pconn_timeout persistent_request_timeout
+ TYPE: time_t
+ LOC: Config.Timeout.clientIdlePconn
+ DEFAULT: 2 minutes
+ DOC_START
+ 	How long to wait for the next HTTP request on a persistent
+ 	client connection after the previous request completes.
+ DOC_END
+ 
+ NAME: ftp_client_idle_timeout
+ TYPE: time_t
+ LOC: Config.Timeout.ftpClientIdle
+ DEFAULT: 30 minutes
+ DOC_START
+ 	How long to wait for an FTP request on a connection to Squid ftp_port.
+ 	Many FTP clients do not deal with idle connection closures well,
+ 	necessitating a longer default timeout than client_idle_pconn_timeout
+ 	used for incoming HTTP requests.
+ DOC_END
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2015-01-13 07:25:36 +0000
++++ src/client_side.cc	2015-01-13 16:36:36 +0000
+@@ -2135,40 +2135,42 @@
+ /** Parse an HTTP request
+  *
+  *  \note Sets result->flags.parsed_ok to 0 if failed to parse the request,
+  *          to 1 if the request was correctly parsed.
+  *  \param[in] csd a ConnStateData. The caller must make sure it is not null
+  *  \param[in] hp an Http1::RequestParser
+  *  \param[out] mehtod_p will be set as a side-effect of the parsing.
+  *          Pointed-to value will be set to Http::METHOD_NONE in case of
+  *          parsing failure
+  *  \param[out] http_ver will be set as a side-effect of the parsing
+  *  \return NULL on incomplete requests,
+  *          a ClientSocketContext structure on success or failure.
+  */
+ ClientSocketContext *
+ parseHttpRequest(ConnStateData *csd, const Http1::RequestParserPointer &hp)
+ {
+     /* Attempt to parse the first line; this will define where the method, url, version and header begin */
+     {
+         const bool parsedOk = hp->parse(csd->in.buf);
+ 
++        if (csd->port->flags.isIntercepted() && Config.accessList.on_first_request_error)
++            csd->preservedClientData = csd->in.buf;
+         // sync the buffers after parsing.
+         csd->in.buf = hp->remaining();
+ 
+         if (hp->needsMoreData()) {
+             debugs(33, 5, "Incomplete request, waiting for end of request line");
+             return NULL;
+         }
+ 
+         if (!parsedOk) {
+             if (hp->request_parse_status == Http::scRequestHeaderFieldsTooLarge || hp->request_parse_status == Http::scUriTooLong)
+                 return csd->abortRequestParsing("error:request-too-large");
+ 
+             return csd->abortRequestParsing("error:invalid-request");
+         }
+     }
+ 
+     /* We know the whole request is in parser now */
+     debugs(11, 2, "HTTP Client " << csd->clientConnection);
+     debugs(11, 2, "HTTP Client REQUEST:\n---------\n" <<
+            hp->method() << " " << hp->requestUri() << " " << hp->messageProtocol() << "\n" <<
+@@ -2440,40 +2442,96 @@
+                     SQUID_X509_V_ERR_DOMAIN_MISMATCH,
+                     srvCert, NULL);
+                 err->detail = errDetail;
+                 // Save the original request for logging purposes.
+                 if (!context->http->al->request) {
+                     context->http->al->request = request;
+                     HTTPMSGLOCK(context->http->al->request);
+                 }
+                 repContext->setReplyToError(request->method, err);
+                 assert(context->http->out.offset == 0);
+                 context->pullData();
+                 return true;
+             }
+         }
+     }
+ 
+     return false;
+ }
+ #endif // USE_OPENSSL
+ 
++/**
++ * Check on_first_request_error checklist and return true if tunnel mode selected
++ * or false otherwise
++ */
++bool
++clientTunnelOnError(ConnStateData *conn, ClientSocketContext *context, HttpRequest *request, const HttpRequestMethod& method, err_type requestError, Http::StatusCode errStatusCode, const char *requestErrorBytes)
++{
++    if (conn->port->flags.isIntercepted() &&
++        Config.accessList.on_first_request_error && conn->nrequests <= 1) {
++        ACLFilledChecklist checklist(Config.accessList.on_first_request_error, request, NULL);
++        checklist.requestErrorType = requestError;
++        checklist.src_addr = conn->clientConnection->remote;
++        checklist.my_addr = conn->clientConnection->local;
++        checklist.conn(conn);
++        allow_t answer = checklist.fastCheck();
++        if (answer == ACCESS_ALLOWED && answer.kind == 1) {
++            debugs(33, 3, "Request will be tunneled to server");
++            if (context)
++                context->removeFromConnectionList(conn);
++            Comm::SetSelect(conn->clientConnection->fd, COMM_SELECT_READ, NULL, NULL, 0);
++    
++            SBuf preReadData;
++            if (conn->preservedClientData.length())
++                preReadData.append(conn->preservedClientData);
++            static char ip[MAX_IPSTRLEN];
++            conn->clientConnection->local.toUrl(ip, sizeof(ip));
++            conn->in.buf.assign("CONNECT ").append(ip).append(" HTTP/1.1\r\nHost: ").append(ip).append("\r\n\r\n").append(preReadData);
++
++            bool ret = conn->handleReadData();
++            if (ret)
++                ret = conn->clientParseRequests();
++
++            if (!ret) {
++                debugs(33, 2, "Failed to start fake CONNECT request for on_first_request_error: " << conn->clientConnection);
++                conn->clientConnection->close();
++            }
++            return true;
++        } else {
++            debugs(33, 3, "Continue with returning the error: " << requestError);
++        }
++    }
++
++    if (context) {
++        conn->quitAfterError(request);
++        clientStreamNode *node = context->getClientReplyContext();
++        clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
++        assert (repContext);
++
++        repContext->setReplyToError(requestError, errStatusCode, method, context->http->uri, conn->clientConnection->remote, NULL, requestErrorBytes, NULL);
++
++        assert(context->http->out.offset == 0);
++        context->pullData();
++    } // else Probably an ERR_REQUEST_START_TIMEOUT error so just return.
++    return false;
++}
++
+ void
+ clientProcessRequestFinished(ConnStateData *conn, const HttpRequest::Pointer &request)
+ {
+     /*
+      * DPW 2007-05-18
+      * Moved the TCP_RESET feature from clientReplyContext::sendMoreData
+      * to here because calling comm_reset_close() causes http to
+      * be freed before accessing.
+      */
+     if (request != NULL && request->flags.resetTcp && Comm::IsConnOpen(conn->clientConnection)) {
+         debugs(33, 3, HERE << "Sending TCP RST on " << conn->clientConnection);
+         conn->flags.readMore = false;
+         comm_reset_close(conn->clientConnection);
+     }
+ }
+ 
+ void
+ clientProcessRequest(ConnStateData *conn, const Http1::RequestParserPointer &hp, ClientSocketContext *context)
+ {
+     ClientHttpRequest *http = context->http;
+@@ -2959,40 +3017,54 @@
+         break;
+     case 0x2: // IPv6
+         clientConnection->local = ipu.ipv6_addr.dst_addr;
+         clientConnection->local.port(ntohs(ipu.ipv6_addr.dst_port));
+         clientConnection->remote = ipu.ipv6_addr.src_addr;
+         clientConnection->remote.port(ntohs(ipu.ipv6_addr.src_port));
+         clientConnection->flags ^= COMM_TRANSPARENT; // prevent TPROXY spoofing of this new IP.
+         break;
+     default: // do nothing
+         break;
+     }
+     debugs(33, 5, "PROXY/2.0 upgrade: " << clientConnection);
+ 
+     // repeat fetch ensuring the new client FQDN can be logged
+     if (Config.onoff.log_fqdn)
+         fqdncache_gethostbyaddr(clientConnection->remote, FQDN_LOOKUP_IF_MISS);
+ 
+     return true;
+ }
+ 
++void
++ConnStateData::receivedFirstByte()
++{
++    if (receivedFirstByte_)
++        return;
++
++    receivedFirstByte_ = true;
++    // Set timeout to Config.Timeout.request
++    typedef CommCbMemFunT<ConnStateData, CommTimeoutCbParams> TimeoutDialer;
++    AsyncCall::Pointer timeoutCall =  JobCallback(33, 5,
++                                      TimeoutDialer, this, ConnStateData::requestTimeout);
++    commSetConnTimeout(clientConnection, Config.Timeout.request, timeoutCall);
++}
++
+ /**
+  * Attempt to parse one or more requests from the input buffer.
+  * Returns true after completing parsing of at least one request [header]. That
+  * includes cases where parsing ended with an error (e.g., a huge request).
+  */
+ bool
+ ConnStateData::clientParseRequests()
+ {
+     bool parsed_req = false;
+ 
+     debugs(33, 5, HERE << clientConnection << ": attempting to parse");
+ 
+     // Loop while we have read bytes that are not needed for producing the body
+     // On errors, bodyPipe may become nil, but readMore will be cleared
+     while (!in.buf.isEmpty() && !bodyPipe && flags.readMore) {
+ 
+         /* Don't try to parse if the buffer is empty */
+         if (in.buf.isEmpty())
+             break;
+ 
+@@ -3056,40 +3128,42 @@
+     assert(io.conn->fd == clientConnection->fd);
+ 
+     /*
+      * Don't reset the timeout value here. The value should be
+      * counting Config.Timeout.request and applies to the request
+      * as a whole, not individual read() calls.
+      * Plus, it breaks our lame *HalfClosed() detection
+      */
+ 
+     CommIoCbParams rd(this); // will be expanded with ReadNow results
+     rd.conn = io.conn;
+     switch (Comm::ReadNow(rd, in.buf)) {
+     case Comm::INPROGRESS:
+         if (in.buf.isEmpty())
+             debugs(33, 2, io.conn << ": no data to process, " << xstrerr(rd.xerrno));
+         readSomeData();
+         return;
+ 
+     case Comm::OK:
+         kb_incr(&(statCounter.client_http.kbytes_in), rd.size);
++        if (!receivedFirstByte_)
++            receivedFirstByte();
+         // may comm_close or setReplyToError
+         if (!handleReadData())
+             return;
+ 
+         /* Continue to process previously read data */
+         break;
+ 
+     case Comm::ENDFILE: // close detected by 0-byte read
+         debugs(33, 5, io.conn << " closed?");
+ 
+         if (connFinishedWithConn(rd.size)) {
+             clientConnection->close();
+             return;
+         }
+ 
+         /* It might be half-closed, we can't tell */
+         fd_table[io.conn->fd].flags.socket_eof = true;
+         commMarkHalfClosed(io.conn->fd);
+         fd_note(io.conn->fd, "half-closed");
+ 
+@@ -3277,77 +3351,96 @@
+     debugs(33, 3, HERE << "aborting chunked request without error " << error);
+     comm_reset_close(clientConnection);
+ #endif
+     flags.readMore = false;
+ }
+ 
+ void
+ ConnStateData::noteBodyConsumerAborted(BodyPipe::Pointer )
+ {
+     // request reader may get stuck waiting for space if nobody consumes body
+     if (bodyPipe != NULL)
+         bodyPipe->enableAutoConsumption();
+ 
+     // kids extend
+ }
+ 
+ /** general lifetime handler for HTTP requests */
+ void
+ ConnStateData::requestTimeout(const CommTimeoutCbParams &io)
+ {
++    if (Config.accessList.on_first_request_error && !receivedFirstByte_) {
++#if USE_OPENSSL
++        if (serverBump() && (serverBump()->act.step1 == Ssl::bumpPeek || serverBump()->act.step1 == Ssl::bumpStare)) {
++            if (spliceOnError(ERR_REQUEST_START_TIMEOUT)) {
++                receivedFirstByte();
++                return;
++            }
++        } else if (fd_table[io.conn->fd].ssl == NULL)
++#endif
++        {
++            const HttpRequestMethod method;
++            if (clientTunnelOnError(this, NULL, NULL, method, ERR_REQUEST_START_TIMEOUT, Http::scNone, NULL)) {
++                // Tunnel established. Set receivedFirstByte to avoid loop.
++                receivedFirstByte();
++                return;
++            }
++        }
++    }
+     /*
+     * Just close the connection to not confuse browsers
+     * using persistent connections. Some browsers open
+     * a connection and then do not use it until much
+     * later (presumeably because the request triggering
+     * the open has already been completed on another
+     * connection)
+     */
+     debugs(33, 3, "requestTimeout: FD " << io.fd << ": lifetime is expired.");
+     io.conn->close();
+ }
+ 
+ static void
+ clientLifetimeTimeout(const CommTimeoutCbParams &io)
+ {
+     ClientHttpRequest *http = static_cast<ClientHttpRequest *>(io.data);
+     debugs(33, DBG_IMPORTANT, "WARNING: Closing client connection due to lifetime timeout");
+     debugs(33, DBG_IMPORTANT, "\t" << http->uri);
+     http->al->http.timedout = true;
+     if (Comm::IsConnOpen(io.conn))
+         io.conn->close();
+ }
+ 
+ ConnStateData::ConnStateData(const MasterXaction::Pointer &xact) :
+     AsyncJob("ConnStateData"), // kids overwrite
+     nrequests(0),
+ #if USE_OPENSSL
+     sslBumpMode(Ssl::bumpEnd),
+ #endif
+     needProxyProtocolHeader_(false),
+ #if USE_OPENSSL
+     switchedToHttps_(false),
+     sslServerBump(NULL),
+     signAlgorithm(Ssl::algSignTrusted),
+ #endif
+     stoppedSending_(NULL),
+-    stoppedReceiving_(NULL)
++    stoppedReceiving_(NULL),
++    receivedFirstByte_(false)
+ {
+     flags.readMore = true; // kids may overwrite
+     flags.swanSang = false;
+ 
+     pinning.host = NULL;
+     pinning.port = -1;
+     pinning.pinned = false;
+     pinning.auth = false;
+     pinning.zeroReply = false;
+     pinning.peer = NULL;
+ 
+     // store the details required for creating more MasterXaction objects as new requests come in
+     clientConnection = xact->tcpClient;
+     port = xact->squidPort;
+     transferProtocol = port->transport; // default to the *_port protocol= setting. may change later.
+     log_addr = xact->tcpClient->remote;
+     log_addr.applyMask(Config.Addrs.client_netmask);
+ }
+ 
+ void
+@@ -3473,108 +3566,111 @@
+     // Socket is ready, setup the connection manager to start using it
+     ConnStateData *connState = Http::NewServer(xact);
+     AsyncJob::Start(connState); // usually async-calls readSomeData()
+ }
+ 
+ #if USE_OPENSSL
+ 
+ /** Create SSL connection structure and update fd_table */
+ static SSL *
+ httpsCreate(const Comm::ConnectionPointer &conn, SSL_CTX *sslContext)
+ {
+     if (SSL *ssl = Ssl::CreateServer(sslContext, conn->fd, "client https start")) {
+         debugs(33, 5, "will negotate SSL on " << conn);
+         return ssl;
+     }
+ 
+     conn->close();
+     return NULL;
+ }
+ 
+-static bool
++/**
++ * 
++ * \retval 1 on success
++ * \retval 0 when needs more data
++ * \retval -1 on error
++ */
++static int
+ Squid_SSL_accept(ConnStateData *conn, PF *callback)
+ {
+     int fd = conn->clientConnection->fd;
+     SSL *ssl = fd_table[fd].ssl;
+     int ret;
+ 
+     if ((ret = SSL_accept(ssl)) <= 0) {
+         int ssl_error = SSL_get_error(ssl, ret);
+ 
+         switch (ssl_error) {
+ 
+         case SSL_ERROR_WANT_READ:
+             Comm::SetSelect(fd, COMM_SELECT_READ, callback, conn, 0);
+-            return false;
++            return 0;
+ 
+         case SSL_ERROR_WANT_WRITE:
+             Comm::SetSelect(fd, COMM_SELECT_WRITE, callback, conn, 0);
+-            return false;
++            return 0;
+ 
+         case SSL_ERROR_SYSCALL:
+ 
+             if (ret == 0) {
+                 debugs(83, 2, "Error negotiating SSL connection on FD " << fd << ": Aborted by client: " << ssl_error);
+-                comm_close(fd);
+-                return false;
+             } else {
+                 int hard = 1;
+ 
+                 if (errno == ECONNRESET)
+                     hard = 0;
+ 
+                 debugs(83, hard ? 1 : 2, "Error negotiating SSL connection on FD " <<
+                        fd << ": " << strerror(errno) << " (" << errno << ")");
+-
+-                comm_close(fd);
+-
+-                return false;
+             }
++            return -1;
+ 
+         case SSL_ERROR_ZERO_RETURN:
+             debugs(83, DBG_IMPORTANT, "Error negotiating SSL connection on FD " << fd << ": Closed by client");
+-            comm_close(fd);
+-            return false;
++            return -1;
+ 
+         default:
+             debugs(83, DBG_IMPORTANT, "Error negotiating SSL connection on FD " <<
+                    fd << ": " << ERR_error_string(ERR_get_error(), NULL) <<
+                    " (" << ssl_error << "/" << ret << ")");
+-            comm_close(fd);
+-            return false;
++            return -1;
+         }
+ 
+         /* NOTREACHED */
+     }
+-    return true;
++    return 1;
+ }
+ 
+ /** negotiate an SSL connection */
+ static void
+ clientNegotiateSSL(int fd, void *data)
+ {
+     ConnStateData *conn = (ConnStateData *)data;
+     X509 *client_cert;
+     SSL *ssl = fd_table[fd].ssl;
+ 
+-    if (!Squid_SSL_accept(conn, clientNegotiateSSL))
++    int ret;
++    if ((ret = Squid_SSL_accept(conn, clientNegotiateSSL)) <= 0) {
++        if (ret < 0) // An error
++            comm_close(fd);
+         return;
++    }
+ 
+     if (SSL_session_reused(ssl)) {
+         debugs(83, 2, "clientNegotiateSSL: Session " << SSL_get_session(ssl) <<
+                " reused on FD " << fd << " (" << fd_table[fd].ipaddr << ":" << (int)fd_table[fd].remote_port << ")");
+     } else {
+         if (do_debug(83, 4)) {
+             /* Write out the SSL session details.. actually the call below, but
+              * OpenSSL headers do strange typecasts confusing GCC.. */
+             /* PEM_write_SSL_SESSION(debug_log, SSL_get_session(ssl)); */
+ #if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x00908000L
+             PEM_ASN1_write((i2d_of_void *)i2d_SSL_SESSION, PEM_STRING_SSL_SESSION, debug_log, (char *)SSL_get_session(ssl), NULL,NULL,0,NULL,NULL);
+ 
+ #elif (ALLOW_ALWAYS_SSL_SESSION_DETAIL == 1)
+ 
+             /* When using gcc 3.3.x and OpenSSL 0.9.7x sometimes a compile error can occur here.
+             * This is caused by an unpredicatble gcc behaviour on a cast of the first argument
+             * of PEM_ASN1_write(). For this reason this code section is disabled. To enable it,
+             * define ALLOW_ALWAYS_SSL_SESSION_DETAIL=1.
+             * Because there are two possible usable cast, if you get an error here, try the other
+             * commented line. */
+@@ -4046,158 +4142,199 @@
+     // and now want to switch to SSL to send the error to the client
+     // without even peeking at the origin server certificate.
+     if (bumpServerMode == Ssl::bumpServerFirst && !sslServerBump) {
+         request->flags.sslPeek = true;
+         sslServerBump = new Ssl::ServerBump(request);
+ 
+         // will call httpsPeeked() with certificate and connection, eventually
+         FwdState::fwdStart(clientConnection, sslServerBump->entry, sslServerBump->request.getRaw());
+         return;
+     } else if (bumpServerMode == Ssl::bumpPeek || bumpServerMode == Ssl::bumpStare) {
+         request->flags.sslPeek = true;
+         sslServerBump = new Ssl::ServerBump(request, NULL, bumpServerMode);
+         startPeekAndSplice();
+         return;
+     }
+ 
+     // otherwise, use sslConnectHostOrIp
+     getSslContextStart();
+ }
+ 
++bool
++ConnStateData::spliceOnError(const err_type err)
++{
++    if (Config.accessList.on_first_request_error) {
++        assert(serverBump());
++        ACLFilledChecklist checklist(Config.accessList.on_first_request_error, serverBump()->request.getRaw(), NULL);
++        checklist.requestErrorType = err;
++        checklist.conn(this);
++        allow_t answer = checklist.fastCheck();
++        if (answer == ACCESS_ALLOWED && answer.kind == 1) {
++            splice();
++            return true;
++        }
++    }
++    return false;
++}
++
+ /** negotiate an SSL connection */
+ static void
+ clientPeekAndSpliceSSL(int fd, void *data)
+ {
+     ConnStateData *conn = (ConnStateData *)data;
+     SSL *ssl = fd_table[fd].ssl;
+ 
+     debugs(83, 5, "Start peek and splice on FD " << fd);
+ 
+-    if (!Squid_SSL_accept(conn, clientPeekAndSpliceSSL))
++    int ret = 0;
++    if ((ret = Squid_SSL_accept(conn, clientPeekAndSpliceSSL)) < 0)
+         debugs(83, 2, "SSL_accept failed.");
+ 
+     BIO *b = SSL_get_rbio(ssl);
+     assert(b);
+     Ssl::ClientBio *bio = static_cast<Ssl::ClientBio *>(b->ptr);
++    if (ret < 0) {
++        const err_type err = bio->noSslClient() ? ERR_PROTOCOL_UNKNOWN : ERR_SECURE_ACCEPT_FAIL;
++        if (!conn->spliceOnError(err))
++            conn->clientConnection->close();
++        return;
++    } 
++
++    if (bio->rBufData().contentSize() > 0)
++        conn->receivedFirstByte();
++
+     if (bio->gotHello()) {
+         if (conn->serverBump()) {
+             Ssl::Bio::sslFeatures const &features = bio->getFeatures();
+             if (!features.serverName.isEmpty())
+                 conn->serverBump()->clientSni = features.serverName;
+         }
+ 
+         debugs(83, 5, "I got hello. Start forwarding the request!!! ");
+         Comm::SetSelect(fd, COMM_SELECT_READ, NULL, NULL, 0);
+         Comm::SetSelect(fd, COMM_SELECT_WRITE, NULL, NULL, 0);
+         conn->startPeekAndSpliceDone();
+         return;
+     }
+ }
+ 
+ void ConnStateData::startPeekAndSplice()
+ {
+     // will call httpsPeeked() with certificate and connection, eventually
+     SSL_CTX *unConfiguredCTX = Ssl::createSSLContext(port->signingCert, port->signPkey, *port);
+     fd_table[clientConnection->fd].dynamicSslContext = unConfiguredCTX;
+ 
+     if (!httpsCreate(clientConnection, unConfiguredCTX))
+         return;
+ 
+     // commSetConnTimeout() was called for this request before we switched.
++    // Fix timeout to request_start_timeout
++    typedef CommCbMemFunT<ConnStateData, CommTimeoutCbParams> TimeoutDialer;
++    AsyncCall::Pointer timeoutCall =  JobCallback(33, 5,
++                                      TimeoutDialer, this, ConnStateData::requestTimeout);
++    commSetConnTimeout(clientConnection, Config.Timeout.request_start_timeout, timeoutCall);
++    // Also reset receivedFirstByte_ flag to allow this timeout work in the case we have
++    // a bumbed "connect" request on non transparent port.
++    receivedFirstByte_ = false;
+ 
+     // Disable the client read handler until CachePeer selection is complete
+     Comm::SetSelect(clientConnection->fd, COMM_SELECT_READ, NULL, NULL, 0);
+     Comm::SetSelect(clientConnection->fd, COMM_SELECT_READ, clientPeekAndSpliceSSL, this, 0);
+     switchedToHttps_ = true;
+ 
+     SSL *ssl = fd_table[clientConnection->fd].ssl;
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ClientBio *bio = static_cast<Ssl::ClientBio *>(b->ptr);
+     bio->hold(true);
+ }
+ 
+ void httpsSslBumpStep2AccessCheckDone(allow_t answer, void *data)
+ {
+     ConnStateData *connState = (ConnStateData *) data;
+ 
+     // if the connection is closed or closing, just return.
+     if (!connState->isOpen())
+         return;
+ 
+     debugs(33, 5, "Answer: " << answer << " kind:" << answer.kind);
+     assert(connState->serverBump());
+     Ssl::BumpMode bumpAction;
+     if (answer == ACCESS_ALLOWED) {
+         if (answer.kind == Ssl::bumpNone)
+             bumpAction = Ssl::bumpSplice;
+         else if (answer.kind == Ssl::bumpClientFirst || answer.kind == Ssl::bumpServerFirst)
+             bumpAction = Ssl::bumpBump;
+         else
+             bumpAction = (Ssl::BumpMode)answer.kind;
+     } else
+         bumpAction = Ssl::bumpSplice;
+ 
+     connState->serverBump()->act.step2 = bumpAction;
+     connState->sslBumpMode = bumpAction;
+ 
+     if (bumpAction == Ssl::bumpTerminate) {
+         comm_close(connState->clientConnection->fd);
+     } else if (bumpAction != Ssl::bumpSplice) {
+         connState->startPeekAndSpliceDone();
+-    } else {
+-        //Normally we can splice here, because we just got client hello message
+-        SSL *ssl = fd_table[connState->clientConnection->fd].ssl;
+-        BIO *b = SSL_get_rbio(ssl);
+-        Ssl::ClientBio *bio = static_cast<Ssl::ClientBio *>(b->ptr);
+-        MemBuf const &rbuf = bio->rBufData();
+-        debugs(83,5, "Bio for  " << connState->clientConnection << " read " << rbuf.contentSize() << " helo bytes");
+-        // Do splice:
+-        fd_table[connState->clientConnection->fd].read_method = &default_read_method;
+-        fd_table[connState->clientConnection->fd].write_method = &default_write_method;
+-
+-        if (connState->transparent()) {
+-            // set the current protocol to something sensible (was "HTTPS" for the bumping process)
+-            // we are sending a faked-up HTTP/1.1 message wrapper, so go with that.
+-            connState->transferProtocol = Http::ProtocolVersion();
+-            // fake a CONNECT request to force connState to tunnel
+-            static char ip[MAX_IPSTRLEN];
+-            connState->clientConnection->local.toUrl(ip, sizeof(ip));
+-            connState->in.buf.assign("CONNECT ").append(ip).append(" HTTP/1.1\r\nHost: ").append(ip).append("\r\n\r\n").append(rbuf.content(), rbuf.contentSize());
+-            bool ret = connState->handleReadData();
+-            if (ret)
+-                ret = connState->clientParseRequests();
++    } else
++        connState->splice();
++}
+ 
+-            if (!ret) {
+-                debugs(33, 2, "Failed to start fake CONNECT request for ssl spliced connection: " << connState->clientConnection);
+-                connState->clientConnection->close();
+-            }
+-        } else {
+-            // XXX: assuming that there was an HTTP/1.1 CONNECT to begin with...
++void
++ConnStateData::splice()
++{
++    //Normally we can splice here, because we just got client hello message
++    SSL *ssl = fd_table[clientConnection->fd].ssl;
++    BIO *b = SSL_get_rbio(ssl);
++    Ssl::ClientBio *bio = static_cast<Ssl::ClientBio *>(b->ptr);
++    MemBuf const &rbuf = bio->rBufData();
++    debugs(83,5, "Bio for  " << clientConnection << " read " << rbuf.contentSize() << " helo bytes");
++    // Do splice:
++    fd_table[clientConnection->fd].read_method = &default_read_method;
++    fd_table[clientConnection->fd].write_method = &default_write_method;
++
++    if (transparent()) {
++        // set the current protocol to something sensible (was "HTTPS" for the bumping process)
++        // we are sending a faked-up HTTP/1.1 message wrapper, so go with that.
++        transferProtocol = Http::ProtocolVersion();
++        // fake a CONNECT request to force connState to tunnel
++        static char ip[MAX_IPSTRLEN];
++        clientConnection->local.toUrl(ip, sizeof(ip));
++        in.buf.assign("CONNECT ").append(ip).append(" HTTP/1.1\r\nHost: ").append(ip).append("\r\n\r\n").append(rbuf.content(), rbuf.contentSize());
++        bool ret = handleReadData();
++        if (ret)
++            ret = clientParseRequests();
+ 
+-            // reset the current protocol to HTTP/1.1 (was "HTTPS" for the bumping process)
+-            connState->transferProtocol = Http::ProtocolVersion();
+-            // in.buf still has the "CONNECT ..." request data, reset it to SSL hello message
+-            connState->in.buf.append(rbuf.content(), rbuf.contentSize());
+-            ClientSocketContext::Pointer context = connState->getCurrentContext();
+-            ClientHttpRequest *http = context->http;
+-            tunnelStart(http, &http->out.size, &http->al->http.code, http->al);
++        if (!ret) {
++            debugs(33, 2, "Failed to start fake CONNECT request for ssl spliced connection: " << clientConnection);
++            clientConnection->close();
+         }
++    } else {
++        // XXX: assuming that there was an HTTP/1.1 CONNECT to begin with...
++
++        // reset the current protocol to HTTP/1.1 (was "HTTPS" for the bumping process)
++        transferProtocol = Http::ProtocolVersion();
++        // in.buf still has the "CONNECT ..." request data, reset it to SSL hello message
++        in.buf.append(rbuf.content(), rbuf.contentSize());
++        ClientSocketContext::Pointer context = getCurrentContext();
++        ClientHttpRequest *http = context->http;
++        tunnelStart(http, &http->out.size, &http->al->http.code, http->al);
+     }
+ }
+ 
+ void
+ ConnStateData::startPeekAndSpliceDone()
+ {
+     // This is the Step2 of the SSL bumping
+     assert(sslServerBump);
+     if (sslServerBump->step == Ssl::bumpStep1) {
+         sslServerBump->step = Ssl::bumpStep2;
+         // Run a accessList check to check if want to splice or continue bumping
+ 
+         ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(Config.accessList.ssl_bump, sslServerBump->request.getRaw(), NULL);
+         //acl_checklist->src_addr = params.conn->remote;
+         //acl_checklist->my_addr = s->s;
+         acl_checklist->nonBlockingCheck(httpsSslBumpStep2AccessCheckDone, this);
+         return;
+     }
+ 
+     FwdState::fwdStart(clientConnection, sslServerBump->entry, sslServerBump->request.getRaw());
+@@ -4869,21 +5006,20 @@
+         if (pinning.closeHandler != NULL) {
+             comm_remove_close_handler(pinning.serverConnection->fd, pinning.closeHandler);
+             pinning.closeHandler = NULL;
+         }
+ 
+         stopPinnedConnectionMonitoring();
+ 
+         // close the server side socket if requested
+         if (andClose)
+             pinning.serverConnection->close();
+         pinning.serverConnection = NULL;
+     }
+ 
+     safe_free(pinning.host);
+ 
+     pinning.zeroReply = false;
+ 
+     /* NOTE: pinning.pinned should be kept. This combined with fd == -1 at the end of a request indicates that the host
+      * connection has gone away */
+ }
+-
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2015-01-13 07:25:36 +0000
++++ src/client_side.h	2015-01-13 16:36:36 +0000
+@@ -170,40 +170,43 @@
+  */
+ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+ {
+ 
+ public:
+     explicit ConnStateData(const MasterXaction::Pointer &xact);
+     virtual ~ConnStateData();
+ 
+     void readSomeData();
+     bool areAllContextsForThisConnection() const;
+     void freeAllContexts();
+     void notifyAllContexts(const int xerrno); ///< tell everybody about the err
+     /// Traffic parsing
+     bool clientParseRequests();
+     void readNextRequest();
+     ClientSocketContext::Pointer getCurrentContext() const;
+     void addContextToQueue(ClientSocketContext * context);
+     int getConcurrentRequestCount() const;
+     bool isOpen() const;
+ 
++    /// Update flags and timeout after the first byte received
++    void receivedFirstByte();
++
+     // HttpControlMsgSink API
+     virtual void sendControlMsg(HttpControlMsg msg);
+ 
+     // Client TCP connection details from comm layer.
+     Comm::ConnectionPointer clientConnection;
+ 
+     /**
+      * The transfer protocol currently being spoken on this connection.
+      * HTTP/1 CONNECT and HTTP/2 SETTINGS offers the ability to change
+      * protocols on the fly.
+      */
+     AnyP::ProtocolVersion transferProtocol;
+ 
+     struct In {
+         In();
+         ~In();
+         bool maybeMakeSpaceAvailable();
+ 
+         ChunkedCodingParser *bodyParser; ///< parses chunked request body
+         SBuf buf;
+@@ -330,40 +333,48 @@
+     void quitAfterError(HttpRequest *request); // meant to be private
+ 
+     /// The caller assumes responsibility for connection closure detection.
+     void stopPinnedConnectionMonitoring();
+ 
+ #if USE_OPENSSL
+     /// the second part of old httpsAccept, waiting for future HttpsServer home
+     void postHttpsAccept();
+ 
+     /// Initializes and starts a peek-and-splice negotiation with the SSL client
+     void startPeekAndSplice();
+     /// Called when the initialization of peek-and-splice negotiation finidhed
+     void startPeekAndSpliceDone();
+     /// Called when a peek-and-splice step finished. For example after
+     /// server SSL certificates received and fake server SSL certificates
+     /// generated
+     void doPeekAndSpliceStep();
+     /// called by FwdState when it is done bumping the server
+     void httpsPeeked(Comm::ConnectionPointer serverConnection);
+ 
++    /// Splice a bumped client connection on peek-and-splice mode
++    void splice();
++
++    /// Check on_first_request_error access list and splice if required
++    /// \retval true on splice
++    /// \retval false otherwise
++    bool spliceOnError(const err_type err);
++
+     /// Start to create dynamic SSL_CTX for host or uses static port SSL context.
+     void getSslContextStart();
+     /**
+      * Done create dynamic ssl certificate.
+      *
+      * \param[in] isNew if generated certificate is new, so we need to add this certificate to storage.
+      */
+     void getSslContextDone(SSL_CTX * sslContext, bool isNew = false);
+     /// Callback function. It is called when squid receive message from ssl_crtd.
+     static void sslCrtdHandleReplyWrapper(void *data, const Helper::Reply &reply);
+     /// Proccess response from ssl_crtd.
+     void sslCrtdHandleReply(const Helper::Reply &reply);
+ 
+     void switchToHttps(HttpRequest *request, Ssl::BumpMode bumpServerMode);
+     bool switchedToHttps() const { return switchedToHttps_; }
+     Ssl::ServerBump *serverBump() {return sslServerBump;}
+     inline void setServerBump(Ssl::ServerBump *srvBump) {
+         if (!sslServerBump)
+             sslServerBump = srvBump;
+         else
+@@ -386,40 +397,43 @@
+ 
+     /* clt_conn_tag=tag annotation access */
+     const SBuf &connectionTag() const { return connectionTag_; }
+     void connectionTag(const char *aTag) { connectionTag_ = aTag; }
+ 
+     /// handle a control message received by context from a peer and call back
+     virtual void writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &call) = 0;
+ 
+     /// ClientStream calls this to supply response header (once) and data
+     /// for the current ClientSocketContext.
+     virtual void handleReply(HttpReply *header, StoreIOBuffer receivedData) = 0;
+ 
+     /// remove no longer needed leading bytes from the input buffer
+     void consumeInput(const size_t byteCount);
+ 
+     /* TODO: Make the methods below (at least) non-public when possible. */
+ 
+     /// stop parsing the request and create context for relaying error info
+     ClientSocketContext *abortRequestParsing(const char *const errUri);
+ 
++    /// client data which may need to forward as-is to server after an 
++    /// on_first_request_error tunnel decision.
++    SBuf preservedClientData;
+ protected:
+     void startDechunkingRequest();
+     void finishDechunkingRequest(bool withSuccess);
+     void abortChunkedRequestBody(const err_type error);
+     err_type handleChunkedRequestBody(size_t &putSize);
+ 
+     void startPinnedConnectionMonitoring();
+     void clientPinnedConnectionRead(const CommIoCbParams &io);
+ 
+     /// parse input buffer prefix into a single transfer protocol request
+     /// return NULL to request more header bytes (after checking any limits)
+     /// use abortRequestParsing() to handle parsing errors w/o creating request
+     virtual ClientSocketContext *parseOneRequest() = 0;
+ 
+     /// start processing a freshly parsed request
+     virtual void processParsedRequest(ClientSocketContext *context) = 0;
+ 
+     /// returning N allows a pipeline of 1+N requests (see pipeline_prefetch)
+     virtual int pipelinePrefetchMax() const;
+ 
+@@ -455,40 +469,41 @@
+ 
+ #if USE_OPENSSL
+     bool switchedToHttps_;
+     /// The SSL server host name appears in CONNECT request or the server ip address for the intercepted requests
+     String sslConnectHostOrIp; ///< The SSL server host name as passed in the CONNECT request
+     String sslCommonName; ///< CN name for SSL certificate generation
+     String sslBumpCertKey; ///< Key to use to store/retrieve generated certificate
+ 
+     /// HTTPS server cert. fetching state for bump-ssl-server-first
+     Ssl::ServerBump *sslServerBump;
+     Ssl::CertSignAlgorithm signAlgorithm; ///< The signing algorithm to use
+ #endif
+ 
+     /// the reason why we no longer write the response or nil
+     const char *stoppedSending_;
+     /// the reason why we no longer read the request or nil
+     const char *stoppedReceiving_;
+ 
+     AsyncCall::Pointer reader; ///< set when we are reading
+ 
++    bool receivedFirstByte_; ///< true if at least one byte received on this connection
+     SBuf connectionTag_; ///< clt_conn_tag=Tag annotation for client connection
+ };
+ 
+ void setLogUri(ClientHttpRequest * http, char const *uri, bool cleanUrl = false);
+ 
+ const char *findTrailingHTTPVersion(const char *uriAndHTTPVersion, const char *end = NULL);
+ 
+ int varyEvaluateMatch(StoreEntry * entry, HttpRequest * req);
+ 
+ /// accept requests to a given port and inform subCall about them
+ void clientStartListeningOn(AnyP::PortCfgPointer &port, const RefCount< CommCbFunPtrCallT<CommAcceptCbPtrFun> > &subCall, const Ipc::FdNoteId noteId);
+ 
+ void clientOpenListenSockets(void);
+ void clientConnectionsClose(void);
+ void httpRequestFree(void *);
+ 
+ /// decide whether to expect multiple requests on the corresponding connection
+ void clientSetKeepaliveFlag(ClientHttpRequest *http);
+ 
+ /* misplaced declaratrions of Stream callbacks provided/used by client side */
+
+=== modified file 'src/err_type.h'
+--- src/err_type.h	2015-01-13 07:25:36 +0000
++++ src/err_type.h	2015-01-13 16:36:36 +0000
+@@ -10,40 +10,41 @@
+ #define _SQUID_ERR_TYPE_H
+ 
+ typedef enum {
+     ERR_NONE,
+ 
+     /* Access Permission Errors.  Prefix new with ERR_ACCESS_ */
+     ERR_ACCESS_DENIED,
+     ERR_CACHE_ACCESS_DENIED,
+     ERR_CACHE_MGR_ACCESS_DENIED,
+     ERR_FORWARDING_DENIED,
+     ERR_NO_RELAY,
+     ERR_CANNOT_FORWARD,
+ 
+     /* TCP Errors. */
+     ERR_READ_TIMEOUT,
+     ERR_LIFETIME_EXP,
+     ERR_READ_ERROR,
+     ERR_WRITE_ERROR,
+     ERR_CONNECT_FAIL,
+     ERR_SECURE_CONNECT_FAIL,
++    ERR_SECURE_ACCEPT_FAIL,
+     ERR_SOCKET_FAILURE,
+ 
+     /* DNS Errors */
+     ERR_DNS_FAIL,
+     ERR_URN_RESOLVE,
+ 
+     /* HTTP Errors */
+     ERR_ONLY_IF_CACHED_MISS,    /* failure to satisfy only-if-cached request */
+     ERR_TOO_BIG,
+     ERR_INVALID_RESP,
+     ERR_UNSUP_HTTPVERSION,     /* HTTP version is not supported */
+     ERR_INVALID_REQ,
+     ERR_UNSUP_REQ,
+     ERR_INVALID_URL,
+     ERR_ZERO_SIZE_OBJECT,
+     ERR_PRECONDITION_FAILED,
+     ERR_CONFLICT_HOST,
+ 
+     /* FTP Errors */
+     ERR_FTP_DISABLED,
+@@ -51,35 +52,56 @@
+     ERR_FTP_FAILURE,
+     ERR_FTP_PUT_ERROR,
+     ERR_FTP_NOT_FOUND,
+     ERR_FTP_FORBIDDEN,
+     ERR_FTP_PUT_CREATED,        /* !error,a note that the file was created */
+     ERR_FTP_PUT_MODIFIED,       /* modified, !created */
+ 
+     /* ESI Errors */
+     ERR_ESI,                    /* Failure to perform ESI processing */
+ 
+     /* ICAP Errors */
+     ERR_ICAP_FAILURE,
+ 
+     /* Squid problem */
+     ERR_GATEWAY_FAILURE,
+ 
+     /* Special Cases */
+     ERR_DIR_LISTING,            /* Display of remote directory (FTP, Gopher) */
+     ERR_SQUID_SIGNATURE,        /* not really an error */
+     ERR_SHUTTING_DOWN,
++    ERR_PROTOCOL_UNKNOWN,
++    ERR_REQUEST_START_TIMEOUT,
+ 
+     // NOTE: error types defined below TCP_RESET are optional and do not generate
+     //       a log warning if the files are missing
+     TCP_RESET,                  // Send TCP RST packet instead of error page
+ 
+     /* Cache Manager GUI can install a manager index/home page */
+     MGR_INDEX,
+ 
+     ERR_MAX
+ } err_type;
+ 
+ extern const char *err_type_str[];
+ 
++inline
++err_type
++errorTypeByName(const char *name)
++{
++    for (int i = 0; i < ERR_MAX; ++i)
++        if (strcmp(name, err_type_str[i]) == 0)
++            return (err_type)i;
++    return ERR_MAX;
++}
++
++inline
++const char *
++errorTypeName(err_type err)
++{
++    if (err < ERR_NONE || err >= ERR_MAX)
++        return "UNKNOWN";
++    return err_type_str[err];
++}
++
+ #endif /* _SQUID_ERR_TYPE_H */
+ 
+
+=== modified file 'src/http/one/RequestParser.cc'
+--- src/http/one/RequestParser.cc	2015-01-13 07:25:36 +0000
++++ src/http/one/RequestParser.cc	2015-01-13 16:36:36 +0000
+@@ -135,40 +135,46 @@
+ 
+                 if (buf_[i + 1] == '\n') {
+                     req.end = i + 1;
+                     break;
+                 }
+             } else {
+                 if (buf_[i + 1] == '\n') {
+                     req.end = i + 1;
+                     line_end = i - 1;
+                     break;
+                 }
+             }
+ 
+             // RFC 7230 section 3.1.1 does not prohibit embeded CR like RFC 2616 used to.
+             // However it does explicitly state an exact syntax which omits un-encoded CR
+             // and defines 400 (Bad Request) as the required action when
+             // handed an invalid request-line.
+             request_parse_status = Http::scBadRequest;
+             return -1;
+         }
++
++        // We are expecting printable ascii characters for method/first word
++        if (first_whitespace < 0 && xisascii(buf_[i]) && xisprint(buf_[i])) {
++            request_parse_status = Http::scBadRequest;
++            return -1;
++        }
+     }
+ 
+     if (req.end == -1) {
+         // DoS protection against long first-line
+         if ((size_t)buf_.length() >= Config.maxRequestHeaderSize) {
+             debugs(33, 5, "Too large request-line");
+             // RFC 7230 section 3.1.1 mandatory 414 response if URL longer than acceptible.
+             request_parse_status = Http::scUriTooLong;
+             return -1;
+         }
+ 
+         debugs(74, 5, "Parser: retval 0: from " << req.start <<
+                "->" << req.end << ": needs more data to complete first line.");
+         return 0;
+     }
+ 
+     // NP: we have now seen EOL, more-data (0) cannot occur.
+     //     From here on any failure is -1, success is 1
+ 
+     // Input Validation:
+
+=== modified file 'src/servers/Http1Server.cc'
+--- src/servers/Http1Server.cc	2015-01-13 07:25:36 +0000
++++ src/servers/Http1Server.cc	2015-01-13 16:42:29 +0000
+@@ -35,164 +35,156 @@
+     return Config.Timeout.clientIdlePconn;
+ }
+ 
+ void
+ Http::One::Server::start()
+ {
+     ConnStateData::start();
+ 
+ #if USE_OPENSSL
+     // XXX: Until we create an HttpsServer class, use this hack to allow old
+     // client_side.cc code to manipulate ConnStateData object directly
+     if (isHttpsServer) {
+         postHttpsAccept();
+         return;
+     }
+ #endif
+ 
+     typedef CommCbMemFunT<Server, CommTimeoutCbParams> TimeoutDialer;
+     AsyncCall::Pointer timeoutCall =  JobCallback(33, 5,
+                                       TimeoutDialer, this, Http1::Server::requestTimeout);
+-    commSetConnTimeout(clientConnection, Config.Timeout.request, timeoutCall);
++    commSetConnTimeout(clientConnection, Config.Timeout.request_start_timeout, timeoutCall);
+     readSomeData();
+ }
+ 
+ void
+ Http::One::Server::noteMoreBodySpaceAvailable(BodyPipe::Pointer)
+ {
+     if (!handleRequestBodyData())
+         return;
+ 
+     // too late to read more body
+     if (!isOpen() || stoppedReceiving())
+         return;
+ 
+     readSomeData();
+ }
+ 
+ ClientSocketContext *
+ Http::One::Server::parseOneRequest()
+ {
+     PROF_start(HttpServer_parseOneRequest);
+ 
+     // parser is incremental. Generate new parser state if we,
+     // a) dont have one already
+     // b) have completed the previous request parsing already
+     if (!parser_ || !parser_->needsMoreData())
+         parser_ = new Http1::RequestParser();
+ 
+     /* Process request */
+     ClientSocketContext *context = parseHttpRequest(this, parser_);
+ 
+     PROF_stop(HttpServer_parseOneRequest);
+     return context;
+ }
+ 
+ void clientProcessRequestFinished(ConnStateData *conn, const HttpRequest::Pointer &request);
++bool clientTunnelOnError(ConnStateData *conn, ClientSocketContext *context, HttpRequest *request, const HttpRequestMethod& method, err_type requestError, Http::StatusCode errStatusCode, const char *requestErrorBytes);
+ 
+ bool
+ Http::One::Server::buildHttpRequest(ClientSocketContext *context)
+ {
+     HttpRequest::Pointer request;
+     ClientHttpRequest *http = context->http;
+     if (context->flags.parsed_ok == 0) {
+-        clientStreamNode *node = context->getClientReplyContext();
+         debugs(33, 2, "Invalid Request");
+-        quitAfterError(NULL);
+-        // setLogUri should called before repContext->setReplyToError
+-        setLogUri(http, http->uri, true);
+-        clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+-        assert(repContext);
+-
+         // determine which error page templates to use for specific parsing errors
+         err_type errPage = ERR_INVALID_REQ;
+         switch (parser_->request_parse_status) {
+         case Http::scRequestHeaderFieldsTooLarge:
+         // fall through to next case
+         case Http::scUriTooLong:
+             errPage = ERR_TOO_BIG;
+             break;
+         case Http::scMethodNotAllowed:
+             errPage = ERR_UNSUP_REQ;
+             break;
+         case Http::scHttpVersionNotSupported:
+             errPage = ERR_UNSUP_HTTPVERSION;
+             break;
+         default:
+-            // use default ERR_INVALID_REQ set above.
++            if (parser_->method() == METHOD_NONE || parser_->requestUri().length() == 0)
++                // no method or url parsed, probably is wrong protocol
++                errPage = ERR_PROTOCOL_UNKNOWN;
++            // else use default ERR_INVALID_REQ set above.
+             break;
+         }
+-        repContext->setReplyToError(errPage, parser_->request_parse_status, parser_->method(), http->uri,
+-                                    clientConnection->remote, NULL, in.buf.c_str(), NULL);
+-        assert(context->http->out.offset == 0);
+-        context->pullData();
++        // setLogUri should called before repContext->setReplyToError
++        setLogUri(http, http->uri, true);
++        const char * requestErrorBytes = in.buf.c_str();
++        if (!clientTunnelOnError(this, context, request.getRaw(), parser_->method(), errPage, parser_->request_parse_status, requestErrorBytes)) {
++            // HttpRequest object not build yet, there is no reason to call
++            // clientProcessRequestFinished method
++        }
++
+         return false;
+     }
+ 
+     if ((request = HttpRequest::CreateFromUrlAndMethod(http->uri, parser_->method())) == NULL) {
+-        clientStreamNode *node = context->getClientReplyContext();
+         debugs(33, 5, "Invalid URL: " << http->uri);
+-        quitAfterError(request.getRaw());
+         // setLogUri should called before repContext->setReplyToError
+         setLogUri(http, http->uri, true);
+-        clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+-        assert(repContext);
+-        repContext->setReplyToError(ERR_INVALID_URL, Http::scBadRequest, parser_->method(), http->uri, clientConnection->remote, NULL, NULL, NULL);
+-        assert(context->http->out.offset == 0);
+-        context->pullData();
++
++        const char * requestErrorBytes = in.buf.c_str();
++        if (!clientTunnelOnError(this, context, request.getRaw(), parser_->method(), ERR_INVALID_URL, Http::scBadRequest, requestErrorBytes)) {
++            // HttpRequest object not build yet, there is no reason to call
++            // clientProcessRequestFinished method
++        }
+         return false;
+     }
+ 
+     /* RFC 2616 section 10.5.6 : handle unsupported HTTP major versions cleanly. */
+     /* We currently only support 0.9, 1.0, 1.1 properly */
+     /* TODO: move HTTP-specific processing into servers/HttpServer and such */
+     if ( (parser_->messageProtocol().major == 0 && parser_->messageProtocol().minor != 9) ||
+             (parser_->messageProtocol().major > 1) ) {
+ 
+-        clientStreamNode *node = context->getClientReplyContext();
+         debugs(33, 5, "Unsupported HTTP version discovered. :\n" << parser_->messageProtocol());
+-        quitAfterError(request.getRaw());
+         // setLogUri should called before repContext->setReplyToError
+         setLogUri(http, http->uri,  true);
+-        clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+-        assert (repContext);
+-        repContext->setReplyToError(ERR_UNSUP_HTTPVERSION, Http::scHttpVersionNotSupported, parser_->method(), http->uri,
+-                                    clientConnection->remote, NULL, NULL, NULL);
+-        assert(context->http->out.offset == 0);
+-        context->pullData();
+-        clientProcessRequestFinished(this, request);
++
++        const char * requestErrorBytes = NULL; //HttpParserHdrBuf(parser_);
++        if (!clientTunnelOnError(this, context, request.getRaw(), parser_->method(), ERR_UNSUP_HTTPVERSION, Http::scHttpVersionNotSupported, requestErrorBytes)) {
++            clientProcessRequestFinished(this, request);
++        }
+         return false;
+     }
+ 
+     /* compile headers */
+     if (parser_->messageProtocol().major >= 1 && !request->parseHeader(*parser_.getRaw())) {
+-        clientStreamNode *node = context->getClientReplyContext();
+         debugs(33, 5, "Failed to parse request headers:\n" << parser_->mimeHeader());
+-        quitAfterError(request.getRaw());
+         // setLogUri should called before repContext->setReplyToError
+         setLogUri(http, http->uri, true);
+-        clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+-        assert(repContext);
+-        repContext->setReplyToError(ERR_INVALID_REQ, Http::scBadRequest, parser_->method(), http->uri, clientConnection->remote, NULL, NULL, NULL);
+-        assert(context->http->out.offset == 0);
+-        context->pullData();
+-        clientProcessRequestFinished(this, request);
++        const char * requestErrorBytes = NULL; //HttpParserHdrBuf(parser_);
++        if (!clientTunnelOnError(this, context, request.getRaw(), parser_->method(), ERR_INVALID_REQ, Http::scBadRequest, requestErrorBytes)) {
++            clientProcessRequestFinished(this, request);
++        }
+         return false;
+     }
+ 
+     http->request = request.getRaw();
+     HTTPMSGLOCK(http->request);
+ 
+     return true;
+ }
+ 
+ void
+ Http::One::Server::proceedAfterBodyContinuation(ClientSocketContext::Pointer context)
+ {
+     debugs(33, 5, "Body Continuation written");
+     clientProcessRequest(this, parser_, context.getRaw());
+ }
+ 
+ void
+ Http::One::Server::processParsedRequest(ClientSocketContext *context)
+ {
+     if (!buildHttpRequest(context))
+
+=== modified file 'src/ssl/bio.cc'
+--- src/ssl/bio.cc	2015-01-13 07:25:36 +0000
++++ src/ssl/bio.cc	2015-01-13 16:36:36 +0000
+@@ -214,40 +214,41 @@
+         const char *s = objToString(head, rbuf.contentSize());
+         debugs(83, 7, "SSL Header: " << s);
+         if (rbuf.contentSize() < 5) {
+             BIO_set_retry_read(table);
+             return 0;
+         }
+ 
+         if (head[0] == 0x16) {
+             debugs(83, 7, "SSL version 3 handshake message");
+             helloSize = (head[3] << 8) + head[4];
+             debugs(83, 7, "SSL Header Size: " << helloSize);
+             helloSize +=5;
+ #if defined(DO_SSLV23)
+         } else if ((head[0] & 0x80) && head[2] == 0x01 && head[3] == 0x03) {
+             debugs(83, 7, "SSL version 2 handshake message with v3 support");
+             helloSize = head[1];
+             helloSize +=5;
+ #endif
+         } else {
+             debugs(83, 7, "Not an SSL acceptable handshake message (SSLv2 message?)");
++            wrongProtocol = true;
+             return -1;
+         }
+ 
+         helloState = atHelloStarted; //Next state
+     }
+ 
+     if (helloState == atHelloStarted) {
+         const unsigned char *head = (const unsigned char *)rbuf.content();
+         const char *s = objToString(head, rbuf.contentSize());
+         debugs(83, 7, "SSL Header: " << s);
+ 
+         if (helloSize > rbuf.contentSize()) {
+             BIO_set_retry_read(table);
+             return -1;
+         }
+         features.get((const unsigned char *)rbuf.content());
+         helloState = atHelloReceived;
+     }
+ 
+     if (holdRead_) {
+
+=== modified file 'src/ssl/bio.h'
+--- src/ssl/bio.h	2015-01-13 07:25:36 +0000
++++ src/ssl/bio.h	2015-01-13 16:36:36 +0000
+@@ -83,68 +83,70 @@
+     /// Creates a low-level BIO table, creates a high-level Ssl::Bio object
+     /// for a given socket, and then links the two together via BIO_C_SET_FD.
+     static BIO *Create(const int fd, Type type);
+     /// Tells ssl connection to use BIO and monitor state via stateChanged()
+     static void Link(SSL *ssl, BIO *bio);
+ 
+     const MemBuf &rBufData() {return rbuf;}
+ protected:
+     const int fd_; ///< the SSL socket we are reading and writing
+     MemBuf rbuf;  ///< Used to buffer input data.
+ };
+ 
+ /// BIO node to handle socket IO for squid client side
+ /// If bumping is enabled  this Bio detects and analyses client hello message
+ /// to retrieve the SSL features supported by the client
+ class ClientBio: public Bio
+ {
+ public:
+     /// The ssl hello message read states
+     typedef enum {atHelloNone = 0, atHelloStarted, atHelloReceived} HelloReadState;
+-    explicit ClientBio(const int anFd): Bio(anFd), holdRead_(false), holdWrite_(false), helloState(atHelloNone), helloSize(0) {}
++    explicit ClientBio(const int anFd): Bio(anFd), holdRead_(false), holdWrite_(false), helloState(atHelloNone), helloSize(0), wrongProtocol(false) {}
+ 
+     /// The ClientBio version of the Ssl::Bio::stateChanged method
+     /// When the client hello message retrieved, fill the
+     /// "features" member with the client provided informations.
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+     /// The ClientBio version of the Ssl::Bio::write method
+     virtual int write(const char *buf, int size, BIO *table);
+     /// The ClientBio version of the Ssl::Bio::read method
+     /// If the holdRead flag is true then it does not write any data
+     /// to socket and sets the "read retry" flag of the BIO to true
+     virtual int read(char *buf, int size, BIO *table);
+     /// Return true if the client hello message received and analized
+     bool gotHello() {return features.sslVersion != -1;}
+     /// Return the SSL features requested by SSL client
+     const Bio::sslFeatures &getFeatures() const {return features;}
+     /// Prevents or allow writting on socket.
+     void hold(bool h) {holdRead_ = holdWrite_ = h;}
+-
++    /// True if client does not looks like an SSL client
++    bool noSslClient() {return wrongProtocol;}
+ private:
+     /// True if the SSL state corresponds to a hello message
+     bool isClientHello(int state);
+     /// The futures retrieved from client SSL hello message
+     Bio::sslFeatures features;
+     bool holdRead_; ///< The read hold state of the bio.
+     bool holdWrite_;  ///< The write hold state of the bio.
+     HelloReadState helloState; ///< The SSL hello read state
+     int helloSize; ///< The SSL hello message sent by client size
++    bool wrongProtocol; ///< true if client SSL hello parsing failed
+ };
+ 
+ /// BIO node to handle socket IO for squid server side
+ /// If bumping is enabled, analyses the SSL hello message sent by squid OpenSSL
+ /// subsystem (step3 bumping step) against bumping mode:
+ ///   * Peek mode:  Send client hello message instead of the openSSL generated
+ ///                 hello message and normaly denies bumping and allow only
+ ///                 splice or terminate the SSL connection
+ ///   * Stare mode: Sends the openSSL generated hello message and normaly
+ ///                 denies splicing and allow bump or terminate the SSL
+ ///                 connection
+ ///  If SQUID_USE_OPENSSL_HELLO_OVERWRITE_HACK is enabled also checks if the
+ ///  openSSL library features are compatible with the features reported in
+ ///  web client SSL hello message and if it is, overwrites the openSSL SSL
+ ///  object members to replace hello message with web client hello message.
+ ///  This is may allow bumping in peek mode and splicing in stare mode after
+ ///  the server hello message received.
+ class ServerBio: public Bio
+ {
+ public:
+
+=== modified file 'src/tunnel.cc'
+--- src/tunnel.cc	2015-01-13 07:25:36 +0000
++++ src/tunnel.cc	2015-01-13 16:36:36 +0000
+@@ -13,40 +13,41 @@
+ #include "base/CbcPointer.h"
+ #include "CachePeer.h"
+ #include "client_side.h"
+ #include "client_side_request.h"
+ #include "comm.h"
+ #include "comm/Connection.h"
+ #include "comm/ConnOpener.h"
+ #include "comm/Read.h"
+ #include "comm/Write.h"
+ #include "errorpage.h"
+ #include "fde.h"
+ #include "FwdState.h"
+ #include "globals.h"
+ #include "http.h"
+ #include "HttpRequest.h"
+ #include "HttpStateFlags.h"
+ #include "ip/QosConfig.h"
+ #include "LogTags.h"
+ #include "MemBuf.h"
+ #include "PeerSelectState.h"
++#include "SBuf.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "StatCounters.h"
+ #if USE_OPENSSL
+ #include "ssl/bio.h"
+ #include "ssl/PeerConnector.h"
+ #include "ssl/ServerBump.h"
+ #endif
+ #include "tools.h"
+ #if USE_DELAY_POOLS
+ #include "DelayId.h"
+ #endif
+ 
+ #include <climits>
+ #include <cerrno>
+ 
+ /**
+  * TunnelStateData is the state engine performing the tasks for
+  * setup of a TCP tunnel from an existing open client FD to a server
+  * then shuffling binary data between the resulting FD pair.
+@@ -133,40 +134,41 @@
+         void dataSent (size_t amount);
+         int len;
+         char *buf;
+         int64_t *size_ptr;      /* pointer to size in an ConnStateData for logging */
+ 
+         Comm::ConnectionPointer conn;    ///< The currently connected connection.
+ 
+     private:
+ #if USE_DELAY_POOLS
+ 
+         DelayId delayId;
+ #endif
+ 
+     };
+ 
+     Connection client, server;
+     int *status_ptr;        ///< pointer for logging HTTP status
+     LogTags *logTag_ptr;    ///< pointer for logging Squid processing code
+     MemBuf *connectRespBuf; ///< accumulates peer CONNECT response when we need it
+     bool connectReqWriting; ///< whether we are writing a CONNECT request to a peer
++    SBuf preReadClientData;
+ 
+     void copyRead(Connection &from, IOCB *completion);
+ 
+     /// continue to set up connection to a peer, going async for SSL peers
+     void connectToPeer();
+ 
+ private:
+ #if USE_OPENSSL
+     /// Gives PeerConnector access to Answer in the TunnelStateData callback dialer.
+     class MyAnswerDialer: public CallDialer, public Ssl::PeerConnector::CbDialer
+     {
+     public:
+         typedef void (TunnelStateData::*Method)(Ssl::PeerConnectorAnswer &);
+ 
+         MyAnswerDialer(Method method, TunnelStateData *tunnel):
+             method_(method), tunnel_(tunnel), answer_() {}
+ 
+         /* CallDialer API */
+         virtual bool canDial(AsyncCall &call) { return tunnel_.valid(); }
+         void dial(AsyncCall &call) { ((&(*tunnel_))->*method_)(answer_); }
+@@ -180,40 +182,41 @@
+     private:
+         Method method_;
+         CbcPointer<TunnelStateData> tunnel_;
+         Ssl::PeerConnectorAnswer answer_;
+     };
+ 
+     void connectedToPeer(Ssl::PeerConnectorAnswer &answer);
+ #endif
+ 
+ public:
+     bool keepGoingAfterRead(size_t len, Comm::Flag errcode, int xerrno, Connection &from, Connection &to);
+     void copy(size_t len, Connection &from, Connection &to, IOCB *);
+     void handleConnectResponse(const size_t chunkSize);
+     void readServer(char *buf, size_t len, Comm::Flag errcode, int xerrno);
+     void readClient(char *buf, size_t len, Comm::Flag errcode, int xerrno);
+     void writeClientDone(char *buf, size_t len, Comm::Flag flag, int xerrno);
+     void writeServerDone(char *buf, size_t len, Comm::Flag flag, int xerrno);
+ 
+     static void ReadConnectResponseDone(const Comm::ConnectionPointer &, char *buf, size_t len, Comm::Flag errcode, int xerrno, void *data);
+     void readConnectResponseDone(char *buf, size_t len, Comm::Flag errcode, int xerrno);
++    void copyClientBytes();
+ };
+ 
+ static const char *const conn_established = "HTTP/1.1 200 Connection established\r\n\r\n";
+ 
+ static CNCB tunnelConnectDone;
+ static ERCB tunnelErrorComplete;
+ static CLCB tunnelServerClosed;
+ static CLCB tunnelClientClosed;
+ static CTCB tunnelTimeout;
+ static PSC tunnelPeerSelectComplete;
+ static void tunnelConnected(const Comm::ConnectionPointer &server, void *);
+ static void tunnelRelayConnectRequest(const Comm::ConnectionPointer &server, void *);
+ 
+ static void
+ tunnelServerClosed(const CommCloseCbParams &params)
+ {
+     TunnelStateData *tunnelState = (TunnelStateData *)params.data;
+     debugs(26, 3, HERE << tunnelState->server.conn);
+     tunnelState->server.conn = NULL;
+ 
+@@ -574,41 +577,41 @@
+         debugs(26, 4, HERE << "No read input. Closing server connection.");
+         server.conn->close();
+         return;
+     }
+ 
+     /* Valid data */
+     kb_incr(&(statCounter.server.all.kbytes_out), len);
+     kb_incr(&(statCounter.server.other.kbytes_out), len);
+     client.dataSent(len);
+ 
+     /* If the other end has closed, so should we */
+     if (!Comm::IsConnOpen(client.conn)) {
+         debugs(26, 4, HERE << "Client gone away. Shutting down server connection.");
+         server.conn->close();
+         return;
+     }
+ 
+     const CbcPointer<TunnelStateData> safetyLock(this); /* ??? should be locked by the caller... */
+ 
+     if (cbdataReferenceValid(this))
+-        copyRead(client, ReadClient);
++        copyClientBytes();
+ }
+ 
+ /* Writes data from the server buffer to the client side */
+ void
+ TunnelStateData::WriteClientDone(const Comm::ConnectionPointer &, char *buf, size_t len, Comm::Flag flag, int xerrno, void *data)
+ {
+     TunnelStateData *tunnelState = (TunnelStateData *)data;
+     assert (cbdataReferenceValid (tunnelState));
+ 
+     tunnelState->writeClientDone(buf, len, flag, xerrno);
+ }
+ 
+ void
+ TunnelStateData::Connection::dataSent(size_t amount)
+ {
+     debugs(26, 3, HERE << "len=" << len << " - amount=" << amount);
+     assert(amount == (size_t)len);
+     len =0;
+     /* increment total object size */
+ 
+@@ -676,73 +679,82 @@
+ void
+ TunnelStateData::copyRead(Connection &from, IOCB *completion)
+ {
+     assert(from.len == 0);
+     AsyncCall::Pointer call = commCbCall(5,4, "TunnelBlindCopyReadHandler",
+                                          CommIoCbPtrFun(completion, this));
+     comm_read(from.conn, from.buf, from.bytesWanted(1, SQUID_TCP_SO_RCVBUF), call);
+ }
+ 
+ void
+ TunnelStateData::readConnectResponse()
+ {
+     assert(waitingForConnectResponse());
+ 
+     AsyncCall::Pointer call = commCbCall(5,4, "readConnectResponseDone",
+                                          CommIoCbPtrFun(ReadConnectResponseDone, this));
+     comm_read(server.conn, connectRespBuf->space(),
+               server.bytesWanted(1, connectRespBuf->spaceSize()), call);
+ }
+ 
++void
++TunnelStateData::copyClientBytes()
++{
++    if (preReadClientData.length()) {
++        size_t copyBytes = preReadClientData.length() > SQUID_TCP_SO_RCVBUF ? SQUID_TCP_SO_RCVBUF : preReadClientData.length();
++        memcpy(client.buf, preReadClientData.rawContent(), copyBytes);
++        preReadClientData.consume(copyBytes);
++        client.bytesIn(copyBytes);
++        if (keepGoingAfterRead(copyBytes, Comm::OK, 0, client, server))
++            copy(copyBytes, client, server, TunnelStateData::WriteServerDone);
++    } else
++        copyRead(client, ReadClient);
++}
++
+ /**
+  * Set the HTTP status for this request and sets the read handlers for client
+  * and server side connections.
+  */
+ static void
+ tunnelStartShoveling(TunnelStateData *tunnelState)
+ {
+     assert(!tunnelState->waitingForConnectExchange());
+     *tunnelState->status_ptr = Http::scOkay;
+     if (tunnelState->logTag_ptr)
+         *tunnelState->logTag_ptr = LOG_TCP_TUNNEL;
+     if (cbdataReferenceValid(tunnelState)) {
+ 
+         // Shovel any payload already pushed into reply buffer by the server response
+         if (!tunnelState->server.len)
+             tunnelState->copyRead(tunnelState->server, TunnelStateData::ReadServer);
+         else {
+             debugs(26, DBG_DATA, "Tunnel server PUSH Payload: \n" << Raw("", tunnelState->server.buf, tunnelState->server.len) << "\n----------");
+             tunnelState->copy(tunnelState->server.len, tunnelState->server, tunnelState->client, TunnelStateData::WriteClientDone);
+         }
+ 
+-        // Bug 3371: shovel any payload already pushed into ConnStateData by the client request
+         if (tunnelState->http.valid() && tunnelState->http->getConn() && !tunnelState->http->getConn()->in.buf.isEmpty()) {
+             struct ConnStateData::In *in = &tunnelState->http->getConn()->in;
+             debugs(26, DBG_DATA, "Tunnel client PUSH Payload: \n" << in->buf << "\n----------");
+-
+-            // We just need to ensure the bytes from ConnStateData are in client.buf already to deliver
+-            memcpy(tunnelState->client.buf, in->buf.rawContent(), in->buf.length());
+-            // NP: readClient() takes care of buffer length accounting.
+-            tunnelState->readClient(tunnelState->client.buf, in->buf.length(), Comm::OK, 0);
++            tunnelState->preReadClientData.append(in->buf);
+             in->buf.consume(); // ConnStateData buffer accounting after the shuffle.
+-        } else
+-            tunnelState->copyRead(tunnelState->client, TunnelStateData::ReadClient);
++        }
++        tunnelState->copyClientBytes();
+     }
+ }
+ 
+ /**
+  * All the pieces we need to write to client and/or server connection
+  * have been written.
+  * Call the tunnelStartShoveling to start the blind pump.
+  */
+ static void
+ tunnelConnectedWriteDone(const Comm::ConnectionPointer &conn, char *, size_t, Comm::Flag flag, int, void *data)
+ {
+     TunnelStateData *tunnelState = (TunnelStateData *)data;
+     debugs(26, 3, HERE << conn << ", flag=" << flag);
+ 
+     if (flag != Comm::OK) {
+         *tunnelState->status_ptr = Http::scInternalServerError;
+         tunnelErrorComplete(conn->fd, data, 0);
+         return;
+     }
+ 
+

@@ -1,0 +1,606 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-users] a lot of TCP_SWAPFAIL_MISS/200
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20a%20lot%20of%20TCP_SWAPFAIL_MISS/200&In-Reply-To=%3C55ABC4D6.6090307%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004630.html">
+   <LINK REL="Next"  HREF="004332.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-users] a lot of TCP_SWAPFAIL_MISS/200</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20a%20lot%20of%20TCP_SWAPFAIL_MISS/200&In-Reply-To=%3C55ABC4D6.6090307%40treenet.co.nz%3E"
+       TITLE="[squid-users] a lot of TCP_SWAPFAIL_MISS/200">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Sun Jul 19 15:40:06 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="004630.html">[squid-users] a lot of TCP_SWAPFAIL_MISS/200
+</A></li>
+        <LI>Next message (by thread): <A HREF="004332.html">[squid-users] TProxy and client_dst_passthru
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4631">[ date ]</a>
+              <a href="thread.html#4631">[ thread ]</a>
+              <a href="subject.html#4631">[ subject ]</a>
+              <a href="author.html#4631">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 19/07/2015 10:09 p.m., HackXBack wrote:
+&gt;<i> but this happen only with version 3.5 , and it increase after restarting
+</I>&gt;<i> squid or rebooting system
+</I>&gt;<i> this is bug in 3.5 and it decrease the HIT ratio ,
+</I>&gt;<i> you dont think so ? 
+</I>
+I've seen a lot of reports of it happening on all Squid versions where
+shutdown did not properly finished saving to those cache files. Usually
+gets bad with very short configured shutdown_lifetime values. Although
+it can happen anytime shutdown interrupts a busy set of clients.
+
+FYI: attached is a backport of a Squid-4 change which should reduce that
+shutdown situation being a problem. If you would like to test we can see
+if it helps with your case.
+
+
+SWAPFAIL also gets seen a lot on caches (or individual files) that were
+created by very old Squid versions (older than 3.1 or 3.3 IIRC) before
+we added checksum validation. Those old objects metadata fail the
+checksum due to format differences at the bit level and SWAPFAIL is done
+to replace them with guaranteed clean content.
+
+The same checksum fails can also still happen on objects created with a
+32-bit Squid loaded by a 64-bit Squid, and vice-versa. For the same reasons.
+
+Then there is genuine HDD corruption, mutiple Squid processes or workers
+touching each others cache files, etc. other programs touching them etc.
+
+So many causes it is guesswork. But an educated guess says it is
+shutdown related errors.
+
+Amos
+
+-------------- next part --------------
+=== modified file 'src/base/RunnersRegistry.cc'
+--- src/base/RunnersRegistry.cc	2015-01-13 09:13:49 +0000
++++ src/base/RunnersRegistry.cc	2015-07-19 15:08:16 +0000
+@@ -15,40 +15,48 @@
+ /// all known runners
+ static Runners *TheRunners = NULL;
+ 
+ /// safely returns registered runners, initializing structures as needed
+ static Runners &amp;
+ GetRunners()
+ {
+     if (!TheRunners)
+         TheRunners = new Runners;
+     return *TheRunners;
+ }
+ 
+ int
+ RegisterRunner(RegisteredRunner *rr)
+ {
+     Runners &amp;runners = GetRunners();
+     runners.insert(rr);
+     return runners.size();
+ }
+ 
++int
++DeregisterRunner(RegisteredRunner *rr)
++{
++    Runners &amp;runners = GetRunners();
++    runners.erase(rr);
++    return runners.size();
++}
++
+ void
+ RunRegistered(const RegisteredRunner::Method &amp;m)
+ {
+     Runners &amp;runners = GetRunners();
+     typedef Runners::iterator RRI;
+     for (RRI i = runners.begin(); i != runners.end(); ++i)
+         ((*i)-&gt;*m)();
+ 
+     if (m == &amp;RegisteredRunner::finishShutdown) {
+         delete TheRunners;
+         TheRunners = NULL;
+     }
+ }
+ 
+ bool
+ UseThisStatic(const void *)
+ {
+     return true;
+ }
+ 
+
+=== modified file 'src/base/RunnersRegistry.h'
+--- src/base/RunnersRegistry.h	2015-01-13 09:13:49 +0000
++++ src/base/RunnersRegistry.h	2015-07-19 15:08:16 +0000
+@@ -51,54 +51,63 @@
+     virtual void claimMemoryNeeds() {}
+ 
+     /// Called after claimMemoryNeeds().
+     /// Meant for activating modules and features using a finalized
+     /// configuration with known memory requirements.
+     virtual void useConfig() {}
+ 
+     /* Reconfiguration events */
+ 
+     /// Called after parsing squid.conf during reconfiguration.
+     /// Meant for adjusting the module state based on configuration changes.
+     virtual void syncConfig() {}
+ 
+     /* Shutdown events */
+ 
+     /// Called after receiving a shutdown request and before stopping the main
+     /// loop. At least one main loop iteration is guaranteed after this call.
+     /// Meant for cleanup and state saving that may require other modules.
+     virtual void startShutdown() {}
+ 
++    /// Called after shutdown_lifetime grace period ends and before stopping
++    /// the main loop. At least one main loop iteration is guaranteed after
++    /// this call.
++    /// Meant for cleanup and state saving that may require other modules.
++    virtual void endingShutdown() {}
++
+     /// Called after stopping the main loop and before releasing memory.
+     /// Meant for quick/basic cleanup that does not require any other modules.
+     virtual ~RegisteredRunner() {}
+     /// exists to simplify caller interface; override the destructor instead
+     void finishShutdown() { delete this; }
+ 
+     /// a pointer to one of the above notification methods
+     typedef void (RegisteredRunner::*Method)();
+ 
+ };
+ 
+ /// registers a given runner with the given registry and returns registry count
+ int RegisterRunner(RegisteredRunner *rr);
+ 
++/// de-registers a given runner with the given registry and returns registry count
++int DeregisterRunner(RegisteredRunner *rr);
++
+ /// Calls a given method of all runners.
+ /// All runners are destroyed after the finishShutdown() call.
+ void RunRegistered(const RegisteredRunner::Method &amp;m);
+ 
+ /// convenience macro to describe/debug the caller and the method being called
+ #define RunRegisteredHere(m) \
+     debugs(1, 2, &quot;running &quot; # m); \
+     RunRegistered(&amp;m)
+ 
+ /// convenience function to &quot;use&quot; an otherwise unreferenced static variable
+ bool UseThisStatic(const void *);
+ 
+ /// convenience macro: register one RegisteredRunner kid as early as possible
+ #define RunnerRegistrationEntry(Who) \
+     static const bool Who ## _Registered_ = \
+         RegisterRunner(new Who) &gt; 0 &amp;&amp; \
+         UseThisStatic(&amp; Who ## _Registered_);
+ 
+ #endif /* SQUID_BASE_RUNNERSREGISTRY_H */
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2015-06-05 23:41:22 +0000
++++ src/client_side.cc	2015-07-19 15:08:16 +0000
+@@ -797,40 +797,41 @@
+     if (aur != auth_) {
+         debugs(33, 2, &quot;ERROR: Closing &quot; &lt;&lt; clientConnection &lt;&lt; &quot; due to change of connection-auth from &quot; &lt;&lt; by);
+         auth_-&gt;releaseAuthServer();
+         auth_ = NULL;
+         // this is a fatal type of problem.
+         // Close the connection immediately with TCP RST to abort all traffic flow
+         comm_reset_close(clientConnection);
+         return;
+     }
+ 
+     /* NOT REACHABLE */
+ }
+ #endif
+ 
+ // cleans up before destructor is called
+ void
+ ConnStateData::swanSong()
+ {
+     debugs(33, 2, HERE &lt;&lt; clientConnection);
+     flags.readMore = false;
++    DeregisterRunner(this);
+     clientdbEstablished(clientConnection-&gt;remote, -1);  /* decrement */
+     assert(areAllContextsForThisConnection());
+     freeAllContexts();
+ 
+     unpinConnection(true);
+ 
+     if (Comm::IsConnOpen(clientConnection))
+         clientConnection-&gt;close();
+ 
+ #if USE_AUTH
+     // NP: do this bit after closing the connections to avoid side effects from unwanted TCP RST
+     setAuth(NULL, &quot;ConnStateData::SwanSong cleanup&quot;);
+ #endif
+ 
+     BodyProducer::swanSong();
+     flags.swanSang = true;
+ }
+ 
+ bool
+ ConnStateData::isOpen() const
+@@ -1874,40 +1875,66 @@
+     }
+ }
+ 
+ ClientSocketContext *
+ ConnStateData::abortRequestParsing(const char *const uri)
+ {
+     ClientHttpRequest *http = new ClientHttpRequest(this);
+     http-&gt;req_sz = in.buf.length();
+     http-&gt;uri = xstrdup(uri);
+     setLogUri (http, uri);
+     ClientSocketContext *context = new ClientSocketContext(clientConnection, http);
+     StoreIOBuffer tempBuffer;
+     tempBuffer.data = context-&gt;reqbuf;
+     tempBuffer.length = HTTP_REQBUF_SZ;
+     clientStreamInit(&amp;http-&gt;client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, new clientReplyContext(http), clientSocketRecipient,
+                      clientSocketDetach, context, tempBuffer);
+     return context;
+ }
+ 
++void
++ConnStateData::startShutdown()
++{
++    // RegisteredRunner API callback - Squid has been shut down
++
++    // if connection is idle terminate it now,
++    // otherwise wait for grace period to end
++    if (getConcurrentRequestCount() == 0)
++        endingShutdown();
++}
++
++void
++ConnStateData::endingShutdown()
++{
++    // RegisteredRunner API callback - Squid shutdown grace period is over
++
++    // force the client connection to close immediately
++    // swanSong() in the close handler will cleanup.
++    if (Comm::IsConnOpen(clientConnection))
++        clientConnection-&gt;close();
++
++    // deregister now to ensure finalShutdown() does not kill us prematurely.
++    // fd_table purge will cleanup if close handler was not fast enough.
++    DeregisterRunner(this);
++}
++
+ char *
+ skipLeadingSpace(char *aString)
+ {
+     char *result = aString;
+ 
+     while (xisspace(*aString))
+         ++aString;
+ 
+     return result;
+ }
+ 
+ /**
+  * 'end' defaults to NULL for backwards compatibility
+  * remove default value if we ever get rid of NULL-terminated
+  * request buffers.
+  */
+ const char *
+ findTrailingHTTPVersion(const char *uriAndHTTPVersion, const char *end)
+ {
+     if (NULL == end) {
+@@ -3502,40 +3529,44 @@
+     signAlgorithm(Ssl::algSignTrusted),
+ #endif
+     stoppedSending_(NULL),
+     stoppedReceiving_(NULL)
+ {
+     flags.readMore = true; // kids may overwrite
+     flags.swanSang = false;
+ 
+     pinning.host = NULL;
+     pinning.port = -1;
+     pinning.pinned = false;
+     pinning.auth = false;
+     pinning.zeroReply = false;
+     pinning.peer = NULL;
+ 
+     // store the details required for creating more MasterXaction objects as new requests come in
+     clientConnection = xact-&gt;tcpClient;
+     port = xact-&gt;squidPort;
+     log_addr = xact-&gt;tcpClient-&gt;remote;
+     log_addr.applyMask(Config.Addrs.client_netmask);
++
++    // register to receive notice of Squid signal events
++    // which may affect long persisting client connections
++    RegisterRunner(this);
+ }
+ 
+ void
+ ConnStateData::start()
+ {
+     BodyProducer::start();
+     HttpControlMsgSink::start();
+ 
+     if (port-&gt;disable_pmtu_discovery != DISABLE_PMTU_OFF &amp;&amp;
+             (transparent() || port-&gt;disable_pmtu_discovery == DISABLE_PMTU_ALWAYS)) {
+ #if defined(IP_MTU_DISCOVER) &amp;&amp; defined(IP_PMTUDISC_DONT)
+         int i = IP_PMTUDISC_DONT;
+         if (setsockopt(clientConnection-&gt;fd, SOL_IP, IP_MTU_DISCOVER, &amp;i, sizeof(i)) &lt; 0)
+             debugs(33, 2, &quot;WARNING: Path MTU discovery disabling failed on &quot; &lt;&lt; clientConnection &lt;&lt; &quot; : &quot; &lt;&lt; xstrerror());
+ #else
+         static bool reported = false;
+ 
+         if (!reported) {
+             debugs(33, DBG_IMPORTANT, &quot;NOTICE: Path MTU discovery disabling is not supported on your platform.&quot;);
+             reported = true;
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2015-04-13 05:59:05 +0000
++++ src/client_side.h	2015-07-19 15:08:41 +0000
+@@ -1,33 +1,34 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 33    Client-side Routines */
+ 
+ #ifndef SQUID_CLIENTSIDE_H
+ #define SQUID_CLIENTSIDE_H
+ 
++#include &quot;base/RunnersRegistry.h&quot;
+ #include &quot;clientStreamForward.h&quot;
+ #include &quot;comm.h&quot;
+ #include &quot;helper/forward.h&quot;
+ #include &quot;HttpControlMsg.h&quot;
+ #include &quot;HttpParser.h&quot;
+ #include &quot;ipc/FdNotes.h&quot;
+ #include &quot;SBuf.h&quot;
+ #if USE_AUTH
+ #include &quot;auth/UserRequest.h&quot;
+ #endif
+ #if USE_OPENSSL
+ #include &quot;ssl/support.h&quot;
+ #endif
+ 
+ class ConnStateData;
+ class ClientHttpRequest;
+ class clientStreamNode;
+ class ChunkedCodingParser;
+ namespace AnyP
+ {
+@@ -152,41 +153,41 @@
+ #if USE_OPENSSL
+ namespace Ssl
+ {
+ class ServerBump;
+ }
+ #endif
+ /**
+  * Manages a connection to a client.
+  *
+  * Multiple requests (up to pipeline_prefetch) can be pipelined. This object is responsible for managing
+  * which one is currently being fulfilled and what happens to the queue if the current one
+  * causes the client connection to be closed early.
+  *
+  * Act as a manager for the connection and passes data in buffer to the current parser.
+  * the parser has ambiguous scope at present due to being made from global functions
+  * I believe this object uses the parser to identify boundaries and kick off the
+  * actual HTTP request handling objects (ClientSocketContext, ClientHttpRequest, HttpRequest)
+  *
+  * If the above can be confirmed accurate we can call this object PipelineManager or similar
+  */
+-class ConnStateData : public BodyProducer, public HttpControlMsgSink
++class ConnStateData : public BodyProducer, public HttpControlMsgSink, public RegisteredRunner
+ {
+ 
+ public:
+     explicit ConnStateData(const MasterXaction::Pointer &amp;xact);
+     virtual ~ConnStateData();
+ 
+     void readSomeData();
+     bool areAllContextsForThisConnection() const;
+     void freeAllContexts();
+     void notifyAllContexts(const int xerrno); ///&lt; tell everybody about the err
+     /// Traffic parsing
+     bool clientParseRequests();
+     void readNextRequest();
+     ClientSocketContext::Pointer getCurrentContext() const;
+     void addContextToQueue(ClientSocketContext * context);
+     int getConcurrentRequestCount() const;
+     bool isOpen() const;
+ 
+     // HttpControlMsgSink API
+     virtual void sendControlMsg(HttpControlMsg msg);
+@@ -382,40 +383,44 @@
+ 
+     /* clt_conn_tag=tag annotation access */
+     const SBuf &amp;connectionTag() const { return connectionTag_; }
+     void connectionTag(const char *aTag) { connectionTag_ = aTag; }
+ 
+     /// handle a control message received by context from a peer and call back
+     virtual void writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &amp;call) = 0;
+ 
+     /// ClientStream calls this to supply response header (once) and data
+     /// for the current ClientSocketContext.
+     virtual void handleReply(HttpReply *header, StoreIOBuffer receivedData) = 0;
+ 
+     /// remove no longer needed leading bytes from the input buffer
+     void consumeInput(const size_t byteCount);
+ 
+     /* TODO: Make the methods below (at least) non-public when possible. */
+ 
+     /// stop parsing the request and create context for relaying error info
+     ClientSocketContext *abortRequestParsing(const char *const errUri);
+ 
++    /* Registered Runner API */
++    virtual void startShutdown();
++    virtual void endingShutdown();
++
+ protected:
+     void startDechunkingRequest();
+     void finishDechunkingRequest(bool withSuccess);
+     void abortChunkedRequestBody(const err_type error);
+     err_type handleChunkedRequestBody(size_t &amp;putSize);
+ 
+     void startPinnedConnectionMonitoring();
+     void clientPinnedConnectionRead(const CommIoCbParams &amp;io);
+ 
+     /// parse input buffer prefix into a single transfer protocol request
+     /// return NULL to request more header bytes (after checking any limits)
+     /// use abortRequestParsing() to handle parsing errors w/o creating request
+     virtual ClientSocketContext *parseOneRequest(Http::ProtocolVersion &amp;ver) = 0;
+ 
+     /// start processing a freshly parsed request
+     virtual void processParsedRequest(ClientSocketContext *context, const Http::ProtocolVersion &amp;ver) = 0;
+ 
+     /// returning N allows a pipeline of 1+N requests (see pipeline_prefetch)
+     virtual int pipelinePrefetchMax() const;
+ 
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2015-03-21 08:16:46 +0000
++++ src/main.cc	2015-07-19 15:11:12 +0000
+@@ -186,40 +186,52 @@
+ 
+ public:
+     int checkEvents(int timeout) {
+         Store::Root().callback();
+         return EVENT_IDLE;
+     };
+ };
+ 
+ class SignalEngine: public AsyncEngine
+ {
+ 
+ public:
+     virtual int checkEvents(int timeout);
+ 
+ private:
+     static void StopEventLoop(void *) {
+         if (EventLoop::Running)
+             EventLoop::Running-&gt;stop();
+     }
+ 
++    static void FinalShutdownRunners(void *) {
++        RunRegisteredHere(RegisteredRunner::endingShutdown);
++
++        // XXX: this should be a Runner.
++#if USE_AUTH
++        /* detach the auth components (only do this on full shutdown) */
++        Auth::Scheme::FreeAll();
++#endif
++
++        eventAdd(&quot;SquidTerminate&quot;, &amp;StopEventLoop, NULL, 0, 1, false);
++    }
++
+     void doShutdown(time_t wait);
+ };
+ 
+ int
+ SignalEngine::checkEvents(int timeout)
+ {
+     PROF_start(SignalEngine_checkEvents);
+ 
+     if (do_reconfigure) {
+         mainReconfigureStart();
+         do_reconfigure = 0;
+     } else if (do_rotate) {
+         mainRotate();
+         do_rotate = 0;
+     } else if (do_shutdown) {
+         doShutdown(do_shutdown &gt; 0 ? (int) Config.shutdownLifetime : 0);
+         do_shutdown = 0;
+     }
+     BroadcastSignalIfAny(DebugSignal);
+     BroadcastSignalIfAny(RotateSignal);
+@@ -227,47 +239,42 @@
+     BroadcastSignalIfAny(ShutdownSignal);
+ 
+     PROF_stop(SignalEngine_checkEvents);
+     return EVENT_IDLE;
+ }
+ 
+ void
+ SignalEngine::doShutdown(time_t wait)
+ {
+     debugs(1, DBG_IMPORTANT, &quot;Preparing for shutdown after &quot; &lt;&lt; statCounter.client_http.requests &lt;&lt; &quot; requests&quot;);
+     debugs(1, DBG_IMPORTANT, &quot;Waiting &quot; &lt;&lt; wait &lt;&lt; &quot; seconds for active connections to finish&quot;);
+ 
+     shutting_down = 1;
+ 
+ #if USE_WIN32_SERVICE
+     WIN32_svcstatusupdate(SERVICE_STOP_PENDING, (wait + 1) * 1000);
+ #endif
+ 
+     /* run the closure code which can be shared with reconfigure */
+     serverConnectionsClose();
+-#if USE_AUTH
+-    /* detach the auth components (only do this on full shutdown) */
+-    Auth::Scheme::FreeAll();
+-#endif
+-
+     RunRegisteredHere(RegisteredRunner::startShutdown);
+-    eventAdd(&quot;SquidShutdown&quot;, &amp;StopEventLoop, this, (double) (wait + 1), 1, false);
++    eventAdd(&quot;SquidShutdown&quot;, &amp;FinalShutdownRunners, this, (double) (wait + 1), 1, false);
+ }
+ 
+ static void
+ usage(void)
+ {
+     fprintf(stderr,
+             &quot;Usage: %s [-cdhvzCFNRVYX] [-n name] [-s | -l facility] [-f config-file] [-[au] port] [-k signal]&quot;
+ #if USE_WIN32_SERVICE
+             &quot;[-ir] [-O CommandLine]&quot;
+ #endif
+             &quot;\n&quot;
+             &quot;       -a port   Specify HTTP port number (default: %d).\n&quot;
+             &quot;       -d level  Write debugging to stderr also.\n&quot;
+             &quot;       -f file   Use given config-file instead of\n&quot;
+             &quot;                 %s\n&quot;
+             &quot;       -h        Print help message.\n&quot;
+ #if USE_WIN32_SERVICE
+             &quot;       -i        Installs as a Windows Service (see -n option).\n&quot;
+ #endif
+             &quot;       -k reconfigure|rotate|shutdown|&quot;
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="004630.html">[squid-users] a lot of TCP_SWAPFAIL_MISS/200
+</A></li>
+	<LI>Next message (by thread): <A HREF="004332.html">[squid-users] TProxy and client_dst_passthru
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4631">[ date ]</a>
+              <a href="thread.html#4631">[ thread ]</a>
+              <a href="subject.html#4631">[ subject ]</a>
+              <a href="author.html#4631">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.squid-cache.org/listinfo/squid-users">More information about the squid-users
+mailing list</a><br>
+</body></html>

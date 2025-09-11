@@ -1,0 +1,184 @@
+Handshake Problem during Renegotiation
+
+Here is what happens:
+
+   - Squid receives SSL Hello from the client (TCP connection A).
+   - Squid successfully negotiates an SSL connection with the origin server
+     (TCP connection B).
+   - Squid successfully negotiates an SSL connection with the client
+     (TCP connection A).
+   - Squid marks connection B as "idle" and waits an HTTP request from
+     connection A.
+   - The origin server continues talking to Squid (TCP connection B).
+     Squid detects a network read on an idle connection and closes TCP
+     connection B (and then the associated TCP connection A as well).
+
+This patch:
+   - When squid detects a network read on server idle connection do an
+     SSL_read to:
+       a) see if application data received from server and abort in this case
+       b) detect possible SSL error, or SSL shutdown message from server
+       c) or ignore if only SSL protocol related packets received.
+
+This is a Measurement Factory project
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2015-09-14 18:02:04 +0000
++++ src/client_side.cc	2015-11-06 18:11:48 +0000
+@@ -4864,57 +4864,103 @@
+ ConnStateData::startPinnedConnectionMonitoring()
+ {
+     if (pinning.readHandler != NULL)
+         return; // already monitoring
+ 
+     typedef CommCbMemFunT<ConnStateData, CommIoCbParams> Dialer;
+     pinning.readHandler = JobCallback(33, 3,
+                                       Dialer, this, ConnStateData::clientPinnedConnectionRead);
+     Comm::Read(pinning.serverConnection, pinning.readHandler);
+ }
+ 
+ void
+ ConnStateData::stopPinnedConnectionMonitoring()
+ {
+     if (pinning.readHandler != NULL) {
+         Comm::ReadCancel(pinning.serverConnection->fd, pinning.readHandler);
+         pinning.readHandler = NULL;
+     }
+ }
+ 
++#if USE_OPENSSL
++bool
++ConnStateData::handleIdleClientPinnedSslRead()
++{
++    // A ready-for-reading connection means that the SSL server either closed
++    // the connection, sent us some unexpected HTTP data, or started SSL 
++    // renegotiations. We should close the connection except for the last case.
++
++    Must(pinning.serverConnection != NULL);
++    SSL *ssl = fd_table[pinning.serverConnection->fd].ssl;
++    if(!ssl)
++        return false;
++
++    char buf[1];
++    const int readResult = SSL_read(ssl, buf, sizeof(buf));
++
++    if (readResult > 0 || SSL_pending(ssl) > 0) {
++        debugs(83, 2, "SSL FD " << pinning.serverConnection->fd << " application data read");
++        return false;
++    }
++
++    switch(const int error = SSL_get_error(ssl, readResult)) {
++    case SSL_ERROR_WANT_WRITE:
++        debugs(83, DBG_IMPORTANT, "SSL FD " << pinning.serverConnection->fd << " SSL_ERROR_WANT_WRITE request for idle pinned connection");
++        // fall through to restart monitoring, for now
++    case SSL_ERROR_NONE:
++    case SSL_ERROR_WANT_READ:
++        startPinnedConnectionMonitoring();
++        return true;
++
++    default:
++        debugs(83, 2, "SSL FD " << pinning.serverConnection->fd << " error: " << error);
++        return false;
++    }
++
++    // not reached
++    return true;
++}
++#endif
++
+ /// Our read handler called by Comm when the server either closes an idle pinned connection or
+ /// perhaps unexpectedly sends something on that idle (from Squid p.o.v.) connection.
+ void
+ ConnStateData::clientPinnedConnectionRead(const CommIoCbParams &io)
+ {
+     pinning.readHandler = NULL; // Comm unregisters handlers before calling
+ 
+     if (io.flag == Comm::ERR_CLOSING)
+         return; // close handler will clean up
+ 
++    Must(pinning.serverConnection == io.conn);
++
++#if USE_OPENSSL
++    if (handleIdleClientPinnedSslRead())
++        return;
++#endif
++
+     // We could use getConcurrentRequestCount(), but this may be faster.
+     const bool clientIsIdle = !getCurrentContext();
+ 
+     debugs(33, 3, "idle pinned " << pinning.serverConnection << " read " <<
+            io.size << (clientIsIdle ? " with idle client" : ""));
+ 
+-    assert(pinning.serverConnection == io.conn);
+     pinning.serverConnection->close();
+ 
+     // If we are still sending data to the client, do not close now. When we are done sending,
+     // ClientSocketContext::keepaliveNextRequest() checks pinning.serverConnection and will close.
+     // However, if we are idle, then we must close to inform the idle client and minimize races.
+     if (clientIsIdle && clientConnection != NULL)
+         clientConnection->close();
+ }
+ 
+ const Comm::ConnectionPointer
+ ConnStateData::validatePinnedConnection(HttpRequest *request, const CachePeer *aPeer)
+ {
+     debugs(33, 7, HERE << pinning.serverConnection);
+ 
+     bool valid = true;
+     if (!Comm::IsConnOpen(pinning.serverConnection))
+         valid = false;
+     else if (pinning.auth && pinning.host && request && strcasecmp(pinning.host, request->url.host()) != 0)
+         valid = false;
+     else if (request && pinning.port != request->url.port())
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2015-08-03 09:15:27 +0000
++++ src/client_side.h	2015-09-30 09:02:01 +0000
+@@ -419,40 +419,46 @@
+     /// generate a fake CONNECT request with the given payload
+     /// at the beginning of the client I/O buffer
+     void fakeAConnectRequest(const char *reason, const SBuf &payload);
+ 
+     /// client data which may need to forward as-is to server after an
+     /// on_unsupported_protocol tunnel decision.
+     SBuf preservedClientData;
+ 
+     /* Registered Runner API */
+     virtual void startShutdown();
+     virtual void endingShutdown();
+ 
+ protected:
+     void startDechunkingRequest();
+     void finishDechunkingRequest(bool withSuccess);
+     void abortChunkedRequestBody(const err_type error);
+     err_type handleChunkedRequestBody();
+ 
+     void startPinnedConnectionMonitoring();
+     void clientPinnedConnectionRead(const CommIoCbParams &io);
++#if USE_OPENSSL
++    /// Handles a ready-for-reading SSL squid-to-server connection that
++    /// we thought was idle.
++    /// Returns false if and only if the connection should be closed.
++    bool handleIdleClientPinnedSslRead();
++#endif
+ 
+     /// parse input buffer prefix into a single transfer protocol request
+     /// return NULL to request more header bytes (after checking any limits)
+     /// use abortRequestParsing() to handle parsing errors w/o creating request
+     virtual ClientSocketContext *parseOneRequest() = 0;
+ 
+     /// start processing a freshly parsed request
+     virtual void processParsedRequest(ClientSocketContext *context) = 0;
+ 
+     /// returning N allows a pipeline of 1+N requests (see pipeline_prefetch)
+     virtual int pipelinePrefetchMax() const;
+ 
+     /// timeout to use when waiting for the next request
+     virtual time_t idleTimeout() const = 0;
+ 
+     BodyPipe::Pointer bodyPipe; ///< set when we are reading request body
+ 
+ private:
+     int connFinishedWithConn(int size);
+     void clientAfterReadingRequests();
+

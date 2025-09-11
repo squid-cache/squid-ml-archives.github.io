@@ -1,0 +1,193 @@
+=== modified file 'src/HttpHeaderTools.cc'
+--- src/HttpHeaderTools.cc	2016-01-24 17:41:43 +0000
++++ src/HttpHeaderTools.cc	2016-03-16 00:31:23 +0000
+@@ -462,11 +462,14 @@
+ }
+ 
+ void
+-httpHdrAdd(HttpHeader *heads, HttpRequest *request, const AccessLogEntryPointer &al, HeaderWithAclList &headersAdd)
++httpHdrAdd(HttpHeader *heads, HttpRequest *request, const AccessLogEntryPointer &al, HeaderWithAclList *headersAdd)
+ {
++    if (headersAdd == NULL || headersAdd->empty())
++        return;
++
+     ACLFilledChecklist checklist(NULL, request, NULL);
+ 
+-    for (HeaderWithAclList::const_iterator hwa = headersAdd.begin(); hwa != headersAdd.end(); ++hwa) {
++    for (HeaderWithAclList::const_iterator hwa = headersAdd->begin(); hwa != headersAdd->end(); ++hwa) {
+         if (!hwa->aclList || checklist.fastCheck(hwa->aclList) == ACCESS_ALLOWED) {
+             const char *fieldValue = NULL;
+             MemBuf mb;
+
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2016-03-12 20:27:35 +0000
++++ src/SquidConfig.h	2016-03-14 23:38:41 +0000
+@@ -463,6 +463,8 @@
+     HeaderManglers *reply_header_access;
+     ///request_header_add access list
+     HeaderWithAclList *request_header_add;
++    ///reply_header_add access list
++    HeaderWithAclList *reply_header_add;
+     ///note
+     Notes notes;
+     char *coredump_dir;
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2016-03-12 20:27:35 +0000
++++ src/cf.data.pre	2016-03-16 00:56:41 +0000
+@@ -109,6 +109,21 @@
+ 	${service_name} expands into the current Squid service instance
+ 	name identifier which is provided by -n on the command line.
+ 
++  Logformat Macros
++
++	Logformat macros can be used in many places outside of the logformat
++	directive. In theory, all of the logformat codes can be used as %macros,
++	where they are supported. In practice, a %macro expands as a dash (-) when
++	the transaction does not yet have enough information and a value is needed.
++
++	There is no definitive list of what tokens are available at the various
++	stages of the transaction.
++
++	And some information may already be available to Squid but not yet
++	committed where the macro expansion code can access it (report
++	such instances!). The macro will be expanded into a single dash
++	('-') in such cases. Not all macros have been tested.
++
+ COMMENT_END
+ 
+ # options still not yet ported from 2.7 to 3.x
+@@ -6086,20 +6101,47 @@
+ 	string format is used, then the surrounding quotes are removed
+ 	while escape sequences and %macros are processed.
+ 
+-	In theory, all of the logformat codes can be used as %macros.
+-	However, unlike logging (which happens at the very end of
+-	transaction lifetime), the transaction may not yet have enough
+-	information to expand a macro when the new header value is needed.
+-	And some information may already be available to Squid but not yet
+-	committed where the macro expansion code can access it (report
+-	such instances!). The macro will be expanded into a single dash
+-	('-') in such cases. Not all macros have been tested.
+-
+ 	One or more Squid ACLs may be specified to restrict header
+ 	injection to matching requests. As always in squid.conf, all
+ 	ACLs in an option ACL list must be satisfied for the insertion
+ 	to happen. The request_header_add option supports fast ACLs
+ 	only.
++
++	See also: reply_header_add.
++DOC_END
++
++NAME: reply_header_add
++TYPE: HeaderWithAclList
++LOC: Config.reply_header_add
++DEFAULT: none
++DOC_START
++	Usage:   reply_header_add field-name field-value acl1 [acl2] ...
++	Example: reply_header_add X-Client-CA "CA=%ssl::>cert_issuer" all
++
++	This option adds header fields to outgoing HTTP responses (i.e., response
++	headers delivered by Squid to the client). This option has no effect on
++	cache hit detection. The equivalent adaptation vectoring point in
++	ICAP terminology is post-cache RESPMOD. This option does not apply to
++	successful CONNECT replies.
++
++	Field-name is a token specifying an HTTP header name. If a
++	standard HTTP header name is used, Squid does not check whether
++	the new header conflicts with any existing headers or violates
++	HTTP rules. If the response to be modified already contains a
++	field with the same name, the old field is preserved but the
++	header field values are not merged.
++
++	Field-value is either a token or a quoted string. If quoted
++	string format is used, then the surrounding quotes are removed
++	while escape sequences and %macros are processed.
++
++	One or more Squid ACLs may be specified to restrict header
++	injection to matching responses. As always in squid.conf, all
++	ACLs in an option ACL list must be satisfied for the insertion
++	to happen. The reply_header_add option supports fast ACLs
++	only.
++
++	See also: request_header_add.
+ DOC_END
+ 
+ NAME: note
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2016-03-11 18:00:51 +0000
++++ src/client_side_reply.cc	2016-03-15 04:33:48 +0000
+@@ -1303,6 +1303,9 @@
+     return result;
+ }
+ 
++//Declared in HttpHeaderTools.cc
++void httpHdrAdd(HttpHeader *heads, HttpRequest *request, const AccessLogEntryPointer &al, HeaderWithAclList *headers_add);
++
+ /**
+  * Generate the reply headers sent to client.
+  *
+@@ -1579,6 +1582,8 @@
+     }
+ 
+     httpHdrMangleList(hdr, request, ROR_REPLY);
++
++    httpHdrAdd(hdr, request, http->al, Config.reply_header_add);
+ }
+ 
+ void
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2016-03-11 18:00:51 +0000
++++ src/http.cc	2016-03-15 04:33:49 +0000
+@@ -84,7 +84,7 @@
+ static void copyOneHeaderFromClientsideRequestToUpstreamRequest(const HttpHeaderEntry *e, const String strConnection, const HttpRequest * request,
+         HttpHeader * hdr_out, const int we_do_ranges, const HttpStateFlags &);
+ //Declared in HttpHeaderTools.cc
+-void httpHdrAdd(HttpHeader *heads, HttpRequest *request, const AccessLogEntryPointer &al, HeaderWithAclList &headers_add);
++void httpHdrAdd(HttpHeader *heads, HttpRequest *request, const AccessLogEntryPointer &al, HeaderWithAclList *headers_add);
+ 
+ HttpStateData::HttpStateData(FwdState *theFwdState) :
+     AsyncJob("HttpStateData"),
+@@ -1945,8 +1945,7 @@
+     if (Config2.onoff.mangle_request_headers)
+         httpHdrMangleList(hdr_out, request, ROR_REQUEST);
+ 
+-    if (Config.request_header_add && !Config.request_header_add->empty())
+-        httpHdrAdd(hdr_out, request, al, *Config.request_header_add);
++    httpHdrAdd(hdr_out, request, al, Config.request_header_add);
+ 
+     strConnection.clean();
+ }
+
+=== modified file 'src/servers/Http1Server.cc'
+--- src/servers/Http1Server.cc	2016-01-24 17:41:43 +0000
++++ src/servers/Http1Server.cc	2016-03-16 00:21:03 +0000
+@@ -24,6 +24,9 @@
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Http1, Server);
+ 
++//Declared in HttpHeaderTools.cc
++void httpHdrAdd(HttpHeader *heads, HttpRequest *request, const AccessLogEntryPointer &al, HeaderWithAclList *headers_add);
++
+ Http::One::Server::Server(const MasterXaction::Pointer &xact, bool beHttpsServer):
+     AsyncJob("Http1::Server"),
+     ConnStateData(xact),
+@@ -276,11 +279,14 @@
+ void
+ Http::One::Server::writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call)
+ {
++    const ClientHttpRequest *http = pipeline.front()->http;
++
+     // apply selected clientReplyContext::buildReplyHeader() mods
+     // it is not clear what headers are required for control messages
+     rep->header.removeHopByHopEntries();
+     rep->header.putStr(Http::HdrType::CONNECTION, "keep-alive");
+-    httpHdrMangleList(&rep->header, pipeline.front()->http->request, ROR_REPLY);
++    httpHdrMangleList(&rep->header, http->request, ROR_REPLY);
++    httpHdrAdd(&rep->header, http->request, http->al, Config.reply_header_add);
+ 
+     MemBuf *mb = rep->pack();
+ 
+

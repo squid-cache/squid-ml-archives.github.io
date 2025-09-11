@@ -1,0 +1,308 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] Care and feeding of ConnStateData
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20Care%20and%20feeding%20of%20ConnStateData&In-Reply-To=%3C577D8526.80905%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006158.html">
+   <LINK REL="Next"  HREF="006131.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] Care and feeding of ConnStateData</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20Care%20and%20feeding%20of%20ConnStateData&In-Reply-To=%3C577D8526.80905%40measurement-factory.com%3E"
+       TITLE="[squid-dev] Care and feeding of ConnStateData">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Wed Jul  6 22:24:38 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006158.html">[squid-dev] [PATCH] TidyPointer removal
+</A></li>
+        <LI>Next message: <A HREF="006131.html">[squid-dev] Care and feeding of ConnStateData
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6130">[ date ]</a>
+              <a href="thread.html#6130">[ thread ]</a>
+              <a href="subject.html#6130">[ subject ]</a>
+              <a href="author.html#6130">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+    Several committed, pending, and upcoming trunk changes revolve
+around ConnStateData-related classes. Audit disagreements, unaudited
+commits, and blocked changes in that area make progress painfully slow.
+This email proposes answers to the following blocking questions:
+
+  Q1. What is ConnStateData?
+  Q2. Where does the pending Downloader class belong?
+  Q3. Where does the future Http::Two::Server class belong?
+  Q4. What to do with the existing src/servers/Server.h?
+
+The answers are summarized at the end of this email if you do not want
+to read the whole thing, but you may want to at least scan the BB1-3
+definitions immediately below because they are used in the answers.
+
+
+I will start with several &quot;obvious&quot; Building Blocks or Squid parts with
+well-understood overall functionality that should not need much
+discussion and should not cause any controversy:
+
+BB1: Servers or protocol request receivers [and response senders]:
+  * HTTP/1 Server (existing Http::One::Server and misplaced code)
+  * HTTP/2 Server (future Http::Two::Server)
+  * FTP server (existing Ftp::Server and misplaced code)
+
+BB2: Protocol-agnostic request routing code:
+  * doCallouts() for access control, StoreID, ICAP, etc.
+  * HIT/MISS detection in client_side_*.cc
+  * FwdState
+
+BB3: Clients or protocol request senders [and response receivers]:
+  * HTTP/1 Client (existing HttpStateData == future Http::One::Client)
+  * HTTP/2 Client (future Http::Two::Client)
+  * FTP Client (existing Ftp::Client)
+
+The above list is not exhaustive (there are more major building blocks,
+of course) or 100% precise (e.g., some routing code does use originating
+protocol information so it is not purely protocol-agnostic), but this
+list is sufficient to answer questions Q1-4.
+
+
+Q1. What is ConnStateData (and related client_side.* code)?
+
+Today, the ConnStateData and related client_side.* code plays many,
+often rather different roles related to a single user connection
+handling, including:
+
+  * some new connection acceptance logic
+  * high-level user connection processing logic:
+    - sequential request handling (pause/resume)
+    - request pipelining (control pipelining depth)
+  * some HTTP/1 parsing (belongs to Http::One::Server)
+  * HTTP/2 rejecting
+  * PROXY protocol handling
+  * some user connection reading/writing
+  * some SSL Bumping
+  * error delaying
+  * transaction logging (access.log)
+
+This heavy mixture and fuzzy boundaries (e.g., all those &quot;some&quot; words)
+complicate analysis and lead to design mistakes. It will take years to
+perfect this code, but I believe that there is actually a simple way to
+define ConnStateData in such a way that will immediately yield answers
+to many questions.
+
+Using the building blocks described above, I propose the following two
+rules for defining ConnStateData boundaries and responsibilities:
+
+  C1. ConnStateData is the code shared among all Servers (BB1).
+  C2. ConnStateData ends where request routing code (BB2) begins.
+
+[ N.B. To avoid misunderstanding, when we talk about class XYZ, we
+generally talk about &quot;class XYZ&quot; itself combined with all its parent
+classes (e.g., &quot;class X&quot; and &quot;class YZ&quot;) (if any) unless noted
+otherwise. This rule applies here as well -- when I say &quot;ConnStateData
+is&quot;, I do _not_ wish to distinguish that class definition from all its
+parent classes, if any; I am talking about what the _combination_ of
+parents and ConnStateData is. ]
+
+The current code more-or-less obeys both rules C1 and C2. Yes, there are
+some violations. For example, ConnStateData contains some non-shared
+HTTP/1- and FTP-specific code that should be moved to protocol-specific
+Servers. However, those violations usually do not have far-reaching side
+effects outside ConnStateData and can usually be ignored for the purpose
+of this discussion.
+
+
+Q2. Where does the pending Downloader class belong?
+
+The Downloader class[1] fetches SBuf-storable things for other Squid
+components/transactions using internal requests. For example, it is used
+to fetch missing intermediate certificates when validating origin server
+certificate chains.
+
+The preview patch[1] implemented Downloader as a ConnStateData kid which
+triggered a request[2] to implement it as a Client kid. At the time, I
+could not fully reconcile those diametrically opposed ideas[3]. Now, I
+am ready to conclude that both designs were wrong:
+
+* Since Downloader does not receive http/ftp_port requests and does not
+send responses, it is not a Server. It was wrong to build it on top of
+ConnStateData as [1] did. Yes, Downloader creates an HTTP[S] request to
+be routed through Squid, but that does not qualify it to be a
+ConnStateData kid. Other things can (and already do) initiate requests
+that are routed through Squid -- ConnStateData does not hold a monopoly
+on that.
+
+* Since Downloader does not care about origin server communication and
+does not even require one (in case of cache hits), but can benefit from
+the usual REQMOD adaptations/hooks, it would also be wrong to make it a
+Client kid as [2] suggested. However, [2] was absolutely correct that
+there is no need to drag Server into Downloader!
+
+[1] Factory &quot;Fetch missing certificates&quot; preview on squid-dev at
+<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/2015-December/004297.html">http://lists.squid-cache.org/pipermail/squid-dev/2015-December/004297.html</A>
+
+[2] Amos' review of [1] at
+<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/2016-February/005100.html">http://lists.squid-cache.org/pipermail/squid-dev/2016-February/005100.html</A>
+
+[3] Alex's response to [2] at
+<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/2016-February/005106.html">http://lists.squid-cache.org/pipermail/squid-dev/2016-February/005106.html</A>
+
+So where does the Downloader class belong then? Downloader is a
+stand-alone class. Just like ConnStateData, it is a &quot;routing client&quot;
+class or a thing that creates internal requests to be routed through
+Squid using the BB2 building block. The three such classes in existence
+that I know of are:
+
+  - ConnStateData
+  - ESIInclude
+  - Downloader
+
+but I suspect that more old code should be on that list if things were
+implemented correctly (e.g., DigestFetchState). In the future, all these
+classes may gain a common RoutingClient parent and become formal siblings.
+
+
+Q3. Where does the future Http::Two::Server class belong?
+
+Http::Two::Server is a natural Http::One::Server sibling. That is, the
+two classes should have the same parent class (possibly among other
+parent classes). Both Http::One::Server and Http::Two::Server classes
+are servers and both are HTTP servers, so they will want to share a lot.
+Some of that sharing will most likely come through their common parent.
+
+Ftp::Server is an existing Http::One::Server sibling which proves that
+it is possible to implement Http::Two::Server as such a sibling as well.
+Moreover, if Ftp::Server and Http::One::Server are siblings but
+Http::One::Server and Http::Two::Server are not, then something clearly
+went wrong because FTP is no more &quot;closer&quot; to HTTP/1 than HTTP/2 is!
+
+Today, that common parent for the two siblings is ConnStateData.
+Tomorrow, we may split and/or rename ConnStateData, of course, but
+Http::One::Server and Http::Two::Server classes are likely to remain
+siblings with a common base that contains the code they share.
+
+
+Q4. What to do with the existing src/servers/Server.h?
+
+Today, that class is a nuisance:
+
+* It is not a common base for all servers (its stated purpose).
+
+* It does not fully encapsulate connection-managing code of its kids
+(its stated usage).
+
+* It is essentially unused (it is not used as an API by others and has
+only one kid).
+
+* It owns the pipeline object but only uses it to abort pending requests
+after I/O errors, and even that is done inconsistently.
+
+* It forces new code to add pure virtual methods that ConnStateData then
+overrides and implements, reminding me of the old Store class that
+slowly accumulated dozens of such methods because we needed to add
+something that one of the Store kids implemented.
+
+Overall, it shows many symptoms of premature encapsulation -- when the
+final purpose/boundaries are still fuzzy, and the new code can be added
+or excluded without any significant penalty; everything &quot;works&quot;, both
+correct solutions and incorrect ones.
+
+Most likely this class will not be able to preserve its current overall
+purpose/API as HTTP/2 support adds more specific requirements. Keeping
+this class until it is needed only increases development overheads and
+developer confusion.
+
+I recommend merging it back into ConnStateData until Squid actually
+needs it (or needs something like it). Merging it into ConnStateData
+would preserve all code improvements we have done after it was split. If
+somebody finds that useful, we can even keep its method definitions
+inside Server.cc, at least for a while.
+
+
+Executive Summary:
+
+  Q1. What is ConnStateData?
+      Code shared among all Server (BB1) classes.
+      ConnStateData does not do routing (that is what BB2 code does).
+
+  Q2. Where does the pending Downloader class belong?
+      It is a stand-alone class generating internal requests for BB2,
+      just like ConnStateData and ESI do.
+
+  Q3. Where does the future Http::Two::Server class belong?
+      It will be an Http::One::Server sibling.
+
+  Q4. What to do with the existing src/servers/Server.h?
+      Merge back into ConnStateData until it is actually needed.
+
+
+Which of the above four questions would you answer differently?
+
+
+Thank you,
+
+Alex.
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006158.html">[squid-dev] [PATCH] TidyPointer removal
+</A></li>
+	<LI>Next message: <A HREF="006131.html">[squid-dev] Care and feeding of ConnStateData
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6130">[ date ]</a>
+              <a href="thread.html#6130">[ thread ]</a>
+              <a href="subject.html#6130">[ subject ]</a>
+              <a href="author.html#6130">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

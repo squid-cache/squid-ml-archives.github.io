@@ -1,0 +1,354 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Http::Stream ID numbering
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Http%3A%3AStream%20ID%20numbering&In-Reply-To=%3C56B1E47D.3020602%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005097.html">
+   <LINK REL="Next"  HREF="005068.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Http::Stream ID numbering</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Http%3A%3AStream%20ID%20numbering&In-Reply-To=%3C56B1E47D.3020602%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] Http::Stream ID numbering">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Wed Feb  3 11:29:01 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005097.html">[squid-dev] Jenkins build is back to normal : trunk-polygraph #943
+</A></li>
+        <LI>Next message: <A HREF="005068.html">[squid-dev] [PATCH] Http::Stream ID numbering
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5067">[ date ]</a>
+              <a href="thread.html#5067">[ thread ]</a>
+              <a href="subject.html#5067">[ subject ]</a>
+              <a href="author.html#5067">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 24/01/2016 2:17 a.m., Amos Jeffries wrote:
+&gt;<i> On 23/01/2016 7:59 a.m., Alex Rousskov wrote:
+</I>&gt;&gt;<i> On 01/14/2016 05:53 AM, Amos Jeffries wrote:
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> The renaming/moving part of the patch scope changes lots of code. It is
+</I>&gt;&gt;<i> very unfortunate that you have decided to combine the above
+</I>&gt;&gt;<i> functionality-preserving polishing with the functionality changes below.
+</I>&gt;&gt;<i> The former makes it very difficult to see the latter. If I had enough
+</I>&gt;&gt;<i> guts, I would -1 this patch for this reason alone. Renaming/moving
+</I>&gt;&gt;<i> changes should have been done separately!
+</I>&gt;<i> 
+</I>&gt;<i> The Pipeline related ID changes are small and only needed for HTTP/2
+</I>&gt;<i> (the combo was due to being sponsored as an line-item). I can separate
+</I>&gt;<i> them out again.
+</I>&gt;<i> 
+</I>&gt;<i> With that Pipeline update gone there is no need for an audit of the
+</I>&gt;<i> shuffling according to our policy. Once we settle on the naming (above)
+</I>&gt;<i> are you happy for the non-logic shuffling bit to go in? and a new patch
+</I>&gt;<i> to audit only the Pipeline ID part?
+</I>&gt;<i> 
+</I>
+Okay, given a week with no response I merged the non-logic shuffling part.
+
+The logic changes are in this updated patch for review:
+
+&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> Pipeline class is updated to use the ID number to manage its contents
+</I>&gt;&gt;&gt;<i> rather than Pointer value matching. It is also updated to drop the
+</I>&gt;&gt;&gt;<i> HTTP/1 specific assumptions within the Pipeline implementation. As a
+</I>&gt;&gt;&gt;<i> behavioural requirement the sequential flow is now left for the Server
+</I>&gt;&gt;&gt;<i> and ClientHttpRequest Jobs to ensure correctness.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> The new Pipeline::popById() method is a bad idea IMO: Linear search is
+</I>&gt;&gt;<i> wrong for both HTTP/1 and HTTP/2.
+</I>&gt;&gt;<i>
+</I>&gt;<i> 
+</I>&gt;<i> Do you have a better algorithm? it needs to pop using only an ID (HTTP/2
+</I>&gt;<i> limit due to framing) and works on linear/list storage (optimal for
+</I>&gt;<i> HTTP/1 sequentialism).
+</I>&gt;<i> 
+</I>
+
+Amos
+
+-------------- next part --------------
+=== modified file 'src/Pipeline.cc'
+--- src/Pipeline.cc	2016-01-24 17:41:43 +0000
++++ src/Pipeline.cc	2016-01-31 12:47:55 +0000
+@@ -21,6 +21,7 @@
+ {
+     requests.push_back(c);
+     ++nrequests;
++    ++nactive;
+     debugs(33, 3, &quot;Pipeline &quot; &lt;&lt; (void*)this &lt;&lt; &quot; add request &quot; &lt;&lt; nrequests &lt;&lt; ' ' &lt;&lt; c);
+ }
+ 
+@@ -49,15 +50,24 @@
+ }
+ 
+ void
+-Pipeline::popMe(const Http::StreamPointer &amp;which)
++Pipeline::popById(uint32_t which)
+ {
+     if (requests.empty())
+         return;
+ 
+-    debugs(33, 3, &quot;Pipeline &quot; &lt;&lt; (void*)this &lt;&lt; &quot; drop &quot; &lt;&lt; requests.front());
+-    // in reality there may be multiple contexts doing processing in parallel.
+-    // XXX: pipeline still assumes HTTP/1 FIFO semantics are obeyed.
+-    assert(which == requests.front());
+-    requests.pop_front();
++    debugs(33, 3, &quot;Pipeline &quot; &lt;&lt; (void*)this &lt;&lt; &quot; drop id=&quot; &lt;&lt; which);
++
++    // find the context and clear its Pointer
++    for (auto &amp;&amp;i : requests) {
++        if (i-&gt;id == which) {
++            i = nullptr;
++            --nactive;
++            break;
++        }
++    }
++
++    // trim closed contexts from the list head (if any)
++    while (!requests.empty() &amp;&amp; !requests.front())
++        requests.pop_front();
+ }
+ 
+
+=== modified file 'src/Pipeline.h'
+--- src/Pipeline.h	2016-01-24 17:41:43 +0000
++++ src/Pipeline.h	2016-01-31 12:47:55 +0000
+@@ -37,7 +37,7 @@
+     Pipeline &amp; operator =(const Pipeline &amp;) = delete;
+ 
+ public:
+-    Pipeline() : nrequests(0) {}
++    Pipeline() : nrequests(0), nactive(0) {}
+     ~Pipeline() = default;
+ 
+     /// register a new request context to the pipeline
+@@ -47,7 +47,7 @@
+     Http::StreamPointer front() const;
+ 
+     /// how many requests are currently pipelined
+-    size_t count() const {return requests.size();}
++    size_t count() const {return nactive;}
+ 
+     /// whether there are none or any requests currently pipelined
+     bool empty() const {return requests.empty();}
+@@ -55,8 +55,8 @@
+     /// tell everybody about the err, and abort all waiting requests
+     void terminateAll(const int xerrno);
+ 
+-    /// deregister the front request from the pipeline
+-    void popMe(const Http::StreamPointer &amp;);
++    /// deregister a request from the pipeline
++    void popById(uint32_t);
+ 
+     /// Number of requests seen in this pipeline (so far).
+     /// Includes incomplete transactions.
+@@ -65,6 +65,10 @@
+ private:
+     /// requests parsed from the connection but not yet completed.
+     std::list&lt;Http::StreamPointer&gt; requests;
++
++    /// Number of still-active streams in this pipeline (so far).
++    /// Includes incomplete transactions.
++    uint32_t nactive;
+ };
+ 
+ #endif /* SQUID_SRC_PIPELINE_H */
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-02-01 11:52:03 +0000
++++ src/client_side.cc	2016-02-02 14:07:04 +0000
+@@ -1010,7 +1010,7 @@
+     http-&gt;req_sz = inBuf.length();
+     http-&gt;uri = xstrdup(uri);
+     setLogUri (http, uri);
+-    auto *context = new Http::Stream(clientConnection, http);
++    auto *context = new Http::Stream(nextStreamId(), clientConnection, http);
+     StoreIOBuffer tempBuffer;
+     tempBuffer.data = context-&gt;reqbuf;
+     tempBuffer.length = HTTP_REQBUF_SZ;
+@@ -1356,7 +1356,7 @@
+     ClientHttpRequest *http = new ClientHttpRequest(csd);
+ 
+     http-&gt;req_sz = hp-&gt;messageHeaderSize();
+-    Http::Stream *result = new Http::Stream(csd-&gt;clientConnection, http);
++    Http::Stream *result = new Http::Stream(csd-&gt;nextStreamId(), csd-&gt;clientConnection, http);
+ 
+     StoreIOBuffer tempBuffer;
+     tempBuffer.data = result-&gt;reqbuf;
+@@ -1573,8 +1573,7 @@
+                 // XXX: Either the context is finished() or it should stay queued.
+                 // The below may leak client streams BodyPipe objects. BUT, we need
+                 // to check if client-streams detatch is safe to do here (finished() will detatch).
+-                assert(conn-&gt;pipeline.front() == context); // XXX: still assumes HTTP/1 semantics
+-                conn-&gt;pipeline.popMe(Http::StreamPointer(context));
++                conn-&gt;pipeline.popById(context-&gt;id);
+             }
+             Comm::SetSelect(conn-&gt;clientConnection-&gt;fd, COMM_SELECT_READ, NULL, NULL, 0);
+             conn-&gt;fakeAConnectRequest(&quot;unknown-protocol&quot;, conn-&gt;preservedClientData);
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2016-01-24 17:41:43 +0000
++++ src/client_side.h	2016-01-31 12:47:55 +0000
+@@ -69,6 +69,7 @@
+     virtual ~ConnStateData();
+ 
+     /* ::Server API */
++    virtual uint32_t nextStreamId() {return ++nextStreamId_;}
+     virtual void receivedFirstByte();
+     virtual bool handleReadData();
+     virtual void afterClientRead();
+
+=== modified file 'src/http/Stream.cc'
+--- src/http/Stream.cc	2016-01-24 17:41:43 +0000
++++ src/http/Stream.cc	2016-01-31 12:50:20 +0000
+@@ -14,7 +14,8 @@
+ #include &quot;Store.h&quot;
+ #include &quot;TimeOrTag.h&quot;
+ 
+-Http::Stream::Stream(const Comm::ConnectionPointer &amp;aConn, ClientHttpRequest *aReq) :
++Http::Stream::Stream(uint32_t anId, const Comm::ConnectionPointer &amp;aConn, ClientHttpRequest *aReq) :
++    id(anId),
+     clientConnection(aConn),
+     http(aReq),
+     reply(nullptr),
+@@ -546,7 +547,7 @@
+ 
+     assert(connRegistered_);
+     connRegistered_ = false;
+-    conn-&gt;pipeline.popMe(Http::StreamPointer(this));
++    conn-&gt;pipeline.popById(id);
+ }
+ 
+ /// called when we encounter a response-related error
+
+=== modified file 'src/http/Stream.h'
+--- src/http/Stream.h	2016-01-31 12:05:30 +0000
++++ src/http/Stream.h	2016-01-31 12:48:43 +0000
+@@ -69,7 +69,7 @@
+ 
+ public:
+     /// construct with HTTP/1.x details
+-    Stream(const Comm::ConnectionPointer &amp;aConn, ClientHttpRequest *aReq);
++    Stream(uint32_t anId, const Comm::ConnectionPointer &amp;aConn, ClientHttpRequest *aReq);
+     ~Stream();
+ 
+     /// register this stream with the Server
+@@ -120,6 +120,10 @@
+ 
+     void deferRecipientForLater(clientStreamNode *, HttpReply *, StoreIOBuffer receivedData);
+ 
++public:
++    // NP: stream ID is relative to the connection, not global.
++    uint32_t id; ///&lt; stream ID within the client connection.
++
+ public: // HTTP/1.x state data
+ 
+     Comm::ConnectionPointer clientConnection; ///&lt; details about the client connection socket
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2016-01-31 12:05:30 +0000
++++ src/servers/FtpServer.cc	2016-01-31 12:47:55 +0000
+@@ -749,7 +749,7 @@
+     http-&gt;uri = newUri;
+ 
+     Http::Stream *const result =
+-        new Http::Stream(clientConnection, http);
++        new Http::Stream(nextStreamId(), clientConnection, http);
+ 
+     StoreIOBuffer tempBuffer;
+     tempBuffer.data = result-&gt;reqbuf;
+
+=== modified file 'src/servers/Server.cc'
+--- src/servers/Server.cc	2016-01-24 17:41:43 +0000
++++ src/servers/Server.cc	2016-01-31 12:47:55 +0000
+@@ -26,7 +26,8 @@
+     clientConnection(xact-&gt;tcpClient),
+     transferProtocol(xact-&gt;squidPort-&gt;transport),
+     port(xact-&gt;squidPort),
+-    receivedFirstByte_(false)
++    receivedFirstByte_(false),
++    nextStreamId_(0)
+ {}
+ 
+ bool
+
+=== modified file 'src/servers/Server.h'
+--- src/servers/Server.h	2016-01-24 17:21:02 +0000
++++ src/servers/Server.h	2016-01-31 12:47:55 +0000
+@@ -35,6 +35,9 @@
+     virtual bool doneAll() const;
+     virtual void swanSong();
+ 
++    /// fetch the next available stream ID
++    virtual uint32_t nextStreamId() = 0;
++
+     /// ??
+     virtual bool connFinishedWithConn(int size) = 0;
+ 
+@@ -117,6 +120,7 @@
+     void doClientRead(const CommIoCbParams &amp;io);
+     void clientWriteDone(const CommIoCbParams &amp;io);
+ 
++    uint32_t nextStreamId_;    ///&lt; incremented as streams are initiated
+     AsyncCall::Pointer reader; ///&lt; set when we are reading
+     AsyncCall::Pointer writer; ///&lt; set when we are writing
+ };
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005097.html">[squid-dev] Jenkins build is back to normal : trunk-polygraph #943
+</A></li>
+	<LI>Next message: <A HREF="005068.html">[squid-dev] [PATCH] Http::Stream ID numbering
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5067">[ date ]</a>
+              <a href="thread.html#5067">[ thread ]</a>
+              <a href="subject.html#5067">[ subject ]</a>
+              <a href="author.html#5067">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

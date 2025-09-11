@@ -1,0 +1,243 @@
+Fixed reporting of NULL header characters. Improved HTTP header debugging.
+
+Level-1 "WARNING: HTTP header contains NULL characters" messages were broken:
+1. They were printing half of the headers twice and not printing the other half.
+2. There could be just one NULL character, not multiple characters.
+
+Level-7 reporting of the headers being parsed was broken:
+3. Squid did not report header characters starting with NULL.
+
+Level-2 reporting of "HTTP Server RESPONSE" headers (and probably raw data in
+other contexts) is still broken for the same reason as #3 above.
+
+Problem #1 was caused by incorrect getStringPrefix() usage. That function cannot
+be called twice in the same debugs() message. We should be using Raw API
+instead. This patch replaces several getStringPrefix() calls to illustrate how
+this could be done (and test the output).
+
+Problem #2 is just poor wording of the WARNING message. Now fixed.
+
+Problem #3 was caused by getStringPrefix() inability to print buffers with NULL
+characters. Using Raw is the right solution for that. Old Raw code could print
+NULL characters, but our debugs() cannot handle them. To combat that, the new
+Raw::defaultprint() method now replaces each NULL character with a '.', like xxd
+does. This replacement would be necessary until somebody rewrites our
+_db_print() API or its callers to handle NULL chars correctly (but the current
+Raw code can be optimized even without that _db_print() rewrite).
+
+
+TODO: If we want to keep the 512-byte header reporting limit provided by
+getStringPrefix(), then we should add Raw::maxVolume() to trigger a similar
+debugging size limit and add Raw::mime() that will call both maxVolume() and
+scoped(). Alternatively, we can limit _all_ Raw output to 512 chars. Either way,
+that getStringPrefix() limit should be preseved IMO.
+
+TODO: Replace all remaining getStringPrefix(...) calls with Raw(...).scoped()
+or Raw(...).mime() and adjust the affected debugs() lines accordingly.
+
+=== modified file 'src/Debug.h'
+--- src/Debug.h	2016-05-23 17:03:20 +0000
++++ src/Debug.h	2016-08-05 02:57:36 +0000
+@@ -153,58 +153,65 @@ HERE(std::ostream& s)
+ /* some uint8_t do not like streaming control-chars (values 0-31, 127+) */
+ inline std::ostream& operator <<(std::ostream &os, const uint8_t d)
+ {
+     return (os << (int)d);
+ }
+ 
+ /* Legacy debug function definitions */
+ void _db_init(const char *logfile, const char *options);
+ void _db_print(const char *,...) PRINTF_FORMAT_ARG1;
+ void _db_set_syslog(const char *facility);
+ void _db_rotate_log(void);
+ 
+ /// Prints raw and/or non-terminated data safely, efficiently, and beautifully.
+ /// Allows raw data debugging in debugs() statements with low debugging levels
+ /// by printing only if higher section debugging levels are configured:
+ ///   debugs(11, DBG_IMPORTANT, "always printed" << Raw(may be printed...));
+ class Raw
+ {
+ public:
+     Raw(const char *label, const char *data, const size_t size):
+-        level(-1), label_(label), data_(data), size_(size), useHex_(false) {}
++        level(-1), label_(label), data_(data), size_(size), useHex_(false),
++        formScope_(false) {}
+ 
+     /// limit data printing to at least the given debugging level
+     Raw &minLevel(const int aLevel) { level = aLevel; return *this; }
+ 
++    /// if data is printed, print newlines right before and right after it,
++    /// as if forming a "paragraph" filled with that data
++    Raw &scoped() { formScope_ = true; return *this; }
++
+     /// print data using two hex digits per byte (decoder: xxd -r -p)
+     Raw &hex() { useHex_ = true; return *this; }
+ 
+     /// If debugging is prohibited by the current debugs() or section level,
+     /// prints nothing. Otherwise, dumps data using one of these formats:
+     ///   " label[size]=data" if label was set and data size is positive
+     ///   " label[0]" if label was set and data size is zero
+     ///   " data" if label was not set and data size is positive
+     ///   "" (i.e., prints nothing) if label was not set and data size is zero
+     std::ostream &print(std::ostream &os) const;
+ 
+     /// Minimum section debugging level necessary for printing. By default,
+     /// small strings are always printed while large strings are only printed
+     /// if DBG_DATA debugging level is enabled.
+     int level;
+ 
+ private:
+     void printHex(std::ostream &os) const;
++    void printDefault(std::ostream &os) const;
+ 
+     const char *label_; ///< optional data name or ID; triggers size printing
+     const char *data_; ///< raw data to be printed
+     size_t size_; ///< data length
+     bool useHex_; ///< whether hex() has been called
++    bool formScope_; ///< whether scoped() has been called
+ };
+ 
+ inline
+ std::ostream &operator <<(std::ostream &os, const Raw &raw)
+ {
+     return raw.print(os);
+ }
+ 
+ #endif /* SQUID_DEBUG_H */
+ 
+
+=== modified file 'src/HttpHeader.cc'
+--- src/HttpHeader.cc	2016-07-27 21:20:40 +0000
++++ src/HttpHeader.cc	2016-08-05 02:56:42 +0000
+@@ -309,47 +309,48 @@ HttpHeader::update(HttpHeader const *fre
+             continue;
+ 
+         debugs(55, 7, "Updating header '" << Http::HeaderLookupTable.lookup(e->id).name << "' in cached entry");
+ 
+         addEntry(e->clone());
+     }
+     return true;
+ }
+ 
+ int
+ HttpHeader::parse(const char *header_start, size_t hdrLen)
+ {
+     const char *field_ptr = header_start;
+     const char *header_end = header_start + hdrLen; // XXX: remove
+     HttpHeaderEntry *e, *e2;
+     int warnOnError = (Config.onoff.relaxed_header_parser <= 0 ? DBG_IMPORTANT : 2);
+ 
+     PROF_start(HttpHeaderParse);
+ 
+     assert(header_start && header_end);
+-    debugs(55, 7, "parsing hdr: (" << this << ")" << std::endl << getStringPrefix(header_start, hdrLen));
++    debugs(55, 7, this << " got" << Raw("buf", header_start, hdrLen).scoped());
+     ++ HttpHeaderStats[owner].parsedCount;
+ 
+     char *nulpos;
+     if ((nulpos = (char*)memchr(header_start, '\0', hdrLen))) {
+-        debugs(55, DBG_IMPORTANT, "WARNING: HTTP header contains NULL characters {" <<
+-               getStringPrefix(header_start, nulpos-header_start) << "}\nNULL\n{" << getStringPrefix(nulpos+1, hdrLen-(nulpos-header_start)-1));
++        debugs(55, DBG_IMPORTANT, "WARNING: HTTP header contains a NULL character;" <<
++               Raw("before", header_start, nulpos-header_start).scoped().minLevel(DBG_IMPORTANT) << " and" <<
++               Raw("after", nulpos+1, hdrLen-(nulpos-header_start)-1).scoped().minLevel(DBG_IMPORTANT));
+         PROF_stop(HttpHeaderParse);
+         clean();
+         return 0;
+     }
+ 
+     /* common format headers are "<name>:[ws]<value>" lines delimited by <CRLF>.
+      * continuation lines start with a (single) space or tab */
+     while (field_ptr < header_end) {
+         const char *field_start = field_ptr;
+         const char *field_end;
+ 
+         do {
+             const char *this_line = field_ptr;
+             field_ptr = (const char *)memchr(field_ptr, '\n', header_end - field_ptr);
+ 
+             if (!field_ptr) {
+                 // missing <LF>
+                 PROF_stop(HttpHeaderParse);
+                 clean();
+                 return 0;
+
+=== modified file 'src/debug.cc'
+--- src/debug.cc	2016-05-23 17:03:20 +0000
++++ src/debug.cc	2016-08-05 03:00:11 +0000
+@@ -816,47 +816,73 @@ const char*
+ SkipBuildPrefix(const char* path)
+ {
+     static const size_t BuildPrefixLength = BuildPrefixInit();
+ 
+     return path+BuildPrefixLength;
+ }
+ 
+ /// print data bytes using hex notation
+ void
+ Raw::printHex(std::ostream &os) const
+ {
+     const auto savedFill = os.fill('0');
+     const auto savedFlags = os.flags(); // std::ios_base::fmtflags
+     os << std::hex;
+     std::for_each(data_, data_ + size_,
+     [&os](const char &c) { os << std::setw(2) << static_cast<uint8_t>(c); });
+     os.flags(savedFlags);
+     os.fill(savedFill);
+ }
+ 
++/// print data bytes when the caller did not specify the presentation format
++void
++Raw::printDefault(std::ostream &os) const
++{
++    // If you want to make the output pretty, this default printing method is
++    // probably the wrong place because "pretty" is caller-specific. Here, we
++    // print everything "as is" unless it screws up Debug::Finish().
++
++    // XXX: \0s screw up our printf("%s", ...c_str()) in Debug::Finish().
++    // TODO: Would using for_each() always/unconditionally be faster?
++    if (memchr(data_, '\0', size_)) {
++        std::for_each(data_, data_ + size_,
++        [&os](const char &c) { os << (c ? c : '.'); }); // mimic xxd
++    } else {
++        os.write(data_, size_);
++    }
++}
++
++
+ std::ostream &
+ Raw::print(std::ostream &os) const
+ {
+     if (label_)
+         os << ' ' << label_ << '[' << size_ << ']';
+ 
+     if (!size_)
+         return os;
+ 
+     // finalize debugging level if no level was set explicitly via minLevel()
+     const int finalLevel = (level >= 0) ? level :
+                            (size_ > 40 ? DBG_DATA : Debug::SectionLevel());
+     if (finalLevel <= Debug::SectionLevel()) {
+         os << (label_ ? '=' : ' ');
++        if (formScope_) {
++            os << '{';
++            if (memchr(data_, '\n', size_))
++                os << '\n';
++        }
+         if (data_) {
+             if (useHex_)
+                 printHex(os);
+             else
+-                os.write(data_, size_);
++                printDefault(os);
+         } else {
+             os << "[null]";
+         }
++        if (formScope_)
++            os << '}';
+     }
+ 
+     return os;
+ }
+ 
+

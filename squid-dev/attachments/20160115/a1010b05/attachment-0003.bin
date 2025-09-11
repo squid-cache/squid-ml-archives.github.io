@@ -1,0 +1,157 @@
+--- src/ssl/Makefile.in	2016-01-07 01:23:44.000000000 -0200
++++ src/ssl/Makefile.in	2016-01-14 16:17:57.432375806 -0200
+@@ -755,7 +755,7 @@ libsslutil_la_SOURCES = \
+ 	crtd_message.h
+ 
+ @USE_SSL_CRTD_TRUE@ssl_crtd_SOURCES = ssl_crtd.cc certificate_db.cc certificate_db.h
+-@USE_SSL_CRTD_TRUE@ssl_crtd_LDADD = libsslutil.la $(SSLLIB) $(COMPAT_LIB)
++@USE_SSL_CRTD_TRUE@ssl_crtd_LDADD = libsslutil.la $(SSLLIB) $(COMPAT_LIB) -lhiredis
+ all: all-am
+ 
+ .SUFFIXES:
+--- src/ssl/Makefile.am	2016-01-07 01:21:47.000000000 -0200
++++ src/ssl/Makefile.am	2016-01-14 14:58:54.945687485 -0200
+@@ -59,5 +59,5 @@ libexec_PROGRAMS = \
+ 
+ if USE_SSL_CRTD
+ ssl_crtd_SOURCES = ssl_crtd.cc certificate_db.cc certificate_db.h
+-ssl_crtd_LDADD = libsslutil.la $(SSLLIB) $(COMPAT_LIB)
++ssl_crtd_LDADD = libsslutil.la $(SSLLIB) $(COMPAT_LIB) -lhiredis
+ endif
+--- src/ssl/ssl_crtd.cc	2016-01-07 01:21:47.000000000 -0200
++++ src/ssl/ssl_crtd.cc	2016-01-14 14:58:54.946687485 -0200
+@@ -20,6 +20,8 @@
+ #include <getopt.h>
+ #endif
+ 
++#include <hiredis/hiredis.h>
++
+ /**
+  \defgroup ssl_crtd ssl_crtd
+  \ingroup ExternalPrograms
+@@ -76,6 +78,9 @@ static const char *const B_MBYTES_STR =
+ static const char *const B_GBYTES_STR = "GB";
+ static const char *const B_BYTES_STR = "B";
+ 
++redisContext *redisCtx;
++redisReply *redisRpl;
++
+ /**
+   \ingroup ssl_crtd
+  * Get current time.
+@@ -199,19 +204,29 @@ static bool proccessNewRequest(Ssl::Crtd
+     if (!request_message.parseRequest(certProperties, error))
+         throw std::runtime_error("Error while parsing the crtd request: " + error);
+ 
+-    Ssl::CertificateDb db(db_path, max_db_size, fs_block_size);
++    //Ssl::CertificateDb db(db_path, max_db_size, fs_block_size);
+ 
+     Ssl::X509_Pointer cert;
+     Ssl::EVP_PKEY_Pointer pkey;
+     std::string &cert_subject = certProperties.dbKey();
+ 
+-    bool dbFailed = false;
++    redisRpl = (redisReply *) redisCommand( redisCtx, "GET CERT_CACHE:%s", std::string(cert_subject).c_str());
++    if (redisRpl->type == REDIS_REPLY_STRING) {
++        std::cerr << "ssl_crtd helper CACHE HIT for certificate subject " << cert_subject << std::endl;
++        std::cout << redisRpl->str << '\1' << std::flush;
++        freeReplyObject( redisRpl );
++        return true;
++    } else {
++        freeReplyObject( redisRpl );
++    }
++
++    /*bool dbFailed = false;
+     try {
+         db.find(cert_subject, cert, pkey);
+     } catch (std::runtime_error &err) {
+         dbFailed = true;
+         error = err.what();
+-    }
++    }*/
+ 
+     if (cert.get()) {
+         if (!Ssl::certificateMatchesProperties(cert.get(), certProperties)) {
+@@ -219,7 +234,7 @@ static bool proccessNewRequest(Ssl::Crtd
+             // Generete a new one with the updated fields.
+             cert.reset(NULL);
+             pkey.reset(NULL);
+-            db.purgeCert(cert_subject);
++            //db.purgeCert(cert_subject);
+         }
+     }
+ 
+@@ -227,7 +242,7 @@ static bool proccessNewRequest(Ssl::Crtd
+         if (!Ssl::generateSslCertificate(cert, pkey, certProperties))
+             throw std::runtime_error("Cannot create ssl certificate or private key.");
+ 
+-        if (!dbFailed && db.IsEnabledDiskStore()) {
++        /*if (!dbFailed && db.IsEnabledDiskStore()) {
+             try {
+                 if (!db.addCertAndPrivateKey(cert, pkey, cert_subject)) {
+                     dbFailed = true;
+@@ -237,11 +252,11 @@ static bool proccessNewRequest(Ssl::Crtd
+                 dbFailed = true;
+                 error = err.what();
+             }
+-        }
++        }*/
+     }
+ 
+-    if (dbFailed)
+-        std::cerr << "ssl_crtd helper database '" << db_path  << "' failed: " << error << std::endl;
++    //if (dbFailed)
++    //    std::cerr << "ssl_crtd helper database '" << db_path  << "' failed: " << error << std::endl;
+ 
+     std::string bufferToWrite;
+     if (!Ssl::writeCertAndPrivateKeyToMemory(cert, pkey, bufferToWrite))
+@@ -254,6 +269,10 @@ static bool proccessNewRequest(Ssl::Crtd
+     // Use the '\1' char as end-of-message character
+     std::cout << response_message.compose() << '\1' << std::flush;
+ 
++    redisRpl = (redisReply *) redisCommand( redisCtx, "SET %s %s", std::string("CERT_CACHE:").append(cert_subject).c_str(), std::string(response_message.compose()).c_str() );
++    freeReplyObject( redisRpl );
++    std::cerr << "ssl_crtd helper NEW CACHE for certificate subject " << cert_subject << std::endl;
++
+     return true;
+ }
+ 
+@@ -263,7 +282,18 @@ static bool proccessNewRequest(Ssl::Crtd
+  */
+ int main(int argc, char *argv[])
+ {
++
+     try {
++
++        redisCtx = redisConnect("127.0.0.1", 6379);
++        if (redisCtx == NULL || redisCtx->err) {
++            if (redisCtx) {
++                throw std::runtime_error(std::string("Connection error: ") + redisCtx->errstr);
++            } else {
++                throw std::runtime_error("Connection error: can't allocate redis context\n");
++            }
++        }
++
+         size_t max_db_size = 0;
+         size_t fs_block_size = 2048;
+         int8_t c;
+@@ -310,9 +340,9 @@ int main(int argc, char *argv[])
+             exit(0);
+         }
+ 
+-        {
++        /*{
+             Ssl::CertificateDb::check(db_path, max_db_size, fs_block_size);
+-        }
++        }*/
+         // Initialize SSL subsystem
+         SSL_load_error_strings();
+         SSLeay_add_ssl_algorithms();
+@@ -339,6 +369,7 @@ int main(int argc, char *argv[])
+             std::cout.flush();
+         }
+     } catch (std::runtime_error & error) {
++        redisFree(redisCtx);
+         std::cerr << argv[0] << ": " << error.what() << std::endl;
+         return 0;
+     }

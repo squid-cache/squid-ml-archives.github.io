@@ -1,0 +1,400 @@
+MUST always revalidate Cache-Control:no-cache responses.
+
+Squid MUST NOT use a CC:no-cache response for satisfying subsequent
+requests without successful validation with the origin server. Squid
+violated this MUST because Squid mapped both "no-cache" and
+"must-revalidate"/etc. directives to the same ENTRY_REVALIDATE flag
+which was interpreted as "revalidate when the cached response becomes
+stale" rather than "revalidate on every request".
+
+This patch splits ENTRY_REVALIDATE into:
+- ENTRY_REVALIDATE_ALWAYS, for entries with CC:no-cache and
+- ENTRY_REVALIDATE_STALE, for entries with other related CC directives
+  like CC:must-revalidate and CC:proxy-revalidate.
+
+Reusing ENTRY_CACHABLE_RESERVED_FOR_FUTURE_USE value for the more
+forgiving ENTRY_REVALIDATE_STALE (instead of the more aggressive
+ENTRY_REVALIDATE_ALWAYS) fixes the bug for the already cached entries -
+they will be revalidated and stored with the correct flag on the next
+request.
+
+=== modified file 'src/enums.h'
+--- src/enums.h	2016-04-01 17:54:10 +0000
++++ src/enums.h	2016-09-02 21:17:57 +0000
+@@ -40,65 +40,65 @@
+     PING_NONE,
+     PING_WAITING,
+     PING_DONE
+ } ping_status_t;
+ 
+ typedef enum {
+     STORE_OK,
+     STORE_PENDING
+ } store_status_t;
+ 
+ typedef enum {
+     SWAPOUT_NONE,
+     SWAPOUT_WRITING,
+     SWAPOUT_DONE
+ } swap_status_t;
+ 
+ typedef enum {
+     STORE_NON_CLIENT,
+     STORE_MEM_CLIENT,
+     STORE_DISK_CLIENT
+ } store_client_t;
+ 
+ /*
+  * These are for StoreEntry->flag, which is defined as a SHORT
+  *
+  * NOTE: These flags are written to swap.state, so think very carefully
+  * about deleting or re-assigning!
+  */
+ enum {
+     ENTRY_SPECIAL,
+-    ENTRY_REVALIDATE,
++    ENTRY_REVALIDATE_ALWAYS,
+     DELAY_SENDING,
+     RELEASE_REQUEST,
+     REFRESH_REQUEST,
+-    ENTRY_CACHABLE_RESERVED_FOR_FUTURE_USE,
++    ENTRY_REVALIDATE_STALE,
+     ENTRY_DISPATCHED,
+     KEY_PRIVATE,
+     ENTRY_FWD_HDR_WAIT,
+     ENTRY_NEGCACHED,
+     ENTRY_VALIDATED,
+     ENTRY_BAD_LENGTH,
+     ENTRY_ABORTED
+ };
+ 
+ /*
+  * These are for client Streams. Each node in the stream can be queried for
+  * its status
+  */
+ typedef enum {
+     STREAM_NONE,        /* No particular status */
+     STREAM_COMPLETE,        /* All data has been flushed, no more reads allowed */
+     /* an unpredicted end has occured, no more
+      * reads occured, but no need to tell
+      * downstream that an error occured
+      */
+     STREAM_UNPLANNED_COMPLETE,
+     /* An error has occured in this node or an above one,
+      * and the node is not generating an error body / it's
+      * midstream
+      */
+     STREAM_FAILED
+ } clientStream_status_t;
+ 
+ /* stateful helper callback response codes */
+ typedef enum {
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2016-08-15 11:26:37 +0000
++++ src/http.cc	2016-09-05 09:12:50 +0000
+@@ -961,72 +961,74 @@
+             if (Config.negativeTtl > 0)
+                 entry->cacheNegatively();
+             else
+ #endif
+                 entry->makePrivate();
+             break;
+ 
+         default:
+             assert(0);
+             break;
+         }
+     }
+ 
+     if (!ignoreCacheControl) {
+         if (rep->cache_control) {
+             // We are required to revalidate on many conditions.
+             // For security reasons we do so even if storage was caused by refresh_pattern ignore-* option
+ 
+             // CC:must-revalidate or CC:proxy-revalidate
+             const bool ccMustRevalidate = (rep->cache_control->proxyRevalidate() || rep->cache_control->mustRevalidate());
+ 
+             // CC:no-cache (only if there are no parameters)
+             const bool ccNoCacheNoParams = (rep->cache_control->hasNoCache() && rep->cache_control->noCache().size()==0);
+ 
+             // CC:s-maxage=N
+             const bool ccSMaxAge = rep->cache_control->hasSMaxAge();
+ 
+             // CC:private (yes, these can sometimes be stored)
+             const bool ccPrivate = rep->cache_control->hasPrivate();
+ 
+-            if (ccMustRevalidate || ccNoCacheNoParams || ccSMaxAge || ccPrivate)
+-                EBIT_SET(entry->flags, ENTRY_REVALIDATE);
++            if (ccNoCacheNoParams || ccPrivate)
++                EBIT_SET(entry->flags, ENTRY_REVALIDATE_ALWAYS);
++            else if (ccMustRevalidate || ccSMaxAge)
++                EBIT_SET(entry->flags, ENTRY_REVALIDATE_STALE);
+         }
+ #if USE_HTTP_VIOLATIONS // response header Pragma::no-cache is undefined in HTTP
+         else {
+             // Expensive calculation. So only do it IF the CC: header is not present.
+ 
+             /* HACK: Pragma: no-cache in _replies_ is not documented in HTTP,
+              * but servers like "Active Imaging Webcast/2.0" sure do use it */
+             if (rep->header.has(Http::HdrType::PRAGMA) &&
+                     rep->header.hasListMember(Http::HdrType::PRAGMA,"no-cache",','))
+-                EBIT_SET(entry->flags, ENTRY_REVALIDATE);
++                EBIT_SET(entry->flags, ENTRY_REVALIDATE_ALWAYS);
+         }
+ #endif
+     }
+ 
+ #if HEADERS_LOG
+     headersLog(1, 0, request->method, rep);
+ 
+ #endif
+ 
+     ctx_exit(ctx);
+ }
+ 
+ HttpStateData::ConnectionStatus
+ HttpStateData::statusIfComplete() const
+ {
+     const HttpReply *rep = virginReply();
+     /** \par
+      * If the reply wants to close the connection, it takes precedence */
+ 
+     if (httpHeaderHasConnDir(&rep->header, "close"))
+         return COMPLETE_NONPERSISTENT_MSG;
+ 
+     /** \par
+      * If we didn't send a keep-alive request header, then this
+      * can not be a persistent connection.
+      */
+     if (!flags.keepalive)
+         return COMPLETE_NONPERSISTENT_MSG;
+ 
+     /** \par
+
+=== modified file 'src/refresh.cc'
+--- src/refresh.cc	2016-01-01 00:12:18 +0000
++++ src/refresh.cc	2016-09-05 09:10:56 +0000
+@@ -319,62 +319,66 @@
+             debugs(22, 3, "\tage + min-fresh:\t" << age << " + " <<
+                    minFresh << " = " << age + minFresh);
+             debugs(22, 3, "\tcheck_time + min-fresh:\t" << check_time << " + "
+                    << minFresh << " = " <<
+                    mkrfc1123(check_time + minFresh));
+             age += minFresh;
+             check_time += minFresh;
+         }
+     }
+ 
+     memset(&sf, '\0', sizeof(sf));
+ 
+     staleness = refreshStaleness(entry, check_time, age, R, &sf);
+ 
+     debugs(22, 3, "Staleness = " << staleness);
+ 
+     // stale-if-error requires any failure be passed thru when its period is over.
+     if (request && entry->mem_obj && entry->mem_obj->getReply() && entry->mem_obj->getReply()->cache_control &&
+             entry->mem_obj->getReply()->cache_control->hasStaleIfError() &&
+             entry->mem_obj->getReply()->cache_control->staleIfError() < staleness) {
+ 
+         debugs(22, 3, "stale-if-error period expired. Will produce error if validation fails.");
+         request->flags.failOnValidationError = true;
+     }
+ 
+     /* If the origin server specified either of:
+      *   Cache-Control: must-revalidate
+      *   Cache-Control: proxy-revalidate
+      * the spec says the response must always be revalidated if stale.
+      */
+-    if (EBIT_TEST(entry->flags, ENTRY_REVALIDATE) && staleness > -1) {
+-        debugs(22, 3, "YES: Must revalidate stale object (origin set must-revalidate, proxy-revalidate, no-cache, s-maxage, or private)");
++    const bool revalidateAlways = EBIT_TEST(entry->flags, ENTRY_REVALIDATE_ALWAYS);
++    if (revalidateAlways || (staleness > -1 &&
++                EBIT_TEST(entry->flags, ENTRY_REVALIDATE_STALE))) {
++        debugs(22, 3, "YES: Must revalidate stale object (origin set " <<
++                (revalidateAlways ? "no-cache or private" :
++                 "must-revalidate, proxy-revalidate or s-maxage") << ")");
+         if (request)
+             request->flags.failOnValidationError = true;
+         return STALE_MUST_REVALIDATE;
+     }
+ 
+     /* request-specific checks */
+     if (request && !request->flags.ignoreCc) {
+         HttpHdrCc *cc = request->cache_control;
+ 
+         /* If the request is an IMS request, and squid is configured NOT to service this from cache
+          * (either by 'refresh-ims' in the refresh pattern or 'refresh_all_ims on' globally)
+          * then force a reload from the origin.
+          */
+         if (request->flags.ims && (R->flags.refresh_ims || Config.onoff.refresh_all_ims)) {
+             // The client's no-cache header is changed into a IMS query
+             debugs(22, 3, "YES: Client IMS request forcing revalidation of object (refresh-ims option)");
+             return STALE_FORCED_RELOAD;
+         }
+ 
+ #if USE_HTTP_VIOLATIONS
+         /* Normally a client reload request ("Cache-Control: no-cache" or "Pragma: no-cache")
+          * means we must treat this reponse as STALE and fetch a new one.
+          *
+          * However, some options exist to override this behaviour. For example, we might just
+          * revalidate our existing response, or even just serve it up without revalidating it.
+          *
+          *     ---- Note on the meaning of nocache_hack -----
+          *
+          * The nocache_hack flag has a very specific and complex meaning:
+          *
+
+=== modified file 'src/stat.cc'
+--- src/stat.cc	2016-01-31 12:05:30 +0000
++++ src/stat.cc	2016-09-02 21:19:58 +0000
+@@ -261,72 +261,75 @@
+                           stats.gopher_read_hist[i],
+                           Math::doublePercent(stats.gopher_read_hist[i], stats.gopher_reads));
+     }
+ 
+     storeAppendPrintf(sentry, "\n");
+ }
+ 
+ static const char *
+ describeStatuses(const StoreEntry * entry)
+ {
+     LOCAL_ARRAY(char, buf, 256);
+     snprintf(buf, 256, "%-13s %-13s %-12s %-12s",
+              storeStatusStr[entry->store_status],
+              memStatusStr[entry->mem_status],
+              swapStatusStr[entry->swap_status],
+              pingStatusStr[entry->ping_status]);
+     return buf;
+ }
+ 
+ const char *
+ storeEntryFlags(const StoreEntry * entry)
+ {
+     LOCAL_ARRAY(char, buf, 256);
+     int flags = (int) entry->flags;
+     char *t;
+     buf[0] = '\0';
+ 
+     if (EBIT_TEST(flags, ENTRY_SPECIAL))
+         strcat(buf, "SPECIAL,");
+ 
+-    if (EBIT_TEST(flags, ENTRY_REVALIDATE))
+-        strcat(buf, "REVALIDATE,");
++    if (EBIT_TEST(flags, ENTRY_REVALIDATE_ALWAYS))
++        strcat(buf, "REVALIDATE_ALWAYS,");
+ 
+     if (EBIT_TEST(flags, DELAY_SENDING))
+         strcat(buf, "DELAY_SENDING,");
+ 
+     if (EBIT_TEST(flags, RELEASE_REQUEST))
+         strcat(buf, "RELEASE_REQUEST,");
+ 
+     if (EBIT_TEST(flags, REFRESH_REQUEST))
+         strcat(buf, "REFRESH_REQUEST,");
+ 
++    if (EBIT_TEST(flags, ENTRY_REVALIDATE_STALE))
++        strcat(buf, "REVALIDATE_STALE,");
++
+     if (EBIT_TEST(flags, ENTRY_DISPATCHED))
+         strcat(buf, "DISPATCHED,");
+ 
+     if (EBIT_TEST(flags, KEY_PRIVATE))
+         strcat(buf, "PRIVATE,");
+ 
+     if (EBIT_TEST(flags, ENTRY_FWD_HDR_WAIT))
+         strcat(buf, "FWD_HDR_WAIT,");
+ 
+     if (EBIT_TEST(flags, ENTRY_NEGCACHED))
+         strcat(buf, "NEGCACHED,");
+ 
+     if (EBIT_TEST(flags, ENTRY_VALIDATED))
+         strcat(buf, "VALIDATED,");
+ 
+     if (EBIT_TEST(flags, ENTRY_BAD_LENGTH))
+         strcat(buf, "BAD_LENGTH,");
+ 
+     if (EBIT_TEST(flags, ENTRY_ABORTED))
+         strcat(buf, "ABORTED,");
+ 
+     if ((t = strrchr(buf, ',')))
+         *t = '\0';
+ 
+     return buf;
+ }
+ 
+ static const char *
+ describeTimestamps(const StoreEntry * entry)
+ {
+
+=== modified file 'src/store.cc'
+--- src/store.cc	2016-07-23 13:36:56 +0000
++++ src/store.cc	2016-09-02 21:18:16 +0000
+@@ -2071,64 +2071,65 @@
+ 
+ std::ostream &operator <<(std::ostream &os, const StoreEntry &e)
+ {
+     os << "e:";
+ 
+     if (e.mem_obj) {
+         if (e.mem_obj->xitTable.index > -1)
+             os << 't' << e.mem_obj->xitTable.index;
+         if (e.mem_obj->memCache.index > -1)
+             os << 'm' << e.mem_obj->memCache.index;
+     }
+     if (e.swap_filen > -1 || e.swap_dirn > -1)
+         os << 'd' << e.swap_filen << '@' << e.swap_dirn;
+ 
+     os << '=';
+ 
+     // print only non-default status values, using unique letters
+     if (e.mem_status != NOT_IN_MEMORY ||
+             e.store_status != STORE_PENDING ||
+             e.swap_status != SWAPOUT_NONE ||
+             e.ping_status != PING_NONE) {
+         if (e.mem_status != NOT_IN_MEMORY) os << 'm';
+         if (e.store_status != STORE_PENDING) os << 's';
+         if (e.swap_status != SWAPOUT_NONE) os << 'w' << e.swap_status;
+         if (e.ping_status != PING_NONE) os << 'p' << e.ping_status;
+     }
+ 
+     // print only set flags, using unique letters
+     if (e.flags) {
+         if (EBIT_TEST(e.flags, ENTRY_SPECIAL)) os << 'S';
+-        if (EBIT_TEST(e.flags, ENTRY_REVALIDATE)) os << 'R';
++        if (EBIT_TEST(e.flags, ENTRY_REVALIDATE_ALWAYS)) os << 'R';
+         if (EBIT_TEST(e.flags, DELAY_SENDING)) os << 'P';
+         if (EBIT_TEST(e.flags, RELEASE_REQUEST)) os << 'X';
+         if (EBIT_TEST(e.flags, REFRESH_REQUEST)) os << 'F';
++        if (EBIT_TEST(e.flags, ENTRY_REVALIDATE_STALE)) os << 'E';
+         if (EBIT_TEST(e.flags, ENTRY_DISPATCHED)) os << 'D';
+         if (EBIT_TEST(e.flags, KEY_PRIVATE)) os << 'I';
+         if (EBIT_TEST(e.flags, ENTRY_FWD_HDR_WAIT)) os << 'W';
+         if (EBIT_TEST(e.flags, ENTRY_NEGCACHED)) os << 'N';
+         if (EBIT_TEST(e.flags, ENTRY_VALIDATED)) os << 'V';
+         if (EBIT_TEST(e.flags, ENTRY_BAD_LENGTH)) os << 'L';
+         if (EBIT_TEST(e.flags, ENTRY_ABORTED)) os << 'A';
+     }
+ 
+     if (e.mem_obj && e.mem_obj->smpCollapsed)
+         os << 'O';
+ 
+     return os << '/' << &e << '*' << e.locks();
+ }
+ 
+ /* NullStoreEntry */
+ 
+ NullStoreEntry NullStoreEntry::_instance;
+ 
+ NullStoreEntry *
+ NullStoreEntry::getInstance()
+ {
+     return &_instance;
+ }
+ 
+ char const *
+ NullStoreEntry::getMD5Text() const
+ {
+     return "N/A";
+ }
+

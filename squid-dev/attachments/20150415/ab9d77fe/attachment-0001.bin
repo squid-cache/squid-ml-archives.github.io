@@ -1,0 +1,134 @@
+pconn_lifetime robustness fixes
+
+This patch changes pconn_lifetime (r13780) to abort only really idle 
+persistent connections (when they timeout). It removes some "extra" features
+(added to pconn_lifetime during the feature review) because they break things
+when aggressive timeouts is combined with picky clients. Specifically,
+
+1. Squid closed connections with partially received requests when they
+   reached pconn_lifetime limit. We should only close _idle_ connections.
+
+2. When connecting to Squid without sending anything for longer than
+   pconn_lifetime, the connection hangs if the request is sent after the
+   waiting period.
+
+3. The connection also hangs if the initial request is starting to be
+   transmitted but then there is a longer pause before the request is
+   completed.
+
+Most of the above problems are easy to trigger only when using very aggressive
+pconn_lifetime settings that the feature was not designed for, but they still
+can be considered bugs from admins point of view. Fixes:
+
+* Do not stop reading a partially received request when we are timing out,
+  to avoid aborting that request.
+
+* Do not set keepalive flag based on the pconn_lifetime timeout. We cannot
+  predict whether some new request data is going to be read (and reset the
+  idle timeout clock) before our Connection:close response is sent back.
+
+HTTP clients are supposed to recover from such races, but some apparently
+do not, especially if it is their first request on the connection.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2015-03-16 09:52:13 +0000
++++ src/client_side.cc	2015-03-23 09:53:55 +0000
+@@ -3045,46 +3045,40 @@
+  */
+ bool
+ ConnStateData::clientParseRequests()
+ {
+     bool parsed_req = false;
+ 
+     debugs(33, 5, HERE << clientConnection << ": attempting to parse");
+ 
+     // Loop while we have read bytes that are not needed for producing the body
+     // On errors, bodyPipe may become nil, but readMore will be cleared
+     while (!in.buf.isEmpty() && !bodyPipe && flags.readMore) {
+ 
+         /* Don't try to parse if the buffer is empty */
+         if (in.buf.isEmpty())
+             break;
+ 
+         /* Limit the number of concurrent requests */
+         if (concurrentRequestQueueFilled())
+             break;
+ 
+-        /*Do not read more requests if persistent connection lifetime exceeded*/
+-        if (Config.Timeout.pconnLifetime && clientConnection->lifeTime() > Config.Timeout.pconnLifetime) {
+-            flags.readMore = false;
+-            break;
+-        }
+-
+         // try to parse the PROXY protocol header magic bytes
+         if (needProxyProtocolHeader_ && !parseProxyProtocolHeader())
+             break;
+ 
+         if (ClientSocketContext *context = parseOneRequest()) {
+             debugs(33, 5, clientConnection << ": done parsing a request");
+ 
+             AsyncCall::Pointer timeoutCall = commCbCall(5, 4, "clientLifetimeTimeout",
+                                              CommTimeoutCbPtrFun(clientLifetimeTimeout, context->http));
+             commSetConnTimeout(clientConnection, Config.Timeout.lifetime, timeoutCall);
+ 
+             context->registerWithConn();
+ 
+             processParsedRequest(context);
+ 
+             parsed_req = true; // XXX: do we really need to parse everything right NOW ?
+ 
+             if (context->mayUseConnection()) {
+                 debugs(33, 3, HERE << "Not parsing new requests, as this request may need the connection");
+                 break;
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2015-01-13 07:25:36 +0000
++++ src/client_side_reply.cc	2015-03-23 09:59:02 +0000
+@@ -1487,44 +1487,40 @@
+     } else if (reply->bodySize(request->method) < 0 && !maySendChunkedReply) {
+         debugs(88, 3, "clientBuildReplyHeader: can't keep-alive, unknown body size" );
+         request->flags.proxyKeepalive = false;
+     } else if (fdUsageHigh()&& !request->flags.mustKeepalive) {
+         debugs(88, 3, "clientBuildReplyHeader: Not many unused FDs, can't keep-alive");
+         request->flags.proxyKeepalive = false;
+     } else if (request->flags.sslBumped && !reply->persistent()) {
+         // We do not really have to close, but we pretend we are a tunnel.
+         debugs(88, 3, "clientBuildReplyHeader: bumped reply forces close");
+         request->flags.proxyKeepalive = false;
+     } else if (request->pinnedConnection() && !reply->persistent()) {
+         // The peer wants to close the pinned connection
+         debugs(88, 3, "pinned reply forces close");
+         request->flags.proxyKeepalive = false;
+     } else if (http->getConn()) {
+         ConnStateData * conn = http->getConn();
+         if (!Comm::IsConnOpen(conn->port->listenConn)) {
+             // The listening port closed because of a reconfigure
+             debugs(88, 3, "listening port closed");
+             request->flags.proxyKeepalive = false;
+-        } else if (Config.Timeout.pconnLifetime && conn->clientConnection->lifeTime() > Config.Timeout.pconnLifetime && conn->getConcurrentRequestCount() <= 1) {
+-            // The persistent connection lifetime exceeded and we are the last parsed request
+-            debugs(88, 3, "persistent connection lifetime exceeded");
+-            request->flags.proxyKeepalive = false;
+         }
+     }
+ 
+     // Decide if we send chunked reply
+     if (maySendChunkedReply &&
+             request->flags.proxyKeepalive &&
+             reply->bodySize(request->method) < 0) {
+         debugs(88, 3, "clientBuildReplyHeader: chunked reply");
+         request->flags.chunkedReply = true;
+         hdr->putStr(HDR_TRANSFER_ENCODING, "chunked");
+     }
+ 
+     /* Append VIA */
+     if (Config.onoff.via) {
+         LOCAL_ARRAY(char, bbuf, MAX_URL + 32);
+         String strVia;
+         hdr->getList(HDR_VIA, &strVia);
+         snprintf(bbuf, MAX_URL + 32, "%d.%d %s",
+                  reply->sline.version.major,
+                  reply->sline.version.minor,
+

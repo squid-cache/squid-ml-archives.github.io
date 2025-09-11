@@ -1,0 +1,482 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [REVIEW] SBuf I/O Comm::Write API
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BREVIEW%5D%20SBuf%20I/O%20Comm%3A%3AWrite%20API&In-Reply-To=%3C5448E9A9.20600%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="000180.html">
+   <LINK REL="Next"  HREF="000187.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [REVIEW] SBuf I/O Comm::Write API</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BREVIEW%5D%20SBuf%20I/O%20Comm%3A%3AWrite%20API&In-Reply-To=%3C5448E9A9.20600%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [REVIEW] SBuf I/O Comm::Write API">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Thu Oct 23 11:42:33 UTC 2014</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000180.html">[squid-dev] Jenkins build is back to normal :	3.HEAD-amd64-centos-7-clang #62
+</A></li>
+        <LI>Next message: <A HREF="000187.html">[squid-dev] Build failed in Jenkins: 3.HEAD-amd64-centos-7-clang #63
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#184">[ date ]</a>
+              <a href="thread.html#184">[ thread ]</a>
+              <a href="subject.html#184">[ subject ]</a>
+              <a href="author.html#184">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>This patch is the proposed Comm::Write API update to handle SBuf writes.
+It is PREVIEW because I have not yet altered or written any code to
+actually use it yet as proof of correct operation. I intend to followup
+with this as part of a larger tunnel conversion later if the design is
+agreed.
+
+
+It follows the same model as implented for Comm::Read:
+
+* The code requiring a write(2) uses Comm::Write() to register interest
+in writes with a callback.
+
+* When write(2) is possible the registerd callback will be scheduled.
+
+* The recipient of a write callback is permitted to use Comm::WriteNow()
+to perform a synchronous write(2) operation (or not, if it chooses).
+
+* The results of Comm::WriteNow() call are:
+ - a Comm::Flag indicating OK/ERROR/INPROGRESS - where INPROGRESS
+represents delay pool preventing write(2), or some minor error requiring
+a retry,
+ - the buffer passed for immediate writing is consume()'d by the amount
+actually written (which may leave it with remaining bytes).
+
+* Comm::MonitorsWrite(fd) test is provided to check if a specific FD is
+already active with a waiting callback.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/comm/Write.cc'
+--- src/comm/Write.cc	2014-09-13 13:59:43 +0000
++++ src/comm/Write.cc	2014-10-23 09:42:40 +0000
+@@ -1,162 +1,264 @@
+ /*
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include &quot;squid.h&quot;
++#include &quot;comm/comm_internal.h&quot;
+ #include &quot;comm/Connection.h&quot;
+ #include &quot;comm/IoCallback.h&quot;
++#include &quot;comm/Loops.h&quot;
+ #include &quot;comm/Write.h&quot;
+ #include &quot;fd.h&quot;
+ #include &quot;fde.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;MemBuf.h&quot;
+ #include &quot;profiler/Profiler.h&quot;
+ #include &quot;SquidTime.h&quot;
+ #include &quot;StatCounters.h&quot;
+ #if USE_DELAY_POOLS
+ #include &quot;ClientInfo.h&quot;
+ #endif
+ 
+ #include &lt;cerrno&gt;
+ 
++// Does comm check this fd for write readiness?
++// Note that when comm is not monitoring, there can be a pending callback
++// call, which may resume comm monitoring once fired.
++bool
++Comm::MonitorsWrite(int fd)
++{
++    assert(isOpen(fd) &amp;&amp; COMMIO_FD_WRITECB(fd));
++    // Being active is usually the same as monitoring because we always
++    // start monitoring the FD when we configure Comm::IoCallback for I/O
++    // and we usually configure Comm::IoCallback for I/O when we starting
++    // monitoring a FD for writing.
++    return COMMIO_FD_WRITECB(fd)-&gt;active();
++}
++
++static void
++handleWriteNow(int fd, void *)
++{
++    PROF_start(commHandleWrite);
++    ScheduleCallHere(COMMIO_FD_WRITECB(fd)-&gt;callback);
++    PROF_stop(commHandleWrite);
++}
++
++void
++Comm::Write(const Comm::ConnectionPointer &amp;conn, AsyncCall::Pointer &amp;callback)
++{
++    debugs(5, 5, conn &lt;&lt; &quot;: sz (undefined): asynCall &quot; &lt;&lt; callback);
++
++    /* Make sure we are open, not closing, and not writing */
++    assert(fd_table[conn-&gt;fd].flags.open);
++    assert(!fd_table[conn-&gt;fd].closing());
++    Comm::IoCallback *ccb = COMMIO_FD_WRITECB(conn-&gt;fd);
++    assert(!ccb-&gt;active());
++
++    fd_table[conn-&gt;fd].writeStart = squid_curtime;
++    ccb-&gt;conn = conn;
++    /* Queue the write */
++    ccb-&gt;setCallback(IOCB_WRITE, callback, NULL, NULL, 0);
++    SetSelect(conn-&gt;fd, COMM_SELECT_WRITE, handleWriteNow, NULL, 0);
++}
++
+ void
+ Comm::Write(const Comm::ConnectionPointer &amp;conn, MemBuf *mb, AsyncCall::Pointer &amp;callback)
+ {
+     Comm::Write(conn, mb-&gt;buf, mb-&gt;size, callback, mb-&gt;freeFunc());
+ }
+ 
+ void
+ Comm::Write(const Comm::ConnectionPointer &amp;conn, const char *buf, int size, AsyncCall::Pointer &amp;callback, FREE * free_func)
+ {
+     debugs(5, 5, HERE &lt;&lt; conn &lt;&lt; &quot;: sz &quot; &lt;&lt; size &lt;&lt; &quot;: asynCall &quot; &lt;&lt; callback);
+ 
+     /* Make sure we are open, not closing, and not writing */
+     assert(fd_table[conn-&gt;fd].flags.open);
+     assert(!fd_table[conn-&gt;fd].closing());
+     Comm::IoCallback *ccb = COMMIO_FD_WRITECB(conn-&gt;fd);
+     assert(!ccb-&gt;active());
+ 
+     fd_table[conn-&gt;fd].writeStart = squid_curtime;
+     ccb-&gt;conn = conn;
+     /* Queue the write */
+     ccb-&gt;setCallback(IOCB_WRITE, callback, (char *)buf, free_func, size);
+     ccb-&gt;selectOrQueueWrite();
+ }
+ 
+-/** Write to FD.
+- * This function is used by the lowest level of IO loop which only has access to FD numbers.
+- * We have to use the comm iocb_table to map FD numbers to waiting data and Comm::Connections.
+- * Once the write has been concluded we schedule the waiting call with success/fail results.
++/**
++ * Adjust the amount to write for available delay pool bandwidth.
+  */
+-void
+-Comm::HandleWrite(int fd, void *data)
++static int
++delayPoolAdjustWriteSz(int wanted, int fd)
+ {
+-    Comm::IoCallback *state = static_cast&lt;Comm::IoCallback *&gt;(data);
+-    int len = 0;
+-    int nleft;
+-
+-    assert(state-&gt;conn != NULL &amp;&amp; state-&gt;conn-&gt;fd == fd);
+-
+-    PROF_start(commHandleWrite);
+-    debugs(5, 5, HERE &lt;&lt; state-&gt;conn &lt;&lt; &quot;: off &quot; &lt;&lt;
+-           (long int) state-&gt;offset &lt;&lt; &quot;, sz &quot; &lt;&lt; (long int) state-&gt;size &lt;&lt; &quot;.&quot;);
+-
+-    nleft = state-&gt;size - state-&gt;offset;
+-
+ #if USE_DELAY_POOLS
+     ClientInfo * clientInfo=fd_table[fd].clientInfo;
+ 
+     if (clientInfo &amp;&amp; !clientInfo-&gt;writeLimitingActive)
+         clientInfo = NULL; // we only care about quota limits here
+ 
+     if (clientInfo) {
+         assert(clientInfo-&gt;selectWaiting);
+         clientInfo-&gt;selectWaiting = false;
+ 
+         assert(clientInfo-&gt;hasQueue());
+         assert(clientInfo-&gt;quotaPeekFd() == fd);
+         clientInfo-&gt;quotaDequeue(); // we will write or requeue below
+ 
+-        if (nleft &gt; 0) {
++        if (wanted &gt; 0) {
+             const int quota = clientInfo-&gt;quotaForDequed();
+             if (!quota) {  // if no write quota left, queue this fd
+                 state-&gt;quotaQueueReserv = clientInfo-&gt;quotaEnqueue(fd);
+                 clientInfo-&gt;kickQuotaQueue();
+-                PROF_stop(commHandleWrite);
+-                return;
++                return -1;
+             }
+ 
+-            const int nleft_corrected = min(nleft, quota);
+-            if (nleft != nleft_corrected) {
+-                debugs(5, 5, HERE &lt;&lt; state-&gt;conn &lt;&lt; &quot; writes only &quot; &lt;&lt;
+-                       nleft_corrected &lt;&lt; &quot; out of &quot; &lt;&lt; nleft);
+-                nleft = nleft_corrected;
++            const int corrected = min(wanted, quota);
++            if (wanted != corrected) {
++                debugs(5, 5, &quot;FD &quot; &lt;&lt; fd &lt;&lt; &quot; writes only &quot; &lt;&lt; corrected &lt;&lt; &quot; out of &quot; &lt;&lt; wanted);
++                wanted = corrected;
+             }
+-
+         }
+     }
+ #endif /* USE_DELAY_POOLS */
+ 
+-    /* actually WRITE data */
+-    len = FD_WRITE_METHOD(fd, state-&gt;buf + state-&gt;offset, nleft);
+-    debugs(5, 5, HERE &lt;&lt; &quot;write() returns &quot; &lt;&lt; len);
++    return wanted;
++}
++
++static void
++countWritten(int fd, int len)
++{
++    fd_bytes(fd, len, FD_WRITE);
++    ++statCounter.syscalls.sock.writes;
++    // After each successful partial write,
++    // reset fde::writeStart to the current time.
++    fd_table[fd].writeStart = squid_curtime;
+ 
+ #if USE_DELAY_POOLS
++    ClientInfo * clientInfo=fd_table[fd].clientInfo;
++
++    if (clientInfo &amp;&amp; !clientInfo-&gt;writeLimitingActive)
++        clientInfo = NULL; // we only care about quota limits here
++
+     if (clientInfo) {
+         if (len &gt; 0) {
+             /* we wrote data - drain them from bucket */
+             clientInfo-&gt;bucketSize -= len;
+             if (clientInfo-&gt;bucketSize &lt; 0.0) {
+-                debugs(5, DBG_IMPORTANT, HERE &lt;&lt; &quot;drained too much&quot;); // should not happen
++                debugs(5, DBG_IMPORTANT, &quot;FD &quot; &lt;&lt; fd &lt;&lt; &quot; drained too much&quot;); // should not happen
+                 clientInfo-&gt;bucketSize = 0;
+             }
+         }
+ 
+         // even if we wrote nothing, we were served; give others a chance
+         clientInfo-&gt;kickQuotaQueue();
+     }
+ #endif /* USE_DELAY_POOLS */
++}
+ 
+-    fd_bytes(fd, len, FD_WRITE);
+-    ++statCounter.syscalls.sock.writes;
+-    // After each successful partial write,
+-    // reset fde::writeStart to the current time.
+-    fd_table[fd].writeStart = squid_curtime;
++/** Write to FD.
++ * This function is used by the lowest level of IO loop which only has access to FD numbers.
++ * We have to use the comm iocb_table to map FD numbers to waiting data and Comm::Connections.
++ * Once the write has been concluded we schedule the waiting call with success/fail results.
++ */
++void
++Comm::HandleWrite(int fd, void *data)
++{
++    Comm::IoCallback *state = static_cast&lt;Comm::IoCallback *&gt;(data);
++    int len = 0;
++    int nleft;
++
++    assert(state-&gt;conn != NULL &amp;&amp; state-&gt;conn-&gt;fd == fd);
++
++    PROF_start(commHandleWrite);
++    debugs(5, 5, HERE &lt;&lt; state-&gt;conn &lt;&lt; &quot;: off &quot; &lt;&lt;
++           (long int) state-&gt;offset &lt;&lt; &quot;, sz &quot; &lt;&lt; (long int) state-&gt;size &lt;&lt; &quot;.&quot;);
++
++    nleft = state-&gt;size - state-&gt;offset;
++
++    /* For legacy callers : Attempt a write */
++    // Keep in sync with Comm::WriteNow()!
++    nleft = delayPoolAdjustWriteSz(nleft, fd);
++    if (nleft &lt; 0)
++        return;
++
++    /* actually WRITE data */
++    len = FD_WRITE_METHOD(fd, state-&gt;buf + state-&gt;offset, nleft);
++    debugs(5, 5, HERE &lt;&lt; &quot;write() returns &quot; &lt;&lt; len);
++    countWritten(fd, len);
+ 
+     if (len == 0) {
+         /* Note we even call write if nleft == 0 */
+         /* We're done */
+         if (nleft != 0)
+             debugs(5, DBG_IMPORTANT, &quot;FD &quot; &lt;&lt; fd &lt;&lt; &quot; write failure: connection closed with &quot; &lt;&lt; nleft &lt;&lt; &quot; bytes remaining.&quot;);
+ 
+         state-&gt;finish(nleft ? Comm::COMM_ERROR : Comm::OK, errno);
+     } else if (len &lt; 0) {
+         /* An error */
+-        if (fd_table[fd].flags.socket_eof) {
+-            debugs(50, 2, HERE &lt;&lt; &quot;FD &quot; &lt;&lt; fd &lt;&lt; &quot; write failure: &quot; &lt;&lt; xstrerror() &lt;&lt; &quot;.&quot;);
+-            state-&gt;finish(nleft ? Comm::COMM_ERROR : Comm::OK, errno);
+-        } else if (ignoreErrno(errno)) {
++        if (!fd_table[fd].flags.socket_eof &amp;&amp; ignoreErrno(errno)) {
+             debugs(50, 9, HERE &lt;&lt; &quot;FD &quot; &lt;&lt; fd &lt;&lt; &quot; write failure: &quot; &lt;&lt; xstrerror() &lt;&lt; &quot;.&quot;);
+             state-&gt;selectOrQueueWrite();
+         } else {
+             debugs(50, 2, HERE &lt;&lt; &quot;FD &quot; &lt;&lt; fd &lt;&lt; &quot; write failure: &quot; &lt;&lt; xstrerror() &lt;&lt; &quot;.&quot;);
+             state-&gt;finish(nleft ? Comm::COMM_ERROR : Comm::OK, errno);
+         }
+     } else {
+         /* A successful write, continue */
+         state-&gt;offset += len;
+ 
+         if (state-&gt;offset &lt; state-&gt;size) {
+             /* Not done, reinstall the write handler and write some more */
+             state-&gt;selectOrQueueWrite();
+         } else {
+             state-&gt;finish(nleft ? Comm::OK : Comm::COMM_ERROR, errno);
+         }
+     }
+ 
+     PROF_stop(commHandleWrite);
+ }
++
++Comm::Flag
++Comm::WriteNow(CommIoCbParams &amp;params, SBuf &amp;buf)
++{
++    int nleft = delayPoolAdjustWriteSz(buf.length(), params.fd);
++    if (nleft &lt; 0) {
++        return (params.flag = Comm::INPROGRESS);
++    }
++
++    /* actually WRITE data */
++    errno = 0;
++    int len = FD_WRITE_METHOD(params.fd, buf.rawContent(), nleft);
++    params.xerrno = errno;
++    debugs(5, 5, &quot;write() returns &quot; &lt;&lt; len);
++    countWritten(params.fd, len);
++
++    if (len == 0) {
++        /* Note we even call write if nleft == 0 */
++        /* We're done */
++        if (nleft != 0)
++            debugs(5, DBG_IMPORTANT, &quot;FD &quot; &lt;&lt; params.fd &lt;&lt; &quot; write failure: connection closed with &quot; &lt;&lt; nleft &lt;&lt; &quot; bytes remaining.&quot;);
++
++        params.flag = (nleft ? Comm::COMM_ERROR : Comm::OK);
++
++    } else if (len &lt; 0) {
++        /* An error */
++        if (!fd_table[params.fd].flags.socket_eof &amp;&amp; ignoreErrno(params.xerrno)) {
++            debugs(50, 9, &quot;FD &quot; &lt;&lt; params.fd &lt;&lt; &quot; write failure: &quot; &lt;&lt; xstrerror() &lt;&lt; &quot;.&quot;);
++            params.flag = Comm::INPROGRESS;
++        } else {
++            debugs(50, 2, &quot;FD &quot; &lt;&lt; params.fd &lt;&lt; &quot; write failure: &quot; &lt;&lt; xstrerror() &lt;&lt; &quot;.&quot;);
++            params.flag = (nleft ? Comm::COMM_ERROR : Comm::OK);
++        }
++    } else {
++        /* A successful write, consume buffer content */
++        params.flag = Comm::OK;
++        buf.consume(len);
++    }
++
++    return params.flag;
++}
+
+=== modified file 'src/comm/Write.h'
+--- src/comm/Write.h	2014-09-13 13:59:43 +0000
++++ src/comm/Write.h	2014-10-23 04:45:25 +0000
+@@ -1,42 +1,70 @@
+ /*
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef _SQUID_COMM_IOWRITE_H
+ #define _SQUID_COMM_IOWRITE_H
+ 
+ #include &quot;base/AsyncCall.h&quot;
++#include &quot;comm/Flag.h&quot;
+ #include &quot;comm/forward.h&quot;
+ #include &quot;typedefs.h&quot;
+ 
++class CommIoCbParams;
+ class MemBuf;
++class SBuf;
++
+ namespace Comm
+ {
+ 
+ /**
++ * Start monitoring for write.
++ *
++ * callback is scheduled when the write is possible,
++ * or on file descriptor close.
++ */
++void Write(const Comm::ConnectionPointer &amp;conn, AsyncCall::Pointer &amp;callback);
++
++/// whether the FD socket is being monitored for write
++bool MonitorsWrite(int fd);
++
++/**
++ * Perform a write(2) on a connection immediately.
++ *
++ * The returned flag is also placed in params.flag.
++ *
++ * \retval Comm::OK          data has been written and placed in buf, amount in params.size
++ * \retval Comm::COMM_ERROR  an error occured, the code is placed in params.xerrno
++ * \retval Comm::INPROGRESS  unable to write at this time, or a minor error occured
++ */
++Comm::Flag WriteNow(CommIoCbParams &amp;params, SBuf &amp;buf);
++
++/**
+  * Queue a write. callback is scheduled when the write
+  * completes, on error, or on file descriptor close.
+  *
+  * free_func is used to free the passed buffer when the write has completed.
++ * \deprecated use bufferless Comm::Write() API instead.
+  */
+ void Write(const Comm::ConnectionPointer &amp;conn, const char *buf, int size, AsyncCall::Pointer &amp;callback, FREE *free_func);
+ 
+ /**
+  * Queue a write. callback is scheduled when the write
+  * completes, on error, or on file descriptor close.
++ * \deprecated use bufferless Comm::Write() API instead.
+  */
+ void Write(const Comm::ConnectionPointer &amp;conn, MemBuf *mb, AsyncCall::Pointer &amp;callback);
+ 
+ /// Cancel the write pending on FD. No action if none pending.
+ void WriteCancel(const Comm::ConnectionPointer &amp;conn, const char *reason);
+ 
+ // callback handler to process an FD which is available for writing.
+ extern PF HandleWrite;
+ 
+ } // namespace Comm
+ 
+ #endif /* _SQUID_COMM_IOWRITE_H */
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000180.html">[squid-dev] Jenkins build is back to normal :	3.HEAD-amd64-centos-7-clang #62
+</A></li>
+	<LI>Next message: <A HREF="000187.html">[squid-dev] Build failed in Jenkins: 3.HEAD-amd64-centos-7-clang #63
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#184">[ date ]</a>
+              <a href="thread.html#184">[ thread ]</a>
+              <a href="subject.html#184">[ subject ]</a>
+              <a href="author.html#184">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

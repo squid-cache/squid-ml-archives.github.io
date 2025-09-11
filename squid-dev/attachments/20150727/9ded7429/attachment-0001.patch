@@ -1,0 +1,430 @@
+# Bazaar merge directive format 2 (Bazaar 0.90)
+# revision_id: kinkie@squid-cache.org-20150727163157-k7m51vbphllf5w7f
+# target_branch: file:///home/kinkie/squid/workspace/trunk/
+# testament_sha1: a22d9ee4ac41a348ffd9d4749118985db7b8112d
+# timestamp: 2015-07-27 18:32:19 +0200
+# base_revision_id: kinkie@squid-cache.org-20150727154235-\
+#   laysak37yrb6qzdu
+# 
+# Begin patch
+=== modified file 'src/Makefile.am'
+--- src/Makefile.am	2015-07-21 13:56:20 +0000
++++ src/Makefile.am	2015-07-27 16:25:09 +0000
+@@ -917,7 +917,8 @@
+ 	tests/testSBuf \
+ 	tests/testSBufList \
+ 	tests/testConfigParser \
+-	tests/testStatHist
++	tests/testStatHist \
++	tests/testLookupTable
+ 
+ if HAVE_FS_ROCK
+ check_PROGRAMS += tests/testRock
+@@ -3655,6 +3656,24 @@
+ 	$(COMPAT_LIB)
+ tests_testStatHist_DEPENDENCIES = $(SQUID_CPPUNIT_LA)
+ 
++tests_testLookupTable_SOURCES = \
++	tests/testLookupTable.h \
++	tests/testLookupTable.cc \
++	tests/stub_debug.cc \
++	tests/stub_libmem.cc \
++	tests/stub_SBufDetailedStats.cc \
++	base/LookupTable.h \
++	String.cc \
++	$(SBUF_SOURCE)
++nodist_tests_testLookupTable_SOURCES = $(TESTSOURCES)
++tests_testLookupTable_LDFLAGS = $(LIBADD_DL)
++tests_testLookupTable_LDADD = \
++	base/libbase.la \
++	$(SQUID_CPPUNIT_LIBS) \
++	$(COMPAT_LIB) \
++	$(XTRA_LIBS)
++tests_testLookupTable_DEPENDENCIES = $(SQUID_CPPUNIT_LA)
++
+ TESTS += testHeaders
+ 
+ ## Special Universal .h dependency test script
+
+=== modified file 'src/auth/digest/Config.cc'
+--- src/auth/digest/Config.cc	2015-06-05 05:56:36 +0000
++++ src/auth/digest/Config.cc	2015-07-27 16:31:57 +0000
+@@ -19,6 +19,7 @@
+ #include "auth/digest/UserRequest.h"
+ #include "auth/Gadgets.h"
+ #include "auth/State.h"
++#include "base/LookupTable.h"
+ #include "base64.h"
+ #include "cache_cf.h"
+ #include "event.h"
+@@ -60,23 +61,25 @@
+     DIGEST_NC,
+     DIGEST_CNONCE,
+     DIGEST_RESPONSE,
+-    DIGEST_ENUM_END
+-};
+-
+-static const HttpHeaderFieldAttrs DigestAttrs[DIGEST_ENUM_END] = {
+-    HttpHeaderFieldAttrs("username",  (http_hdr_type)DIGEST_USERNAME),
+-    HttpHeaderFieldAttrs("realm", (http_hdr_type)DIGEST_REALM),
+-    HttpHeaderFieldAttrs("qop", (http_hdr_type)DIGEST_QOP),
+-    HttpHeaderFieldAttrs("algorithm", (http_hdr_type)DIGEST_ALGORITHM),
+-    HttpHeaderFieldAttrs("uri", (http_hdr_type)DIGEST_URI),
+-    HttpHeaderFieldAttrs("nonce", (http_hdr_type)DIGEST_NONCE),
+-    HttpHeaderFieldAttrs("nc", (http_hdr_type)DIGEST_NC),
+-    HttpHeaderFieldAttrs("cnonce", (http_hdr_type)DIGEST_CNONCE),
+-    HttpHeaderFieldAttrs("response", (http_hdr_type)DIGEST_RESPONSE),
+-};
+-
+-class HttpHeaderFieldInfo;
+-static HttpHeaderFieldInfo *DigestFieldsInfo = NULL;
++    DIGEST_INVALID_ATTR
++};
++
++static const LookupTable<http_digest_attr_type>::Record
++  DigestAttrs[] = {
++    {"username", DIGEST_USERNAME},
++    {"realm", DIGEST_REALM},
++    {"qop", DIGEST_QOP},
++    {"algorithm", DIGEST_ALGORITHM},
++    {"uri", DIGEST_URI},
++    {"nonce", DIGEST_NONCE},
++    {"nc", DIGEST_NC},
++    {"cnonce", DIGEST_CNONCE},
++    {"response", DIGEST_RESPONSE},
++    {nullptr, DIGEST_INVALID_ATTR}
++};
++
++LookupTable<http_digest_attr_type>
++DigestFieldsLookupTable(DIGEST_INVALID_ATTR, DigestAttrs);
+ 
+ /*
+  *
+@@ -545,7 +548,6 @@
+ Auth::Digest::Config::init(Auth::Config *)
+ {
+     if (authenticateProgram) {
+-        DigestFieldsInfo = httpHeaderBuildFieldsInfo(DigestAttrs, DIGEST_ENUM_END);
+         authenticateDigestNonceSetup();
+         authdigest_initialised = 1;
+ 
+@@ -581,11 +583,6 @@
+     if (digestauthenticators)
+         helperShutdown(digestauthenticators);
+ 
+-    if (DigestFieldsInfo) {
+-        httpHeaderDestroyFieldsInfo(DigestFieldsInfo, DIGEST_ENUM_END);
+-        DigestFieldsInfo = NULL;
+-    }
+-
+     if (!shutting_down)
+         return;
+ 
+@@ -815,7 +812,7 @@
+         }
+ 
+         /* find type */
+-        http_digest_attr_type t = (http_digest_attr_type)httpHeaderIdByName(item, nlen, DigestFieldsInfo, DIGEST_ENUM_END);
++        const http_digest_attr_type t = DigestFieldsLookupTable.lookup(keyName);
+ 
+         switch (t) {
+         case DIGEST_USERNAME:
+
+=== added file 'src/base/LookupTable.h'
+--- src/base/LookupTable.h	1970-01-01 00:00:00 +0000
++++ src/base/LookupTable.h	2015-07-27 16:25:09 +0000
+@@ -0,0 +1,62 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_LOOKUPTABLE_H_
++#define SQUID_LOOKUPTABLE_H_
++
++#include "SBuf.h"
++
++#include <map>
++
++/**
++ * SBuf -> enum lookup table
++ *
++ * How to use:
++ * enum enum_type { ... };
++ * static const LookupTable<enum_type>::Record initializerTable[] {
++ *   {"key1", ENUM_1}, {"key2", ENUM_2}, ... {nullptr, ENUM_INVALID_VALUE}
++ * };
++ * LookupTable<enum_type> lookupTableInstance(ENUM_INVALID_VALUE, initializerTable);
++ *
++ * then in the code:
++ * SBuf s(string_to_lookup);
++ * enum_type item = lookupTableInstance.lookup(s);
++ * if (item != ENUM_INVALID_VALUE) { // do stuff }
++ *
++ */
++template<typename EnumType>
++class LookupTable
++{
++public:
++    /// element of the lookup table initialization list
++    typedef struct {
++        const char *name;
++        EnumType id;
++    } Record;
++
++    LookupTable(const EnumType theInvalid, const Record data[]) :
++        invalidValue(theInvalid)
++    {
++        for (auto i = 0; data[i].name != nullptr; ++i) {
++            lookupTable[SBuf(data[i].name)] = data[i].id;
++        }
++    }
++    EnumType lookup(const SBuf &key) const {
++        auto r = lookupTable.find(key);
++        if (r == lookupTable.end())
++            return invalidValue;
++        return r->second;
++    }
++
++private:
++    typedef std::map<const SBuf, EnumType> lookupTable_t;
++    lookupTable_t lookupTable;
++    EnumType invalidValue;
++};
++
++#endif /* SQUID_LOOKUPTABLE_H_ */
+
+=== modified file 'src/base/Makefile.am'
+--- src/base/Makefile.am	2015-03-03 09:45:37 +0000
++++ src/base/Makefile.am	2015-07-27 09:30:32 +0000
+@@ -25,6 +25,7 @@
+ 	CharacterSet.cc \
+ 	InstanceId.h \
+ 	Lock.h \
++	LookupTable.h \
+ 	LruMap.h \
+ 	Packable.h \
+ 	RunnersRegistry.cc \
+
+=== added file 'src/tests/testLookupTable.cc'
+--- src/tests/testLookupTable.cc	1970-01-01 00:00:00 +0000
++++ src/tests/testLookupTable.cc	2015-07-27 16:25:09 +0000
+@@ -0,0 +1,53 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "base/LookupTable.h"
++#include "testLookupTable.h"
++#include "unitTestMain.h"
++
++CPPUNIT_TEST_SUITE_REGISTRATION( testLookupTable );
++
++enum EnumData {
++    ENUM_1,
++    ENUM_2,
++    ENUM_3,
++    ENUM_4,
++    ENUM_5,
++    ENUM_6,
++    ENUM_7,
++    ENUM_INVALID
++};
++
++static const LookupTable<EnumData>::Record tableData[] = {
++                {"one", ENUM_1},
++                {"two", ENUM_2},
++                {"three", ENUM_3},
++                {"four", ENUM_4},
++                {"five", ENUM_5},
++                {"six", ENUM_6},
++                {"seven", ENUM_7},
++                {nullptr, ENUM_INVALID}
++};
++
++void
++testLookupTable::testLookupTableLookup()
++{
++    LookupTable<EnumData> lt(ENUM_INVALID, tableData);
++    // element found
++    CPPUNIT_ASSERT_EQUAL(lt.lookup(SBuf("one")), ENUM_1);
++    CPPUNIT_ASSERT_EQUAL(lt.lookup(SBuf("two")), ENUM_2);
++    CPPUNIT_ASSERT_EQUAL(lt.lookup(SBuf("three")), ENUM_3);
++    CPPUNIT_ASSERT_EQUAL(lt.lookup(SBuf("four")), ENUM_4);
++    CPPUNIT_ASSERT_EQUAL(lt.lookup(SBuf("five")), ENUM_5);
++    CPPUNIT_ASSERT_EQUAL(lt.lookup(SBuf("six")), ENUM_6);
++    CPPUNIT_ASSERT_EQUAL(lt.lookup(SBuf("seven")), ENUM_7);
++
++    // element not found
++    CPPUNIT_ASSERT_EQUAL(lt.lookup(SBuf("eleventy")), ENUM_INVALID);
++}
+
+=== added file 'src/tests/testLookupTable.h'
+--- src/tests/testLookupTable.h	1970-01-01 00:00:00 +0000
++++ src/tests/testLookupTable.h	2015-07-27 16:25:09 +0000
+@@ -0,0 +1,23 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_TESTLOOKUPTABLE_H_
++#define SQUID_TESTLOOKUPTABLE_H_
++
++#include <cppunit/extensions/HelperMacros.h>
++
++class testLookupTable : public CPPUNIT_NS::TestFixture
++{
++    CPPUNIT_TEST_SUITE( testLookupTable );
++    CPPUNIT_TEST( testLookupTableLookup );
++    CPPUNIT_TEST_SUITE_END();
++public:
++    void testLookupTableLookup();
++};
++
++#endif /* SQUID_TESTLOOKUPTABLE_H_ */
+
+# Begin bundle
+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
+8vJ7tutzr6VIxWf+LuSKcKEhvh9U/A==

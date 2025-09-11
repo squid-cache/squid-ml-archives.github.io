@@ -1,0 +1,1386 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] PeerConnector shuffling to libsecurity
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20PeerConnector%20shuffling%20to%20libsecurity&In-Reply-To=%3C570F8BA4.30505%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005588.html">
+   <LINK REL="Next"  HREF="005599.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] PeerConnector shuffling to libsecurity</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20PeerConnector%20shuffling%20to%20libsecurity&In-Reply-To=%3C570F8BA4.30505%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] PeerConnector shuffling to libsecurity">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Thu Apr 14 12:23:00 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005588.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » gcc,d-ubuntu-vivid #614
+</A></li>
+        <LI>Next message: <A HREF="005599.html">[squid-dev] [PATCH] PeerConnector shuffling to libsecurity
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5596">[ date ]</a>
+              <a href="thread.html#5596">[ thread ]</a>
+              <a href="subject.html#5596">[ subject ]</a>
+              <a href="author.html#5596">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I have used the term Encryptor rather than Connector because these Job
+classes require an pre-opened connection over some other transport and
+just initiate encryption for it (be it raw TCP, PROXY, HTTP CONNECT or
+other). Not starting from a closed connection.
+
+This patch shuffles the Ssl::PeerConnector to Security::TlsPeerEncryptor
+and Ssl::BlindPeerConnector to Security::BlindTlsPeerEncryptor.
+
+As libsecurity API classes both are now always built. But in the absence
+of OpenSSL they currently are expected to result in an error just as if
+crypto had failed. At present the classes should still only be actually
+used from within code wrapped in USE_OPENSSL. So that is not easily
+testable.
+
+To do this in a minimal way I had to also shuffle the BIO type
+enumeration out to the namespace level. That seems not to have had any
+significant effect.
+
+
+This shuffling is a required step to simplify converting the basic TLS
+I/O logic to libsecurity and for GnuTLS to actually begin adding useful
+implementation bits.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2016-03-12 20:27:35 +0000
++++ src/FwdState.cc	2016-04-05 09:05:34 +0000
+@@ -45,9 +45,9 @@
+ #include &quot;pconn.h&quot;
+ #include &quot;PeerPoolMgr.h&quot;
+ #include &quot;PeerSelectState.h&quot;
++#include &quot;security/BlindTlsPeerEncryptor.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ #include &quot;SquidTime.h&quot;
+-#include &quot;ssl/BlindPeerConnector.h&quot;
+ #include &quot;ssl/PeekingPeerConnector.h&quot;
+ #include &quot;Store.h&quot;
+ #include &quot;StoreClient.h&quot;
+@@ -79,7 +79,7 @@
+ CBDATA_CLASS_INIT(FwdState);
+ 
+ #if USE_OPENSSL
+-class FwdStatePeerAnswerDialer: public CallDialer, public Ssl::PeerConnector::CbDialer
++class FwdStatePeerAnswerDialer: public CallDialer, public Security::TlsPeerEncryptor::CbDialer
+ {
+ public:
+     typedef void (FwdState::*Method)(Security::EncryptorAnswer &amp;);
+@@ -94,7 +94,7 @@
+         os &lt;&lt; '(' &lt;&lt; fwd_.get() &lt;&lt; &quot;, &quot; &lt;&lt; answer_ &lt;&lt; ')';
+     }
+ 
+-    /* Ssl::PeerConnector::CbDialer API */
++    /* Security::TlsPeerEncryptor::CbDialer API */
+     virtual Security::EncryptorAnswer &amp;answer() { return answer_; }
+ 
+ private:
+@@ -700,11 +700,11 @@
+                                                     FwdStatePeerAnswerDialer(&amp;FwdState::connectedToPeer, this));
+             // Use positive timeout when less than one second is left.
+             const time_t sslNegotiationTimeout = max(static_cast&lt;time_t&gt;(1), timeLeft());
+-            Ssl::PeerConnector *connector = NULL;
++            Security::TlsPeerEncryptor *connector = nullptr;
+             if (request-&gt;flags.sslPeek)
+                 connector = new Ssl::PeekingPeerConnector(requestPointer, serverConnection(), clientConn, callback, al, sslNegotiationTimeout);
+             else
+-                connector = new Ssl::BlindPeerConnector(requestPointer, serverConnection(), callback, al, sslNegotiationTimeout);
++                connector = new Security::BlindTlsPeerEncryptor(requestPointer, serverConnection(), callback, al, sslNegotiationTimeout);
+             AsyncJob::Start(connector); // will call our callback
+             return;
+         }
+
+=== modified file 'src/PeerPoolMgr.cc'
+--- src/PeerPoolMgr.cc	2016-02-02 15:39:23 +0000
++++ src/PeerPoolMgr.cc	2016-04-06 03:27:32 +0000
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include &quot;squid.h&quot;
++#include &quot;AccessLogEntry.h&quot;
+ #include &quot;base/AsyncJobCalls.h&quot;
+ #include &quot;base/RunnersRegistry.h&quot;
+ #include &quot;CachePeer.h&quot;
+@@ -20,22 +21,22 @@
+ #include &quot;neighbors.h&quot;
+ #include &quot;pconn.h&quot;
+ #include &quot;PeerPoolMgr.h&quot;
++#include &quot;security/BlindTlsPeerEncryptor.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ #include &quot;SquidTime.h&quot;
+-#include &quot;ssl/BlindPeerConnector.h&quot;
+ 
+ CBDATA_CLASS_INIT(PeerPoolMgr);
+ 
+-#if USE_OPENSSL
+-/// Gives Ssl::PeerConnector access to Answer in the PeerPoolMgr callback dialer.
++#if USE_OPENSSL || USE_GNUTLS
++/// Gives Security::TlsPeerEncryptor access to Answer in the PeerPoolMgr callback dialer.
+ class MyAnswerDialer: public UnaryMemFunT&lt;PeerPoolMgr, Security::EncryptorAnswer, Security::EncryptorAnswer&amp;&gt;,
+-    public Ssl::PeerConnector::CbDialer
++    public Security::TlsPeerEncryptor::CbDialer
+ {
+ public:
+     MyAnswerDialer(const JobPointer &amp;aJob, Method aMethod):
+         UnaryMemFunT&lt;PeerPoolMgr, Security::EncryptorAnswer, Security::EncryptorAnswer&amp;&gt;(aJob, aMethod, Security::EncryptorAnswer()) {}
+ 
+-    /* Ssl::PeerConnector::CbDialer API */
++    /* Security::TlsPeerEncryptor::CbDialer API */
+     virtual Security::EncryptorAnswer &amp;answer() { return arg1; }
+ };
+ #endif
+@@ -109,7 +110,7 @@
+ 
+     Must(params.conn != NULL);
+ 
+-#if USE_OPENSSL
++#if USE_OPENSSL || USE_GNUTLS
+     // Handle SSL peers.
+     if (peer-&gt;secure.encryptTransport) {
+         typedef CommCbMemFunT&lt;PeerPoolMgr, CommCloseCbParams&gt; CloserDialer;
+@@ -125,8 +126,8 @@
+         const int timeUsed = squid_curtime - params.conn-&gt;startTime();
+         // Use positive timeout when less than one second is left for conn.
+         const int timeLeft = max(1, (peerTimeout - timeUsed));
+-        Ssl::BlindPeerConnector *connector =
+-            new Ssl::BlindPeerConnector(request, params.conn, securer, NULL, timeLeft);
++        Security::BlindTlsPeerEncryptor *connector =
++            new Security::BlindTlsPeerEncryptor(request, params.conn, securer, NULL, timeLeft);
+         AsyncJob::Start(connector); // will call our callback
+         return;
+     }
+
+=== modified file 'src/PeerPoolMgr.h'
+--- src/PeerPoolMgr.h	2016-01-01 00:12:18 +0000
++++ src/PeerPoolMgr.h	2016-03-14 06:22:12 +0000
+@@ -51,7 +51,7 @@
+     /// Comm::ConnOpener calls this when done opening a connection for us
+     void handleOpenedConnection(const CommConnectCbParams &amp;params);
+ 
+-    /// Ssl::PeerConnector callback
++    /// Security::TlsPeerEncryptor callback
+     void handleSecuredPeer(Security::EncryptorAnswer &amp;answer);
+ 
+     /// called when the connection we are trying to secure is closed by a 3rd party
+
+=== modified file 'src/adaptation/icap/Xaction.cc'
+--- src/adaptation/icap/Xaction.cc	2016-02-02 15:39:23 +0000
++++ src/adaptation/icap/Xaction.cc	2016-03-25 13:18:06 +0000
+@@ -34,22 +34,22 @@
+ #include &quot;SquidTime.h&quot;
+ 
+ #if USE_OPENSSL
+-/// Gives Ssl::PeerConnector access to Answer in the PeerPoolMgr callback dialer.
++/// Gives Security::TlsPeerEncryptor access to Answer in the PeerPoolMgr callback dialer.
+ class MyIcapAnswerDialer: public UnaryMemFunT&lt;Adaptation::Icap::Xaction, Security::EncryptorAnswer, Security::EncryptorAnswer&amp;&gt;,
+-    public Ssl::PeerConnector::CbDialer
++    public Security::TlsPeerEncryptor::CbDialer
+ {
+ public:
+     MyIcapAnswerDialer(const JobPointer &amp;aJob, Method aMethod):
+         UnaryMemFunT&lt;Adaptation::Icap::Xaction, Security::EncryptorAnswer, Security::EncryptorAnswer&amp;&gt;(aJob, aMethod, Security::EncryptorAnswer()) {}
+ 
+-    /* Ssl::PeerConnector::CbDialer API */
++    /* Security::TlsPeerEncryptor::CbDialer API */
+     virtual Security::EncryptorAnswer &amp;answer() { return arg1; }
+ };
+ 
+ namespace Ssl
+ {
+ /// A simple PeerConnector for Secure ICAP services. No SslBump capabilities.
+-class IcapPeerConnector: public PeerConnector {
++class IcapPeerConnector: public Security::TlsPeerEncryptor {
+     CBDATA_CLASS(IcapPeerConnector);
+ public:
+     IcapPeerConnector(
+@@ -59,9 +59,9 @@
+         AccessLogEntry::Pointer const &amp;alp,
+         const time_t timeout = 0):
+         AsyncJob(&quot;Ssl::IcapPeerConnector&quot;),
+-        PeerConnector(aServerConn, aCallback, alp, timeout), icapService(service) {}
++        Security::TlsPeerEncryptor(aServerConn, aCallback, alp, timeout), icapService(service) {}
+ 
+-    /* PeerConnector API */
++    /* Security::TlsPeerEncryptor API */
+     virtual Security::SessionPtr initializeSsl();
+     virtual void noteNegotiationDone(ErrorState *error);
+     virtual Security::ContextPtr getSslContext() {return icapService-&gt;sslContext;}
+@@ -311,7 +311,6 @@
+         securer = asyncCall(93, 4, &quot;Adaptation::Icap::Xaction::handleSecuredPeer&quot;,
+                             MyIcapAnswerDialer(me, &amp;Adaptation::Icap::Xaction::handleSecuredPeer));
+ 
+-        Ssl::PeerConnector::HttpRequestPointer tmpReq(NULL);
+         Ssl::IcapPeerConnector *sslConnector =
+             new Ssl::IcapPeerConnector(theService, io.conn, securer, masterLogEntry(), TheConfig.connect_timeout(service().cfg().bypass));
+         AsyncJob::Start(sslConnector); // will call our callback
+@@ -713,7 +712,7 @@
+ Security::SessionPtr
+ Ssl::IcapPeerConnector::initializeSsl()
+ {
+-    auto ssl = Ssl::PeerConnector::initializeSsl();
++    auto ssl = Security::TlsPeerEncryptor::initializeSsl();
+     if (!ssl)
+         return nullptr;
+ 
+
+=== modified file 'src/adaptation/icap/Xaction.h'
+--- src/adaptation/icap/Xaction.h	2016-02-23 08:51:22 +0000
++++ src/adaptation/icap/Xaction.h	2016-03-19 06:11:03 +0000
+@@ -16,9 +16,7 @@
+ #include &quot;HttpReply.h&quot;
+ #include &quot;ipcache.h&quot;
+ #include &quot;sbuf/SBuf.h&quot;
+-#if USE_OPENSSL
+-#include &quot;ssl/PeerConnector.h&quot;
+-#endif
++#include &quot;security/TlsPeerEncryptor.h&quot;
+ 
+ class MemBuf;
+ 
+
+=== modified file 'src/ipc/mem/Segment.cc'
+--- src/ipc/mem/Segment.cc	2016-04-08 07:35:47 +0000
++++ src/ipc/mem/Segment.cc	2016-04-12 11:33:20 +0000
+@@ -216,7 +216,7 @@
+     if (mlock(theMem, theSize) != 0) {
+         const int savedError = errno;
+         fatalf(&quot;shared_memory_locking on but failed to mlock(%s, %&quot; PRId64 &quot;): %s\n&quot;,
+-               theName.termedBuf(),static_cast&lt;int64_t&gt;(theSize), xstrerr(savedError));
++               theName.termedBuf(), static_cast&lt;int64_t&gt;(theSize), xstrerr(savedError));
+     }
+     // TODO: Warn if it took too long.
+     debugs(54, 7, &quot;mlock(&quot; &lt;&lt; theName &lt;&lt; ',' &lt;&lt; theSize &lt;&lt; &quot;) OK&quot;);
+
+=== renamed file 'src/ssl/BlindPeerConnector.cc' =&gt; 'src/security/BlindTlsPeerEncryptor.cc'
+--- src/ssl/BlindPeerConnector.cc	2016-01-27 16:56:38 +0000
++++ src/security/BlindTlsPeerEncryptor.cc	2016-04-04 23:13:47 +0000
+@@ -9,17 +9,18 @@
+ #include &quot;squid.h&quot;
+ #include &quot;CachePeer.h&quot;
+ #include &quot;comm/Connection.h&quot;
++#include &quot;errorpage.h&quot;
+ #include &quot;fde.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;neighbors.h&quot;
++#include &quot;security/BlindTlsPeerEncryptor.h&quot;
+ #include &quot;security/NegotiationHistory.h&quot;
+ #include &quot;SquidConfig.h&quot;
+-#include &quot;ssl/BlindPeerConnector.h&quot;
+ 
+-CBDATA_NAMESPACED_CLASS_INIT(Ssl, BlindPeerConnector);
++CBDATA_NAMESPACED_CLASS_INIT(Security, BlindTlsPeerEncryptor);
+ 
+ Security::ContextPtr
+-Ssl::BlindPeerConnector::getSslContext()
++Security::BlindTlsPeerEncryptor::getSslContext()
+ {
+     if (const CachePeer *peer = serverConnection()-&gt;getPeer()) {
+         assert(peer-&gt;secure.encryptTransport);
+@@ -30,9 +31,9 @@
+ }
+ 
+ Security::SessionPtr
+-Ssl::BlindPeerConnector::initializeSsl()
++Security::BlindTlsPeerEncryptor::initializeSsl()
+ {
+-    auto ssl = Ssl::PeerConnector::initializeSsl();
++    auto ssl = Security::TlsPeerEncryptor::initializeSsl();
+     if (!ssl)
+         return nullptr;
+ 
+@@ -42,22 +43,31 @@
+         // NP: domain may be a raw-IP but it is now always set
+         assert(!peer-&gt;secure.sslDomain.isEmpty());
+ 
++#if USE_OPENSSL
+         // const loss is okay here, ssl_ex_index_server is only read and not assigned a destructor
+         SBuf *host = new SBuf(peer-&gt;secure.sslDomain);
+         SSL_set_ex_data(ssl, ssl_ex_index_server, host);
+ 
+         if (peer-&gt;sslSession)
+             SSL_set_session(ssl, peer-&gt;sslSession);
++#elif USE_GNUTLS
++        // TODO
++#endif
++
+     } else {
++#if USE_OPENSSL
+         SBuf *hostName = new SBuf(request-&gt;url.host());
+         SSL_set_ex_data(ssl, ssl_ex_index_server, (void*)hostName);
++#elif USE_GNUTLS
++        // TODO
++#endif
+     }
+ 
+     return ssl;
+ }
+ 
+ void
+-Ssl::BlindPeerConnector::noteNegotiationDone(ErrorState *error)
++Security::BlindTlsPeerEncryptor::noteNegotiationDone(ErrorState *error)
+ {
+     if (error) {
+         // XXX: forward.cc calls peerConnectSucceeded() after an OK TCP connect but
+@@ -69,14 +79,21 @@
+             peerConnectFailed(p);
+         return;
+     }
+-
++#if USE_OPENSSL || USE_GNUTLS
+     const int fd = serverConnection()-&gt;fd;
+     Security::SessionPtr ssl = fd_table[fd].ssl.get();
++#endif
++#if USE_OPENSSL
+     if (serverConnection()-&gt;getPeer() &amp;&amp; !SSL_session_reused(ssl)) {
+         if (serverConnection()-&gt;getPeer()-&gt;sslSession)
+             SSL_SESSION_free(serverConnection()-&gt;getPeer()-&gt;sslSession);
+ 
+         serverConnection()-&gt;getPeer()-&gt;sslSession = SSL_get1_session(ssl);
+     }
++#elif USE_GNUTLS
++    if (serverConnection()-&gt;getPeer() &amp;&amp; !gnutls_session_is_resumed(ssl)) {
++        // TODO
++    }
++#endif
+ }
+ 
+
+=== renamed file 'src/ssl/BlindPeerConnector.h' =&gt; 'src/security/BlindTlsPeerEncryptor.h'
+--- src/ssl/BlindPeerConnector.h	2016-02-02 15:39:23 +0000
++++ src/security/BlindTlsPeerEncryptor.h	2016-04-04 23:12:23 +0000
+@@ -6,47 +6,46 @@
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+-#ifndef SQUID_SRC_SSL_BLINDPEERCONNECTOR_H
+-#define SQUID_SRC_SSL_BLINDPEERCONNECTOR_H
+-
+-#include &quot;ssl/PeerConnector.h&quot;
+-
+-#if USE_OPENSSL
+-
+-namespace Ssl
++#ifndef SQUID_SRC_SECURITY_BLINDTLSPEERENCRYPTOR_H
++#define SQUID_SRC_SECURITY_BLINDTLSPEERENCRYPTOR_H
++
++#include &quot;security/TlsPeerEncryptor.h&quot;
++
++class ErrorState;
++
++namespace Security
+ {
+ 
+ /// A simple PeerConnector for SSL/TLS cache_peers. No SslBump capabilities.
+-class BlindPeerConnector: public PeerConnector {
+-    CBDATA_CLASS(BlindPeerConnector);
++class BlindTlsPeerEncryptor: public Security::TlsPeerEncryptor {
++    CBDATA_CLASS(BlindTlsPeerEncryptor);
+ public:
+-    BlindPeerConnector(HttpRequestPointer &amp;aRequest,
+-                       const Comm::ConnectionPointer &amp;aServerConn,
+-                       AsyncCall::Pointer &amp;aCallback,
+-                       const AccessLogEntryPointer &amp;alp,
+-                       const time_t timeout = 0) :
+-        AsyncJob(&quot;Ssl::BlindPeerConnector&quot;),
+-        PeerConnector(aServerConn, aCallback, alp, timeout)
++    BlindTlsPeerEncryptor(HttpRequestPointer &amp;aRequest,
++                          const Comm::ConnectionPointer &amp;aServerConn,
++                          AsyncCall::Pointer &amp;aCallback,
++                          const AccessLogEntryPointer &amp;alp,
++                          const time_t timeout = 0) :
++        AsyncJob(&quot;Security::BlindTlsPeerEncryptor&quot;),
++        Security::TlsPeerEncryptor(aServerConn, aCallback, alp, timeout)
+     {
+         request = aRequest;
+     }
+ 
+-    /* PeerConnector API */
++    /* Security::TlsPeerEncryptor API */
+ 
+-    /// Calls parent initializeSSL, configure the created SSL object to try reuse SSL session
+-    /// and sets the hostname to use for certificates validation
++    /// Calls parent initializeSSL, configure the created SSL object to try
++    /// reuse TLS session and sets the hostname to use for certificates
++    /// validation
+     virtual Security::SessionPtr initializeSsl();
+ 
+     /// Return the configured Security::ContextPtr object
+     virtual Security::ContextPtr getSslContext();
+ 
+-    /// On error calls peerConnectFailed function, on success store the used SSL session
+-    /// for later use
+-    virtual void noteNegotiationDone(ErrorState *error);
++    /// On error calls peerConnectFailed function, on success store the used
++    /// TLS session for later use
++    virtual void noteNegotiationDone(ErrorState *);
+ };
+ 
+-} // namespace Ssl
+-
+-#endif /* USE_OPENSSL */
+-#endif /* SQUID_SRC_SSL_BLINDPEERCONNECTOR_H */
+-
++} // namespace Security
++
++#endif /* SQUID_SRC_SECURITY_BLINDTLSPEERENCRYPTOR_H */
+
+=== modified file 'src/security/Makefile.am'
+--- src/security/Makefile.am	2016-02-17 21:03:29 +0000
++++ src/security/Makefile.am	2016-03-25 19:32:15 +0000
+@@ -13,6 +13,8 @@
+ noinst_LTLIBRARIES = libsecurity.la
+ 
+ libsecurity_la_SOURCES= \
++	BlindTlsPeerEncryptor.cc \
++	BlindTlsPeerEncryptor.h \
+ 	Context.h \
+ 	EncryptorAnswer.cc \
+ 	EncryptorAnswer.h \
+@@ -26,4 +28,6 @@
+ 	ServerOptions.cc \
+ 	ServerOptions.h \
+ 	Session.cc \
+-	Session.h
++	Session.h \
++	TlsPeerEncryptor.cc \
++	TlsPeerEncryptor.h
+
+=== modified file 'src/security/Session.h'
+--- src/security/Session.h	2016-02-13 12:12:10 +0000
++++ src/security/Session.h	2016-03-27 03:43:31 +0000
+@@ -31,6 +31,10 @@
+ CtoCpp1(SSL_free, SSL *);
+ typedef LockingPointer&lt;SSL, Security::SSL_free_cpp, CRYPTO_LOCK_SSL&gt; SessionPointer;
+ 
++typedef SSL_SESSION* SessionStatePtr;
++CtoCpp1(SSL_SESSION_free, SSL_SESSION *);
++typedef LockingPointer&lt;SSL_SESSION, Security::SSL_SESSION_free_cpp, CRYPTO_LOCK_SSL_SESSION&gt; SessionStatePointer;
++
+ #elif USE_GNUTLS
+ typedef gnutls_session_t SessionPtr;
+ CtoCpp1(gnutls_deinit, gnutls_session_t);
+
+=== renamed file 'src/ssl/PeerConnector.cc' =&gt; 'src/security/TlsPeerEncryptor.cc'
+--- src/ssl/PeerConnector.cc	2016-02-13 07:51:20 +0000
++++ src/security/TlsPeerEncryptor.cc	2016-04-04 23:11:14 +0000
+@@ -15,15 +15,18 @@
+ #include &quot;fde.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;SquidConfig.h&quot;
++#include &quot;security/TlsPeerEncryptor.h&quot;
++#if USE_OPENSSL
++#include &quot;ssl/bio.h&quot;
+ #include &quot;ssl/cert_validate_message.h&quot;
+ #include &quot;ssl/Config.h&quot;
+ #include &quot;ssl/helper.h&quot;
+-#include &quot;ssl/PeerConnector.h&quot;
+-
+-CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeerConnector);
+-
+-Ssl::PeerConnector::PeerConnector(const Comm::ConnectionPointer &amp;aServerConn, AsyncCall::Pointer &amp;aCallback, const AccessLogEntryPointer &amp;alp, const time_t timeout) :
+-    AsyncJob(&quot;Ssl::PeerConnector&quot;),
++#endif
++
++CBDATA_NAMESPACED_CLASS_INIT(Security, TlsPeerEncryptor);
++
++Security::TlsPeerEncryptor::TlsPeerEncryptor(const Comm::ConnectionPointer &amp;aServerConn, AsyncCall::Pointer &amp;aCallback, const AccessLogEntryPointer &amp;alp, const time_t timeout) :
++    AsyncJob(&quot;Security::TlsPeerEncryptor&quot;),
+     serverConn(aServerConn),
+     al(alp),
+     callback(aCallback),
+@@ -35,19 +38,19 @@
+     Must(dynamic_cast&lt;CbDialer*&gt;(callback-&gt;getDialer()));
+ }
+ 
+-Ssl::PeerConnector::~PeerConnector()
++Security::TlsPeerEncryptor::~TlsPeerEncryptor()
+ {
+-    debugs(83, 5, &quot;Peer connector &quot; &lt;&lt; this &lt;&lt; &quot; gone&quot;);
++    debugs(83, 5, &quot;Peer encryptor &quot; &lt;&lt; this &lt;&lt; &quot; gone&quot;);
+ }
+ 
+-bool Ssl::PeerConnector::doneAll() const
++bool Security::TlsPeerEncryptor::doneAll() const
+ {
+     return (!callback || callback-&gt;canceled()) &amp;&amp; AsyncJob::doneAll();
+ }
+ 
+ /// Preps connection and SSL state. Calls negotiate().
+ void
+-Ssl::PeerConnector::start()
++Security::TlsPeerEncryptor::start()
+ {
+     AsyncJob::start();
+ 
+@@ -56,54 +59,60 @@
+ }
+ 
+ void
+-Ssl::PeerConnector::commCloseHandler(const CommCloseCbParams &amp;params)
++Security::TlsPeerEncryptor::commCloseHandler(const CommCloseCbParams &amp;params)
+ {
+-    debugs(83, 5, &quot;FD &quot; &lt;&lt; params.fd &lt;&lt; &quot;, Ssl::PeerConnector=&quot; &lt;&lt; params.data);
+-    connectionClosed(&quot;Ssl::PeerConnector::commCloseHandler&quot;);
++    debugs(83, 5, &quot;FD &quot; &lt;&lt; params.fd &lt;&lt; &quot;, Security::TlsPeerEncryptor=&quot; &lt;&lt; params.data);
++    connectionClosed(&quot;Security::TlsPeerEncryptor::commCloseHandler&quot;);
+ }
+ 
+ void
+-Ssl::PeerConnector::connectionClosed(const char *reason)
++Security::TlsPeerEncryptor::connectionClosed(const char *reason)
+ {
+     mustStop(reason);
+     callback = NULL;
+ }
+ 
+ bool
+-Ssl::PeerConnector::prepareSocket()
++Security::TlsPeerEncryptor::prepareSocket()
+ {
+     const int fd = serverConnection()-&gt;fd;
+     if (!Comm::IsConnOpen(serverConn) || fd_table[serverConn-&gt;fd].closing()) {
+-        connectionClosed(&quot;Ssl::PeerConnector::prepareSocket&quot;);
++        connectionClosed(&quot;Security::TlsPeerEncryptor::prepareSocket&quot;);
+         return false;
+     }
+ 
+     // watch for external connection closures
+-    typedef CommCbMemFunT&lt;Ssl::PeerConnector, CommCloseCbParams&gt; Dialer;
+-    closeHandler = JobCallback(9, 5, Dialer, this, Ssl::PeerConnector::commCloseHandler);
++    typedef CommCbMemFunT&lt;Security::TlsPeerEncryptor, CommCloseCbParams&gt; Dialer;
++    closeHandler = JobCallback(9, 5, Dialer, this, Security::TlsPeerEncryptor::commCloseHandler);
+     comm_add_close_handler(fd, closeHandler);
+     return true;
+ }
+ 
+ Security::SessionPtr
+-Ssl::PeerConnector::initializeSsl()
++Security::TlsPeerEncryptor::initializeSsl()
+ {
+     Security::ContextPtr sslContext(getSslContext());
+     assert(sslContext);
+ 
+-    const int fd = serverConnection()-&gt;fd;
+-
+-    auto ssl = Ssl::CreateClient(sslContext, fd, &quot;server https start&quot;);
++#if USE_OPENSSL
++    auto ssl = Ssl::Create(sslContext, serverConnection()-&gt;fd, Ssl::BIO_TO_SERVER, &quot;server https start&quot;);
++#else
++    Security::SessionPtr ssl = nullptr;
++#endif
+     if (!ssl) {
+         ErrorState *anErr = new ErrorState(ERR_SOCKET_FAILURE, Http::scInternalServerError, request.getRaw());
+         anErr-&gt;xerrno = errno;
++#if USE_OPENSSL
+         debugs(83, DBG_IMPORTANT, &quot;Error allocating SSL handle: &quot; &lt;&lt; ERR_error_string(ERR_get_error(), NULL));
+-
++#else
++        debugs(83, DBG_IMPORTANT, &quot;Error allocating SSL handle: SSL not supported&quot;);
++#endif
+         noteNegotiationDone(anErr);
+         bail(anErr);
+         return nullptr;
+     }
+ 
++#if USE_OPENSSL
+     // If CertValidation Helper used do not lookup checklist for errors,
+     // but keep a list of errors to send it to CertValidator
+     if (!Ssl::TheConfig.ssl_crt_validator) {
+@@ -116,11 +125,15 @@
+             SSL_set_ex_data(ssl, ssl_ex_index_cert_error_check, check);
+         }
+     }
++#elif USE_GNUTLS
++    // XXX: no GnuTLS support for cert validation helper yet
++#endif
++
+     return ssl;
+ }
+ 
+ void
+-Ssl::PeerConnector::setReadTimeout()
++Security::TlsPeerEncryptor::setReadTimeout()
+ {
+     int timeToRead;
+     if (negotiationTimeout) {
+@@ -134,14 +147,20 @@
+ }
+ 
+ void
+-Ssl::PeerConnector::negotiateSsl()
++Security::TlsPeerEncryptor::negotiateSsl()
+ {
+-    if (!Comm::IsConnOpen(serverConnection()) || fd_table[serverConnection()-&gt;fd].closing())
++    if (!Comm::IsConnOpen(serverConnection()))
+         return;
+ 
+     const int fd = serverConnection()-&gt;fd;
+-    Security::SessionPtr ssl = fd_table[fd].ssl.get();
+-    const int result = SSL_connect(ssl);
++    if (fd_table[fd].closing())
++        return;
++
++#if USE_OPENSSL
++    const int result = SSL_connect(fd_table[fd].ssl.get());
++#else
++    const int result = 0;
++#endif
+     if (result &lt;= 0) {
+         handleNegotiateError(result);
+         return; // we might be gone by now
+@@ -154,8 +173,9 @@
+ }
+ 
+ bool
+-Ssl::PeerConnector::sslFinalized()
++Security::TlsPeerEncryptor::sslFinalized()
+ {
++#if USE_OPENSSL
+     if (Ssl::TheConfig.ssl_crt_validator &amp;&amp; useCertValidator_) {
+         const int fd = serverConnection()-&gt;fd;
+         Security::SessionPtr ssl = fd_table[fd].ssl.get();
+@@ -174,7 +194,7 @@
+             validationRequest.errors = NULL;
+         try {
+             debugs(83, 5, &quot;Sending SSL certificate for validation to ssl_crtvd.&quot;);
+-            AsyncCall::Pointer call = asyncCall(83,5, &quot;Ssl::PeerConnector::sslCrtvdHandleReply&quot;, Ssl::CertValidationHelper::CbDialer(this, &amp;Ssl::PeerConnector::sslCrtvdHandleReply, nullptr));
++            AsyncCall::Pointer call = asyncCall(83,5, &quot;Security::TlsPeerEncryptor::sslCrtvdHandleReply&quot;, Ssl::CertValidationHelper::CbDialer(this, &amp;Security::TlsPeerEncryptor::sslCrtvdHandleReply, nullptr));
+             Ssl::CertValidationHelper::GetInstance()-&gt;sslSubmit(validationRequest, call);
+             return false;
+         } catch (const std::exception &amp;e) {
+@@ -192,12 +212,17 @@
+         }
+     }
+ 
++#elif USE_GNUTLS
++    // XXX: no GnuTLS support for cert validation helper yet
++#endif
++
+     noteNegotiationDone(NULL);
+     return true;
+ }
+ 
++#if USE_OPENSSL
+ void
+-Ssl::PeerConnector::sslCrtvdHandleReply(Ssl::CertValidationResponse::Pointer validationResponse)
++Security::TlsPeerEncryptor::sslCrtvdHandleReply(Ssl::CertValidationResponse::Pointer validationResponse)
+ {
+     Must(validationResponse != NULL);
+ 
+@@ -239,12 +264,16 @@
+     serverConn-&gt;close();
+     return;
+ }
++#elif USE_GNUTLS
++    // XXX: no GnuTLS support for cert validation helper yet
++#endif
+ 
++#if USE_OPENSSL
+ /// Checks errors in the cert. validator response against sslproxy_cert_error.
+ /// The first honored error, if any, is returned via errDetails parameter.
+ /// The method returns all seen errors except SSL_ERROR_NONE as Ssl::CertErrors.
+ Ssl::CertErrors *
+-Ssl::PeerConnector::sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &amp;resp, Ssl::ErrorDetail *&amp; errDetails)
++Security::TlsPeerEncryptor::sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &amp;resp, Ssl::ErrorDetail *&amp; errDetails)
+ {
+     Ssl::CertErrors *errs = NULL;
+ 
+@@ -296,19 +325,23 @@
+ 
+     return errs;
+ }
++#elif USE_GNUTLS
++    // XXX: no GnuTLS support for cert validation helper yet
++#endif
+ 
+ /// A wrapper for Comm::SetSelect() notifications.
+ void
+-Ssl::PeerConnector::NegotiateSsl(int, void *data)
++Security::TlsPeerEncryptor::NegotiateSsl(int, void *data)
+ {
+-    PeerConnector *pc = static_cast&lt;PeerConnector*&gt;(data);
++    TlsPeerEncryptor *pc = static_cast&lt;Security::TlsPeerEncryptor *&gt;(data);
+     // Use job calls to add done() checks and other job logic/protections.
+-    CallJobHere(83, 7, pc, Ssl::PeerConnector, negotiateSsl);
++    CallJobHere(83, 7, pc, Security::TlsPeerEncryptor, negotiateSsl);
+ }
+ 
+ void
+-Ssl::PeerConnector::handleNegotiateError(const int ret)
++Security::TlsPeerEncryptor::handleNegotiateError(const int ret)
+ {
++#if USE_OPENSSL
+     const int fd = serverConnection()-&gt;fd;
+     unsigned long ssl_lib_error = SSL_ERROR_NONE;
+     Security::SessionPtr ssl = fd_table[fd].ssl.get();
+@@ -333,10 +366,14 @@
+         break;
+     }
+     noteSslNegotiationError(ret, ssl_error, ssl_lib_error);
++
++#else
++    // XXX
++#endif
+ }
+ 
+ void
+-Ssl::PeerConnector::noteWantRead()
++Security::TlsPeerEncryptor::noteWantRead()
+ {
+     setReadTimeout();
+     const int fd = serverConnection()-&gt;fd;
+@@ -344,7 +381,7 @@
+ }
+ 
+ void
+-Ssl::PeerConnector::noteWantWrite()
++Security::TlsPeerEncryptor::noteWantWrite()
+ {
+     const int fd = serverConnection()-&gt;fd;
+     Comm::SetSelect(fd, COMM_SELECT_WRITE, &amp;NegotiateSsl, this, 0);
+@@ -352,9 +389,11 @@
+ }
+ 
+ void
+-Ssl::PeerConnector::noteSslNegotiationError(const int ret, const int ssl_error, const int ssl_lib_error)
++Security::TlsPeerEncryptor::noteSslNegotiationError(const int ret, const int ssl_error, const int ssl_lib_error)
+ {
+-#ifdef EPROTO
++#if USE_OPENSSL
++
++#if defined(EPROTO)
+     int sysErrNo = EPROTO;
+ #else
+     int sysErrNo = EACCES;
+@@ -370,15 +409,15 @@
+            ssl_error &lt;&lt; &quot;/&quot; &lt;&lt; ret &lt;&lt; &quot;/&quot; &lt;&lt; errno &lt;&lt; &quot;)&quot;);
+ 
+     ErrorState *anErr = NULL;
+-    if (request != NULL)
++    if (request)
+         anErr = ErrorState::NewForwarding(ERR_SECURE_CONNECT_FAIL, request.getRaw());
+     else
+         anErr = new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scServiceUnavailable, NULL);
+     anErr-&gt;xerrno = sysErrNo;
+ 
+     Security::SessionPtr ssl = fd_table[fd].ssl.get();
+-    Ssl::ErrorDetail *errFromFailure = (Ssl::ErrorDetail *)SSL_get_ex_data(ssl, ssl_ex_index_ssl_error_detail);
+-    if (errFromFailure != NULL) {
++    Ssl::ErrorDetail *errFromFailure = static_cast&lt;Ssl::ErrorDetail *&gt;(SSL_get_ex_data(ssl, ssl_ex_index_ssl_error_detail));
++    if (errFromFailure) {
+         // The errFromFailure is attached to the ssl object
+         // and will be released when ssl object destroyed.
+         // Copy errFromFailure to a new Ssl::ErrorDetail object
+@@ -395,10 +434,14 @@
+ 
+     noteNegotiationDone(anErr);
+     bail(anErr);
++
++#else
++    // XXX
++#endif
+ }
+ 
+ void
+-Ssl::PeerConnector::bail(ErrorState *error)
++Security::TlsPeerEncryptor::bail(ErrorState *error)
+ {
+     Must(error); // or the recepient will not know there was a problem
+     Must(callback != NULL);
+@@ -416,7 +459,7 @@
+ }
+ 
+ void
+-Ssl::PeerConnector::callBack()
++Security::TlsPeerEncryptor::callBack()
+ {
+     AsyncCall::Pointer cb = callback;
+     // Do this now so that if we throw below, swanSong() assert that we _tried_
+@@ -433,7 +476,7 @@
+ }
+ 
+ void
+-Ssl::PeerConnector::swanSong()
++Security::TlsPeerEncryptor::swanSong()
+ {
+     // XXX: unregister fd-closure monitoring and CommSetSelect interest, if any
+     AsyncJob::swanSong();
+@@ -447,7 +490,7 @@
+ }
+ 
+ const char *
+-Ssl::PeerConnector::status() const
++Security::TlsPeerEncryptor::status() const
+ {
+     static MemBuf buf;
+     buf.reset();
+@@ -466,4 +509,3 @@
+ 
+     return buf.content();
+ }
+-
+
+=== renamed file 'src/ssl/PeerConnector.h' =&gt; 'src/security/TlsPeerEncryptor.h'
+--- src/ssl/PeerConnector.h	2016-02-13 07:51:20 +0000
++++ src/security/TlsPeerEncryptor.h	2016-04-04 23:10:09 +0000
+@@ -6,32 +6,33 @@
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+-#ifndef SQUID_SRC_SSL_PEERCONNECTOR_H
+-#define SQUID_SRC_SSL_PEERCONNECTOR_H
++#ifndef SQUID_SRC_SECURITY_TLSPEERENCRYPTOR_H
++#define SQUID_SRC_SECURITY_TLSPEERENCRYPTOR_H
+ 
+ #include &quot;acl/Acl.h&quot;
+ #include &quot;base/AsyncCbdataCalls.h&quot;
+ #include &quot;base/AsyncJob.h&quot;
+ #include &quot;CommCalls.h&quot;
++#include &quot;http/forward.h&quot;
+ #include &quot;security/EncryptorAnswer.h&quot;
++#include &quot;security/forward.h&quot;
++#if USE_OPENSSL || USE_GNUTLS
+ #include &quot;ssl/support.h&quot;
++#endif
+ 
+ #include &lt;iosfwd&gt;
+ 
+-#if USE_OPENSSL
+-
+-class HttpRequest;
+ class ErrorState;
+ class AccessLogEntry;
+ typedef RefCount&lt;AccessLogEntry&gt; AccessLogEntryPointer;
+ 
+-namespace Ssl
++namespace Security
+ {
+ 
+ /**
+  \par
+  * Connects Squid to SSL/TLS-capable peers or services.
+- * Contains common code and interfaces of various specialized PeerConnectors,
++ * Contains common code and interfaces of various specialized TlsPeerEncryptors,
+  * including peer certificate validation code.
+  \par
+  * The caller receives a call back with Security::EncryptorAnswer. If answer.error
+@@ -42,7 +43,7 @@
+  * The caller must monitor the connection for closure because this
+  * job will not inform the caller about such events.
+  \par
+- * PeerConnector class curently supports a form of SSL negotiation timeout,
++ * TlsPeerEncryptor class curently supports a form of SSL negotiation timeout,
+  * which accounted only when sets the read timeout from SSL peer.
+  * For a complete solution, the caller must monitor the overall connection
+  * establishment timeout and close the connection on timeouts. This is probably
+@@ -57,28 +58,26 @@
+  * This job never closes the connection, even on errors. If a 3rd-party
+  * closes the connection, this job simply quits without informing the caller.
+  */
+-class PeerConnector: virtual public AsyncJob
++class TlsPeerEncryptor: virtual public AsyncJob
+ {
+-    CBDATA_CLASS(PeerConnector);
++    CBDATA_CLASS(TlsPeerEncryptor);
+ 
+ public:
+-    /// Callback dialier API to allow PeerConnector to set the answer.
++    /// Callback dialier API to allow TlsPeerEncryptor to set the answer.
+     class CbDialer
+     {
+     public:
+         virtual ~CbDialer() {}
+-        /// gives PeerConnector access to the in-dialer answer
++        /// gives TlsPeerEncryptor access to the in-dialer answer
+         virtual Security::EncryptorAnswer &amp;answer() = 0;
+     };
+ 
+-    typedef RefCount&lt;HttpRequest&gt; HttpRequestPointer;
+-
+ public:
+-    PeerConnector(const Comm::ConnectionPointer &amp;aServerConn,
++    TlsPeerEncryptor(const Comm::ConnectionPointer &amp;aServerConn,
+                   AsyncCall::Pointer &amp;aCallback,
+                   const AccessLogEntryPointer &amp;alp,
+                   const time_t timeout = 0);
+-    virtual ~PeerConnector();
++    virtual ~TlsPeerEncryptor();
+ 
+ protected:
+     // AsyncJob API
+@@ -116,7 +115,7 @@
+     /// Called when the SSL negotiation step aborted because data needs to
+     /// be transferred to/from SSL server or on error. In the first case
+     /// setups the appropriate Comm::SetSelect handler. In second case
+-    /// fill an error and report to the PeerConnector caller.
++    /// fill an error and report to the TlsPeerEncryptor caller.
+     void handleNegotiateError(const int result);
+ 
+     /// Called when the openSSL SSL_connect fnction request more data from
+@@ -146,10 +145,10 @@
+     /// mimics FwdState to minimize changes to FwdState::initiate/negotiateSsl
+     Comm::ConnectionPointer const &amp;serverConnection() const { return serverConn; }
+ 
+-    void bail(ErrorState *error); ///&lt; Return an error to the PeerConnector caller
++    void bail(ErrorState *error); ///&lt; Return an error to the TlsPeerEncryptor caller
+ 
+     /// Callback the caller class, and pass the ready to communicate secure
+-    /// connection or an error if PeerConnector failed.
++    /// connection or an error if TlsPeerEncryptor failed.
+     void callBack();
+ 
+     /// If called the certificates validator will not used
+@@ -160,14 +159,18 @@
+     AccessLogEntryPointer al; ///&lt; info for the future access.log entry
+     AsyncCall::Pointer callback; ///&lt; we call this with the results
+ private:
+-    PeerConnector(const PeerConnector &amp;); // not implemented
+-    PeerConnector &amp;operator =(const PeerConnector &amp;); // not implemented
++    TlsPeerEncryptor(const TlsPeerEncryptor &amp;); // not implemented
++    TlsPeerEncryptor &amp;operator =(const TlsPeerEncryptor &amp;); // not implemented
+ 
++#if USE_OPENSSL
+     /// Process response from cert validator helper
+     void sslCrtvdHandleReply(Ssl::CertValidationResponsePointer);
+ 
+     /// Check SSL errors returned from cert validator against sslproxy_cert_error access list
+     Ssl::CertErrors *sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &amp;, Ssl::ErrorDetail *&amp;);
++#elif USE_GNUTLS
++    // XXX: no GnuTLS support for cert validation helper yet
++#endif
+ 
+     /// A wrapper function for negotiateSsl for use with Comm::SetSelect
+     static void NegotiateSsl(int fd, void *data);
+@@ -177,8 +180,7 @@
+     bool useCertValidator_; ///&lt; whether the certificate validator should bypassed
+ };
+ 
+-} // namespace Ssl
++} // namespace Security
+ 
+-#endif /* USE_OPENSSL */
+-#endif /* SQUID_SRC_SSL_PEERCONNECTOR_H */
++#endif /* SQUID_SRC_SECURITY_TLSPEERENCRYPTOR_H */
+ 
+
+=== modified file 'src/security/forward.h'
+--- src/security/forward.h	2016-01-01 00:12:18 +0000
++++ src/security/forward.h	2016-03-19 06:06:34 +0000
+@@ -32,10 +32,6 @@
+ namespace Security
+ {
+ 
+-class EncryptorAnswer;
+-class PeerOptions;
+-class ServerOptions;
+-
+ #if USE_OPENSSL
+ CtoCpp1(X509_free, X509 *)
+ typedef Security::LockingPointer&lt;X509, X509_free_cpp, CRYPTO_LOCK_X509&gt; CertPointer;
+@@ -65,7 +61,11 @@
+ typedef void *DhePointer;
+ #endif
+ 
++class EncryptorAnswer;
+ class KeyData;
++class PeerOptions;
++class ServerOptions;
++class TlsPeerEncryptor;
+ 
+ } // namespace Security
+ 
+
+=== modified file 'src/ssl/Makefile.am'
+--- src/ssl/Makefile.am	2016-02-01 11:52:03 +0000
++++ src/ssl/Makefile.am	2016-03-25 19:32:04 +0000
+@@ -14,8 +14,6 @@
+ libsslsquid_la_SOURCES = \
+ 	bio.cc \
+ 	bio.h \
+-	BlindPeerConnector.cc \
+-	BlindPeerConnector.h \
+ 	cert_validate_message.cc \
+ 	cert_validate_message.h \
+ 	context_storage.cc \
+@@ -28,8 +26,6 @@
+ 	ErrorDetailManager.h \
+ 	PeekingPeerConnector.cc \
+ 	PeekingPeerConnector.h \
+-	PeerConnector.cc \
+-	PeerConnector.h \
+ 	ProxyCerts.h \
+ 	ServerBump.cc \
+ 	ServerBump.h \
+
+=== modified file 'src/ssl/PeekingPeerConnector.cc'
+--- src/ssl/PeekingPeerConnector.cc	2016-02-13 07:51:20 +0000
++++ src/ssl/PeekingPeerConnector.cc	2016-03-14 06:21:39 +0000
+@@ -97,7 +97,7 @@
+         srvBio-&gt;holdWrite(false);
+         srvBio-&gt;recordInput(false);
+         debugs(83,5, &quot;Retry the fwdNegotiateSSL on FD &quot; &lt;&lt; serverConn-&gt;fd);
+-        Ssl::PeerConnector::noteWantWrite();
++        Security::TlsPeerEncryptor::noteWantWrite();
+     } else {
+         splice = true;
+         // Ssl Negotiation stops here. Last SSL checks for valid certificates
+@@ -136,7 +136,7 @@
+ Security::SessionPtr
+ Ssl::PeekingPeerConnector::initializeSsl()
+ {
+-    auto ssl = Ssl::PeerConnector::initializeSsl();
++    auto ssl = Security::TlsPeerEncryptor::initializeSsl();
+     if (!ssl)
+         return nullptr;
+ 
+@@ -282,7 +282,7 @@
+         return;
+     }
+ 
+-    Ssl::PeerConnector::noteWantWrite();
++    Security::TlsPeerEncryptor::noteWantWrite();
+ }
+ 
+ void
+@@ -327,7 +327,7 @@
+     }
+ 
+     // else call parent noteNegotiationError to produce an error page
+-    Ssl::PeerConnector::noteSslNegotiationError(result, ssl_error, ssl_lib_error);
++    Security::TlsPeerEncryptor::noteSslNegotiationError(result, ssl_error, ssl_lib_error);
+ }
+ 
+ void
+
+=== modified file 'src/ssl/PeekingPeerConnector.h'
+--- src/ssl/PeekingPeerConnector.h	2016-02-12 10:45:47 +0000
++++ src/ssl/PeekingPeerConnector.h	2016-03-19 06:10:28 +0000
+@@ -9,7 +9,7 @@
+ #ifndef SQUID_SRC_SSL_PEEKINGPEERCONNECTOR_H
+ #define SQUID_SRC_SSL_PEEKINGPEERCONNECTOR_H
+ 
+-#include &quot;ssl/PeerConnector.h&quot;
++#include &quot;security/TlsPeerEncryptor.h&quot;
+ 
+ #if USE_OPENSSL
+ 
+@@ -17,7 +17,7 @@
+ {
+ 
+ /// A PeerConnector for HTTP origin servers. Capable of SslBumping.
+-class PeekingPeerConnector: public PeerConnector {
++class PeekingPeerConnector: public Security::TlsPeerEncryptor {
+     CBDATA_CLASS(PeekingPeerConnector);
+ public:
+     PeekingPeerConnector(HttpRequestPointer &amp;aRequest,
+@@ -27,7 +27,7 @@
+                          const AccessLogEntryPointer &amp;alp,
+                          const time_t timeout = 0) :
+         AsyncJob(&quot;Ssl::PeekingPeerConnector&quot;),
+-        PeerConnector(aServerConn, aCallback, alp, timeout),
++        Security::TlsPeerEncryptor(aServerConn, aCallback, alp, timeout),
+         clientConn(aClientConn),
+         splice(false),
+         resumingSession(false),
+@@ -36,7 +36,7 @@
+         request = aRequest;
+     }
+ 
+-    /* PeerConnector API */
++    /* Security::TlsPeerEncryptor API */
+     virtual Security::SessionPtr initializeSsl();
+     virtual Security::ContextPtr getSslContext();
+     virtual void noteWantWrite();
+
+=== modified file 'src/ssl/bio.cc'
+--- src/ssl/bio.cc	2016-01-26 21:02:00 +0000
++++ src/ssl/bio.cc	2016-03-13 13:20:39 +0000
+@@ -56,7 +56,7 @@
+ };
+ 
+ BIO *
+-Ssl::Bio::Create(const int fd, Ssl::Bio::Type type)
++Ssl::Bio::Create(const int fd, Ssl::BioType type)
+ {
+     if (BIO *bio = BIO_new(&amp;SquidMethods)) {
+         BIO_int_ctrl(bio, BIO_C_SET_FD, type, fd);
+@@ -583,7 +583,7 @@
+         assert(arg2);
+         const int fd = *static_cast&lt;int*&gt;(arg2);
+         Ssl::Bio *bio;
+-        if (arg1 == Ssl::Bio::BIO_TO_SERVER)
++        if (arg1 == Ssl::BIO_TO_SERVER)
+             bio = new Ssl::ServerBio(fd);
+         else
+             bio = new Ssl::ClientBio(fd);
+
+=== modified file 'src/ssl/bio.h'
+--- src/ssl/bio.h	2016-02-23 08:51:22 +0000
++++ src/ssl/bio.h	2016-03-13 11:17:02 +0000
+@@ -26,11 +26,6 @@
+ class Bio
+ {
+ public:
+-    enum Type {
+-        BIO_TO_CLIENT = 6000,
+-        BIO_TO_SERVER
+-    };
+-
+     /// Class to store SSL connection features
+     class sslFeatures
+     {
+@@ -107,7 +102,7 @@
+ 
+     /// Creates a low-level BIO table, creates a high-level Ssl::Bio object
+     /// for a given socket, and then links the two together via BIO_C_SET_FD.
+-    static BIO *Create(const int fd, Type type);
++    static BIO *Create(const int fd, BioType type);
+     /// Tells ssl connection to use BIO and monitor state via stateChanged()
+     static void Link(SSL *ssl, BIO *bio);
+ 
+
+=== modified file 'src/ssl/helper.h'
+--- src/ssl/helper.h	2016-02-01 11:52:03 +0000
++++ src/ssl/helper.h	2016-03-14 06:46:19 +0000
+@@ -12,6 +12,7 @@
+ #include &quot;base/AsyncJobCalls.h&quot;
+ #include &quot;base/LruMap.h&quot;
+ #include &quot;helper/forward.h&quot;
++#include &quot;security/forward.h&quot;
+ #include &quot;ssl/cert_validate_message.h&quot;
+ #include &quot;ssl/crtd_message.h&quot;
+ 
+@@ -39,13 +40,12 @@
+ };
+ #endif
+ 
+-class PeerConnector;
+ class CertValidationRequest;
+ class CertValidationResponse;
+ class CertValidationHelper
+ {
+ public:
+-    typedef UnaryMemFunT&lt;Ssl::PeerConnector, CertValidationResponse::Pointer&gt; CbDialer;
++    typedef UnaryMemFunT&lt;Security::TlsPeerEncryptor, CertValidationResponse::Pointer&gt; CbDialer;
+ 
+     typedef void CVHCB(void *, Ssl::CertValidationResponse const &amp;);
+     static CertValidationHelper * GetInstance(); ///&lt; Instance class.
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2016-04-05 09:43:47 +0000
++++ src/ssl/support.cc	2016-04-12 11:33:20 +0000
+@@ -1306,8 +1306,8 @@
+     return Ssl::generateSslCertificate(untrustedCert, untrustedPkey, certProperties);
+ }
+ 
+-SSL *
+-SslCreate(Security::ContextPtr sslContext, const int fd, Ssl::Bio::Type type, const char *squidCtx)
++Security::SessionPtr
++Ssl::Create(Security::ContextPtr sslContext, const int fd, Ssl::BioType type, const char *squidCtx)
+ {
+     if (fd &lt; 0) {
+         debugs(83, DBG_IMPORTANT, &quot;Gone connection&quot;);
+@@ -1341,15 +1341,9 @@
+ }
+ 
+ SSL *
+-Ssl::CreateClient(Security::ContextPtr sslContext, const int fd, const char *squidCtx)
+-{
+-    return SslCreate(sslContext, fd, Ssl::Bio::BIO_TO_SERVER, squidCtx);
+-}
+-
+-SSL *
+ Ssl::CreateServer(Security::ContextPtr sslContext, const int fd, const char *squidCtx)
+ {
+-    return SslCreate(sslContext, fd, Ssl::Bio::BIO_TO_CLIENT, squidCtx);
++    return Ssl::Create(sslContext, fd, Ssl::BIO_TO_CLIENT, squidCtx);
+ }
+ 
+ Ssl::CertError::CertError(ssl_error_t anErr, X509 *aCert, int aDepth): code(anErr), depth(aDepth)
+
+=== modified file 'src/ssl/support.h'
+--- src/ssl/support.h	2016-04-05 09:43:47 +0000
++++ src/ssl/support.h	2016-04-12 11:33:20 +0000
+@@ -76,9 +76,14 @@
+ class CertValidationResponse;
+ typedef RefCount&lt;CertValidationResponse&gt; CertValidationResponsePointer;
+ 
+-/// Creates SSL Client connection structure and initializes SSL I/O (Comm and BIO).
++enum BioType {
++    BIO_TO_CLIENT = 6000,
++    BIO_TO_SERVER
++};
++
++/// Creates SSL connection structure and initializes SSL I/O (Comm and BIO).
+ /// On errors, emits DBG_IMPORTANT with details and returns NULL.
+-SSL *CreateClient(Security::ContextPtr sslContext, const int fd, const char *squidCtx);
++Security::SessionPtr Create(Security::ContextPtr, const int fd, Ssl::BioType type, const char *squidCtx);
+ 
+ /// Creates SSL Server connection structure and initializes SSL I/O (Comm and BIO).
+ /// On errors, emits DBG_IMPORTANT with details and returns NULL.
+
+=== modified file 'src/tests/stub_libsecurity.cc'
+--- src/tests/stub_libsecurity.cc	2016-01-26 21:02:00 +0000
++++ src/tests/stub_libsecurity.cc	2016-04-13 11:39:02 +0000
+@@ -7,15 +7,49 @@
+  */
+ 
+ #include &quot;squid.h&quot;
++#include &quot;AccessLogEntry.h&quot;
+ #include &quot;comm/Connection.h&quot;
++#include &quot;HttpRequest.h&quot;
+ 
+ #define STUB_API &quot;security/libsecurity.la&quot;
+ #include &quot;tests/STUB.h&quot;
+ 
++#include &quot;security/BlindTlsPeerEncryptor.h&quot;
++CBDATA_NAMESPACED_CLASS_INIT(Security, BlindTlsPeerEncryptor);
++Security::SessionPtr Security::BlindTlsPeerEncryptor::initializeSsl() STUB_RETVAL(nullptr)
++Security::ContextPtr Security::BlindTlsPeerEncryptor::getSslContext() STUB_RETVAL(nullptr)
++void Security::BlindTlsPeerEncryptor::noteNegotiationDone(ErrorState *) STUB
++
+ #include &quot;security/EncryptorAnswer.h&quot;
+ Security::EncryptorAnswer::~EncryptorAnswer() {}
+ std::ostream &amp;Security::operator &lt;&lt;(std::ostream &amp;os, const Security::EncryptorAnswer &amp;) STUB_RETVAL(os)
+ 
++#include &quot;security/TlsPeerEncryptor.h&quot;
++Security::TlsPeerEncryptor::TlsPeerEncryptor(const Comm::ConnectionPointer &amp;, AsyncCall::Pointer &amp;, const AccessLogEntryPointer &amp;, const time_t):
++    AsyncJob(&quot;Security::TlsPeerEncryptor&quot;),
++    negotiationTimeout(0),
++    startTime(0),
++    useCertValidator_(false)
++{STUB}
++Security::TlsPeerEncryptor::~TlsPeerEncryptor() {STUB}
++void Security::TlsPeerEncryptor::start() STUB
++bool Security::TlsPeerEncryptor::doneAll() const STUB_RETVAL(true)
++void Security::TlsPeerEncryptor::swanSong() STUB
++const char *Security::TlsPeerEncryptor::status() const STUB_RETVAL(&quot;&quot;)
++void Security::TlsPeerEncryptor::commCloseHandler(const CommCloseCbParams &amp;) STUB
++void Security::TlsPeerEncryptor::connectionClosed(const char *) STUB
++bool Security::TlsPeerEncryptor::prepareSocket() STUB
++void Security::TlsPeerEncryptor::setReadTimeout() STUB
++Security::SessionPtr Security::TlsPeerEncryptor::initializeSsl() STUB_RETVAL(nullptr)
++void Security::TlsPeerEncryptor::negotiateSsl() STUB
++bool Security::TlsPeerEncryptor::sslFinalized() STUB_RETVAL(false)
++void Security::TlsPeerEncryptor::handleNegotiateError(const int) STUB
++void Security::TlsPeerEncryptor::noteWantRead() STUB
++void Security::TlsPeerEncryptor::noteWantWrite() STUB
++void Security::TlsPeerEncryptor::noteSslNegotiationError(const int, const int, const int) STUB
++void Security::TlsPeerEncryptor::bail(ErrorState *) STUB
++void Security::TlsPeerEncryptor::callBack() STUB
++
+ #include &quot;security/PeerOptions.h&quot;
+ Security::PeerOptions Security::ProxyOutgoingConfig;
+ void Security::PeerOptions::parse(char const*) STUB
+
+=== modified file 'src/tunnel.cc'
+--- src/tunnel.cc	2016-04-03 23:41:58 +0000
++++ src/tunnel.cc	2016-04-05 09:31:17 +0000
+@@ -33,9 +33,9 @@
+ #include &quot;MemBuf.h&quot;
+ #include &quot;PeerSelectState.h&quot;
+ #include &quot;sbuf/SBuf.h&quot;
++#include &quot;security/BlindTlsPeerEncryptor.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ #include &quot;SquidTime.h&quot;
+-#include &quot;ssl/BlindPeerConnector.h&quot;
+ #include &quot;StatCounters.h&quot;
+ #if USE_OPENSSL
+ #include &quot;ssl/bio.h&quot;
+@@ -172,9 +172,9 @@
+     void connectToPeer();
+ 
+ private:
+-#if USE_OPENSSL
+-    /// Gives PeerConnector access to Answer in the TunnelStateData callback dialer.
+-    class MyAnswerDialer: public CallDialer, public Ssl::PeerConnector::CbDialer
++#if USE_OPENSSL || USE_GNUTLS
++    /// Gives Securit::TlsPeerEncryptor access to Answer in the TunnelStateData callback dialer.
++    class MyAnswerDialer: public CallDialer, public Security::TlsPeerEncryptor::CbDialer
+     {
+     public:
+         typedef void (TunnelStateData::*Method)(Security::EncryptorAnswer &amp;);
+@@ -189,7 +189,7 @@
+             os &lt;&lt; '(' &lt;&lt; tunnel_.get() &lt;&lt; &quot;, &quot; &lt;&lt; answer_ &lt;&lt; ')';
+         }
+ 
+-        /* Ssl::PeerConnector::CbDialer API */
++        /* Security::TlsPeerEncryptor::CbDialer API */
+         virtual Security::EncryptorAnswer &amp;answer() { return answer_; }
+ 
+     private:
+@@ -1092,14 +1092,14 @@
+ void
+ TunnelStateData::connectToPeer()
+ {
+-#if USE_OPENSSL
++#if USE_OPENSSL || USE_GNUTLS
+     if (CachePeer *p = server.conn-&gt;getPeer()) {
+         if (p-&gt;secure.encryptTransport) {
+             AsyncCall::Pointer callback = asyncCall(5,4,
+                                                     &quot;TunnelStateData::ConnectedToPeer&quot;,
+                                                     MyAnswerDialer(&amp;TunnelStateData::connectedToPeer, this));
+-            Ssl::BlindPeerConnector *connector =
+-                new Ssl::BlindPeerConnector(request, server.conn, callback, al);
++            Security::BlindTlsPeerEncryptor *connector =
++                new Security::BlindTlsPeerEncryptor(request, server.conn, callback, al);
+             AsyncJob::Start(connector); // will call our callback
+             return;
+         }
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005588.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » gcc,d-ubuntu-vivid #614
+</A></li>
+	<LI>Next message: <A HREF="005599.html">[squid-dev] [PATCH] PeerConnector shuffling to libsecurity
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5596">[ date ]</a>
+              <a href="thread.html#5596">[ thread ]</a>
+              <a href="subject.html#5596">[ subject ]</a>
+              <a href="author.html#5596">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

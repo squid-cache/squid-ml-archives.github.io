@@ -1,0 +1,3321 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Http::StreamContext refactoring
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Http%3A%3AStreamContext%20refactoring&In-Reply-To=%3C56979A5F.80704%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="004644.html">
+   <LINK REL="Next"  HREF="004839.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Http::StreamContext refactoring</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Http%3A%3AStreamContext%20refactoring&In-Reply-To=%3C56979A5F.80704%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] Http::StreamContext refactoring">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Thu Jan 14 12:53:51 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004644.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » gcc,d-ubuntu-trusty #503
+</A></li>
+        <LI>Next message: <A HREF="004839.html">[squid-dev] [PATCH] Http::StreamContext refactoring
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4674">[ date ]</a>
+              <a href="thread.html#4674">[ thread ]</a>
+              <a href="subject.html#4674">[ subject ]</a>
+              <a href="author.html#4674">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>This patch updates the Pipeline and ClientSocketContext class
+interaction for better HTTP/2 compatibility.
+
+The ClientSocketContext is renamed and shuffled to Http::StreamContext.
+
+The name is chosen to match the HTTP/2 &quot;stream&quot; terminology. Which
+defines a stream as a bi-directional transaction, including request,
+reply and all related 1xx informational and/or control messages. That
+same word &quot;stream&quot; is also used in RFC7230 briefly to describe the same
+&quot;transaction&quot; scope and details. But not formalized until RFC7540.
+
+Each StreamContext is assigned a 32-bit ID number from a per-connection
+range of IDs on creation. HTTP/1 and FTP Server just incrementally
+assign a new ID as requests are receved on a connection. HTTP/2 Server
+will be assigning according to RFC7540 algorithms.
+
+Pipeline class is updated to use the ID number to manage its contents
+rather than Pointer value matching. It is also updated to drop the
+HTTP/1 specific assumptions within the Pipeline implementation. As a
+behavioural requirement the sequential flow is now left for the Server
+and ClientHttpRequest Jobs to ensure correctness.
+
+
+The old &quot;client-side&quot; classes are now split along the following scopes:
+
+* ::Server / ConnStateData/ *::Server
+ - the AsynJob managing I/O on a client connection.
+
+* ClientHttpRequest
+ - the AsyncJob operating transaction internal behaviours and Calls.
+Will make use of ConnStateData and Http::StreamContext to perform its
+duties (has not yet been refactored to do so cleanly yet).
+
+* Http::StreamContext
+ - the state data for a transaction. Refcounted and used by the Server
+and ClientHttpRequest Jobs for their mutual data storage.
+
+As noted the ClientHttpRequest part of the refactoring has not been
+included in this. It still directly performs much of the tasks scoped
+for Server classes and needs a restructure in how it utilizes
+StreamContext members and method (or possibly whether its activity is
+fully migrated to Http1::Server). That is all left for a followup patch.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/DelayId.cc'
+--- src/DelayId.cc	2016-01-01 00:12:18 +0000
++++ src/DelayId.cc	2016-01-10 19:11:02 +0000
+@@ -20,6 +20,7 @@
+ #include &quot;DelayId.h&quot;
+ #include &quot;DelayPool.h&quot;
+ #include &quot;DelayPools.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ 
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2016-01-01 00:12:18 +0000
++++ src/FwdState.cc	2016-01-07 14:33:35 +0000
+@@ -31,6 +31,7 @@
+ #include &quot;gopher.h&quot;
+ #include &quot;hier_code.h&quot;
+ #include &quot;http.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;icmp/net_db.h&quot;
+
+=== modified file 'src/HttpHdrRange.cc'
+--- src/HttpHdrRange.cc	2016-01-01 00:12:18 +0000
++++ src/HttpHdrRange.cc	2016-01-07 15:30:15 +0000
+@@ -10,6 +10,7 @@
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;client_side_request.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHeaderRange.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+ #include &quot;HttpReply.h&quot;
+
+=== modified file 'src/HttpHeaderTools.cc'
+--- src/HttpHeaderTools.cc	2016-01-01 00:12:18 +0000
++++ src/HttpHeaderTools.cc	2016-01-07 15:38:22 +0000
+@@ -20,6 +20,7 @@
+ #include &quot;fde.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;http/RegisteredHeaders.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHdrContRange.h&quot;
+ #include &quot;HttpHeader.h&quot;
+ #include &quot;HttpHeaderFieldInfo.h&quot;
+
+=== modified file 'src/HttpRequest.cc'
+--- src/HttpRequest.cc	2016-01-01 00:12:18 +0000
++++ src/HttpRequest.cc	2016-01-07 15:20:17 +0000
+@@ -19,6 +19,7 @@
+ #include &quot;gopher.h&quot;
+ #include &quot;http.h&quot;
+ #include &quot;http/one/RequestParser.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHdrCc.h&quot;
+ #include &quot;HttpHeaderRange.h&quot;
+ #include &quot;HttpRequest.h&quot;
+
+=== modified file 'src/Notes.cc'
+--- src/Notes.cc	2016-01-01 00:12:18 +0000
++++ src/Notes.cc	2016-01-07 15:29:13 +0000
+@@ -13,6 +13,7 @@
+ #include &quot;client_side.h&quot;
+ #include &quot;ConfigParser.h&quot;
+ #include &quot;globals.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;SquidConfig.h&quot;
+
+=== modified file 'src/Pipeline.cc'
+--- src/Pipeline.cc	2016-01-01 00:12:18 +0000
++++ src/Pipeline.cc	2016-01-08 10:27:07 +0000
+@@ -13,22 +13,24 @@
+ #include &quot;anyp/PortCfg.h&quot;
+ #include &quot;client_side.h&quot;
+ #include &quot;Debug.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;Pipeline.h&quot;
+ 
+ void
+-Pipeline::add(const ClientSocketContextPointer &amp;c)
++Pipeline::add(const Http::StreamContextPointer &amp;c)
+ {
+     requests.push_back(c);
+     ++nrequests;
++    ++nactive;
+     debugs(33, 3, &quot;Pipeline &quot; &lt;&lt; (void*)this &lt;&lt; &quot; add request &quot; &lt;&lt; nrequests &lt;&lt; ' ' &lt;&lt; c);
+ }
+ 
+-ClientSocketContextPointer
++Http::StreamContextPointer
+ Pipeline::front() const
+ {
+     if (requests.empty()) {
+         debugs(33, 3, &quot;Pipeline &quot; &lt;&lt; (void*)this &lt;&lt; &quot; empty&quot;);
+-        return ClientSocketContextPointer();
++        return Http::StreamContextPointer();
+     }
+ 
+     debugs(33, 3, &quot;Pipeline &quot; &lt;&lt; (void*)this &lt;&lt; &quot; front &quot; &lt;&lt; requests.front());
+@@ -39,7 +41,7 @@
+ Pipeline::terminateAll(int xerrno)
+ {
+     while (!requests.empty()) {
+-        ClientSocketContextPointer context = requests.front();
++        Http::StreamContextPointer context = requests.front();
+         debugs(33, 3, &quot;Pipeline &quot; &lt;&lt; (void*)this &lt;&lt; &quot; notify(&quot; &lt;&lt; xerrno &lt;&lt; &quot;) &quot; &lt;&lt; context);
+         context-&gt;noteIoError(xerrno);
+         context-&gt;finished();  // cleanup and self-deregister
+@@ -48,15 +50,24 @@
+ }
+ 
+ void
+-Pipeline::popMe(const ClientSocketContextPointer &amp;which)
++Pipeline::popById(uint32_t which)
+ {
+     if (requests.empty())
+         return;
+ 
+-    debugs(33, 3, &quot;Pipeline &quot; &lt;&lt; (void*)this &lt;&lt; &quot; drop &quot; &lt;&lt; requests.front());
+-    // in reality there may be multiple contexts doing processing in parallel.
+-    // XXX: pipeline still assumes HTTP/1 FIFO semantics are obeyed.
+-    assert(which == requests.front());
+-    requests.pop_front();
++    debugs(33, 3, &quot;Pipeline &quot; &lt;&lt; (void*)this &lt;&lt; &quot; drop id=&quot; &lt;&lt; which);
++
++    // find the context and clear its Pointer
++    for (auto &amp;&amp;i : requests) {
++        if (i-&gt;id == which) {
++            i = nullptr;
++            --nactive;
++            break;
++        }
++    }
++
++    // trim closed contexts from the list head (if any)
++    while (!requests.empty() &amp;&amp; !requests.front())
++        requests.pop_front();
+ }
+ 
+
+=== modified file 'src/Pipeline.h'
+--- src/Pipeline.h	2016-01-01 00:12:18 +0000
++++ src/Pipeline.h	2016-01-08 09:54:15 +0000
+@@ -10,12 +10,10 @@
+ #define SQUID_SRC_PIPELINE_H
+ 
+ #include &quot;base/RefCount.h&quot;
++#include &quot;http/forward.h&quot;
+ 
+ #include &lt;list&gt;
+ 
+-class ClientSocketContext;
+-typedef RefCount&lt;ClientSocketContext&gt; ClientSocketContextPointer;
+-
+ /**
+  * A queue of transactions awaiting completion.
+  *
+@@ -39,17 +37,17 @@
+     Pipeline &amp; operator =(const Pipeline &amp;) = delete;
+ 
+ public:
+-    Pipeline() : nrequests(0) {}
++    Pipeline() : nrequests(0), nactive(0) {}
+     ~Pipeline() = default;
+ 
+     /// register a new request context to the pipeline
+-    void add(const ClientSocketContextPointer &amp;);
++    void add(const Http::StreamContextPointer &amp;);
+ 
+     /// get the first request context in the pipeline
+-    ClientSocketContextPointer front() const;
++    Http::StreamContextPointer front() const;
+ 
+     /// how many requests are currently pipelined
+-    size_t count() const {return requests.size();}
++    size_t count() const {return nactive;}
+ 
+     /// whether there are none or any requests currently pipelined
+     bool empty() const {return requests.empty();}
+@@ -57,8 +55,8 @@
+     /// tell everybody about the err, and abort all waiting requests
+     void terminateAll(const int xerrno);
+ 
+-    /// deregister the front request from the pipeline
+-    void popMe(const ClientSocketContextPointer &amp;);
++    /// deregister a request from the pipeline
++    void popById(uint32_t);
+ 
+     /// Number of requests seen in this pipeline (so far).
+     /// Includes incomplete transactions.
+@@ -66,7 +64,11 @@
+ 
+ private:
+     /// requests parsed from the connection but not yet completed.
+-    std::list&lt;ClientSocketContextPointer&gt; requests;
++    std::list&lt;Http::StreamContextPointer&gt; requests;
++
++    /// Number of still-active streams in this pipeline (so far).
++    /// Includes incomplete transactions.
++    uint32_t nactive;
+ };
+ 
+ #endif /* SQUID_SRC_PIPELINE_H */
+
+=== modified file 'src/acl/AtStep.cc'
+--- src/acl/AtStep.cc	2016-01-01 00:12:18 +0000
++++ src/acl/AtStep.cc	2016-01-07 11:26:51 +0000
+@@ -14,6 +14,7 @@
+ #include &quot;acl/AtStepData.h&quot;
+ #include &quot;acl/Checklist.h&quot;
+ #include &quot;client_side.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;ssl/ServerBump.h&quot;
+ 
+ int
+
+=== modified file 'src/acl/Certificate.cc'
+--- src/acl/Certificate.cc	2016-01-01 00:12:18 +0000
++++ src/acl/Certificate.cc	2016-01-07 11:52:43 +0000
+@@ -21,6 +21,7 @@
+ #include &quot;client_side.h&quot;
+ #include &quot;fde.h&quot;
+ #include &quot;globals.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ 
+ int
+
+=== modified file 'src/acl/DestinationIp.cc'
+--- src/acl/DestinationIp.cc	2016-01-01 00:12:18 +0000
++++ src/acl/DestinationIp.cc	2016-01-07 11:22:14 +0000
+@@ -13,6 +13,7 @@
+ #include &quot;acl/FilledChecklist.h&quot;
+ #include &quot;client_side.h&quot;
+ #include &quot;comm/Connection.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ 
+
+=== modified file 'src/acl/ExtUser.cc'
+--- src/acl/ExtUser.cc	2016-01-01 00:12:18 +0000
++++ src/acl/ExtUser.cc	2016-01-07 11:25:11 +0000
+@@ -16,6 +16,7 @@
+ #include &quot;acl/FilledChecklist.h&quot;
+ #include &quot;acl/RegexData.h&quot;
+ #include &quot;acl/UserData.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;client_side.h&quot;
+ 
+ ACLExtUser::~ACLExtUser()
+
+=== modified file 'src/acl/FilledChecklist.cc'
+--- src/acl/FilledChecklist.cc	2016-01-01 00:12:18 +0000
++++ src/acl/FilledChecklist.cc	2016-01-07 10:48:32 +0000
+@@ -12,6 +12,7 @@
+ #include &quot;comm/Connection.h&quot;
+ #include &quot;comm/forward.h&quot;
+ #include &quot;ExternalACLEntry.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;SquidConfig.h&quot;
+
+=== modified file 'src/acl/MyPortName.cc'
+--- src/acl/MyPortName.cc	2016-01-01 00:12:18 +0000
++++ src/acl/MyPortName.cc	2016-01-07 11:25:07 +0000
+@@ -11,11 +11,10 @@
+ #include &quot;acl/MyPortName.h&quot;
+ #include &quot;acl/StringData.h&quot;
+ #include &quot;anyp/PortCfg.h&quot;
++#include &quot;client_side.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ 
+-/* for ConnStateData */
+-#include &quot;client_side.h&quot;
+-
+ int
+ ACLMyPortNameStrategy::match(ACLData&lt;MatchType&gt; * &amp;data, ACLFilledChecklist *checklist, ACLFlags &amp;)
+ {
+
+=== modified file 'src/acl/ServerCertificate.cc'
+--- src/acl/ServerCertificate.cc	2016-01-01 00:12:18 +0000
++++ src/acl/ServerCertificate.cc	2016-01-07 11:52:47 +0000
+@@ -15,6 +15,7 @@
+ #include &quot;acl/ServerCertificate.h&quot;
+ #include &quot;client_side.h&quot;
+ #include &quot;fde.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;ssl/ServerBump.h&quot;
+ 
+ int
+
+=== modified file 'src/acl/ServerName.cc'
+--- src/acl/ServerName.cc	2016-01-01 00:12:18 +0000
++++ src/acl/ServerName.cc	2016-01-07 11:20:48 +0000
+@@ -15,6 +15,7 @@
+ #include &quot;acl/ServerName.h&quot;
+ #include &quot;client_side.h&quot;
+ #include &quot;fde.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;ipcache.h&quot;
+ #include &quot;SquidString.h&quot;
+
+=== modified file 'src/auth/Acl.cc'
+--- src/auth/Acl.cc	2016-01-01 00:12:18 +0000
++++ src/auth/Acl.cc	2016-01-07 13:58:55 +0000
+@@ -14,6 +14,7 @@
+ #include &quot;auth/UserRequest.h&quot;
+ #include &quot;client_side.h&quot;
+ #include &quot;fatal.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ 
+ /**
+
+=== modified file 'src/auth/AclProxyAuth.cc'
+--- src/auth/AclProxyAuth.cc	2016-01-01 00:12:18 +0000
++++ src/auth/AclProxyAuth.cc	2016-01-07 13:03:01 +0000
+@@ -18,6 +18,7 @@
+ #include &quot;auth/User.h&quot;
+ #include &quot;auth/UserRequest.h&quot;
+ #include &quot;client_side.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ 
+ ACLProxyAuth::~ACLProxyAuth()
+
+=== modified file 'src/auth/Gadgets.cc'
+--- src/auth/Gadgets.cc	2016-01-01 00:12:18 +0000
++++ src/auth/Gadgets.cc	2016-01-07 13:52:33 +0000
+@@ -28,6 +28,7 @@
+ #include &quot;auth/UserRequest.h&quot;
+ #include &quot;client_side.h&quot;
+ #include &quot;globals.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ 
+
+=== modified file 'src/auth/UserRequest.cc'
+--- src/auth/UserRequest.cc	2016-01-01 00:12:18 +0000
++++ src/auth/UserRequest.cc	2016-01-07 13:55:24 +0000
+@@ -21,6 +21,7 @@
+ #include &quot;comm/Connection.h&quot;
+ #include &quot;fatal.h&quot;
+ #include &quot;format/Format.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;MemBuf.h&quot;
+
+=== modified file 'src/auth/negotiate/Config.cc'
+--- src/auth/negotiate/Config.cc	2016-01-01 00:12:18 +0000
++++ src/auth/negotiate/Config.cc	2016-01-07 12:57:14 +0000
+@@ -22,6 +22,7 @@
+ #include &quot;cache_cf.h&quot;
+ #include &quot;client_side.h&quot;
+ #include &quot;helper.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+
+=== modified file 'src/auth/negotiate/UserRequest.cc'
+--- src/auth/negotiate/UserRequest.cc	2016-01-01 00:12:18 +0000
++++ src/auth/negotiate/UserRequest.cc	2016-01-07 12:59:53 +0000
+@@ -20,6 +20,7 @@
+ #include &quot;globals.h&quot;
+ #include &quot;helper.h&quot;
+ #include &quot;helper/Reply.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+
+=== modified file 'src/auth/ntlm/Config.cc'
+--- src/auth/ntlm/Config.cc	2016-01-01 00:12:18 +0000
++++ src/auth/ntlm/Config.cc	2016-01-07 12:58:51 +0000
+@@ -22,6 +22,7 @@
+ #include &quot;cache_cf.h&quot;
+ #include &quot;client_side.h&quot;
+ #include &quot;helper.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+
+=== modified file 'src/auth/ntlm/UserRequest.cc'
+--- src/auth/ntlm/UserRequest.cc	2016-01-01 00:12:18 +0000
++++ src/auth/ntlm/UserRequest.cc	2016-01-07 13:03:45 +0000
+@@ -20,6 +20,7 @@
+ #include &quot;globals.h&quot;
+ #include &quot;helper.h&quot;
+ #include &quot;helper/Reply.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpMsg.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;MemBuf.h&quot;
+
+=== modified file 'src/clientStream.cc'
+--- src/clientStream.cc	2016-01-01 00:12:18 +0000
++++ src/clientStream.cc	2016-01-07 14:38:30 +0000
+@@ -11,6 +11,7 @@
+ #include &quot;squid.h&quot;
+ #include &quot;client_side_request.h&quot;
+ #include &quot;clientStream.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-01-01 00:12:18 +0000
++++ src/client_side.cc	2016-01-09 14:15:47 +0000
+@@ -87,6 +87,7 @@
+ #include &quot;http.h&quot;
+ #include &quot;http/one/RequestParser.h&quot;
+ #include &quot;http/one/TeChunkedParser.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHdrContRange.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+ #include &quot;HttpReply.h&quot;
+@@ -188,91 +189,10 @@
+ static void clientUpdateHierCounters(HierarchyLogEntry *);
+ static bool clientPingHasFinished(ping_data const *aPing);
+ void prepareLogWithRequestDetails(HttpRequest *, AccessLogEntry::Pointer &amp;);
+-static void ClientSocketContextPushDeferredIfNeeded(ClientSocketContext::Pointer deferredRequest, ConnStateData * conn);
+-static void clientUpdateSocketStats(const LogTags &amp;logType, size_t size);
++static void ClientSocketContextPushDeferredIfNeeded(Http::StreamContextPointer deferredRequest, ConnStateData * conn);
+ 
+ char *skipLeadingSpace(char *aString);
+ 
+-clientStreamNode *
+-ClientSocketContext::getTail() const
+-{
+-    if (http-&gt;client_stream.tail)
+-        return (clientStreamNode *)http-&gt;client_stream.tail-&gt;data;
+-
+-    return NULL;
+-}
+-
+-clientStreamNode *
+-ClientSocketContext::getClientReplyContext() const
+-{
+-    return (clientStreamNode *)http-&gt;client_stream.tail-&gt;prev-&gt;data;
+-}
+-
+-ConnStateData *
+-ClientSocketContext::getConn() const
+-{
+-    return http-&gt;getConn();
+-}
+-
+-ClientSocketContext::~ClientSocketContext()
+-{
+-    clientStreamNode *node = getTail();
+-
+-    if (node) {
+-        ClientSocketContext *streamContext = dynamic_cast&lt;ClientSocketContext *&gt; (node-&gt;data.getRaw());
+-
+-        if (streamContext) {
+-            /* We are *always* the tail - prevent recursive free */
+-            assert(this == streamContext);
+-            node-&gt;data = NULL;
+-        }
+-    }
+-
+-    httpRequestFree(http);
+-}
+-
+-void
+-ClientSocketContext::registerWithConn()
+-{
+-    assert (!connRegistered_);
+-    assert (http);
+-    assert (http-&gt;getConn() != NULL);
+-    connRegistered_ = true;
+-    http-&gt;getConn()-&gt;pipeline.add(ClientSocketContext::Pointer(this));
+-}
+-
+-void
+-ClientSocketContext::finished()
+-{
+-    assert (http);
+-    assert (http-&gt;getConn() != NULL);
+-    ConnStateData *conn = http-&gt;getConn();
+-
+-    /* we can't handle any more stream data - detach */
+-    clientStreamDetach(getTail(), http);
+-
+-    assert(connRegistered_);
+-    connRegistered_ = false;
+-    assert(conn-&gt;pipeline.front() == this); // XXX: still assumes HTTP/1 semantics
+-    conn-&gt;pipeline.popMe(ClientSocketContext::Pointer(this));
+-}
+-
+-ClientSocketContext::ClientSocketContext(const Comm::ConnectionPointer &amp;aConn, ClientHttpRequest *aReq) :
+-    clientConnection(aConn),
+-    http(aReq),
+-    reply(NULL),
+-    writtenToSocket(0),
+-    mayUseConnection_ (false),
+-    connRegistered_ (false)
+-{
+-    assert(http != NULL);
+-    memset (reqbuf, '\0', sizeof (reqbuf));
+-    flags.deferred = 0;
+-    flags.parsed_ok = 0;
+-    deferredparams.node = NULL;
+-    deferredparams.rep = NULL;
+-}
+-
+ #if USE_IDENT
+ static void
+ clientIdentDone(const char *ident, void *data)
+@@ -765,129 +685,20 @@
+     return 0;
+ }
+ 
+-void
+-ClientSocketContext::deferRecipientForLater(clientStreamNode * node, HttpReply * rep, StoreIOBuffer receivedData)
+-{
+-    debugs(33, 2, &quot;clientSocketRecipient: Deferring request &quot; &lt;&lt; http-&gt;uri);
+-    assert(flags.deferred == 0);
+-    flags.deferred = 1;
+-    deferredparams.node = node;
+-    deferredparams.rep = rep;
+-    deferredparams.queuedBuffer = receivedData;
+-    return;
+-}
+-
+-bool
+-ClientSocketContext::startOfOutput() const
+-{
+-    return http-&gt;out.size == 0;
+-}
+-
+-size_t
+-ClientSocketContext::lengthToSend(Range&lt;int64_t&gt; const &amp;available)
+-{
+-    /*the size of available range can always fit in a size_t type*/
+-    size_t maximum = (size_t)available.size();
+-
+-    if (!http-&gt;request-&gt;range)
+-        return maximum;
+-
+-    assert (canPackMoreRanges());
+-
+-    if (http-&gt;range_iter.debt() == -1)
+-        return maximum;
+-
+-    assert (http-&gt;range_iter.debt() &gt; 0);
+-
+-    /* TODO this + the last line could be a range intersection calculation */
+-    if (available.start &lt; http-&gt;range_iter.currentSpec()-&gt;offset)
+-        return 0;
+-
+-    return min(http-&gt;range_iter.debt(), (int64_t)maximum);
+-}
+-
+-void
+-ClientSocketContext::noteSentBodyBytes(size_t bytes)
+-{
+-    debugs(33, 7, bytes &lt;&lt; &quot; body bytes&quot;);
+-
+-    http-&gt;out.offset += bytes;
+-
+-    if (!http-&gt;request-&gt;range)
+-        return;
+-
+-    if (http-&gt;range_iter.debt() != -1) {
+-        http-&gt;range_iter.debt(http-&gt;range_iter.debt() - bytes);
+-        assert (http-&gt;range_iter.debt() &gt;= 0);
+-    }
+-
+-    /* debt() always stops at -1, below that is a bug */
+-    assert (http-&gt;range_iter.debt() &gt;= -1);
+-}
+-
+ bool
+ ClientHttpRequest::multipartRangeRequest() const
+ {
+     return request-&gt;multipartRangeRequest();
+ }
+ 
+-bool
+-ClientSocketContext::multipartRangeRequest() const
+-{
+-    return http-&gt;multipartRangeRequest();
+-}
+-
+-void
+-ClientSocketContext::sendBody(HttpReply * rep, StoreIOBuffer bodyData)
+-{
+-    assert(rep == NULL);
+-
+-    if (!multipartRangeRequest() &amp;&amp; !http-&gt;request-&gt;flags.chunkedReply) {
+-        size_t length = lengthToSend(bodyData.range());
+-        noteSentBodyBytes (length);
+-        getConn()-&gt;write(bodyData.data, length);
+-        return;
+-    }
+-
+-    MemBuf mb;
+-    mb.init();
+-    if (multipartRangeRequest())
+-        packRange(bodyData, &amp;mb);
+-    else
+-        packChunk(bodyData, mb);
+-
+-    if (mb.contentSize())
+-        getConn()-&gt;write(&amp;mb);
+-    else
+-        writeComplete(0);
+-}
+-
+-/**
+- * Packs bodyData into mb using chunked encoding. Packs the last-chunk
+- * if bodyData is empty.
+- */
+-void
+-ClientSocketContext::packChunk(const StoreIOBuffer &amp;bodyData, MemBuf &amp;mb)
+-{
+-    const uint64_t length =
+-        static_cast&lt;uint64_t&gt;(lengthToSend(bodyData.range()));
+-    noteSentBodyBytes(length);
+-
+-    mb.appendf(&quot;%&quot; PRIX64 &quot;\r\n&quot;, length);
+-    mb.append(bodyData.data, length);
+-    mb.append(&quot;\r\n&quot;, 2);
+-}
+-
+-/** put terminating boundary for multiparts */
+-static void
+-clientPackTermBound(String boundary, MemBuf * mb)
++void
++clientPackTermBound(String boundary, MemBuf *mb)
+ {
+     mb-&gt;appendf(&quot;\r\n--&quot; SQUIDSTRINGPH &quot;--\r\n&quot;, SQUIDSTRINGPRINT(boundary));
+-    debugs(33, 6, &quot;clientPackTermBound: buf offset: &quot; &lt;&lt; mb-&gt;size);
++    debugs(33, 6, &quot;buf offset: &quot; &lt;&lt; mb-&gt;size);
+ }
+ 
+-/** appends a &quot;part&quot; HTTP header (as in a multi-part/range reply) to the buffer */
+-static void
++void
+ clientPackRangeHdr(const HttpReply * rep, const HttpHdrRangeSpec * spec, String boundary, MemBuf * mb)
+ {
+     HttpHeader hdr(hoReply);
+@@ -895,7 +706,7 @@
+     assert(spec);
+ 
+     /* put boundary */
+-    debugs(33, 5, &quot;clientPackRangeHdr: appending boundary: &quot; &lt;&lt; boundary);
++    debugs(33, 5, &quot;appending boundary: &quot; &lt;&lt; boundary);
+     /* rfc2046 requires to _prepend_ boundary with &lt;crlf&gt;! */
+     mb-&gt;appendf(&quot;\r\n--&quot; SQUIDSTRINGPH &quot;\r\n&quot;, SQUIDSTRINGPRINT(boundary));
+ 
+@@ -913,90 +724,6 @@
+     mb-&gt;append(&quot;\r\n&quot;, 2);
+ }
+ 
+-/**
+- * extracts a &quot;range&quot; from *buf and appends them to mb, updating
+- * all offsets and such.
+- */
+-void
+-ClientSocketContext::packRange(StoreIOBuffer const &amp;source, MemBuf * mb)
+-{
+-    HttpHdrRangeIter * i = &amp;http-&gt;range_iter;
+-    Range&lt;int64_t&gt; available (source.range());
+-    char const *buf = source.data;
+-
+-    while (i-&gt;currentSpec() &amp;&amp; available.size()) {
+-        const size_t copy_sz = lengthToSend(available);
+-
+-        if (copy_sz) {
+-            /*
+-             * intersection of &quot;have&quot; and &quot;need&quot; ranges must not be empty
+-             */
+-            assert(http-&gt;out.offset &lt; i-&gt;currentSpec()-&gt;offset + i-&gt;currentSpec()-&gt;length);
+-            assert(http-&gt;out.offset + (int64_t)available.size() &gt; i-&gt;currentSpec()-&gt;offset);
+-
+-            /*
+-             * put boundary and headers at the beginning of a range in a
+-             * multi-range
+-             */
+-
+-            if (http-&gt;multipartRangeRequest() &amp;&amp; i-&gt;debt() == i-&gt;currentSpec()-&gt;length) {
+-                assert(http-&gt;memObject());
+-                clientPackRangeHdr(
+-                    http-&gt;memObject()-&gt;getReply(),  /* original reply */
+-                    i-&gt;currentSpec(),       /* current range */
+-                    i-&gt;boundary,    /* boundary, the same for all */
+-                    mb);
+-            }
+-
+-            /*
+-             * append content
+-             */
+-            debugs(33, 3, &quot;clientPackRange: appending &quot; &lt;&lt; copy_sz &lt;&lt; &quot; bytes&quot;);
+-
+-            noteSentBodyBytes (copy_sz);
+-
+-            mb-&gt;append(buf, copy_sz);
+-
+-            /*
+-             * update offsets
+-             */
+-            available.start += copy_sz;
+-
+-            buf += copy_sz;
+-
+-        }
+-
+-        if (!canPackMoreRanges()) {
+-            debugs(33, 3, &quot;clientPackRange: Returning because !canPackMoreRanges.&quot;);
+-
+-            if (i-&gt;debt() == 0)
+-                /* put terminating boundary for multiparts */
+-                clientPackTermBound(i-&gt;boundary, mb);
+-
+-            return;
+-        }
+-
+-        int64_t nextOffset = getNextRangeOffset();
+-
+-        assert (nextOffset &gt;= http-&gt;out.offset);
+-
+-        int64_t skip = nextOffset - http-&gt;out.offset;
+-
+-        /* adjust for not to be transmitted bytes */
+-        http-&gt;out.offset = nextOffset;
+-
+-        if (available.size() &lt;= (uint64_t)skip)
+-            return;
+-
+-        available.start += skip;
+-
+-        buf += skip;
+-
+-        if (copy_sz == 0)
+-            return;
+-    }
+-}
+-
+ /** returns expected content length for multi-range replies
+  * note: assumes that httpHdrRangeCanonize has already been called
+  * warning: assumes that HTTP headers for individual ranges at the
+@@ -1040,44 +767,6 @@
+ }
+ 
+ /**
+- * returns true if If-Range specs match reply, false otherwise
+- */
+-static int
+-clientIfRangeMatch(ClientHttpRequest * http, HttpReply * rep)
+-{
+-    const TimeOrTag spec = http-&gt;request-&gt;header.getTimeOrTag(Http::HdrType::IF_RANGE);
+-    /* check for parsing falure */
+-
+-    if (!spec.valid)
+-        return 0;
+-
+-    /* got an ETag? */
+-    if (spec.tag.str) {
+-        ETag rep_tag = rep-&gt;header.getETag(Http::HdrType::ETAG);
+-        debugs(33, 3, &quot;clientIfRangeMatch: ETags: &quot; &lt;&lt; spec.tag.str &lt;&lt; &quot; and &quot; &lt;&lt;
+-               (rep_tag.str ? rep_tag.str : &quot;&lt;none&gt;&quot;));
+-
+-        if (!rep_tag.str)
+-            return 0;       /* entity has no etag to compare with! */
+-
+-        if (spec.tag.weak || rep_tag.weak) {
+-            debugs(33, DBG_IMPORTANT, &quot;clientIfRangeMatch: Weak ETags are not allowed in If-Range: &quot; &lt;&lt; spec.tag.str &lt;&lt; &quot; ? &quot; &lt;&lt; rep_tag.str);
+-            return 0;       /* must use strong validator for sub-range requests */
+-        }
+-
+-        return etagIsStrongEqual(rep_tag, spec.tag);
+-    }
+-
+-    /* got modification time? */
+-    if (spec.time &gt;= 0) {
+-        return http-&gt;storeEntry()-&gt;lastmod &lt;= spec.time;
+-    }
+-
+-    assert(0);          /* should not happen */
+-    return 0;
+-}
+-
+-/**
+  * generates a &quot;unique&quot; boundary string for multipart responses
+  * the caller is responsible for cleaning the string */
+ String
+@@ -1091,165 +780,6 @@
+     return b;
+ }
+ 
+-/** adds appropriate Range headers if needed */
+-void
+-ClientSocketContext::buildRangeHeader(HttpReply * rep)
+-{
+-    HttpHeader *hdr = rep ? &amp;rep-&gt;header : 0;
+-    const char *range_err = NULL;
+-    HttpRequest *request = http-&gt;request;
+-    assert(request-&gt;range);
+-    /* check if we still want to do ranges */
+-
+-    int64_t roffLimit = request-&gt;getRangeOffsetLimit();
+-
+-    if (!rep)
+-        range_err = &quot;no [parse-able] reply&quot;;
+-    else if ((rep-&gt;sline.status() != Http::scOkay) &amp;&amp; (rep-&gt;sline.status() != Http::scPartialContent))
+-        range_err = &quot;wrong status code&quot;;
+-    else if (hdr-&gt;has(Http::HdrType::CONTENT_RANGE))
+-        range_err = &quot;origin server does ranges&quot;;
+-    else if (rep-&gt;content_length &lt; 0)
+-        range_err = &quot;unknown length&quot;;
+-    else if (rep-&gt;content_length != http-&gt;memObject()-&gt;getReply()-&gt;content_length)
+-        range_err = &quot;INCONSISTENT length&quot;;  /* a bug? */
+-
+-    /* hits only - upstream CachePeer determines correct behaviour on misses, and client_side_reply determines
+-     * hits candidates
+-     */
+-    else if (http-&gt;logType.isTcpHit() &amp;&amp; http-&gt;request-&gt;header.has(Http::HdrType::IF_RANGE) &amp;&amp; !clientIfRangeMatch(http, rep))
+-        range_err = &quot;If-Range match failed&quot;;
+-    else if (!http-&gt;request-&gt;range-&gt;canonize(rep))
+-        range_err = &quot;canonization failed&quot;;
+-    else if (http-&gt;request-&gt;range-&gt;isComplex())
+-        range_err = &quot;too complex range header&quot;;
+-    else if (!http-&gt;logType.isTcpHit() &amp;&amp; http-&gt;request-&gt;range-&gt;offsetLimitExceeded(roffLimit))
+-        range_err = &quot;range outside range_offset_limit&quot;;
+-
+-    /* get rid of our range specs on error */
+-    if (range_err) {
+-        /* XXX We do this here because we need canonisation etc. However, this current
+-         * code will lead to incorrect store offset requests - the store will have the
+-         * offset data, but we won't be requesting it.
+-         * So, we can either re-request, or generate an error
+-         */
+-        http-&gt;request-&gt;ignoreRange(range_err);
+-    } else {
+-        /* XXX: TODO: Review, this unconditional set may be wrong. */
+-        rep-&gt;sline.set(rep-&gt;sline.version, Http::scPartialContent);
+-        // web server responded with a valid, but unexpected range.
+-        // will (try-to) forward as-is.
+-        //TODO: we should cope with multirange request/responses
+-        bool replyMatchRequest = rep-&gt;content_range != NULL ?
+-                                 request-&gt;range-&gt;contains(rep-&gt;content_range-&gt;spec) :
+-                                 true;
+-        const int spec_count = http-&gt;request-&gt;range-&gt;specs.size();
+-        int64_t actual_clen = -1;
+-
+-        debugs(33, 3, &quot;clientBuildRangeHeader: range spec count: &quot; &lt;&lt;
+-               spec_count &lt;&lt; &quot; virgin clen: &quot; &lt;&lt; rep-&gt;content_length);
+-        assert(spec_count &gt; 0);
+-        /* append appropriate header(s) */
+-
+-        if (spec_count == 1) {
+-            if (!replyMatchRequest) {
+-                hdr-&gt;delById(Http::HdrType::CONTENT_RANGE);
+-                hdr-&gt;putContRange(rep-&gt;content_range);
+-                actual_clen = rep-&gt;content_length;
+-                //http-&gt;range_iter.pos = rep-&gt;content_range-&gt;spec.begin();
+-                (*http-&gt;range_iter.pos)-&gt;offset = rep-&gt;content_range-&gt;spec.offset;
+-                (*http-&gt;range_iter.pos)-&gt;length = rep-&gt;content_range-&gt;spec.length;
+-
+-            } else {
+-                HttpHdrRange::iterator pos = http-&gt;request-&gt;range-&gt;begin();
+-                assert(*pos);
+-                /* append Content-Range */
+-
+-                if (!hdr-&gt;has(Http::HdrType::CONTENT_RANGE)) {
+-                    /* No content range, so this was a full object we are
+-                     * sending parts of.
+-                     */
+-                    httpHeaderAddContRange(hdr, **pos, rep-&gt;content_length);
+-                }
+-
+-                /* set new Content-Length to the actual number of bytes
+-                 * transmitted in the message-body */
+-                actual_clen = (*pos)-&gt;length;
+-            }
+-        } else {
+-            /* multipart! */
+-            /* generate boundary string */
+-            http-&gt;range_iter.boundary = http-&gt;rangeBoundaryStr();
+-            /* delete old Content-Type, add ours */
+-            hdr-&gt;delById(Http::HdrType::CONTENT_TYPE);
+-            httpHeaderPutStrf(hdr, Http::HdrType::CONTENT_TYPE,
+-                              &quot;multipart/byteranges; boundary=\&quot;&quot; SQUIDSTRINGPH &quot;\&quot;&quot;,
+-                              SQUIDSTRINGPRINT(http-&gt;range_iter.boundary));
+-            /* Content-Length is not required in multipart responses
+-             * but it is always nice to have one */
+-            actual_clen = http-&gt;mRangeCLen();
+-            /* http-&gt;out needs to start where we want data at */
+-            http-&gt;out.offset = http-&gt;range_iter.currentSpec()-&gt;offset;
+-        }
+-
+-        /* replace Content-Length header */
+-        assert(actual_clen &gt;= 0);
+-
+-        hdr-&gt;delById(Http::HdrType::CONTENT_LENGTH);
+-
+-        hdr-&gt;putInt64(Http::HdrType::CONTENT_LENGTH, actual_clen);
+-
+-        debugs(33, 3, &quot;clientBuildRangeHeader: actual content length: &quot; &lt;&lt; actual_clen);
+-
+-        /* And start the range iter off */
+-        http-&gt;range_iter.updateSpec();
+-    }
+-}
+-
+-void
+-ClientSocketContext::prepareReply(HttpReply * rep)
+-{
+-    reply = rep;
+-
+-    if (http-&gt;request-&gt;range)
+-        buildRangeHeader(rep);
+-}
+-
+-void
+-ClientSocketContext::sendStartOfMessage(HttpReply * rep, StoreIOBuffer bodyData)
+-{
+-    prepareReply(rep);
+-    assert (rep);
+-    MemBuf *mb = rep-&gt;pack();
+-
+-    // dump now, so we dont output any body.
+-    debugs(11, 2, &quot;HTTP Client &quot; &lt;&lt; clientConnection);
+-    debugs(11, 2, &quot;HTTP Client REPLY:\n---------\n&quot; &lt;&lt; mb-&gt;buf &lt;&lt; &quot;\n----------&quot;);
+-
+-    /* Save length of headers for persistent conn checks */
+-    http-&gt;out.headers_sz = mb-&gt;contentSize();
+-#if HEADERS_LOG
+-
+-    headersLog(0, 0, http-&gt;request-&gt;method, rep);
+-#endif
+-
+-    if (bodyData.data &amp;&amp; bodyData.length) {
+-        if (multipartRangeRequest())
+-            packRange(bodyData, mb);
+-        else if (http-&gt;request-&gt;flags.chunkedReply) {
+-            packChunk(bodyData, *mb);
+-        } else {
+-            size_t length = lengthToSend(bodyData.range());
+-            noteSentBodyBytes (length);
+-
+-            mb-&gt;append(bodyData.data, length);
+-        }
+-    }
+-
+-    getConn()-&gt;write(mb);
+-    delete mb;
+-}
+-
+ /**
+  * Write a chunk of data to a client socket. If the reply is present,
+  * send the reply headers down the wire too, and clean them up when
+@@ -1277,7 +807,7 @@
+      */
+     assert(cbdataReferenceValid(node));
+     assert(node-&gt;node.next == NULL);
+-    ClientSocketContext::Pointer context = dynamic_cast&lt;ClientSocketContext *&gt;(node-&gt;data.getRaw());
++    Http::StreamContextPointer context = dynamic_cast&lt;Http::StreamContext *&gt;(node-&gt;data.getRaw());
+     assert(context != NULL);
+ 
+     /* TODO: check offset is what we asked for */
+@@ -1310,7 +840,7 @@
+     /* Set null by ContextFree */
+     assert(node-&gt;node.next == NULL);
+     /* this is the assert discussed above */
+-    assert(NULL == dynamic_cast&lt;ClientSocketContext *&gt;(node-&gt;data.getRaw()));
++    assert(NULL == dynamic_cast&lt;Http::StreamContext *&gt;(node-&gt;data.getRaw()));
+     /* We are only called when the client socket shutsdown.
+      * Tell the prev pipeline member we're finished
+      */
+@@ -1336,7 +866,7 @@
+ }
+ 
+ static void
+-ClientSocketContextPushDeferredIfNeeded(ClientSocketContext::Pointer deferredRequest, ConnStateData * conn)
++ClientSocketContextPushDeferredIfNeeded(Http::StreamContextPointer deferredRequest, ConnStateData * conn)
+ {
+     debugs(33, 2, HERE &lt;&lt; conn-&gt;clientConnection &lt;&lt; &quot; Sending next&quot;);
+ 
+@@ -1425,7 +955,7 @@
+      * then look at processing it. If not, simply kickstart
+      * another read.
+      */
+-    ClientSocketContext::Pointer deferredRequest = pipeline.front();
++    Http::StreamContextPointer deferredRequest = pipeline.front();
+     if (deferredRequest != nullptr) {
+         debugs(33, 3, clientConnection &lt;&lt; &quot;: calling PushDeferredIfNeeded&quot;);
+         ClientSocketContextPushDeferredIfNeeded(deferredRequest, this);
+@@ -1439,190 +969,6 @@
+ }
+ 
+ void
+-clientUpdateSocketStats(const LogTags &amp;logType, size_t size)
+-{
+-    if (size == 0)
+-        return;
+-
+-    statCounter.client_http.kbytes_out += size;
+-
+-    if (logType.isTcpHit())
+-        statCounter.client_http.hit_kbytes_out += size;
+-}
+-
+-/**
+- * increments iterator &quot;i&quot;
+- * used by clientPackMoreRanges
+- *
+- \retval true    there is still data available to pack more ranges
+- \retval false
+- */
+-bool
+-ClientSocketContext::canPackMoreRanges() const
+-{
+-    /** first update iterator &quot;i&quot; if needed */
+-
+-    if (!http-&gt;range_iter.debt()) {
+-        debugs(33, 5, HERE &lt;&lt; &quot;At end of current range spec for &quot; &lt;&lt; clientConnection);
+-
+-        if (http-&gt;range_iter.pos != http-&gt;range_iter.end)
+-            ++http-&gt;range_iter.pos;
+-
+-        http-&gt;range_iter.updateSpec();
+-    }
+-
+-    assert(!http-&gt;range_iter.debt() == !http-&gt;range_iter.currentSpec());
+-
+-    /* paranoid sync condition */
+-    /* continue condition: need_more_data */
+-    debugs(33, 5, &quot;ClientSocketContext::canPackMoreRanges: returning &quot; &lt;&lt; (http-&gt;range_iter.currentSpec() ? true : false));
+-    return http-&gt;range_iter.currentSpec() ? true : false;
+-}
+-
+-int64_t
+-ClientSocketContext::getNextRangeOffset() const
+-{
+-    debugs (33, 5, &quot;range: &quot; &lt;&lt; http-&gt;request-&gt;range &lt;&lt;
+-            &quot;; http offset &quot; &lt;&lt; http-&gt;out.offset &lt;&lt;
+-            &quot;; reply &quot; &lt;&lt; reply);
+-
+-    // XXX: This method is called from many places, including pullData() which
+-    // may be called before prepareReply() [on some Squid-generated errors].
+-    // Hence, we may not even know yet whether we should honor/do ranges.
+-
+-    if (http-&gt;request-&gt;range) {
+-        /* offset in range specs does not count the prefix of an http msg */
+-        /* check: reply was parsed and range iterator was initialized */
+-        assert(http-&gt;range_iter.valid);
+-        /* filter out data according to range specs */
+-        assert (canPackMoreRanges());
+-        {
+-            int64_t start;      /* offset of still missing data */
+-            assert(http-&gt;range_iter.currentSpec());
+-            start = http-&gt;range_iter.currentSpec()-&gt;offset + http-&gt;range_iter.currentSpec()-&gt;length - http-&gt;range_iter.debt();
+-            debugs(33, 3, &quot;clientPackMoreRanges: in:  offset: &quot; &lt;&lt; http-&gt;out.offset);
+-            debugs(33, 3, &quot;clientPackMoreRanges: out:&quot;
+-                   &quot; start: &quot; &lt;&lt; start &lt;&lt;
+-                   &quot; spec[&quot; &lt;&lt; http-&gt;range_iter.pos - http-&gt;request-&gt;range-&gt;begin() &lt;&lt; &quot;]:&quot; &lt;&lt;
+-                   &quot; [&quot; &lt;&lt; http-&gt;range_iter.currentSpec()-&gt;offset &lt;&lt;
+-                   &quot;, &quot; &lt;&lt; http-&gt;range_iter.currentSpec()-&gt;offset + http-&gt;range_iter.currentSpec()-&gt;length &lt;&lt; &quot;),&quot;
+-                   &quot; len: &quot; &lt;&lt; http-&gt;range_iter.currentSpec()-&gt;length &lt;&lt;
+-                   &quot; debt: &quot; &lt;&lt; http-&gt;range_iter.debt());
+-            if (http-&gt;range_iter.currentSpec()-&gt;length != -1)
+-                assert(http-&gt;out.offset &lt;= start);  /* we did not miss it */
+-
+-            return start;
+-        }
+-
+-    } else if (reply &amp;&amp; reply-&gt;content_range) {
+-        /* request does not have ranges, but reply does */
+-        /** \todo FIXME: should use range_iter_pos on reply, as soon as reply-&gt;content_range
+-         *        becomes HttpHdrRange rather than HttpHdrRangeSpec.
+-         */
+-        return http-&gt;out.offset + reply-&gt;content_range-&gt;spec.offset;
+-    }
+-
+-    return http-&gt;out.offset;
+-}
+-
+-void
+-ClientSocketContext::pullData()
+-{
+-    debugs(33, 5, reply &lt;&lt; &quot; written &quot; &lt;&lt; http-&gt;out.size &lt;&lt; &quot; into &quot; &lt;&lt; clientConnection);
+-
+-    /* More data will be coming from the stream. */
+-    StoreIOBuffer readBuffer;
+-    /* XXX: Next requested byte in the range sequence */
+-    /* XXX: length = getmaximumrangelenfgth */
+-    readBuffer.offset = getNextRangeOffset();
+-    readBuffer.length = HTTP_REQBUF_SZ;
+-    readBuffer.data = reqbuf;
+-    /* we may note we have reached the end of the wanted ranges */
+-    clientStreamRead(getTail(), http, readBuffer);
+-}
+-
+-/** Adapt stream status to account for Range cases
+- *
+- */
+-clientStream_status_t
+-ClientSocketContext::socketState()
+-{
+-    switch (clientStreamStatus(getTail(), http)) {
+-
+-    case STREAM_NONE:
+-        /* check for range support ending */
+-
+-        if (http-&gt;request-&gt;range) {
+-            /* check: reply was parsed and range iterator was initialized */
+-            assert(http-&gt;range_iter.valid);
+-            /* filter out data according to range specs */
+-
+-            if (!canPackMoreRanges()) {
+-                debugs(33, 5, HERE &lt;&lt; &quot;Range request at end of returnable &quot; &lt;&lt;
+-                       &quot;range sequence on &quot; &lt;&lt; clientConnection);
+-                // we got everything we wanted from the store
+-                return STREAM_COMPLETE;
+-            }
+-        } else if (reply &amp;&amp; reply-&gt;content_range) {
+-            /* reply has content-range, but Squid is not managing ranges */
+-            const int64_t &amp;bytesSent = http-&gt;out.offset;
+-            const int64_t &amp;bytesExpected = reply-&gt;content_range-&gt;spec.length;
+-
+-            debugs(33, 7, HERE &lt;&lt; &quot;body bytes sent vs. expected: &quot; &lt;&lt;
+-                   bytesSent &lt;&lt; &quot; ? &quot; &lt;&lt; bytesExpected &lt;&lt; &quot; (+&quot; &lt;&lt;
+-                   reply-&gt;content_range-&gt;spec.offset &lt;&lt; &quot;)&quot;);
+-
+-            // did we get at least what we expected, based on range specs?
+-
+-            if (bytesSent == bytesExpected) // got everything
+-                return STREAM_COMPLETE;
+-
+-            if (bytesSent &gt; bytesExpected) // Error: Sent more than expected
+-                return STREAM_UNPLANNED_COMPLETE;
+-        }
+-
+-        return STREAM_NONE;
+-
+-    case STREAM_COMPLETE:
+-        return STREAM_COMPLETE;
+-
+-    case STREAM_UNPLANNED_COMPLETE:
+-        return STREAM_UNPLANNED_COMPLETE;
+-
+-    case STREAM_FAILED:
+-        return STREAM_FAILED;
+-    }
+-
+-    fatal (&quot;unreachable code\n&quot;);
+-    return STREAM_NONE;
+-}
+-
+-/// remembers the abnormal connection termination for logging purposes
+-void
+-ClientSocketContext::noteIoError(const int xerrno)
+-{
+-    if (http) {
+-        http-&gt;logType.err.timedout = (xerrno == ETIMEDOUT);
+-        // aborted even if xerrno is zero (which means read abort/eof)
+-        http-&gt;logType.err.aborted = (xerrno != ETIMEDOUT);
+-    }
+-}
+-
+-void
+-ClientSocketContext::doClose()
+-{
+-    clientConnection-&gt;close();
+-}
+-
+-/// called when we encounter a response-related error
+-void
+-ClientSocketContext::initiateClose(const char *reason)
+-{
+-    debugs(33, 4, clientConnection &lt;&lt; &quot; because &quot; &lt;&lt; reason);
+-    http-&gt;getConn()-&gt;stopSending(reason); // closes ASAP
+-}
+-
+-void
+ ConnStateData::stopSending(const char *error)
+ {
+     debugs(33, 4, HERE &lt;&lt; &quot;sending error (&quot; &lt;&lt; clientConnection &lt;&lt; &quot;): &quot; &lt;&lt; error &lt;&lt;
+@@ -1652,64 +998,23 @@
+     if (pipeline.empty())
+         return;
+ 
+-    pipeline.front()-&gt;writeComplete(size);
+-}
+-
+-// TODO: make this only need size parameter, ConnStateData handles the rest
+-void
+-ClientSocketContext::writeComplete(size_t size)
+-{
+-    const StoreEntry *entry = http-&gt;storeEntry();
+-    debugs(33, 5, clientConnection &lt;&lt; &quot;, sz &quot; &lt;&lt; size &lt;&lt;
+-           &quot;, off &quot; &lt;&lt; (http-&gt;out.size + size) &lt;&lt; &quot;, len &quot; &lt;&lt;
+-           (entry ? entry-&gt;objectLen() : 0));
+-
+-    http-&gt;out.size += size;
+-    clientUpdateSocketStats(http-&gt;logType, size);
+-
+-    if (clientHttpRequestStatus(clientConnection-&gt;fd, http)) {
+-        initiateClose(&quot;failure or true request status&quot;);
+-        /* Do we leak here ? */
+-        return;
+-    }
+-
+-    switch (socketState()) {
+-
+-    case STREAM_NONE:
+-        pullData();
+-        break;
+-
+-    case STREAM_COMPLETE: {
+-        debugs(33, 5, clientConnection &lt;&lt; &quot; Stream complete, keepalive is &quot; &lt;&lt; http-&gt;request-&gt;flags.proxyKeepalive);
+-        ConnStateData *c = http-&gt;getConn();
+-        if (!http-&gt;request-&gt;flags.proxyKeepalive)
+-            clientConnection-&gt;close();
+-        finished();
+-        c-&gt;kick();
+-    }
+-    return;
+-
+-    case STREAM_UNPLANNED_COMPLETE:
+-        initiateClose(&quot;STREAM_UNPLANNED_COMPLETE&quot;);
+-        return;
+-
+-    case STREAM_FAILED:
+-        initiateClose(&quot;STREAM_FAILED&quot;);
+-        return;
+-
+-    default:
+-        fatal(&quot;Hit unreachable code in ClientSocketContext::writeComplete\n&quot;);
+-    }
+-}
+-
+-ClientSocketContext *
++    auto ctx = pipeline.front();
++    if (size) {
++        statCounter.client_http.kbytes_out += size;
++        if (ctx-&gt;http-&gt;logType.isTcpHit())
++            statCounter.client_http.hit_kbytes_out += size;
++    }
++    ctx-&gt;writeComplete(size);
++}
++
++Http::StreamContext *
+ ConnStateData::abortRequestParsing(const char *const uri)
+ {
+     ClientHttpRequest *http = new ClientHttpRequest(this);
+     http-&gt;req_sz = inBuf.length();
+     http-&gt;uri = xstrdup(uri);
+     setLogUri (http, uri);
+-    ClientSocketContext *context = new ClientSocketContext(clientConnection, http);
++    auto *context = new Http::StreamContext(nextStreamId(), clientConnection, http);
+     StoreIOBuffer tempBuffer;
+     tempBuffer.data = context-&gt;reqbuf;
+     tempBuffer.length = HTTP_REQBUF_SZ;
+@@ -1985,9 +1290,9 @@
+  *          parsing failure
+  *  \param[out] http_ver will be set as a side-effect of the parsing
+  *  \return NULL on incomplete requests,
+- *          a ClientSocketContext structure on success or failure.
++ *          a Http::StreamContext on success or failure.
+  */
+-ClientSocketContext *
++Http::StreamContext *
+ parseHttpRequest(ConnStateData *csd, const Http1::RequestParserPointer &amp;hp)
+ {
+     /* Attempt to parse the first line; this will define where the method, url, version and header begin */
+@@ -2055,7 +1360,7 @@
+     ClientHttpRequest *http = new ClientHttpRequest(csd);
+ 
+     http-&gt;req_sz = hp-&gt;messageHeaderSize();
+-    ClientSocketContext *result = new ClientSocketContext(csd-&gt;clientConnection, http);
++    Http::StreamContext *result = new Http::StreamContext(csd-&gt;nextStreamId(), csd-&gt;clientConnection, http);
+ 
+     StoreIOBuffer tempBuffer;
+     tempBuffer.data = result-&gt;reqbuf;
+@@ -2166,7 +1471,7 @@
+ }
+ 
+ #if USE_OPENSSL
+-bool ConnStateData::serveDelayedError(ClientSocketContext *context)
++bool ConnStateData::serveDelayedError(Http::StreamContext *context)
+ {
+     ClientHttpRequest *http = context-&gt;http;
+ 
+@@ -2256,7 +1561,7 @@
+  * or false otherwise
+  */
+ bool
+-clientTunnelOnError(ConnStateData *conn, ClientSocketContext *context, HttpRequest *request, const HttpRequestMethod&amp; method, err_type requestError, Http::StatusCode errStatusCode, const char *requestErrorBytes)
++clientTunnelOnError(ConnStateData *conn, Http::StreamContext *context, HttpRequest *request, const HttpRequestMethod&amp; method, err_type requestError, Http::StatusCode errStatusCode, const char *requestErrorBytes)
+ {
+     if (conn-&gt;port-&gt;flags.isIntercepted() &amp;&amp;
+             Config.accessList.on_unsupported_protocol &amp;&amp; conn-&gt;pipeline.nrequests &lt;= 1) {
+@@ -2272,8 +1577,7 @@
+                 // XXX: Either the context is finished() or it should stay queued.
+                 // The below may leak client streams BodyPipe objects. BUT, we need
+                 // to check if client-streams detatch is safe to do here (finished() will detatch).
+-                assert(conn-&gt;pipeline.front() == context); // XXX: still assumes HTTP/1 semantics
+-                conn-&gt;pipeline.popMe(ClientSocketContextPointer(context));
++                conn-&gt;pipeline.popById(context-&gt;id);
+             }
+             Comm::SetSelect(conn-&gt;clientConnection-&gt;fd, COMM_SELECT_READ, NULL, NULL, 0);
+             conn-&gt;fakeAConnectRequest(&quot;unknown-protocol&quot;, conn-&gt;preservedClientData);
+@@ -2314,7 +1618,7 @@
+ }
+ 
+ void
+-clientProcessRequest(ConnStateData *conn, const Http1::RequestParserPointer &amp;hp, ClientSocketContext *context)
++clientProcessRequest(ConnStateData *conn, const Http1::RequestParserPointer &amp;hp, Http::StreamContext *context)
+ {
+     ClientHttpRequest *http = context-&gt;http;
+     bool chunked = false;
+@@ -2850,7 +2154,7 @@
+         if (needProxyProtocolHeader_ &amp;&amp; !parseProxyProtocolHeader())
+             break;
+ 
+-        if (ClientSocketContext *context = parseOneRequest()) {
++        if (Http::StreamContext *context = parseOneRequest()) {
+             debugs(33, 5, clientConnection &lt;&lt; &quot;: done parsing a request&quot;);
+ 
+             AsyncCall::Pointer timeoutCall = commCbCall(5, 4, &quot;clientLifetimeTimeout&quot;,
+@@ -3021,7 +2325,7 @@
+     // but if we fail when the server connection is used already, the server may send
+     // us its response too, causing various assertions. How to prevent that?
+ #if WE_KNOW_HOW_TO_SEND_ERRORS
+-    ClientSocketContext::Pointer context = pipeline.front();
++    Http::StreamContextPointer context = pipeline.front();
+     if (context != NULL &amp;&amp; !context-&gt;http-&gt;out.offset) { // output nothing yet
+         clientStreamNode *node = context-&gt;getClientReplyContext();
+         clientReplyContext *repContext = dynamic_cast&lt;clientReplyContext*&gt;(node-&gt;data.getRaw());
+@@ -3968,7 +3272,7 @@
+         transferProtocol = Http::ProtocolVersion();
+         // inBuf still has the &quot;CONNECT ...&quot; request data, reset it to SSL hello message
+         inBuf.append(rbuf.content(), rbuf.contentSize());
+-        ClientSocketContext::Pointer context = pipeline.front();
++        Http::StreamContextPointer context = pipeline.front();
+         ClientHttpRequest *http = context-&gt;http;
+         tunnelStart(http);
+     }
+@@ -4416,7 +3720,7 @@
+         Must(!bodyPipe); // we rely on it being nil after we are done with body
+         if (withSuccess) {
+             Must(myPipe-&gt;bodySizeKnown());
+-            ClientSocketContext::Pointer context = pipeline.front();
++            Http::StreamContextPointer context = pipeline.front();
+             if (context != NULL &amp;&amp; context-&gt;http &amp;&amp; context-&gt;http-&gt;request)
+                 context-&gt;http-&gt;request-&gt;setContentLength(myPipe-&gt;bodySize());
+         }
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2016-01-01 00:12:18 +0000
++++ src/client_side.h	2016-01-09 15:19:01 +0000
+@@ -27,130 +27,9 @@
+ #include &quot;ssl/support.h&quot;
+ #endif
+ 
+-class ConnStateData;
+ class ClientHttpRequest;
+-class clientStreamNode;
+-namespace AnyP
+-{
+-class PortCfg;
+-} // namespace Anyp
+-
+-/**
+- * Badly named.
+- * This is in fact the processing context for a single HTTP transaction.
+- *
+- * A context lifetime extends from directly after a request has been parsed
+- * off the client connection buffer, until the last byte of both request
+- * and reply payload (if any) have been written.
+- *
+- * (NOTE: it is not certain yet if an early reply to a POST/PUT is sent by
+- * the server whether the context will remain in the pipeline until its
+- * request payload has finished being read. It is supposed to, but may not)
+- *
+- * Contexts self-register with the Pipeline being managed by the Server
+- * for the connection on which the request was received.
+- *
+- * When HTTP/1 pipeline is operating there may be multiple transactions using
+- * the clientConnection. Only the back() context may read from the connection,
+- * and only the front() context may write to it. A context which needs to read
+- * or write to the connection but does not meet those criteria must be shifted
+- * to the deferred state.
+- *
+- * When a context is completed the finished() method needs to be called which
+- * will perform all cleanup and deregistration operations. If the reason for
+- * finishing is an error, then notifyIoError() needs to be called prior to
+- * the finished() method.
+- * The caller should follow finished() with a call to ConnStateData::kick()
+- * to resume processing of other transactions or I/O on the connection.
+- *
+- * Alternatively the initiateClose() method can be called to terminate the
+- * whole client connection and all other pending contexts.
+- *
+- * The socket level management is done by a Server which owns us.
+- * The scope of this objects control over a socket consists of the data
+- * buffer received from the Server with an initially unknown length.
+- * When that length is known it sets the end boundary of our access to the
+- * buffer.
+- *
+- * The individual processing actions are done by other Jobs which we
+- * kick off as needed.
+- *
+- * XXX: If an async call ends the ClientHttpRequest job, ClientSocketContext
+- * (and ConnStateData) may not know about it, leading to segfaults and
+- * assertions. This is difficult to fix
+- * because ClientHttpRequest lacks a good way to communicate its ongoing
+- * destruction back to the ClientSocketContext which pretends to &quot;own&quot; *http.
+- */
+-class ClientSocketContext : public RefCountable
+-{
+-    MEMPROXY_CLASS(ClientSocketContext);
+-
+-public:
+-    typedef RefCount&lt;ClientSocketContext&gt; Pointer;
+-    ClientSocketContext(const Comm::ConnectionPointer &amp;aConn, ClientHttpRequest *aReq);
+-    ~ClientSocketContext();
+-    bool startOfOutput() const;
+-    void writeComplete(size_t size);
+-
+-    Comm::ConnectionPointer clientConnection; /// details about the client connection socket.
+-    ClientHttpRequest *http;    /* we pretend to own that job */
+-    HttpReply *reply;
+-    char reqbuf[HTTP_REQBUF_SZ];
+-
+-    struct {
+-
+-        unsigned deferred:1; /* This is a pipelined request waiting for the current object to complete */
+-
+-        unsigned parsed_ok:1; /* Was this parsed correctly? */
+-    } flags;
+-    bool mayUseConnection() const {return mayUseConnection_;}
+-
+-    void mayUseConnection(bool aBool) {
+-        mayUseConnection_ = aBool;
+-        debugs(33,3, HERE &lt;&lt; &quot;This &quot; &lt;&lt; this &lt;&lt; &quot; marked &quot; &lt;&lt; aBool);
+-    }
+-
+-    class DeferredParams
+-    {
+-
+-    public:
+-        clientStreamNode *node;
+-        HttpReply *rep;
+-        StoreIOBuffer queuedBuffer;
+-    };
+-
+-    DeferredParams deferredparams;
+-    int64_t writtenToSocket;
+-    void pullData();
+-    int64_t getNextRangeOffset() const;
+-    bool canPackMoreRanges() const;
+-    clientStream_status_t socketState();
+-    void sendBody(HttpReply * rep, StoreIOBuffer bodyData);
+-    void sendStartOfMessage(HttpReply * rep, StoreIOBuffer bodyData);
+-    size_t lengthToSend(Range&lt;int64_t&gt; const &amp;available);
+-    void noteSentBodyBytes(size_t);
+-    void buildRangeHeader(HttpReply * rep);
+-    clientStreamNode * getTail() const;
+-    clientStreamNode * getClientReplyContext() const;
+-    ConnStateData *getConn() const;
+-    void finished(); ///&lt; cleanup when the transaction has finished. may destroy 'this'
+-    void deferRecipientForLater(clientStreamNode * node, HttpReply * rep, StoreIOBuffer receivedData);
+-    bool multipartRangeRequest() const;
+-    void registerWithConn();
+-    void noteIoError(const int xerrno); ///&lt; update state to reflect I/O error
+-    void initiateClose(const char *reason); ///&lt; terminate due to a send/write error (may continue reading)
+-
+-private:
+-    void prepareReply(HttpReply * rep);
+-    void packChunk(const StoreIOBuffer &amp;bodyData, MemBuf &amp;mb);
+-    void packRange(StoreIOBuffer const &amp;, MemBuf * mb);
+-    void doClose();
+-
+-    bool mayUseConnection_; /* This request may use the connection. Don't read anymore requests for now */
+-    bool connRegistered_;
+-};
+-
+-class ConnectionDetail;
++class HttpHdrRangeSpec;
++
+ #if USE_OPENSSL
+ namespace Ssl
+ {
+@@ -174,7 +53,7 @@
+  * processed.
+  *
+  * Performs HTTP message processing to kick off the actual HTTP request
+- * handling objects (ClientSocketContext, ClientHttpRequest, HttpRequest).
++ * handling objects (Http::StreamContext, ClientHttpRequest, HttpRequest).
+  *
+  * Performs SSL-Bump processing for switching between HTTP and HTTPS protocols.
+  *
+@@ -190,6 +69,7 @@
+     virtual ~ConnStateData();
+ 
+     /* ::Server API */
++    virtual uint32_t nextStreamId() {return ++nextStreamId_;}
+     virtual void receivedFirstByte();
+     virtual bool handleReadData();
+     virtual void afterClientRead();
+@@ -372,7 +252,7 @@
+     /// Returns false if no [delayed] error should be written to the client.
+     /// Otherwise, writes the error to the client and returns true. Also checks
+     /// for SQUID_X509_V_ERR_DOMAIN_MISMATCH on bumped requests.
+-    bool serveDelayedError(ClientSocketContext *context);
++    bool serveDelayedError(Http::StreamContext *);
+ 
+     Ssl::BumpMode sslBumpMode; ///&lt; ssl_bump decision (Ssl::bumpEnd if n/a).
+ 
+@@ -388,7 +268,7 @@
+     virtual void writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &amp;call) = 0;
+ 
+     /// ClientStream calls this to supply response header (once) and data
+-    /// for the current ClientSocketContext.
++    /// for the current Http::StreamContext.
+     virtual void handleReply(HttpReply *header, StoreIOBuffer receivedData) = 0;
+ 
+     /// remove no longer needed leading bytes from the input buffer
+@@ -397,7 +277,7 @@
+     /* TODO: Make the methods below (at least) non-public when possible. */
+ 
+     /// stop parsing the request and create context for relaying error info
+-    ClientSocketContext *abortRequestParsing(const char *const errUri);
++    Http::StreamContext *abortRequestParsing(const char *const errUri);
+ 
+     /// generate a fake CONNECT request with the given payload
+     /// at the beginning of the client I/O buffer
+@@ -429,10 +309,10 @@
+     /// parse input buffer prefix into a single transfer protocol request
+     /// return NULL to request more header bytes (after checking any limits)
+     /// use abortRequestParsing() to handle parsing errors w/o creating request
+-    virtual ClientSocketContext *parseOneRequest() = 0;
++    virtual Http::StreamContext *parseOneRequest() = 0;
+ 
+     /// start processing a freshly parsed request
+-    virtual void processParsedRequest(ClientSocketContext *context) = 0;
++    virtual void processParsedRequest(Http::StreamContext *) = 0;
+ 
+     /// returning N allows a pipeline of 1+N requests (see pipeline_prefetch)
+     virtual int pipelinePrefetchMax() const;
+@@ -505,6 +385,12 @@
+ /// decide whether to expect multiple requests on the corresponding connection
+ void clientSetKeepaliveFlag(ClientHttpRequest *http);
+ 
++/// append a &quot;part&quot; HTTP header (as in a multi-part/range reply) to the buffer
++void clientPackRangeHdr(const HttpReply *, const HttpHdrRangeSpec *, String boundary, MemBuf *);
++
++/// put terminating boundary for multiparts to the buffer
++void clientPackTermBound(String boundary, MemBuf *);
++
+ /* misplaced declaratrions of Stream callbacks provided/used by client side */
+ SQUIDCEXTERN CSR clientGetMoreData;
+ SQUIDCEXTERN CSS clientReplyStatus;
+@@ -513,8 +399,8 @@
+ CSD clientSocketDetach;
+ 
+ /* TODO: Move to HttpServer. Warning: Move requires large code nonchanges! */
+-ClientSocketContext *parseHttpRequest(ConnStateData *, const Http1::RequestParserPointer &amp;);
+-void clientProcessRequest(ConnStateData *, const Http1::RequestParserPointer &amp;, ClientSocketContext *);
++Http::StreamContext *parseHttpRequest(ConnStateData *, const Http1::RequestParserPointer &amp;);
++void clientProcessRequest(ConnStateData *, const Http1::RequestParserPointer &amp;, Http::StreamContext *);
+ void clientPostHttpsAccept(ConnStateData *);
+ 
+ #endif /* SQUID_CLIENTSIDE_H */
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2016-01-01 00:12:18 +0000
++++ src/client_side_reply.cc	2016-01-07 14:42:33 +0000
+@@ -21,6 +21,7 @@
+ #include &quot;FwdState.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;globals.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+
+=== modified file 'src/client_side_request.cc'
+--- src/client_side_request.cc	2016-01-01 00:12:18 +0000
++++ src/client_side_request.cc	2016-01-07 14:38:37 +0000
+@@ -37,6 +37,7 @@
+ #include &quot;helper.h&quot;
+ #include &quot;helper/Reply.h&quot;
+ #include &quot;http.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHdrCc.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+
+=== modified file 'src/clients/FtpClient.cc'
+--- src/clients/FtpClient.cc	2016-01-01 00:12:18 +0000
++++ src/clients/FtpClient.cc	2016-01-07 12:27:48 +0000
+@@ -19,6 +19,7 @@
+ #include &quot;errorpage.h&quot;
+ #include &quot;fd.h&quot;
+ #include &quot;ftp/Parsing.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;ip/tools.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ #include &quot;SquidString.h&quot;
+
+=== modified file 'src/clients/FtpRelay.cc'
+--- src/clients/FtpRelay.cc	2016-01-01 00:12:18 +0000
++++ src/clients/FtpRelay.cc	2016-01-07 12:29:45 +0000
+@@ -15,6 +15,7 @@
+ #include &quot;clients/FtpClient.h&quot;
+ #include &quot;ftp/Elements.h&quot;
+ #include &quot;ftp/Parsing.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHdrCc.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;SBuf.h&quot;
+
+=== modified file 'src/delay_pools.cc'
+--- src/delay_pools.cc	2016-01-01 00:12:18 +0000
++++ src/delay_pools.cc	2016-01-10 17:22:50 +0000
+@@ -30,6 +30,7 @@
+ #include &quot;DelayUser.h&quot;
+ #include &quot;DelayVector.h&quot;
+ #include &quot;event.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;ip/Address.h&quot;
+ #include &quot;MemObject.h&quot;
+ #include &quot;mgr/Registration.h&quot;
+
+=== modified file 'src/esi/Context.cc'
+--- src/esi/Context.cc	2016-01-01 00:12:18 +0000
++++ src/esi/Context.cc	2016-01-07 14:18:55 +0000
+@@ -17,6 +17,7 @@
+ 
+ #include &quot;client_side_request.h&quot;
+ #include &quot;esi/Context.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;Store.h&quot;
+ 
+ void
+
+=== modified file 'src/esi/Esi.cc'
+--- src/esi/Esi.cc	2016-01-01 00:12:18 +0000
++++ src/esi/Esi.cc	2016-01-07 14:34:39 +0000
+@@ -30,6 +30,7 @@
+ #include &quot;esi/Segment.h&quot;
+ #include &quot;esi/VarState.h&quot;
+ #include &quot;fatal.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHdrSc.h&quot;
+ #include &quot;HttpHdrScTarget.h&quot;
+ #include &quot;HttpReply.h&quot;
+
+=== modified file 'src/esi/Include.cc'
+--- src/esi/Include.cc	2016-01-01 00:12:18 +0000
++++ src/esi/Include.cc	2016-01-07 14:43:44 +0000
+@@ -17,6 +17,7 @@
+ #include &quot;esi/Include.h&quot;
+ #include &quot;esi/VarState.h&quot;
+ #include &quot;fatal.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;log/access_log.h&quot;
+ 
+
+=== modified file 'src/external_acl.cc'
+--- src/external_acl.cc	2016-01-01 00:12:18 +0000
++++ src/external_acl.cc	2016-01-07 14:33:44 +0000
+@@ -22,6 +22,7 @@
+ #include &quot;format/Token.h&quot;
+ #include &quot;helper.h&quot;
+ #include &quot;helper/Reply.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2016-01-01 00:12:18 +0000
++++ src/format/Format.cc	2016-01-07 12:11:18 +0000
+@@ -17,6 +17,7 @@
+ #include &quot;format/Quoting.h&quot;
+ #include &quot;format/Token.h&quot;
+ #include &quot;fqdncache.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;MemBuf.h&quot;
+ #include &quot;rfc1738.h&quot;
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2016-01-01 00:12:18 +0000
++++ src/http.cc	2016-01-07 15:18:05 +0000
+@@ -32,6 +32,7 @@
+ #include &quot;http.h&quot;
+ #include &quot;http/one/ResponseParser.h&quot;
+ #include &quot;http/one/TeChunkedParser.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpControlMsg.h&quot;
+ #include &quot;HttpHdrCc.h&quot;
+ #include &quot;HttpHdrContRange.h&quot;
+
+=== modified file 'src/http/Makefile.am'
+--- src/http/Makefile.am	2016-01-01 00:12:18 +0000
++++ src/http/Makefile.am	2016-01-09 03:08:25 +0000
+@@ -26,7 +26,9 @@
+ 	StatusCode.cc \
+ 	StatusCode.h \
+ 	StatusLine.cc \
+-	StatusLine.h
++	StatusLine.h \
++	StreamContext.cc \
++	StreamContext.h
+ 
+ libsquid_http_la_LIBADD= one/libhttp1.la
+ 
+
+=== added file 'src/http/StreamContext.cc'
+--- src/http/StreamContext.cc	1970-01-01 00:00:00 +0000
++++ src/http/StreamContext.cc	2016-01-10 12:47:07 +0000
+@@ -0,0 +1,667 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include &quot;squid.h&quot;
++#include &quot;client_side_request.h&quot;
++#include &quot;http/StreamContext.h&quot;
++#include &quot;HttpHdrContRange.h&quot;
++#include &quot;HttpHeaderTools.h&quot;
++#include &quot;Store.h&quot;
++#include &quot;TimeOrTag.h&quot;
++
++Http::StreamContext::StreamContext(uint32_t anId, const Comm::ConnectionPointer &amp;aConn, ClientHttpRequest *aReq) :
++    id(anId),
++    clientConnection(aConn),
++    http(aReq),
++    reply(nullptr),
++    writtenToSocket(0),
++    mayUseConnection_(false),
++    connRegistered_(false)
++{
++    assert(http != nullptr);
++    memset(reqbuf, '\0', sizeof (reqbuf));
++    flags.deferred = 0;
++    flags.parsed_ok = 0;
++    deferredparams.node = nullptr;
++    deferredparams.rep = nullptr;
++}
++
++Http::StreamContext::~StreamContext()
++{
++    if (auto node = getTail()) {
++        if (auto ctx = dynamic_cast&lt;Http::StreamContext *&gt;(node-&gt;data.getRaw())) {
++            /* We are *always* the tail - prevent recursive free */
++            assert(this == ctx);
++            node-&gt;data = nullptr;
++        }
++    }
++    httpRequestFree(http);
++}
++
++void
++Http::StreamContext::registerWithConn()
++{
++    assert(!connRegistered_);
++    assert(getConn());
++    connRegistered_ = true;
++    getConn()-&gt;pipeline.add(Http::StreamContextPointer(this));
++}
++
++bool
++Http::StreamContext::startOfOutput() const
++{
++    return http-&gt;out.size == 0;
++}
++
++void
++Http::StreamContext::writeComplete(size_t size)
++{
++    const StoreEntry *entry = http-&gt;storeEntry();
++    debugs(33, 5, clientConnection &lt;&lt; &quot;, sz &quot; &lt;&lt; size &lt;&lt;
++           &quot;, off &quot; &lt;&lt; (http-&gt;out.size + size) &lt;&lt; &quot;, len &quot; &lt;&lt;
++           (entry ? entry-&gt;objectLen() : 0));
++
++    http-&gt;out.size += size;
++
++    if (clientHttpRequestStatus(clientConnection-&gt;fd, http)) {
++        initiateClose(&quot;failure or true request status&quot;);
++        /* Do we leak here ? */
++        return;
++    }
++
++    switch (socketState()) {
++
++    case STREAM_NONE:
++        pullData();
++        break;
++
++    case STREAM_COMPLETE: {
++        debugs(33, 5, clientConnection &lt;&lt; &quot; Stream complete, keepalive is &quot; &lt;&lt;
++                      http-&gt;request-&gt;flags.proxyKeepalive);
++        ConnStateData *c = getConn();
++        if (!http-&gt;request-&gt;flags.proxyKeepalive)
++            clientConnection-&gt;close();
++        finished();
++        c-&gt;kick();
++    }
++    return;
++
++    case STREAM_UNPLANNED_COMPLETE:
++        initiateClose(&quot;STREAM_UNPLANNED_COMPLETE&quot;);
++        return;
++
++    case STREAM_FAILED:
++        initiateClose(&quot;STREAM_FAILED&quot;);
++        return;
++
++    default:
++        fatal(&quot;Hit unreachable code in Http::StreamContext::writeComplete\n&quot;);
++    }
++}
++
++void
++Http::StreamContext::pullData()
++{
++    debugs(33, 5, reply &lt;&lt; &quot; written &quot; &lt;&lt; http-&gt;out.size &lt;&lt; &quot; into &quot; &lt;&lt; clientConnection);
++
++    /* More data will be coming from the stream. */
++    StoreIOBuffer readBuffer;
++    /* XXX: Next requested byte in the range sequence */
++    /* XXX: length = getmaximumrangelenfgth */
++    readBuffer.offset = getNextRangeOffset();
++    readBuffer.length = HTTP_REQBUF_SZ;
++    readBuffer.data = reqbuf;
++    /* we may note we have reached the end of the wanted ranges */
++    clientStreamRead(getTail(), http, readBuffer);
++}
++
++bool
++Http::StreamContext::multipartRangeRequest() const
++{
++    return http-&gt;multipartRangeRequest();
++}
++
++int64_t
++Http::StreamContext::getNextRangeOffset() const
++{
++    debugs (33, 5, &quot;range: &quot; &lt;&lt; http-&gt;request-&gt;range &lt;&lt;
++            &quot;; http offset &quot; &lt;&lt; http-&gt;out.offset &lt;&lt;
++            &quot;; reply &quot; &lt;&lt; reply);
++
++    // XXX: This method is called from many places, including pullData() which
++    // may be called before prepareReply() [on some Squid-generated errors].
++    // Hence, we may not even know yet whether we should honor/do ranges.
++
++    if (http-&gt;request-&gt;range) {
++        /* offset in range specs does not count the prefix of an http msg */
++        /* check: reply was parsed and range iterator was initialized */
++        assert(http-&gt;range_iter.valid);
++        /* filter out data according to range specs */
++        assert(canPackMoreRanges());
++        {
++            assert(http-&gt;range_iter.currentSpec());
++            /* offset of still missing data */
++            int64_t start = http-&gt;range_iter.currentSpec()-&gt;offset +
++                            http-&gt;range_iter.currentSpec()-&gt;length -
++                            http-&gt;range_iter.debt();
++            debugs(33, 3, &quot;clientPackMoreRanges: in:  offset: &quot; &lt;&lt; http-&gt;out.offset);
++            debugs(33, 3, &quot;clientPackMoreRanges: out:&quot;
++                   &quot; start: &quot; &lt;&lt; start &lt;&lt;
++                   &quot; spec[&quot; &lt;&lt; http-&gt;range_iter.pos - http-&gt;request-&gt;range-&gt;begin() &lt;&lt; &quot;]:&quot; &lt;&lt;
++                   &quot; [&quot; &lt;&lt; http-&gt;range_iter.currentSpec()-&gt;offset &lt;&lt;
++                   &quot;, &quot; &lt;&lt; http-&gt;range_iter.currentSpec()-&gt;offset +
++                   http-&gt;range_iter.currentSpec()-&gt;length &lt;&lt; &quot;),&quot;
++                   &quot; len: &quot; &lt;&lt; http-&gt;range_iter.currentSpec()-&gt;length &lt;&lt;
++                   &quot; debt: &quot; &lt;&lt; http-&gt;range_iter.debt());
++            if (http-&gt;range_iter.currentSpec()-&gt;length != -1)
++                assert(http-&gt;out.offset &lt;= start);  /* we did not miss it */
++
++            return start;
++        }
++
++    } else if (reply &amp;&amp; reply-&gt;content_range) {
++        /* request does not have ranges, but reply does */
++        /** \todo FIXME: should use range_iter_pos on reply, as soon as reply-&gt;content_range
++         *        becomes HttpHdrRange rather than HttpHdrRangeSpec.
++         */
++        return http-&gt;out.offset + reply-&gt;content_range-&gt;spec.offset;
++    }
++
++    return http-&gt;out.offset;
++}
++
++/**
++ * increments iterator &quot;i&quot;
++ * used by clientPackMoreRanges
++ *
++ * \retval true    there is still data available to pack more ranges
++ * \retval false
++ */
++bool
++Http::StreamContext::canPackMoreRanges() const
++{
++    /** first update iterator &quot;i&quot; if needed */
++    if (!http-&gt;range_iter.debt()) {
++        debugs(33, 5, &quot;At end of current range spec for &quot; &lt;&lt; clientConnection);
++
++        if (http-&gt;range_iter.pos != http-&gt;range_iter.end)
++            ++http-&gt;range_iter.pos;
++
++        http-&gt;range_iter.updateSpec();
++    }
++
++    assert(!http-&gt;range_iter.debt() == !http-&gt;range_iter.currentSpec());
++
++    /* paranoid sync condition */
++    /* continue condition: need_more_data */
++    debugs(33, 5, &quot;returning &quot; &lt;&lt; (http-&gt;range_iter.currentSpec() ? true : false));
++    return http-&gt;range_iter.currentSpec() ? true : false;
++}
++
++/// Adapt stream status to account for Range cases
++clientStream_status_t
++Http::StreamContext::socketState()
++{
++    switch (clientStreamStatus(getTail(), http)) {
++
++    case STREAM_NONE:
++        /* check for range support ending */
++        if (http-&gt;request-&gt;range) {
++            /* check: reply was parsed and range iterator was initialized */
++            assert(http-&gt;range_iter.valid);
++            /* filter out data according to range specs */
++
++            if (!canPackMoreRanges()) {
++                debugs(33, 5, &quot;Range request at end of returnable &quot; &lt;&lt;
++                       &quot;range sequence on &quot; &lt;&lt; clientConnection);
++                // we got everything we wanted from the store
++                return STREAM_COMPLETE;
++            }
++        } else if (reply &amp;&amp; reply-&gt;content_range) {
++            /* reply has content-range, but Squid is not managing ranges */
++            const int64_t &amp;bytesSent = http-&gt;out.offset;
++            const int64_t &amp;bytesExpected = reply-&gt;content_range-&gt;spec.length;
++
++            debugs(33, 7, &quot;body bytes sent vs. expected: &quot; &lt;&lt;
++                   bytesSent &lt;&lt; &quot; ? &quot; &lt;&lt; bytesExpected &lt;&lt; &quot; (+&quot; &lt;&lt;
++                   reply-&gt;content_range-&gt;spec.offset &lt;&lt; &quot;)&quot;);
++
++            // did we get at least what we expected, based on range specs?
++
++            if (bytesSent == bytesExpected) // got everything
++                return STREAM_COMPLETE;
++
++            if (bytesSent &gt; bytesExpected) // Error: Sent more than expected
++                return STREAM_UNPLANNED_COMPLETE;
++        }
++
++        return STREAM_NONE;
++
++    case STREAM_COMPLETE:
++        return STREAM_COMPLETE;
++
++    case STREAM_UNPLANNED_COMPLETE:
++        return STREAM_UNPLANNED_COMPLETE;
++
++    case STREAM_FAILED:
++        return STREAM_FAILED;
++    }
++
++    fatal (&quot;unreachable code\n&quot;);
++    return STREAM_NONE;
++}
++
++void
++Http::StreamContext::sendStartOfMessage(HttpReply *rep, StoreIOBuffer bodyData)
++{
++    prepareReply(rep);
++    assert(rep);
++    MemBuf *mb = rep-&gt;pack();
++
++    // dump now, so we dont output any body.
++    debugs(11, 2, &quot;HTTP Client &quot; &lt;&lt; clientConnection);
++    debugs(11, 2, &quot;HTTP Client REPLY:\n---------\n&quot; &lt;&lt; mb-&gt;buf &lt;&lt; &quot;\n----------&quot;);
++
++    /* Save length of headers for persistent conn checks */
++    http-&gt;out.headers_sz = mb-&gt;contentSize();
++#if HEADERS_LOG
++    headersLog(0, 0, http-&gt;request-&gt;method, rep);
++#endif
++
++    if (bodyData.data &amp;&amp; bodyData.length) {
++        if (multipartRangeRequest())
++            packRange(bodyData, mb);
++        else if (http-&gt;request-&gt;flags.chunkedReply) {
++            packChunk(bodyData, *mb);
++        } else {
++            size_t length = lengthToSend(bodyData.range());
++            noteSentBodyBytes(length);
++            mb-&gt;append(bodyData.data, length);
++        }
++    }
++
++    getConn()-&gt;write(mb);
++    delete mb;
++}
++
++void
++Http::StreamContext::sendBody(StoreIOBuffer bodyData)
++{
++    if (!multipartRangeRequest() &amp;&amp; !http-&gt;request-&gt;flags.chunkedReply) {
++        size_t length = lengthToSend(bodyData.range());
++        noteSentBodyBytes(length);
++        getConn()-&gt;write(bodyData.data, length);
++        return;
++    }
++
++    MemBuf mb;
++    mb.init();
++    if (multipartRangeRequest())
++        packRange(bodyData, &amp;mb);
++    else
++        packChunk(bodyData, mb);
++
++    if (mb.contentSize())
++        getConn()-&gt;write(&amp;mb);
++    else
++        writeComplete(0);
++}
++
++size_t
++Http::StreamContext::lengthToSend(Range&lt;int64_t&gt; const &amp;available) const
++{
++    // the size of available range can always fit into a size_t type
++    size_t maximum = available.size();
++
++    if (!http-&gt;request-&gt;range)
++        return maximum;
++
++    assert(canPackMoreRanges());
++
++    if (http-&gt;range_iter.debt() == -1)
++        return maximum;
++
++    assert(http-&gt;range_iter.debt() &gt; 0);
++
++    /* TODO this + the last line could be a range intersection calculation */
++    if (available.start &lt; http-&gt;range_iter.currentSpec()-&gt;offset)
++        return 0;
++
++    return min(http-&gt;range_iter.debt(), static_cast&lt;int64_t&gt;(maximum));
++}
++
++void
++Http::StreamContext::noteSentBodyBytes(size_t bytes)
++{
++    debugs(33, 7, bytes &lt;&lt; &quot; body bytes&quot;);
++    http-&gt;out.offset += bytes;
++
++    if (!http-&gt;request-&gt;range)
++        return;
++
++    if (http-&gt;range_iter.debt() != -1) {
++        http-&gt;range_iter.debt(http-&gt;range_iter.debt() - bytes);
++        assert (http-&gt;range_iter.debt() &gt;= 0);
++    }
++
++    /* debt() always stops at -1, below that is a bug */
++    assert(http-&gt;range_iter.debt() &gt;= -1);
++}
++
++/// \return true when If-Range specs match reply, false otherwise
++static bool
++clientIfRangeMatch(ClientHttpRequest * http, HttpReply * rep)
++{
++    const TimeOrTag spec = http-&gt;request-&gt;header.getTimeOrTag(Http::HdrType::IF_RANGE);
++
++    /* check for parsing falure */
++    if (!spec.valid)
++        return false;
++
++    /* got an ETag? */
++    if (spec.tag.str) {
++        ETag rep_tag = rep-&gt;header.getETag(Http::HdrType::ETAG);
++        debugs(33, 3, &quot;ETags: &quot; &lt;&lt; spec.tag.str &lt;&lt; &quot; and &quot; &lt;&lt;
++               (rep_tag.str ? rep_tag.str : &quot;&lt;none&gt;&quot;));
++
++        if (!rep_tag.str)
++            return false; // entity has no etag to compare with!
++
++        if (spec.tag.weak || rep_tag.weak) {
++            debugs(33, DBG_IMPORTANT, &quot;Weak ETags are not allowed in If-Range: &quot; &lt;&lt;
++                   spec.tag.str &lt;&lt; &quot; ? &quot; &lt;&lt; rep_tag.str);
++            return false; // must use strong validator for sub-range requests
++        }
++
++        return etagIsStrongEqual(rep_tag, spec.tag);
++    }
++
++    /* got modification time? */
++    if (spec.time &gt;= 0)
++        return http-&gt;storeEntry()-&gt;lastmod &lt;= spec.time;
++
++    assert(0);          /* should not happen */
++    return false;
++}
++
++// seems to be something better suited to Server logic
++/** adds appropriate Range headers if needed */
++void
++Http::StreamContext::buildRangeHeader(HttpReply *rep)
++{
++    HttpHeader *hdr = rep ? &amp;rep-&gt;header : nullptr;
++    const char *range_err = nullptr;
++    HttpRequest *request = http-&gt;request;
++    assert(request-&gt;range);
++    /* check if we still want to do ranges */
++    int64_t roffLimit = request-&gt;getRangeOffsetLimit();
++
++    if (!rep)
++        range_err = &quot;no [parse-able] reply&quot;;
++    else if ((rep-&gt;sline.status() != Http::scOkay) &amp;&amp; (rep-&gt;sline.status() != Http::scPartialContent))
++        range_err = &quot;wrong status code&quot;;
++    else if (hdr-&gt;has(Http::HdrType::CONTENT_RANGE))
++        range_err = &quot;origin server does ranges&quot;;
++    else if (rep-&gt;content_length &lt; 0)
++        range_err = &quot;unknown length&quot;;
++    else if (rep-&gt;content_length != http-&gt;memObject()-&gt;getReply()-&gt;content_length)
++        range_err = &quot;INCONSISTENT length&quot;;  /* a bug? */
++
++    /* hits only - upstream CachePeer determines correct behaviour on misses,
++     * and client_side_reply determines hits candidates
++     */
++    else if (http-&gt;logType.isTcpHit() &amp;&amp;
++             http-&gt;request-&gt;header.has(Http::HdrType::IF_RANGE) &amp;&amp;
++             !clientIfRangeMatch(http, rep))
++        range_err = &quot;If-Range match failed&quot;;
++
++    else if (!http-&gt;request-&gt;range-&gt;canonize(rep))
++        range_err = &quot;canonization failed&quot;;
++    else if (http-&gt;request-&gt;range-&gt;isComplex())
++        range_err = &quot;too complex range header&quot;;
++    else if (!http-&gt;logType.isTcpHit() &amp;&amp; http-&gt;request-&gt;range-&gt;offsetLimitExceeded(roffLimit))
++        range_err = &quot;range outside range_offset_limit&quot;;
++
++    /* get rid of our range specs on error */
++    if (range_err) {
++        /* XXX We do this here because we need canonisation etc. However, this current
++         * code will lead to incorrect store offset requests - the store will have the
++         * offset data, but we won't be requesting it.
++         * So, we can either re-request, or generate an error
++         */
++        http-&gt;request-&gt;ignoreRange(range_err);
++    } else {
++        /* XXX: TODO: Review, this unconditional set may be wrong. */
++        rep-&gt;sline.set(rep-&gt;sline.version, Http::scPartialContent);
++        // web server responded with a valid, but unexpected range.
++        // will (try-to) forward as-is.
++        //TODO: we should cope with multirange request/responses
++        bool replyMatchRequest = rep-&gt;content_range != nullptr ?
++                                 request-&gt;range-&gt;contains(rep-&gt;content_range-&gt;spec) :
++                                 true;
++        const int spec_count = http-&gt;request-&gt;range-&gt;specs.size();
++        int64_t actual_clen = -1;
++
++        debugs(33, 3, &quot;range spec count: &quot; &lt;&lt; spec_count &lt;&lt;
++               &quot; virgin clen: &quot; &lt;&lt; rep-&gt;content_length);
++        assert(spec_count &gt; 0);
++        /* append appropriate header(s) */
++        if (spec_count == 1) {
++            if (!replyMatchRequest) {
++                hdr-&gt;delById(Http::HdrType::CONTENT_RANGE);
++                hdr-&gt;putContRange(rep-&gt;content_range);
++                actual_clen = rep-&gt;content_length;
++                //http-&gt;range_iter.pos = rep-&gt;content_range-&gt;spec.begin();
++                (*http-&gt;range_iter.pos)-&gt;offset = rep-&gt;content_range-&gt;spec.offset;
++                (*http-&gt;range_iter.pos)-&gt;length = rep-&gt;content_range-&gt;spec.length;
++
++            } else {
++                HttpHdrRange::iterator pos = http-&gt;request-&gt;range-&gt;begin();
++                assert(*pos);
++                /* append Content-Range */
++
++                if (!hdr-&gt;has(Http::HdrType::CONTENT_RANGE)) {
++                    /* No content range, so this was a full object we are
++                     * sending parts of.
++                     */
++                    httpHeaderAddContRange(hdr, **pos, rep-&gt;content_length);
++                }
++
++                /* set new Content-Length to the actual number of bytes
++                 * transmitted in the message-body */
++                actual_clen = (*pos)-&gt;length;
++            }
++        } else {
++            /* multipart! */
++            /* generate boundary string */
++            http-&gt;range_iter.boundary = http-&gt;rangeBoundaryStr();
++            /* delete old Content-Type, add ours */
++            hdr-&gt;delById(Http::HdrType::CONTENT_TYPE);
++            httpHeaderPutStrf(hdr, Http::HdrType::CONTENT_TYPE,
++                              &quot;multipart/byteranges; boundary=\&quot;&quot; SQUIDSTRINGPH &quot;\&quot;&quot;,
++                              SQUIDSTRINGPRINT(http-&gt;range_iter.boundary));
++            /* Content-Length is not required in multipart responses
++             * but it is always nice to have one */
++            actual_clen = http-&gt;mRangeCLen();
++
++            /* http-&gt;out needs to start where we want data at */
++            http-&gt;out.offset = http-&gt;range_iter.currentSpec()-&gt;offset;
++        }
++
++        /* replace Content-Length header */
++        assert(actual_clen &gt;= 0);
++        hdr-&gt;delById(Http::HdrType::CONTENT_LENGTH);
++        hdr-&gt;putInt64(Http::HdrType::CONTENT_LENGTH, actual_clen);
++        debugs(33, 3, &quot;actual content length: &quot; &lt;&lt; actual_clen);
++
++        /* And start the range iter off */
++        http-&gt;range_iter.updateSpec();
++    }
++}
++
++clientStreamNode *
++Http::StreamContext::getTail() const
++{
++    if (http-&gt;client_stream.tail)
++        return static_cast&lt;clientStreamNode *&gt;(http-&gt;client_stream.tail-&gt;data);
++
++    return nullptr;
++}
++
++clientStreamNode *
++Http::StreamContext::getClientReplyContext() const
++{
++    return static_cast&lt;clientStreamNode *&gt;(http-&gt;client_stream.tail-&gt;prev-&gt;data);
++}
++
++ConnStateData *
++Http::StreamContext::getConn() const
++{
++    assert(http &amp;&amp; http-&gt;getConn());
++    return http-&gt;getConn();
++}
++
++/// remembers the abnormal connection termination for logging purposes
++void
++Http::StreamContext::noteIoError(const int xerrno)
++{
++    if (http) {
++        http-&gt;logType.err.timedout = (xerrno == ETIMEDOUT);
++        // aborted even if xerrno is zero (which means read abort/eof)
++        http-&gt;logType.err.aborted = (xerrno != ETIMEDOUT);
++    }
++}
++
++void
++Http::StreamContext::finished()
++{
++    ConnStateData *conn = getConn();
++
++    /* we can't handle any more stream data - detach */
++    clientStreamDetach(getTail(), http);
++
++    assert(connRegistered_);
++    connRegistered_ = false;
++    conn-&gt;pipeline.popById(id);
++}
++
++/// called when we encounter a response-related error
++void
++Http::StreamContext::initiateClose(const char *reason)
++{
++    debugs(33, 4, clientConnection &lt;&lt; &quot; because &quot; &lt;&lt; reason);
++    getConn()-&gt;stopSending(reason); // closes ASAP
++}
++
++void
++Http::StreamContext::deferRecipientForLater(clientStreamNode *node, HttpReply *rep, StoreIOBuffer receivedData)
++{
++    debugs(33, 2, &quot;Deferring request &quot; &lt;&lt; http-&gt;uri);
++    assert(flags.deferred == 0);
++    flags.deferred = 1;
++    deferredparams.node = node;
++    deferredparams.rep = rep;
++    deferredparams.queuedBuffer = receivedData;
++}
++
++void
++Http::StreamContext::prepareReply(HttpReply *rep)
++{
++    reply = rep;
++    if (http-&gt;request-&gt;range)
++        buildRangeHeader(rep);
++}
++
++/**
++ * Packs bodyData into mb using chunked encoding.
++ * Packs the last-chunk if bodyData is empty.
++ */
++void
++Http::StreamContext::packChunk(const StoreIOBuffer &amp;bodyData, MemBuf &amp;mb)
++{
++    const uint64_t length =
++        static_cast&lt;uint64_t&gt;(lengthToSend(bodyData.range()));
++    noteSentBodyBytes(length);
++
++    mb.appendf(&quot;%&quot; PRIX64 &quot;\r\n&quot;, length);
++    mb.append(bodyData.data, length);
++    mb.append(&quot;\r\n&quot;, 2);
++}
++
++/**
++ * extracts a &quot;range&quot; from *buf and appends them to mb, updating
++ * all offsets and such.
++ */
++void
++Http::StreamContext::packRange(StoreIOBuffer const &amp;source, MemBuf *mb)
++{
++    HttpHdrRangeIter * i = &amp;http-&gt;range_iter;
++    Range&lt;int64_t&gt; available(source.range());
++    char const *buf = source.data;
++
++    while (i-&gt;currentSpec() &amp;&amp; available.size()) {
++        const size_t copy_sz = lengthToSend(available);
++        if (copy_sz) {
++            // intersection of &quot;have&quot; and &quot;need&quot; ranges must not be empty
++            assert(http-&gt;out.offset &lt; i-&gt;currentSpec()-&gt;offset + i-&gt;currentSpec()-&gt;length);
++            assert(http-&gt;out.offset + (int64_t)available.size() &gt; i-&gt;currentSpec()-&gt;offset);
++
++            /*
++             * put boundary and headers at the beginning of a range in a
++             * multi-range
++             */
++            if (http-&gt;multipartRangeRequest() &amp;&amp; i-&gt;debt() == i-&gt;currentSpec()-&gt;length) {
++                assert(http-&gt;memObject());
++                clientPackRangeHdr(
++                    http-&gt;memObject()-&gt;getReply(),  /* original reply */
++                    i-&gt;currentSpec(),       /* current range */
++                    i-&gt;boundary,    /* boundary, the same for all */
++                    mb);
++            }
++
++            // append content
++            debugs(33, 3, &quot;appending &quot; &lt;&lt; copy_sz &lt;&lt; &quot; bytes&quot;);
++            noteSentBodyBytes(copy_sz);
++            mb-&gt;append(buf, copy_sz);
++
++            // update offsets
++            available.start += copy_sz;
++            buf += copy_sz;
++        }
++
++        if (!canPackMoreRanges()) {
++            debugs(33, 3, &quot;Returning because !canPackMoreRanges.&quot;);
++            if (i-&gt;debt() == 0)
++                // put terminating boundary for multiparts
++                clientPackTermBound(i-&gt;boundary, mb);
++            return;
++        }
++
++        int64_t nextOffset = getNextRangeOffset();
++        assert(nextOffset &gt;= http-&gt;out.offset);
++        int64_t skip = nextOffset - http-&gt;out.offset;
++        /* adjust for not to be transmitted bytes */
++        http-&gt;out.offset = nextOffset;
++
++        if (available.size() &lt;= (uint64_t)skip)
++            return;
++
++        available.start += skip;
++        buf += skip;
++
++        if (copy_sz == 0)
++            return;
++    }
++}
++
++void
++Http::StreamContext::doClose()
++{
++    clientConnection-&gt;close();
++}
++
+
+=== added file 'src/http/StreamContext.h'
+--- src/http/StreamContext.h	1970-01-01 00:00:00 +0000
++++ src/http/StreamContext.h	2016-01-09 13:43:46 +0000
+@@ -0,0 +1,168 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SRC_HTTP_STREAMCONTEXT_H
++#define SQUID_SRC_HTTP_STREAMCONTEXT_H
++
++#include &quot;http/forward.h&quot;
++#include &quot;mem/forward.h&quot;
++#include &quot;StoreIOBuffer.h&quot;
++
++class clientStreamNode;
++class ClientHttpRequest;
++
++namespace Http
++{
++
++/**
++ * The processing context for a single HTTP transaction (stream).
++ *
++ * A context lifetime extends from directly after a request has been parsed
++ * off the client connection buffer, until the last byte of both request
++ * and reply payload (if any) have been written.
++ *
++ * Contexts self-register with the Http::Server Pipeline being managed by the
++ * Server for the connection on which the request was received.
++ *
++ * The socket level management and I/O is done by a Server which owns us.
++ * The scope of this objects control over a socket consists of the data
++ * buffer received from the Server with an initially unknown length.
++ * When that length is known it sets the end boundary of our access to the
++ * buffer.
++ *
++ * The individual processing actions are done by other Jobs which we start.
++ *
++ * When a context is completed the finished() method needs to be called which
++ * will perform all cleanup and deregistration operations. If the reason for
++ * finishing is an error, then notifyIoError() needs to be called prior to
++ * the finished() method.
++ * The caller should follow finished() with a call to ConnStateData::kick()
++ * to resume processing of other transactions or I/O on the connection.
++ *
++ * Alternatively the initiateClose() method can be called to terminate the
++ * whole client connection and all other pending contexts.
++ *
++ * HTTP/1.x:
++ *
++ * When HTTP/1 pipeline is operating there may be multiple transactions using
++ * the client connection. Only the back() context may read from the connection,
++ * and only the front() context may write to it. A context which needs to read
++ * or write to the connection but does not meet those criteria must be shifted
++ * to the deferred state.
++ *
++ *
++ * XXX: If an async call ends the ClientHttpRequest job, Http::StreamContext
++ * (and ConnStateData) may not know about it, leading to segfaults and
++ * assertions. This is difficult to fix
++ * because ClientHttpRequest lacks a good way to communicate its ongoing
++ * destruction back to the Http::StreamContext which pretends to &quot;own&quot; *http.
++ */
++class StreamContext : public RefCountable
++{
++    MEMPROXY_CLASS(StreamContext);
++
++public:
++    /// construct with HTTP/1.x details
++    StreamContext(uint32_t id, const Comm::ConnectionPointer &amp;, ClientHttpRequest *);
++    ~StreamContext();
++
++    /// register this stream with the Server
++    void registerWithConn();
++
++    /// whether the reply has started being sent
++    bool startOfOutput() const;
++
++    /// update stream state after a write, may initiate more I/O
++    void writeComplete(size_t size);
++
++    /// get more data to send
++    void pullData();
++
++    /// \return true if the HTTP request is for multiple ranges
++    bool multipartRangeRequest() const;
++
++    int64_t getNextRangeOffset() const;
++    bool canPackMoreRanges() const;
++    size_t lengthToSend(Range&lt;int64_t&gt; const &amp;available) const;
++
++    clientStream_status_t socketState();
++
++    /// send an HTTP reply message headers and maybe some initial payload
++    void sendStartOfMessage(HttpReply *, StoreIOBuffer bodyData);
++    /// send some HTTP reply message payload
++    void sendBody(StoreIOBuffer bodyData);
++    /// update stream state when N bytes are being sent.
++    /// NP: Http1Server bytes actually not sent yet, just packed into a MemBuf ready
++    void noteSentBodyBytes(size_t);
++
++    /// add Range headers (if any) to the given HTTP reply message
++    void buildRangeHeader(HttpReply *);
++
++    clientStreamNode * getTail() const;
++    clientStreamNode * getClientReplyContext() const;
++
++    ConnStateData *getConn() const;
++
++    /// update state to reflect I/O error
++    void noteIoError(const int xerrno);
++
++    /// cleanup when the transaction has finished. may destroy 'this'
++    void finished();
++
++    /// terminate due to a send/write error (may continue reading)
++    void initiateClose(const char *reason);
++
++    void deferRecipientForLater(clientStreamNode *, HttpReply *, StoreIOBuffer receivedData);
++
++public:
++    // NP: stream ID is relative to the connection, not global.
++    uint32_t id; ///&lt; stream ID within the client connection.
++
++public: // HTTP/1.x state data
++
++    Comm::ConnectionPointer clientConnection; ///&lt; details about the client connection socket
++    ClientHttpRequest *http;    /* we pretend to own that Job */
++    HttpReply *reply;
++    char reqbuf[HTTP_REQBUF_SZ];
++    struct {
++        unsigned deferred:1; ///&lt; This is a pipelined request waiting for the current object to complete
++        unsigned parsed_ok:1; ///&lt; Was this parsed correctly?
++    } flags;
++
++    bool mayUseConnection() const {return mayUseConnection_;}
++
++    void mayUseConnection(bool aBool) {
++        mayUseConnection_ = aBool;
++        debugs(33, 3, &quot;This &quot; &lt;&lt; this &lt;&lt; &quot; marked &quot; &lt;&lt; aBool);
++    }
++
++    class DeferredParams
++    {
++
++    public:
++        clientStreamNode *node;
++        HttpReply *rep;
++        StoreIOBuffer queuedBuffer;
++    };
++
++    DeferredParams deferredparams;
++    int64_t writtenToSocket;
++
++private:
++    void prepareReply(HttpReply *);
++    void packChunk(const StoreIOBuffer &amp;bodyData, MemBuf &amp;);
++    void packRange(StoreIOBuffer const &amp;, MemBuf *);
++    void doClose();
++
++    bool mayUseConnection_; /* This request may use the connection. Don't read anymore requests for now */
++    bool connRegistered_;
++};
++
++} // namespace Http
++
++#endif /* SQUID_SRC_HTTP_STREAMCONTEXT_H */
+
+=== modified file 'src/http/forward.h'
+--- src/http/forward.h	2016-01-01 00:12:18 +0000
++++ src/http/forward.h	2016-01-07 09:53:34 +0000
+@@ -11,6 +11,14 @@
+ 
+ #include &quot;http/one/forward.h&quot;
+ 
++namespace Http
++{
++
++class StreamContext;
++typedef RefCount&lt;Http::StreamContext&gt; StreamContextPointer;
++
++} // namespace Http
++
+ // TODO move these classes into Http namespace
+ class HttpRequestMethod;
+ typedef RefCount&lt;HttpRequestMethod&gt; HttpRequestMethodPointer;
+
+=== modified file 'src/ident/AclIdent.cc'
+--- src/ident/AclIdent.cc	2016-01-01 00:12:18 +0000
++++ src/ident/AclIdent.cc	2016-01-07 14:03:46 +0000
+@@ -18,6 +18,7 @@
+ #include &quot;client_side.h&quot;
+ #include &quot;comm/Connection.h&quot;
+ #include &quot;globals.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;ident/AclIdent.h&quot;
+ #include &quot;ident/Ident.h&quot;
+ 
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2016-01-01 00:12:18 +0000
++++ src/main.cc	2016-01-07 15:41:12 +0000
+@@ -37,6 +37,7 @@
+ #include &quot;FwdState.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;htcp.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHeader.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;icmp/IcmpSquid.h&quot;
+
+=== modified file 'src/peer_select.cc'
+--- src/peer_select.cc	2016-01-01 00:12:18 +0000
++++ src/peer_select.cc	2016-01-07 15:23:59 +0000
+@@ -20,6 +20,7 @@
+ #include &quot;globals.h&quot;
+ #include &quot;hier_code.h&quot;
+ #include &quot;htcp.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;icmp/net_db.h&quot;
+ #include &quot;ICP.h&quot;
+
+=== modified file 'src/redirect.cc'
+--- src/redirect.cc	2016-01-01 00:12:18 +0000
++++ src/redirect.cc	2016-01-07 15:23:55 +0000
+@@ -20,6 +20,7 @@
+ #include &quot;globals.h&quot;
+ #include &quot;helper.h&quot;
+ #include &quot;helper/Reply.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;mgr/Registration.h&quot;
+ #include &quot;redirect.h&quot;
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2016-01-01 00:12:18 +0000
++++ src/servers/FtpServer.cc	2016-01-08 15:40:48 +0000
+@@ -26,6 +26,7 @@
+ #include &quot;ftp/Parsing.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;http/one/RequestParser.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHdrCc.h&quot;
+ #include &quot;ip/tools.h&quot;
+ #include &quot;ipc/FdNotes.h&quot;
+@@ -125,7 +126,7 @@
+ {
+     // zero pipelinePrefetchMax() ensures that there is only parsed request
+     Must(pipeline.count() == 1);
+-    ClientSocketContext::Pointer context = pipeline.front();
++    Http::StreamContextPointer context = pipeline.front();
+     Must(context != nullptr);
+ 
+     ClientHttpRequest *const http = context-&gt;http;
+@@ -149,7 +150,7 @@
+ }
+ 
+ void
+-Ftp::Server::processParsedRequest(ClientSocketContext *)
++Ftp::Server::processParsedRequest(Http::StreamContext *)
+ {
+     Must(pipeline.count() == 1);
+ 
+@@ -288,7 +289,7 @@
+ Ftp::Server::notePeerConnection(Comm::ConnectionPointer conn)
+ {
+     // find request
+-    ClientSocketContext::Pointer context = pipeline.front();
++    Http::StreamContextPointer context = pipeline.front();
+     Must(context != nullptr);
+     ClientHttpRequest *const http = context-&gt;http;
+     Must(http != NULL);
+@@ -548,7 +549,7 @@
+ }
+ 
+ /// creates a context filled with an error message for a given early error
+-ClientSocketContext *
++Http::StreamContext *
+ Ftp::Server::earlyError(const EarlyErrorKind eek)
+ {
+     /* Default values, to be updated by the switch statement below */
+@@ -602,7 +603,7 @@
+         // no default so that a compiler can check that we have covered all cases
+     }
+ 
+-    ClientSocketContext *context = abortRequestParsing(errUri);
++    Http::StreamContext *context = abortRequestParsing(errUri);
+     clientStreamNode *node = context-&gt;getClientReplyContext();
+     Must(node);
+     clientReplyContext *repContext = dynamic_cast&lt;clientReplyContext *&gt;(node-&gt;data.getRaw());
+@@ -616,9 +617,9 @@
+ }
+ 
+ /// Parses a single FTP request on the control connection.
+-/// Returns a new ClientSocketContext on valid requests and all errors.
++/// Returns a new Http::StreamContext on valid requests and all errors.
+ /// Returns NULL on incomplete requests that may still succeed given more data.
+-ClientSocketContext *
++Http::StreamContext *
+ Ftp::Server::parseOneRequest()
+ {
+     flags.readMore = false; // common for all but one case below
+@@ -696,7 +697,7 @@
+ 
+         // process USER request now because it sets FTP peer host name
+         if (cmd == cmdUser()) {
+-            if (ClientSocketContext *errCtx = handleUserRequest(cmd, params))
++            if (Http::StreamContext *errCtx = handleUserRequest(cmd, params))
+                 return errCtx;
+         }
+     }
+@@ -740,8 +741,8 @@
+     http-&gt;req_sz = tok.parsedSize();
+     http-&gt;uri = newUri;
+ 
+-    ClientSocketContext *const result =
+-        new ClientSocketContext(clientConnection, http);
++    Http::StreamContext *const result =
++        new Http::StreamContext(nextStreamId(), clientConnection, http);
+ 
+     StoreIOBuffer tempBuffer;
+     tempBuffer.data = result-&gt;reqbuf;
+@@ -761,7 +762,7 @@
+ Ftp::Server::handleReply(HttpReply *reply, StoreIOBuffer data)
+ {
+     // the caller guarantees that we are dealing with the current context only
+-    ClientSocketContext::Pointer context = pipeline.front();
++    Http::StreamContextPointer context = pipeline.front();
+     assert(context != nullptr);
+ 
+     if (context-&gt;http &amp;&amp; context-&gt;http-&gt;al != NULL &amp;&amp;
+@@ -869,7 +870,7 @@
+ void
+ Ftp::Server::handlePasvReply(const HttpReply *reply, StoreIOBuffer)
+ {
+-    const ClientSocketContext::Pointer context(pipeline.front());
++    const Http::StreamContextPointer context(pipeline.front());
+     assert(context != nullptr);
+ 
+     if (context-&gt;http-&gt;request-&gt;errType != ERR_NONE) {
+@@ -1227,7 +1228,7 @@
+         return;
+     }
+ 
+-    ClientSocketContext::Pointer context = pipeline.front();
++    Http::StreamContextPointer context = pipeline.front();
+     if (context != nullptr &amp;&amp; context-&gt;http) {
+         context-&gt;http-&gt;out.size += io.size;
+         context-&gt;http-&gt;out.headers_sz += io.size;
+@@ -1249,7 +1250,7 @@
+         return;
+     }
+ 
+-    ClientSocketContext::Pointer context = pipeline.front();
++    Http::StreamContextPointer context = pipeline.front();
+     assert(context-&gt;http);
+     context-&gt;http-&gt;out.size += io.size;
+     context-&gt;http-&gt;out.headers_sz += io.size;
+@@ -1339,7 +1340,7 @@
+ 
+ /// Called to parse USER command, which is required to create an HTTP request
+ /// wrapper. W/o request, the errors are handled by returning earlyError().
+-ClientSocketContext *
++Http::StreamContext *
+ Ftp::Server::handleUserRequest(const SBuf &amp;, SBuf &amp;params)
+ {
+     if (params.isEmpty())
+@@ -1665,7 +1666,7 @@
+         if (params.conn != NULL)
+             params.conn-&gt;close();
+         setReply(425, &quot;Cannot open data connection.&quot;);
+-        ClientSocketContext::Pointer context = pipeline.front();
++        Http::StreamContextPointer context = pipeline.front();
+         Must(context-&gt;http);
+         Must(context-&gt;http-&gt;storeEntry() != NULL);
+     } else {
+@@ -1680,7 +1681,7 @@
+ void
+ Ftp::Server::setReply(const int code, const char *msg)
+ {
+-    ClientSocketContext::Pointer context = pipeline.front();
++    Http::StreamContextPointer context = pipeline.front();
+     ClientHttpRequest *const http = context-&gt;http;
+     assert(http != NULL);
+     assert(http-&gt;storeEntry() == NULL);
+
+=== modified file 'src/servers/FtpServer.h'
+--- src/servers/FtpServer.h	2016-01-01 00:12:18 +0000
++++ src/servers/FtpServer.h	2016-01-07 09:51:48 +0000
+@@ -81,8 +81,8 @@
+     };
+ 
+     /* ConnStateData API */
+-    virtual ClientSocketContext *parseOneRequest();
+-    virtual void processParsedRequest(ClientSocketContext *context);
++    virtual Http::StreamContext *parseOneRequest();
++    virtual void processParsedRequest(Http::StreamContext *context);
+     virtual void notePeerConnection(Comm::ConnectionPointer conn);
+     virtual void clientPinnedConnectionClosed(const CommCloseCbParams &amp;io);
+     virtual void handleReply(HttpReply *header, StoreIOBuffer receivedData);
+@@ -112,7 +112,7 @@
+ 
+     void calcUri(const SBuf *file);
+     void changeState(const Ftp::ServerState newState, const char *reason);
+-    ClientSocketContext *handleUserRequest(const SBuf &amp;cmd, SBuf &amp;params);
++    Http::StreamContext *handleUserRequest(const SBuf &amp;cmd, SBuf &amp;params);
+     bool checkDataConnPost() const;
+     void replyDataWritingCheckpoint();
+     void maybeReadUploadData();
+@@ -126,7 +126,7 @@
+     void writeForwardedReplyAndCall(const HttpReply *reply, AsyncCall::Pointer &amp;call);
+     void writeReply(MemBuf &amp;mb);
+ 
+-    ClientSocketContext *earlyError(const EarlyErrorKind eek);
++    Http::StreamContext *earlyError(const EarlyErrorKind eek);
+     bool handleRequest(HttpRequest *);
+     void setDataCommand();
+     bool checkDataConnPre();
+
+=== modified file 'src/servers/Http1Server.cc'
+--- src/servers/Http1Server.cc	2016-01-01 00:12:18 +0000
++++ src/servers/Http1Server.cc	2016-01-09 09:36:17 +0000
+@@ -15,6 +15,7 @@
+ #include &quot;client_side_request.h&quot;
+ #include &quot;comm/Write.h&quot;
+ #include &quot;http/one/RequestParser.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+ #include &quot;profiler/Profiler.h&quot;
+ #include &quot;servers/Http1Server.h&quot;
+@@ -70,7 +71,7 @@
+     readSomeData();
+ }
+ 
+-ClientSocketContext *
++Http::StreamContext *
+ Http::One::Server::parseOneRequest()
+ {
+     PROF_start(HttpServer_parseOneRequest);
+@@ -82,17 +83,17 @@
+         parser_ = new Http1::RequestParser();
+ 
+     /* Process request */
+-    ClientSocketContext *context = parseHttpRequest(this, parser_);
++    Http::StreamContext *context = parseHttpRequest(this, parser_);
+ 
+     PROF_stop(HttpServer_parseOneRequest);
+     return context;
+ }
+ 
+ void clientProcessRequestFinished(ConnStateData *conn, const HttpRequest::Pointer &amp;request);
+-bool clientTunnelOnError(ConnStateData *conn, ClientSocketContext *context, HttpRequest *request, const HttpRequestMethod&amp; method, err_type requestError, Http::StatusCode errStatusCode, const char *requestErrorBytes);
++bool clientTunnelOnError(ConnStateData *conn, Http::StreamContext *context, HttpRequest *request, const HttpRequestMethod&amp; method, err_type requestError, Http::StatusCode errStatusCode, const char *requestErrorBytes);
+ 
+ bool
+-Http::One::Server::buildHttpRequest(ClientSocketContext *context)
++Http::One::Server::buildHttpRequest(Http::StreamContext *context)
+ {
+     HttpRequest::Pointer request;
+     ClientHttpRequest *http = context-&gt;http;
+@@ -179,14 +180,14 @@
+ }
+ 
+ void
+-Http::One::Server::proceedAfterBodyContinuation(ClientSocketContext::Pointer context)
++Http::One::Server::proceedAfterBodyContinuation(Http::StreamContextPointer context)
+ {
+     debugs(33, 5, &quot;Body Continuation written&quot;);
+     clientProcessRequest(this, parser_, context.getRaw());
+ }
+ 
+ void
+-Http::One::Server::processParsedRequest(ClientSocketContext *context)
++Http::One::Server::processParsedRequest(Http::StreamContext *context)
+ {
+     if (!buildHttpRequest(context))
+         return;
+@@ -221,8 +222,8 @@
+                 HttpReply::Pointer rep = new HttpReply;
+                 rep-&gt;sline.set(Http::ProtocolVersion(), Http::scContinue);
+ 
+-                typedef UnaryMemFunT&lt;Http1::Server, ClientSocketContext::Pointer&gt; CbDialer;
+-                const AsyncCall::Pointer cb = asyncCall(11, 3,  &quot;Http1::Server::proceedAfterBodyContinuation&quot;, CbDialer(this, &amp;Http1::Server::proceedAfterBodyContinuation, ClientSocketContext::Pointer(context)));
++                typedef UnaryMemFunT&lt;Http1::Server, Http::StreamContextPointer&gt; CbDialer;
++                const AsyncCall::Pointer cb = asyncCall(11, 3,  &quot;Http1::Server::proceedAfterBodyContinuation&quot;, CbDialer(this, &amp;Http1::Server::proceedAfterBodyContinuation, Http::StreamContextPointer(context)));
+                 sendControlMsg(HttpControlMsg(rep, cb));
+                 return;
+             }
+@@ -242,7 +243,7 @@
+ Http::One::Server::handleReply(HttpReply *rep, StoreIOBuffer receivedData)
+ {
+     // the caller guarantees that we are dealing with the current context only
+-    ClientSocketContext::Pointer context = pipeline.front();
++    Http::StreamContextPointer context = pipeline.front();
+     Must(context != nullptr);
+     const ClientHttpRequest *http = context-&gt;http;
+     Must(http != NULL);
+@@ -262,7 +263,7 @@
+     }
+ 
+     if (!context-&gt;startOfOutput()) {
+-        context-&gt;sendBody(rep, receivedData);
++        context-&gt;sendBody(receivedData);
+         return;
+     }
+ 
+
+=== modified file 'src/servers/Http1Server.h'
+--- src/servers/Http1Server.h	2016-01-01 00:12:18 +0000
++++ src/servers/Http1Server.h	2016-01-07 09:54:38 +0000
+@@ -29,8 +29,8 @@
+ 
+ protected:
+     /* ConnStateData API */
+-    virtual ClientSocketContext *parseOneRequest();
+-    virtual void processParsedRequest(ClientSocketContext *context);
++    virtual Http::StreamContext *parseOneRequest();
++    virtual void processParsedRequest(Http::StreamContext *context);
+     virtual void handleReply(HttpReply *rep, StoreIOBuffer receivedData);
+     virtual void writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &amp;call);
+     virtual time_t idleTimeout() const;
+@@ -42,17 +42,17 @@
+     /* AsyncJob API */
+     virtual void start();
+ 
+-    void proceedAfterBodyContinuation(ClientSocketContext::Pointer context);
++    void proceedAfterBodyContinuation(Http::StreamContextPointer context);
+ 
+ private:
+-    void processHttpRequest(ClientSocketContext *const context);
++    void processHttpRequest(Http::StreamContext *const context);
+     void handleHttpRequestData();
+ 
+     /// Handles parsing results. May generate and deliver an error reply
+     /// to the client if parsing is failed, or parses the url and build the
+     /// HttpRequest object using parsing results.
+     /// Return false if parsing is failed, true otherwise.
+-    bool buildHttpRequest(ClientSocketContext *context);
++    bool buildHttpRequest(Http::StreamContext *context);
+ 
+     Http1::RequestParserPointer parser_;
+     HttpRequestMethod method_; ///&lt; parsed HTTP method
+
+=== modified file 'src/servers/Server.cc'
+--- src/servers/Server.cc	2016-01-01 00:12:18 +0000
++++ src/servers/Server.cc	2016-01-08 15:14:16 +0000
+@@ -14,6 +14,7 @@
+ #include &quot;Debug.h&quot;
+ #include &quot;fd.h&quot;
+ #include &quot;fde.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;MasterXaction.h&quot;
+ #include &quot;servers/Server.h&quot;
+ #include &quot;SquidConfig.h&quot;
+@@ -25,7 +26,8 @@
+     clientConnection(xact-&gt;tcpClient),
+     transferProtocol(xact-&gt;squidPort-&gt;transport),
+     port(xact-&gt;squidPort),
+-    receivedFirstByte_(false)
++    receivedFirstByte_(false),
++    nextStreamId_(0)
+ {}
+ 
+ bool
+
+=== modified file 'src/servers/Server.h'
+--- src/servers/Server.h	2016-01-01 00:12:18 +0000
++++ src/servers/Server.h	2016-01-08 15:31:26 +0000
+@@ -35,6 +35,9 @@
+     virtual bool doneAll() const;
+     virtual void swanSong();
+ 
++    /// fetch the next available stream ID
++    virtual uint32_t nextStreamId() = 0;
++
+     /// ??
+     virtual bool connFinishedWithConn(int size) = 0;
+ 
+@@ -117,6 +120,7 @@
+     void doClientRead(const CommIoCbParams &amp;io);
+     void clientWriteDone(const CommIoCbParams &amp;io);
+ 
++    uint32_t nextStreamId_;    ///&lt; incremented as streams are initiated
+     AsyncCall::Pointer reader; ///&lt; set when we are reading
+     AsyncCall::Pointer writer; ///&lt; set when we are writing
+ };
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2016-01-01 00:12:18 +0000
++++ src/ssl/PeerConnector.cc	2016-01-07 14:08:16 +0000
+@@ -18,6 +18,7 @@
+ #include &quot;fde.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;helper/ResultCode.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;neighbors.h&quot;
+ #include &quot;security/NegotiationHistory.h&quot;
+
+=== modified file 'src/ssl/ServerBump.cc'
+--- src/ssl/ServerBump.cc	2016-01-01 00:12:18 +0000
++++ src/ssl/ServerBump.cc	2016-01-07 14:09:55 +0000
+@@ -12,6 +12,7 @@
+ 
+ #include &quot;client_side.h&quot;
+ #include &quot;FwdState.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;ssl/ServerBump.h&quot;
+ #include &quot;Store.h&quot;
+ #include &quot;StoreClient.h&quot;
+
+=== modified file 'src/stat.cc'
+--- src/stat.cc	2016-01-01 00:12:18 +0000
++++ src/stat.cc	2016-01-07 15:23:50 +0000
+@@ -19,6 +19,7 @@
+ #include &quot;fde.h&quot;
+ #include &quot;format/Token.h&quot;
+ #include &quot;globals.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;IoStats.h&quot;
+ #include &quot;mem/Pool.h&quot;
+
+=== modified file 'src/tests/stub_client_side.cc'
+--- src/tests/stub_client_side.cc	2016-01-01 00:12:18 +0000
++++ src/tests/stub_client_side.cc	2016-01-09 18:44:01 +0000
+@@ -7,72 +7,54 @@
+  */
+ 
+ #include &quot;squid.h&quot;
+-#include &quot;client_side.h&quot;
++#include &quot;client_side_request.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ 
+ #define STUB_API &quot;client_side.cc&quot;
+ #include &quot;tests/STUB.h&quot;
+ 
+-//ClientSocketContext::ClientSocketContext(const ConnectionPointer&amp;, ClientHttpRequest*) STUB
+-//ClientSocketContext::~ClientSocketContext() STUB
+-bool ClientSocketContext::startOfOutput() const STUB_RETVAL(false)
+-void ClientSocketContext::writeComplete(size_t size) STUB
+-void ClientSocketContext::pullData() STUB
+-int64_t ClientSocketContext::getNextRangeOffset() const STUB_RETVAL(0)
+-bool ClientSocketContext::canPackMoreRanges() const STUB_RETVAL(false)
+-clientStream_status_t ClientSocketContext::socketState() STUB_RETVAL(STREAM_NONE)
+-void ClientSocketContext::sendBody(HttpReply * rep, StoreIOBuffer bodyData) STUB
+-void ClientSocketContext::sendStartOfMessage(HttpReply * rep, StoreIOBuffer bodyData) STUB
+-size_t ClientSocketContext::lengthToSend(Range&lt;int64_t&gt; const &amp;available) STUB_RETVAL(0)
+-void ClientSocketContext::noteSentBodyBytes(size_t) STUB
+-void ClientSocketContext::buildRangeHeader(HttpReply * rep) STUB
+-clientStreamNode * ClientSocketContext::getTail() const STUB_RETVAL(NULL)
+-clientStreamNode * ClientSocketContext::getClientReplyContext() const STUB_RETVAL(NULL)
+-void ClientSocketContext::finished() STUB
+-void ClientSocketContext::deferRecipientForLater(clientStreamNode * node, HttpReply * rep, StoreIOBuffer receivedData) STUB
+-bool ClientSocketContext::multipartRangeRequest() const STUB_RETVAL(false)
+-void ClientSocketContext::registerWithConn() STUB
+-void ClientSocketContext::noteIoError(const int xerrno) STUB
+-
++#include &quot;client_side.h&quot;
+ bool ConnStateData::clientParseRequests() STUB_RETVAL(false)
+ void ConnStateData::readNextRequest() STUB
+ bool ConnStateData::isOpen() const STUB_RETVAL(false)
+ void ConnStateData::kick() STUB
+-void ConnStateData::sendControlMsg(HttpControlMsg msg) STUB
++void ConnStateData::sendControlMsg(HttpControlMsg) STUB
+ int64_t ConnStateData::mayNeedToReadMoreBody() const STUB_RETVAL(0)
+ #if USE_AUTH
+-void ConnStateData::setAuth(const Auth::UserRequest::Pointer &amp;aur, const char *cause) STUB
++void ConnStateData::setAuth(const Auth::UserRequest::Pointer &amp;, const char *) STUB
+ #endif
+ bool ConnStateData::transparent() const STUB_RETVAL(false)
+-void ConnStateData::stopReceiving(const char *error) STUB
+-void ConnStateData::stopSending(const char *error) STUB
++void ConnStateData::stopReceiving(const char *) STUB
++void ConnStateData::stopSending(const char *) STUB
+ void ConnStateData::expectNoForwarding() STUB
+ void ConnStateData::noteMoreBodySpaceAvailable(BodyPipe::Pointer) STUB
+ void ConnStateData::noteBodyConsumerAborted(BodyPipe::Pointer) STUB
+ bool ConnStateData::handleReadData() STUB_RETVAL(false)
+ bool ConnStateData::handleRequestBodyData() STUB_RETVAL(false)
+-void ConnStateData::pinConnection(const Comm::ConnectionPointer &amp;pinServerConn, HttpRequest *request, CachePeer *peer, bool auth, bool monitor) STUB
+-void ConnStateData::unpinConnection(const bool andClose) STUB
+-const Comm::ConnectionPointer ConnStateData::validatePinnedConnection(HttpRequest *request, const CachePeer *peer) STUB_RETVAL(NULL)
+-void ConnStateData::clientPinnedConnectionClosed(const CommCloseCbParams &amp;io) STUB
+-void ConnStateData::connStateClosed(const CommCloseCbParams &amp;io) STUB
+-void ConnStateData::requestTimeout(const CommTimeoutCbParams &amp;params) STUB
++void ConnStateData::pinConnection(const Comm::ConnectionPointer &amp;, HttpRequest *, CachePeer *, bool, bool) STUB
++void ConnStateData::unpinConnection(const bool) STUB
++const Comm::ConnectionPointer ConnStateData::validatePinnedConnection(HttpRequest *, const CachePeer *) STUB_RETVAL(NULL)
++void ConnStateData::clientPinnedConnectionClosed(const CommCloseCbParams &amp;) STUB
++void ConnStateData::connStateClosed(const CommCloseCbParams &amp;) STUB
++void ConnStateData::requestTimeout(const CommTimeoutCbParams &amp;) STUB
+ void ConnStateData::swanSong() STUB
+-void ConnStateData::quitAfterError(HttpRequest *request) STUB
++void ConnStateData::quitAfterError(HttpRequest *) STUB
+ #if USE_OPENSSL
+-void ConnStateData::httpsPeeked(Comm::ConnectionPointer serverConnection) STUB
++void ConnStateData::httpsPeeked(Comm::ConnectionPointer) STUB
+ void ConnStateData::getSslContextStart() STUB
+ void ConnStateData::getSslContextDone(Security::ContextPtr, bool) STUB
+-void ConnStateData::sslCrtdHandleReplyWrapper(void *data, const Helper::Reply &amp;reply) STUB
+-void ConnStateData::sslCrtdHandleReply(const Helper::Reply &amp;reply) STUB
+-void ConnStateData::switchToHttps(HttpRequest *request, Ssl::BumpMode bumpServerMode) STUB
+-void ConnStateData::buildSslCertGenerationParams(Ssl::CertificateProperties &amp;certProperties) STUB
+-bool ConnStateData::serveDelayedError(ClientSocketContext *context) STUB_RETVAL(false)
++void ConnStateData::sslCrtdHandleReplyWrapper(void *, const Helper::Reply &amp;) STUB
++void ConnStateData::sslCrtdHandleReply(const Helper::Reply &amp;) STUB
++void ConnStateData::switchToHttps(HttpRequest *, Ssl::BumpMode) STUB
++void ConnStateData::buildSslCertGenerationParams(Ssl::CertificateProperties &amp;) STUB
++bool ConnStateData::serveDelayedError(Http::StreamContext *) STUB_RETVAL(false)
+ #endif
+ 
+-void setLogUri(ClientHttpRequest * http, char const *uri, bool cleanUrl) STUB
+-const char *findTrailingHTTPVersion(const char *uriAndHTTPVersion, const char *end) STUB_RETVAL(NULL)
+-int varyEvaluateMatch(StoreEntry * entry, HttpRequest * req) STUB_RETVAL(0)
++void setLogUri(ClientHttpRequest *, char const *, bool) STUB
++const char *findTrailingHTTPVersion(const char *, const char *) STUB_RETVAL(NULL)
++int varyEvaluateMatch(StoreEntry *, HttpRequest *) STUB_RETVAL(0)
+ void clientOpenListenSockets(void) STUB
+ void clientHttpConnectionsClose(void) STUB
+ void httpRequestFree(void *) STUB
+-
++void clientPackRangeHdr(const HttpReply *, const HttpHdrRangeSpec *, String, MemBuf *) STUB
++void clientPackTermBound(String, MemBuf *) STUB
+
+=== modified file 'src/tests/stub_client_side_request.cc'
+--- src/tests/stub_client_side_request.cc	2016-01-01 00:12:18 +0000
++++ src/tests/stub_client_side_request.cc	2016-01-07 16:15:19 +0000
+@@ -8,6 +8,7 @@
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;client_side_request.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;Store.h&quot;
+ 
+ #if !_USE_INLINE_
+
+=== modified file 'src/tools.cc'
+--- src/tools.cc	2016-01-01 00:12:18 +0000
++++ src/tools.cc	2016-01-07 15:29:08 +0000
+@@ -17,6 +17,7 @@
+ #include &quot;fqdncache.h&quot;
+ #include &quot;fs_io.h&quot;
+ #include &quot;htcp.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;ICP.h&quot;
+ #include &quot;ip/Intercept.h&quot;
+ #include &quot;ip/QosConfig.h&quot;
+
+=== modified file 'src/tunnel.cc'
+--- src/tunnel.cc	2016-01-01 00:12:18 +0000
++++ src/tunnel.cc	2016-01-07 15:45:17 +0000
+@@ -25,6 +25,7 @@
+ #include &quot;FwdState.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;http.h&quot;
++#include &quot;http/StreamContext.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;HttpStateFlags.h&quot;
+ #include &quot;ip/QosConfig.h&quot;
+@@ -1240,7 +1241,7 @@
+     tunnelState = new TunnelStateData;
+     tunnelState-&gt;url = SBufToCstring(url);
+     tunnelState-&gt;request = request;
+-    tunnelState-&gt;server.size_ptr = NULL; //Set later if ClientSocketContext is available
++    tunnelState-&gt;server.size_ptr = NULL; //Set later if Http::StreamContext is available
+ 
+     // Temporary static variable to store the unneeded for our case status code
+     static int status_code = 0;
+@@ -1249,7 +1250,7 @@
+ 
+     ConnStateData *conn;
+     if ((conn = request-&gt;clientConnectionManager.get())) {
+-        ClientSocketContext::Pointer context = conn-&gt;pipeline.front();
++        Http::StreamContextPointer context = conn-&gt;pipeline.front();
+         if (context != nullptr &amp;&amp; context-&gt;http != nullptr) {
+             tunnelState-&gt;logTag_ptr = &amp;context-&gt;http-&gt;logType;
+             tunnelState-&gt;server.size_ptr = &amp;context-&gt;http-&gt;out.size;
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004644.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » gcc,d-ubuntu-trusty #503
+</A></li>
+	<LI>Next message: <A HREF="004839.html">[squid-dev] [PATCH] Http::StreamContext refactoring
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4674">[ date ]</a>
+              <a href="thread.html#4674">[ thread ]</a>
+              <a href="subject.html#4674">[ subject ]</a>
+              <a href="author.html#4674">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

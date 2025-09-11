@@ -1,0 +1,355 @@
+Mitigate DoS attacks that use client-initiated SSL/TLS renegotiation.
+
+There is a well-known DoS attack using client-initiated SSL/TLS
+renegotiation. The severety or uniqueness of this attack method
+is disputed, but many believe it is serious/real.
+There is even a (disputed) CVE 2011-1473:
+    https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2011-1473
+
+The old Squid code tried to disable client-initiated renegotiation, but
+it did not work reliably (or at all), depending on Squid version, due
+to OpenSSL API changes and conflicting SslBump callbacks. That
+code is now removed and client-initiated renegotiations are allowed.
+
+With this change, Squid aborts the TLS connection, with a level-1 ERROR
+message if the rate of client-initiated renegotiate requests exceeds 
+5 requests in 10 seconds (approximately). This protection and the rate
+limit are currently hard-coded but the rate is not expected to be 
+exceeded under normal circumstances.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/ssl/bio.cc'
+--- src/ssl/bio.cc	2017-01-01 00:12:22 +0000
++++ src/ssl/bio.cc	2017-01-22 11:48:31 +0000
+@@ -3,40 +3,41 @@
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 83    SSL accelerator support */
+ 
+ #include "squid.h"
+ #include "ssl/support.h"
+ 
+ /* support.cc says this is needed */
+ #if USE_OPENSSL
+ 
+ #include "comm.h"
+ #include "fd.h"
+ #include "fde.h"
+ #include "globals.h"
+ #include "ip/Address.h"
+ #include "parser/BinaryTokenizer.h"
++#include "SquidTime.h"
+ #include "ssl/bio.h"
+ 
+ #if HAVE_OPENSSL_SSL_H
+ #include <openssl/ssl.h>
+ #endif
+ 
+ #if _SQUID_WINDOWS_
+ extern int socket_read_method(int, char *, int);
+ extern int socket_write_method(int, const char *, int);
+ #endif
+ 
+ /* BIO callbacks */
+ static int squid_bio_write(BIO *h, const char *buf, int num);
+ static int squid_bio_read(BIO *h, char *buf, int size);
+ static int squid_bio_puts(BIO *h, const char *str);
+ //static int squid_bio_gets(BIO *h, char *str, int size);
+ static long squid_bio_ctrl(BIO *h, int cmd, long arg1, void *arg2);
+ static int squid_bio_create(BIO *h);
+ static int squid_bio_destroy(BIO *data);
+ /* SSL callbacks */
+@@ -154,56 +155,90 @@
+ void
+ Ssl::Bio::stateChanged(const SSL *ssl, int where, int ret)
+ {
+     // Here we can use (where & STATE) to check the current state.
+     // Many STATE values are possible, including: SSL_CB_CONNECT_LOOP,
+     // SSL_CB_ACCEPT_LOOP, SSL_CB_HANDSHAKE_START, and SSL_CB_HANDSHAKE_DONE.
+     // For example:
+     // if (where & SSL_CB_HANDSHAKE_START)
+     //    debugs(83, 9, "Trying to establish the SSL connection");
+     // else if (where & SSL_CB_HANDSHAKE_DONE)
+     //    debugs(83, 9, "SSL connection established");
+ 
+     debugs(83, 7, "FD " << fd_ << " now: 0x" << std::hex << where << std::dec << ' ' <<
+            SSL_state_string(ssl) << " (" << SSL_state_string_long(ssl) << ")");
+ }
+ 
+ void
+ Ssl::ClientBio::stateChanged(const SSL *ssl, int where, int ret)
+ {
+     Ssl::Bio::stateChanged(ssl, where, ret);
++    // detect client-initiated renegotiations DoS
++    if (where & SSL_CB_HANDSHAKE_START) {
++        ++totalRenegotiations;
++
++        if (abortReason)
++            return; // already decided and informed the admin
++
++        const time_t currentTime = getCurrentTime();
++        if (windowRenegotiationsStart + RenegotiationsWindow < currentTime) {
++            windowRenegotiationsStart = currentTime;
++            windowRenegotiations = 1;
++        } else {
++            ++windowRenegotiations;
++            if (windowRenegotiations > RenegotiationsLimit) {
++                abortReason = "renegotiate requests flood";
++                debugs(83, DBG_IMPORTANT, "Terminating TLS connection [from " << fd_table[fd_].ipaddr << "] due to " << abortReason << ". This connection received " <<
++                       windowRenegotiations << " renegotiate requests in the last " <<
++                       currentTime - windowRenegotiationsStart << " seconds (and " <<
++                       totalRenegotiations << " requests total).");
++            }
++        }
++    }
+ }
+ 
+ int
+ Ssl::ClientBio::write(const char *buf, int size, BIO *table)
+ {
++    if (abortReason) {
++        debugs(83, 3, "BIO on FD " << fd_ << " is aborted");
++        BIO_clear_retry_flags(table);
++        return -1;
++    }
++
+     if (holdWrite_) {
+         BIO_set_retry_write(table);
+         return 0;
+     }
+ 
+     return Ssl::Bio::write(buf, size, table);
+ }
+ 
+ int
+ Ssl::ClientBio::read(char *buf, int size, BIO *table)
+ {
++    if (abortReason) {
++        debugs(83, 3, "BIO on FD " << fd_ << " is aborted");
++        BIO_clear_retry_flags(table);
++        return -1;
++    }
++
+     if (holdRead_) {
+         debugs(83, 7, "Hold flag is set, retry latter. (Hold " << size << "bytes)");
+         BIO_set_retry_read(table);
+         return -1;
+     }
+ 
+     if (!rbuf.isEmpty()) {
+         int bytes = (size <= (int)rbuf.length() ? size : rbuf.length());
+         memcpy(buf, rbuf.rawContent(), bytes);
+         rbuf.consume(bytes);
+         return bytes;
+     } else
+         return Ssl::Bio::read(buf, size, table);
+ 
+     return -1;
+ }
+ 
+ Ssl::ServerBio::ServerBio(const int anFd):
+     Bio(anFd),
+     helloMsgSize(0),
+
+=== modified file 'src/ssl/bio.h'
+--- src/ssl/bio.h	2017-01-01 00:12:22 +0000
++++ src/ssl/bio.h	2017-01-22 11:48:05 +0000
+@@ -52,63 +52,75 @@
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+ 
+     /// Creates a low-level BIO table, creates a high-level Ssl::Bio object
+     /// for a given socket, and then links the two together via BIO_C_SET_FD.
+     static BIO *Create(const int fd, Type type);
+     /// Tells ssl connection to use BIO and monitor state via stateChanged()
+     static void Link(SSL *ssl, BIO *bio);
+ 
+     const SBuf &rBufData() {return rbuf;} ///< The buffered input data
+ protected:
+     const int fd_; ///< the SSL socket we are reading and writing
+     SBuf rbuf;  ///< Used to buffer input data.
+ };
+ 
+ /// BIO node to handle socket IO for squid client side
+ /// If bumping is enabled  this Bio detects and analyses client hello message
+ /// to retrieve the SSL features supported by the client
+ class ClientBio: public Bio
+ {
+ public:
+-    explicit ClientBio(const int anFd): Bio(anFd), holdRead_(false), holdWrite_(false), helloSize(0) {}
++    explicit ClientBio(const int anFd): Bio(anFd), holdRead_(false), holdWrite_(false), helloSize(0), windowRenegotiationsStart(0), windowRenegotiations(0), totalRenegotiations(0), abortReason(nullptr) {}
+ 
+     /// The ClientBio version of the Ssl::Bio::stateChanged method
+     /// When the client hello message retrieved, fill the
+     /// "features" member with the client provided informations.
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+     /// The ClientBio version of the Ssl::Bio::write method
+     virtual int write(const char *buf, int size, BIO *table);
+     /// The ClientBio version of the Ssl::Bio::read method
+     /// If the holdRead flag is true then it does not write any data
+     /// to socket and sets the "read retry" flag of the BIO to true
+     virtual int read(char *buf, int size, BIO *table);
+     /// Prevents or allow writting on socket.
+     void hold(bool h) {holdRead_ = holdWrite_ = h;}
+ 
+     /// Sets the buffered input data (Bio::rbuf).
+     /// Used to pass payload data (normally client HELLO data) retrieved
+     /// by the caller.
+     void setReadBufData(SBuf &data) {rbuf = data;}
+ private:
++    /// approximate size of a time window for computing client-initiated renegotiation rate (in seconds)
++    static const time_t RenegotiationsWindow = 10;
++
++    /// the maximum tolerated number of client-initiated renegotiations in RenegotiationsWindow
++    static const unsigned int RenegotiationsLimit = 5;
++    
+     bool holdRead_; ///< The read hold state of the bio.
+     bool holdWrite_;  ///< The write hold state of the bio.
+     int helloSize; ///< The SSL hello message sent by client size
++    time_t windowRenegotiationsStart; ///< The time of last requested renegotiate
++    unsigned int windowRenegotiations; ///< The number of client requested renegotiations in last time-window
++    unsigned int totalRenegotiations; ///< The total number of client renegotiate requests
++
++    /// why we should terminate the connection during next TLS operation (or nil)
++    const char *abortReason;
+ };
+ 
+ /// BIO node to handle socket IO for squid server side
+ /// If bumping is enabled, analyses the SSL hello message sent by squid OpenSSL
+ /// subsystem (step3 bumping step) against bumping mode:
+ ///   * Peek mode:  Send client hello message instead of the openSSL generated
+ ///                 hello message and normaly denies bumping and allow only
+ ///                 splice or terminate the SSL connection
+ ///   * Stare mode: Sends the openSSL generated hello message and normaly
+ ///                 denies splicing and allow bump or terminate the SSL
+ ///                 connection
+ ///  If SQUID_USE_OPENSSL_HELLO_OVERWRITE_HACK is enabled also checks if the
+ ///  openSSL library features are compatible with the features reported in
+ ///  web client SSL hello message and if it is, overwrites the openSSL SSL
+ ///  object members to replace hello message with web client hello message.
+ ///  This is may allow bumping in peek mode and splicing in stare mode after
+ ///  the server hello message received.
+ class ServerBio: public Bio
+ {
+ public:
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2017-01-01 00:12:22 +0000
++++ src/ssl/support.cc	2017-01-18 09:47:18 +0000
+@@ -484,68 +484,46 @@
+     if (::Config.SSL.ssl_engine)
+         fatalf("Your OpenSSL has no SSL engine support\n");
+ #endif
+ 
+     const char *defName = ::Config.SSL.certSignHash ? ::Config.SSL.certSignHash : SQUID_SSL_SIGN_HASH_IF_NONE;
+     Ssl::DefaultSignHash = EVP_get_digestbyname(defName);
+     if (!Ssl::DefaultSignHash)
+         fatalf("Sign hash '%s' is not supported\n", defName);
+ 
+     ssl_ex_index_server = SSL_get_ex_new_index(0, (void *) "server", NULL, NULL, ssl_free_SBuf);
+     ssl_ctx_ex_index_dont_verify_domain = SSL_CTX_get_ex_new_index(0, (void *) "dont_verify_domain", NULL, NULL, NULL);
+     ssl_ex_index_cert_error_check = SSL_get_ex_new_index(0, (void *) "cert_error_check", NULL, &ssl_dupAclChecklist, &ssl_freeAclChecklist);
+     ssl_ex_index_ssl_error_detail = SSL_get_ex_new_index(0, (void *) "ssl_error_detail", NULL, NULL, &ssl_free_ErrorDetail);
+     ssl_ex_index_ssl_peeked_cert  = SSL_get_ex_new_index(0, (void *) "ssl_peeked_cert", NULL, NULL, &ssl_free_X509);
+     ssl_ex_index_ssl_errors =  SSL_get_ex_new_index(0, (void *) "ssl_errors", NULL, NULL, &ssl_free_SslErrors);
+     ssl_ex_index_ssl_cert_chain = SSL_get_ex_new_index(0, (void *) "ssl_cert_chain", NULL, NULL, &ssl_free_CertChain);
+     ssl_ex_index_ssl_validation_counter = SSL_get_ex_new_index(0, (void *) "ssl_validation_counter", NULL, NULL, &ssl_free_int);
+     ssl_ex_index_ssl_untrusted_chain = SSL_get_ex_new_index(0, (void *) "ssl_untrusted_chain", NULL, NULL, &ssl_free_CertChain);
+ }
+ 
+-#if defined(SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS) && (OPENSSL_VERSION_NUMBER < 0x10100000L)
+-static void
+-ssl_info_cb(const SSL *ssl, int where, int ret)
+-{
+-    (void)ret;
+-    if ((where & SSL_CB_HANDSHAKE_DONE) != 0) {
+-        // disable renegotiation (CVE-2009-3555)
+-        ssl->s3->flags |= SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS;
+-    }
+-}
+-#endif
+-
+-static void
+-maybeDisableRenegotiate(Security::ContextPointer &ctx)
+-{
+-#if defined(SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS) && (OPENSSL_VERSION_NUMBER < 0x10100000L)
+-    SSL_CTX_set_info_callback(ctx.get(), ssl_info_cb);
+-#endif
+-}
+-
+ static bool
+ configureSslContext(Security::ContextPointer &ctx, AnyP::PortCfg &port)
+ {
+     int ssl_error;
+     SSL_CTX_set_options(ctx.get(), port.secure.parsedOptions);
+ 
+-    maybeDisableRenegotiate(ctx);
+-
+     if (port.sslContextSessionId)
+         SSL_CTX_set_session_id_context(ctx.get(), (const unsigned char *)port.sslContextSessionId, strlen(port.sslContextSessionId));
+ 
+     if (port.secure.parsedFlags & SSL_FLAG_NO_SESSION_REUSE) {
+         SSL_CTX_set_session_cache_mode(ctx.get(), SSL_SESS_CACHE_OFF);
+     }
+ 
+     if (Config.SSL.unclean_shutdown) {
+         debugs(83, 5, "Enabling quiet SSL shutdowns (RFC violation).");
+ 
+         SSL_CTX_set_quiet_shutdown(ctx.get(), 1);
+     }
+ 
+     if (!port.secure.sslCipher.isEmpty()) {
+         debugs(83, 5, "Using chiper suite " << port.secure.sslCipher << ".");
+ 
+         if (!SSL_CTX_set_cipher_list(ctx.get(), port.secure.sslCipher.c_str())) {
+             ssl_error = ERR_get_error();
+             debugs(83, DBG_CRITICAL, "ERROR: Failed to set SSL cipher suite '" << port.secure.sslCipher << "': " << Security::ErrorString(ssl_error));
+             return false;
+@@ -639,42 +617,40 @@
+             return false;
+         }
+     */
+ 
+     if (!configureSslContext(ctx, port)) {
+         debugs(83, DBG_CRITICAL, "ERROR: Configuring static SSL context");
+         return false;
+     }
+ 
+     return true;
+ }
+ 
+ bool
+ Ssl::InitClientContext(Security::ContextPointer &ctx, Security::PeerOptions &peer, long options, long fl)
+ {
+     if (!ctx)
+         return false;
+ 
+     SSL_CTX_set_options(ctx.get(), options);
+ 
+-    maybeDisableRenegotiate(ctx);
+-
+     if (!peer.sslCipher.isEmpty()) {
+         debugs(83, 5, "Using chiper suite " << peer.sslCipher << ".");
+ 
+         const char *cipher = peer.sslCipher.c_str();
+         if (!SSL_CTX_set_cipher_list(ctx.get(), cipher)) {
+             const int ssl_error = ERR_get_error();
+             fatalf("Failed to set SSL cipher suite '%s': %s\n",
+                    cipher, Security::ErrorString(ssl_error));
+         }
+     }
+ 
+     if (!peer.certs.empty()) {
+         // TODO: support loading multiple cert/key pairs
+         auto &keys = peer.certs.front();
+         if (!keys.certFile.isEmpty()) {
+             debugs(83, DBG_IMPORTANT, "Using certificate in " << keys.certFile);
+ 
+             const char *certfile = keys.certFile.c_str();
+             if (!SSL_CTX_use_certificate_chain_file(ctx.get(), certfile)) {
+                 const int ssl_error = ERR_get_error();
+

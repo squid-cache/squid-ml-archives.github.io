@@ -1,0 +1,194 @@
+Avoid startup/shutdown crashes [by avoiding static non-POD globals].
+
+Squid crashes on startup when the parent process exit()s after fork()ing
+the kid process. Squid may also crash on shutdown after exiting main().
+
+In both cases, the crashes are build- and environment-specific. Many
+environments show no problems at all. Even disabling compiler
+optimizations may prevent crashes. When crashes do happen, their
+symptoms (e.g., backtrace) point to problems during destruction of
+global objects, but the details point to innocent objects (e.g., PortCfg
+or SSL_CTX).
+
+In some environments, the following malloc error is printed on console
+before the crash: "corrupted double-linked list".
+
+This change replaces two StatHist globals used for SBuf statistics
+collection with always-available singletons. The replaced globals could
+be destructed before the last SBuf object using them, leading to memory
+corruption (that would eventually crash Squid).
+
+There are probably more such globals.
+
+=== modified file 'src/SBufStatsAction.cc'
+--- src/SBufStatsAction.cc	2016-02-26 15:53:52 +0000
++++ src/SBufStatsAction.cc	2016-04-07 04:48:24 +0000
+@@ -21,42 +21,42 @@ SBufStatsAction::SBufStatsAction(const M
+ SBufStatsAction::Pointer
+ SBufStatsAction::Create(const Mgr::CommandPointer &cmd)
+ {
+     return new SBufStatsAction(cmd);
+ }
+ 
+ void
+ SBufStatsAction::add(const Mgr::Action& action)
+ {
+     sbdata += dynamic_cast<const SBufStatsAction&>(action).sbdata;
+     mbdata += dynamic_cast<const SBufStatsAction&>(action).mbdata;
+     sbsizesatdestruct += dynamic_cast<const SBufStatsAction&>(action).sbsizesatdestruct;
+     mbsizesatdestruct += dynamic_cast<const SBufStatsAction&>(action).mbsizesatdestruct;
+ }
+ 
+ void
+ SBufStatsAction::collect()
+ {
+     sbdata = SBuf::GetStats();
+     mbdata = MemBlob::GetStats();
+-    sbsizesatdestruct = *collectSBufDestructTimeStats();
+-    mbsizesatdestruct = *collectMemBlobDestructTimeStats();
++    sbsizesatdestruct = collectSBufDestructTimeStats();
++    mbsizesatdestruct = collectMemBlobDestructTimeStats();
+ }
+ 
+ static void
+ statHistSBufDumper(StoreEntry * sentry, int, double val, double size, int count)
+ {
+     if (count == 0)
+         return;
+     storeAppendPrintf(sentry, "\t%d-%d\t%d\n", static_cast<int>(val), static_cast<int>(val+size), count);
+ }
+ 
+ void
+ SBufStatsAction::dump(StoreEntry* entry)
+ {
+     PackableStream ses(*entry);
+     ses << "\n\n\nThese statistics are experimental; their format and contents "
+         "should not be relied upon, they are bound to change as "
+         "the SBuf feature is evolved\n";
+     sbdata.dump(ses);
+     mbdata.dump(ses);
+     ses << "\n";
+
+=== modified file 'src/sbuf/DetailedStats.cc'
+--- src/sbuf/DetailedStats.cc	2016-02-26 15:53:52 +0000
++++ src/sbuf/DetailedStats.cc	2016-04-07 04:48:24 +0000
+@@ -1,56 +1,50 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "sbuf/DetailedStats.h"
+ #include "StatHist.h"
+ 
+ /*
+  * Implementation note: the purpose of this construct is to avoid adding
+  * external dependencies to the SBuf code
+  */
+ 
+-static StatHist sbufDestructTimeStats;
+-static StatHist memblobDestructTimeStats;
+-
+-namespace SBufDetailedStatsHistInitializer
+-{
+-// run the post-instantiation initialization methods for StatHist objects
+-struct Initializer {
+-    Initializer() {
+-        sbufDestructTimeStats.logInit(100,30.0,128000.0);
+-        memblobDestructTimeStats.logInit(100,30.0,128000.0);
+-    }
+-};
+-Initializer initializer;
++static StatHist *
++newStatHist() {
++    StatHist *stats = new StatHist;
++    stats->logInit(100, 30.0, 128000.0);
++    return stats;
+ }
+ 
+-void
+-recordSBufSizeAtDestruct(SBuf::size_type sz)
++StatHist &
++collectSBufDestructTimeStats()
+ {
+-    sbufDestructTimeStats.count(static_cast<double>(sz));
++    static StatHist *stats = newStatHist();
++    return *stats;
+ }
+ 
+-const StatHist *
+-collectSBufDestructTimeStats()
++StatHist &
++collectMemBlobDestructTimeStats()
+ {
+-    return &sbufDestructTimeStats;
++    static StatHist *stats = newStatHist();
++    return *stats;
+ }
+ 
+ void
+-recordMemBlobSizeAtDestruct(SBuf::size_type sz)
++recordSBufSizeAtDestruct(SBuf::size_type sz)
+ {
+-    memblobDestructTimeStats.count(static_cast<double>(sz));
++    collectSBufDestructTimeStats().count(static_cast<double>(sz));
+ }
+ 
+-const StatHist *
+-collectMemBlobDestructTimeStats()
++void
++recordMemBlobSizeAtDestruct(SBuf::size_type sz)
+ {
+-    return &memblobDestructTimeStats;
++    collectMemBlobDestructTimeStats().count(static_cast<double>(sz));
+ }
+ 
+
+=== modified file 'src/sbuf/DetailedStats.h'
+--- src/sbuf/DetailedStats.h	2016-02-26 15:53:52 +0000
++++ src/sbuf/DetailedStats.h	2016-04-07 04:48:24 +0000
+@@ -1,35 +1,29 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SBUFDETAILEDSTATS_H
+ #define SQUID_SBUFDETAILEDSTATS_H
+ 
+ #include "sbuf/SBuf.h"
+ 
+ class StatHist;
+ 
+ /// Record the size a SBuf had when it was destructed
+ void recordSBufSizeAtDestruct(SBuf::size_type sz);
+ 
+-/** Collect the SBuf size-at-destruct-time histogram
+- *
+- * \note the returned StatHist object must not be freed
+- */
+-const StatHist * collectSBufDestructTimeStats();
++/// the SBuf size-at-destruct-time histogram
++StatHist &collectSBufDestructTimeStats();
+ 
+ /// Record the size a MemBlob had when it was destructed
+ void recordMemBlobSizeAtDestruct(MemBlob::size_type sz);
+ 
+-/** Collect the MemBlob size-at-destruct-time histogram
+- *
+- * \note the returned StatHist object must not be freed
+- */
+-const StatHist * collectMemBlobDestructTimeStats();
++/// the MemBlob size-at-destruct-time histogram
++StatHist &collectMemBlobDestructTimeStats();
+ 
+ #endif /* SQUID_SBUFDETAILEDSTATS_H */
+ 
+

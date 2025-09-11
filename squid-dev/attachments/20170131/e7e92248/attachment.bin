@@ -1,0 +1,191 @@
+Fix URI scheme case-sensitivity treatment broken since r14802.
+
+A parsed value for the AnyP::UriScheme image constructor parameter was
+stored without toLower() canonicalization for known protocols (e.g.,
+after successful "HTTP://EXAMPLE.COM/" parsing in urlParseFinish).
+Without that canonicalization step, Squid violated various HTTP caching
+rules related to URI comparison (and served fewer hits) when dealing
+with absolute URLs containing non-lowercase HTTP scheme.
+
+According to my limited tests, URL-based ACLs are not affected by this
+bug, but I have not investigated how URL-based ACL code differs from
+caching code when it comes to stored URL access and whether some ACLs
+are actually affected in some environments.
+
+=== modified file 'src/anyp/UriScheme.cc'
+--- src/anyp/UriScheme.cc	2017-01-01 00:12:22 +0000
++++ src/anyp/UriScheme.cc	2017-01-31 12:49:52 +0000
+@@ -1,61 +1,81 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 23    URL Scheme parsing */
+ 
+ #include "squid.h"
+ #include "anyp/UriScheme.h"
+ 
++std::vector<SBuf> AnyP::UriScheme::LowercaseSchemeNames;
++
+ AnyP::UriScheme::UriScheme(AnyP::ProtocolType const aScheme, const char *img) :
+     theScheme_(aScheme)
+ {
+-    if (img)
+-        // image could be provided explicitly (case-sensitive)
+-        image_ = img;
+-
++    // RFC 3986 section 3.1: schemes are case-insensitive.
++
++    // To improve diagnostic, remember exactly how an unsupported scheme looks like.
++    // XXX: Object users may rely on toLower() canonicalization that we refuse to provide.
++    if (img && theScheme_ == AnyP::PROTO_UNKNOWN)
++         image_ = img;
++
++    // XXX: A broken caller supplies an image of an absent scheme?
++    // XXX: We assume that the caller is using a lower-case image.
++    else if (img && theScheme_ == AnyP::PROTO_NONE)
++         image_ = img;
++
++    // the caller knows nothing about the scheme
++    // TODO: Avoid special casing by storing this string in the generated ProtocolType_str?
+     else if (theScheme_ == AnyP::PROTO_UNKNOWN)
+-        // image could be actually unknown and not provided
+         image_ = "(unknown)";
+ 
+-    else if (theScheme_ > AnyP::PROTO_NONE && theScheme_ < AnyP::PROTO_MAX) {
+-        // image could be implied by a registered transfer protocol
+-        // which use upper-case labels, so down-case for scheme image
+-        image_ = AnyP::ProtocolType_str[theScheme_];
+-        image_.toLower();
++    else if (theScheme_ > AnyP::PROTO_NONE && theScheme_ < AnyP::PROTO_MAX)
++        image_ = LowercaseScheme(theScheme_);
++    // else, the image remains empty (e.g., "://example.com/")
++    // hopefully, theScheme_ is PROTO_NONE here
++}
++
++const SBuf &AnyP::UriScheme::LowercaseScheme(const AnyP::ProtocolType protoType)
++{
++    if (LowercaseSchemeNames.empty()) {
++        for (int i = AnyP::PROTO_NONE; i < AnyP::PROTO_MAX; ++i) {
++            SBuf image(ProtocolType_str[i]);
++            image.toLower();
++            LowercaseSchemeNames.push_back(image);
++        }
+     }
+-    // else, image is an empty string ("://example.com/")
++    return LowercaseSchemeNames.at(protoType);
+ }
+ 
+ unsigned short
+ AnyP::UriScheme::defaultPort() const
+ {
+     switch (theScheme_) {
+ 
+     case AnyP::PROTO_HTTP:
+         return 80;
+ 
+     case AnyP::PROTO_HTTPS:
+         return 443;
+ 
+     case AnyP::PROTO_FTP:
+         return 21;
+ 
+     case AnyP::PROTO_COAP:
+     case AnyP::PROTO_COAPS:
+         // coaps:// default is TBA as of draft-ietf-core-coap-08.
+         // Assuming IANA policy of allocating same port for base and TLS protocol versions will occur.
+         return 5683;
+ 
+     case AnyP::PROTO_GOPHER:
+         return 70;
+ 
+     case AnyP::PROTO_WAIS:
+         return 210;
+ 
+     case AnyP::PROTO_CACHE_OBJECT:
+         return CACHE_HTTP_PORT;
+
+=== modified file 'src/anyp/UriScheme.h'
+--- src/anyp/UriScheme.h	2017-01-01 00:12:22 +0000
++++ src/anyp/UriScheme.h	2017-01-31 12:51:36 +0000
+@@ -1,68 +1,75 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ANYP_URISCHEME_H
+ #define SQUID_ANYP_URISCHEME_H
+ 
+ #include "anyp/ProtocolType.h"
+ #include "sbuf/SBuf.h"
+ 
+ #include <iosfwd>
+ 
+ namespace AnyP
+ {
+ 
+ /** This class represents a URI Scheme such as http:// https://, wais://, urn: etc.
+  * It does not represent the PROTOCOL that such schemes refer to.
+  */
+ class UriScheme
+ {
+ public:
+     UriScheme() : theScheme_(AnyP::PROTO_NONE) {}
++    /// \param img Explicit scheme representation for unknown/none schemes.
+     UriScheme(AnyP::ProtocolType const aScheme, const char *img = nullptr);
+     UriScheme(const AnyP::UriScheme &o) : theScheme_(o.theScheme_), image_(o.image_) {}
+     UriScheme(AnyP::UriScheme &&) = default;
+     ~UriScheme() {}
+ 
+     AnyP::UriScheme& operator=(const AnyP::UriScheme &o) {
+         theScheme_ = o.theScheme_;
+         image_ = o.image_;
+         return *this;
+     }
+     AnyP::UriScheme& operator=(AnyP::UriScheme &&) = default;
+ 
+     operator AnyP::ProtocolType() const { return theScheme_; }
+     // XXX: does not account for comparison of unknown schemes (by image)
+     bool operator != (AnyP::ProtocolType const & aProtocol) const { return theScheme_ != aProtocol; }
+ 
+     /** Get a char string representation of the scheme.
+      * Does not include the ':' or "://" terminators.
+      */
+     SBuf image() const {return image_;}
+ 
+     unsigned short defaultPort() const;
+ 
+ private:
++    /// \returns the corresponding down-cased protocol scheme name
++    static const SBuf &LowercaseScheme(const AnyP::ProtocolType protoType);
++    /// optimization: stores down-cased protocol scheme names from
++    /// AnyP::ProtocolType_str
++    static std::vector<SBuf> LowercaseSchemeNames;
++
+     /// This is a typecode pointer into the enum/registry of protocols handled.
+     AnyP::ProtocolType theScheme_;
+ 
+     /// the string representation
+     SBuf image_;
+ };
+ 
+ } // namespace AnyP
+ 
+ inline std::ostream &
+ operator << (std::ostream &os, AnyP::UriScheme const &scheme)
+ {
+     os << scheme.image();
+     return os;
+ }
+ 
+ #endif /* SQUID_ANYP_URISCHEME_H */
+ 
+

@@ -1,0 +1,557 @@
+Segfault via Ftp::Client::readControlReply.
+
+Added nil dereference checks for Ftp::Client::ctrl.conn, including:
+- Ftp::Client::handlePasvReply() and handleEpsvReply() that dereference
+  ctrl.conn in DBG_IMPORTANT messages.
+- Many functions inside FtpClient.cc and FtpGateway.cc files.
+
+TODO: We need to find a better way to handle nil ctrl.conn. It is only
+a matter of time when we forget to add another dereference check or
+discover a place we missed during this change.
+
+Also disabled forwarding of EPRT and PORT commands to origin servers.
+Squid support for those commands is broken and their forwarding may
+cause segfaults (bug #4004). Active FTP is still supported, of course.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/clients/FtpClient.cc'
+--- src/clients/FtpClient.cc	2016-07-27 09:44:39 +0000
++++ src/clients/FtpClient.cc	2016-11-11 16:19:47 +0000
+@@ -425,71 +425,81 @@
+     if (ctrl.offset == bytes_used) {
+         /* used it all up */
+         ctrl.offset = 0;
+     } else {
+         /* Got some data past the complete reply */
+         assert(bytes_used < ctrl.offset);
+         ctrl.offset -= bytes_used;
+         memmove(ctrl.buf, ctrl.buf + bytes_used, ctrl.offset);
+     }
+ 
+     debugs(9, 3, "state=" << state << ", code=" << ctrl.replycode);
+ }
+ 
+ bool
+ Ftp::Client::handlePasvReply(Ip::Address &srvAddr)
+ {
+     int code = ctrl.replycode;
+     char *buf;
+     debugs(9, 3, status());
+ 
++    if (!Comm::IsConnOpen(ctrl.conn)) {
++        debugs(9, 5, "The control connection to the remote end is closed");
++        return false;
++    }
++
+     if (code != 227) {
+         debugs(9, 2, "PASV not supported by remote end");
+         return false;
+     }
+ 
+     /*  227 Entering Passive Mode (h1,h2,h3,h4,p1,p2).  */
+     /*  ANSI sez [^0-9] is undefined, it breaks on Watcom cc */
+     debugs(9, 5, "scanning: " << ctrl.last_reply);
+ 
+     buf = ctrl.last_reply + strcspn(ctrl.last_reply, "0123456789");
+ 
+     const char *forceIp = Config.Ftp.sanitycheck ?
+                           fd_table[ctrl.conn->fd].ipaddr : NULL;
+     if (!Ftp::ParseIpPort(buf, forceIp, srvAddr)) {
+         debugs(9, DBG_IMPORTANT, "Unsafe PASV reply from " <<
+                ctrl.conn->remote << ": " << ctrl.last_reply);
+         return false;
+     }
+ 
+     data.addr(srvAddr);
+ 
+     return true;
+ }
+ 
+ bool
+ Ftp::Client::handleEpsvReply(Ip::Address &remoteAddr)
+ {
+     int code = ctrl.replycode;
+     char *buf;
+     debugs(9, 3, status());
+ 
++    if (!Comm::IsConnOpen(ctrl.conn)) {
++        debugs(9, 5, "The control connection to the remote end is closed");
++        return false;
++    }
++
+     if (code != 229 && code != 522) {
+         if (code == 200) {
+             /* handle broken servers (RFC 2428 says OK code for EPSV MUST be 229 not 200) */
+             /* vsftpd for one send '200 EPSV ALL ok.' without even port info.
+              * Its okay to re-send EPSV 1/2 but nothing else. */
+             debugs(9, DBG_IMPORTANT, "Broken FTP Server at " << ctrl.conn->remote << ". Wrong accept code for EPSV");
+         } else {
+             debugs(9, 2, "EPSV not supported by remote end");
+         }
+         return sendPassive();
+     }
+ 
+     if (code == 522) {
+         /* Peer responded with a list of supported methods:
+          *   522 Network protocol not supported, use (1)
+          *   522 Network protocol not supported, use (1,2)
+          *   522 Network protocol not supported, use (2)
+          * TODO: Handle the (1,2) case which may happen after EPSV ALL. Close
+          * data + control without self-destructing and re-open from scratch.
+          */
+@@ -716,40 +726,45 @@
+             }
+         }
+         break;
+     }
+     }
+ 
+     if (ctrl.message)
+         wordlistDestroy(&ctrl.message);
+     ctrl.message = NULL; //No message to return to client.
+     ctrl.offset = 0; //reset readed response, to make room read the next response
+ 
+     writeCommand(mb.content());
+ 
+     shortenReadTimeout = true;
+     return true;
+ }
+ 
+ void
+ Ftp::Client::connectDataChannel()
+ {
++    if (!Comm::IsConnOpen(ctrl.conn)) {
++        debugs(9, 5, "The control connection to the remote end is closed");
++        return;
++    }
++
+     safe_free(ctrl.last_command);
+ 
+     safe_free(ctrl.last_reply);
+ 
+     ctrl.last_command = xstrdup("Connect to server data port");
+ 
+     // Generate a new data channel descriptor to be opened.
+     Comm::ConnectionPointer conn = new Comm::Connection;
+     conn->setAddrs(ctrl.conn->local, data.host);
+     conn->local.port(0);
+     conn->remote.port(data.port);
+     conn->tos = ctrl.conn->tos;
+     conn->nfmark = ctrl.conn->nfmark;
+ 
+     debugs(9, 3, "connecting to " << conn->remote);
+ 
+     typedef CommCbMemFunT<Client, CommConnectCbParams> Dialer;
+     data.opener = JobCallback(9, 3, Dialer, this, Ftp::Client::dataChannelConnected);
+     Comm::ConnOpener *cs = new Comm::ConnOpener(conn, data.opener, Config.Timeout.connect);
+     cs->setHost(data.host);
+
+=== modified file 'src/clients/FtpGateway.cc'
+--- src/clients/FtpGateway.cc	2016-04-25 16:21:13 +0000
++++ src/clients/FtpGateway.cc	2016-11-11 16:27:43 +0000
+@@ -195,41 +195,43 @@
+ #define CTRL_BUFLEN 1024
+ static char cbuf[CTRL_BUFLEN];
+ 
+ /*
+  * State machine functions
+  * send == state transition
+  * read == wait for response, and select next state transition
+  * other == Transition logic
+  */
+ static FTPSM ftpReadWelcome;
+ static FTPSM ftpSendUser;
+ static FTPSM ftpReadUser;
+ static FTPSM ftpSendPass;
+ static FTPSM ftpReadPass;
+ static FTPSM ftpSendType;
+ static FTPSM ftpReadType;
+ static FTPSM ftpSendMdtm;
+ static FTPSM ftpReadMdtm;
+ static FTPSM ftpSendSize;
+ static FTPSM ftpReadSize;
++#if 0
+ static FTPSM ftpSendEPRT;
++#endif
+ static FTPSM ftpReadEPRT;
+ static FTPSM ftpSendPORT;
+ static FTPSM ftpReadPORT;
+ static FTPSM ftpSendPassive;
+ static FTPSM ftpReadEPSV;
+ static FTPSM ftpReadPasv;
+ static FTPSM ftpTraverseDirectory;
+ static FTPSM ftpListDir;
+ static FTPSM ftpGetFile;
+ static FTPSM ftpSendCwd;
+ static FTPSM ftpReadCwd;
+ static FTPSM ftpRestOrList;
+ static FTPSM ftpSendList;
+ static FTPSM ftpSendNlst;
+ static FTPSM ftpReadList;
+ static FTPSM ftpSendRest;
+ static FTPSM ftpReadRest;
+ static FTPSM ftpSendRetr;
+ static FTPSM ftpReadRetr;
+ static FTPSM ftpReadTransferDone;
+@@ -433,40 +435,45 @@
+             }
+             debugs(9, 9, HERE << ": found password='" << password << "'(" << len <<") unescaped.");
+         }
+     } else if (login[0]) {
+         /* no password, just username */
+         if (total_len > MAX_URL)
+             total_len = MAX_URL -1;
+         xstrncpy(user, login, total_len +1);
+         debugs(9, 9, HERE << ": found user='" << user << "'(" << total_len <<"), escaped=" << escaped);
+         if (escaped)
+             rfc1738_unescape(user);
+         debugs(9, 9, HERE << ": found user='" << user << "'(" << total_len <<") unescaped.");
+     }
+ 
+     debugs(9, 9, HERE << ": OUT: login='" << login << "', escaped=" << escaped << ", user=" << user << ", password=" << password);
+ }
+ 
+ void
+ Ftp::Gateway::listenForDataChannel(const Comm::ConnectionPointer &conn)
+ {
++    if (!Comm::IsConnOpen(ctrl.conn)) {
++        debugs(9, 5, "The control connection to the remote end is closed");
++        return;
++    }
++
+     assert(!Comm::IsConnOpen(data.conn));
+ 
+     typedef CommCbMemFunT<Gateway, CommAcceptCbParams> AcceptDialer;
+     typedef AsyncCallT<AcceptDialer> AcceptCall;
+     RefCount<AcceptCall> call = static_cast<AcceptCall*>(JobCallback(11, 5, AcceptDialer, this, Ftp::Gateway::ftpAcceptDataConnection));
+     Subscription::Pointer sub = new CallSubscription<AcceptCall>(call);
+     const char *note = entry->url();
+ 
+     /* open the conn if its not already open */
+     if (!Comm::IsConnOpen(conn)) {
+         conn->fd = comm_open_listener(SOCK_STREAM, IPPROTO_TCP, conn->local, conn->flags, note);
+         if (!Comm::IsConnOpen(conn)) {
+             debugs(5, DBG_CRITICAL, HERE << "comm_open_listener failed:" << conn->local << " error: " << errno);
+             return;
+         }
+         debugs(9, 3, HERE << "Unconnected data socket created on " << conn);
+     }
+ 
+     conn->tos = ctrl.conn->tos;
+     conn->nfmark = ctrl.conn->nfmark;
+@@ -1166,41 +1173,41 @@
+         base_href.append(xitoa(request->port));
+     }
+ 
+     base_href.append(request->urlpath);
+     base_href.append("/");
+ }
+ 
+ void
+ Ftp::Gateway::start()
+ {
+     if (!checkAuth(&request->header)) {
+         /* create appropriate reply */
+         HttpReply *reply = ftpAuthRequired(request, ftpRealm());
+         entry->replaceHttpReply(reply);
+         serverComplete();
+         return;
+     }
+ 
+     checkUrlpath();
+     buildTitleUrl();
+-    debugs(9, 5, HERE << "FD " << ctrl.conn->fd << " : host=" << request->GetHost() <<
++    debugs(9, 5, HERE << "FD " << (ctrl.conn != NULL ? ctrl.conn->fd : -1) << " : host=" << request->GetHost() <<
+            ", path=" << request->urlpath << ", user=" << user << ", passwd=" << password);
+     state = BEGIN;
+     Ftp::Client::start();
+ }
+ 
+ /* ====================================================================== */
+ 
+ void
+ Ftp::Gateway::handleControlReply()
+ {
+     Ftp::Client::handleControlReply();
+     if (ctrl.message == NULL)
+         return; // didn't get complete reply yet
+ 
+     /* Copy the message except for the last line to cwd_message to be
+      * printed in error messages.
+      */
+     for (wordlist *w = ctrl.message; w && w->next; w = w->next) {
+         cwd_message.append('\n');
+         cwd_message.append(w->key);
+@@ -1733,80 +1740,87 @@
+     }
+ 
+ #if USE_ADAPTATION
+     if (adaptationAccessCheckPending) {
+         debugs(9,3, HERE << "returning due to adaptationAccessCheckPending");
+         return;
+     }
+ #endif
+ 
+     // processReplyBody calls serverComplete() since there is no body
+     processReplyBody();
+ }
+ 
+ static void
+ ftpReadPasv(Ftp::Gateway * ftpState)
+ {
+     Ip::Address srvAddr; // unused
+     if (ftpState->handlePasvReply(srvAddr))
+         ftpState->connectDataChannel();
+     else {
+-        ftpSendEPRT(ftpState);
++        ftpFail(ftpState);
++        // Currently disabled, does not work correctly:
++        // ftpSendEPRT(ftpState);
+         return;
+     }
+ }
+ 
+ void
+ Ftp::Gateway::dataChannelConnected(const CommConnectCbParams &io)
+ {
+     debugs(9, 3, HERE);
+     data.opener = NULL;
+ 
+     if (io.flag != Comm::OK) {
+         debugs(9, 2, HERE << "Failed to connect. Retrying via another method.");
+ 
+         // ABORT on timeouts. server may be waiting on a broken TCP link.
+         if (io.xerrno == Comm::TIMEOUT)
+             writeCommand("ABOR");
+ 
+         // try another connection attempt with some other method
+         ftpSendPassive(this);
+         return;
+     }
+ 
+     data.opened(io.conn, dataCloser());
+     ftpRestOrList(this);
+ }
+ 
+ static void
+ ftpOpenListenSocket(Ftp::Gateway * ftpState, int fallback)
+ {
+     /// Close old data channels, if any. We may open a new one below.
+     if (ftpState->data.conn != NULL) {
+         if ((ftpState->data.conn->flags & COMM_REUSEADDR))
+             // NP: in fact it points to the control channel. just clear it.
+             ftpState->data.clear();
+         else
+             ftpState->data.close();
+     }
+     safe_free(ftpState->data.host);
+ 
++    if (!Comm::IsConnOpen(ftpState->ctrl.conn)) {
++        debugs(9, 5, "The control connection to the remote end is closed");
++        return;
++    }
++
+     /*
+      * Set up a listen socket on the same local address as the
+      * control connection.
+      */
+     Comm::ConnectionPointer temp = new Comm::Connection;
+     temp->local = ftpState->ctrl.conn->local;
+ 
+     /*
+      * REUSEADDR is needed in fallback mode, since the same port is
+      * used for both control and data.
+      */
+     if (fallback) {
+         int on = 1;
+         setsockopt(ftpState->ctrl.conn->fd, SOL_SOCKET, SO_REUSEADDR, (char *) &on, sizeof(on));
+         ftpState->ctrl.conn->flags |= COMM_REUSEADDR;
+         temp->flags |= COMM_REUSEADDR;
+     } else {
+         /* if not running in fallback mode a new port needs to be retrieved */
+         temp->local.port(0);
+     }
+@@ -1858,120 +1872,132 @@
+     ftpState->state = Ftp::Client::SENT_PORT;
+ 
+     Ip::Address::FreeAddr(AI);
+ }
+ 
+ static void
+ ftpReadPORT(Ftp::Gateway * ftpState)
+ {
+     int code = ftpState->ctrl.replycode;
+     debugs(9, 3, HERE);
+ 
+     if (code != 200) {
+         /* Fall back on using the same port as the control connection */
+         debugs(9, 3, "PORT not supported by remote end");
+         ftpOpenListenSocket(ftpState, 1);
+     }
+ 
+     ftpRestOrList(ftpState);
+ }
+ 
++#if 0
+ static void
+ ftpSendEPRT(Ftp::Gateway * ftpState)
+ {
++    /* check the server control channel is still available */
++    if (!ftpState || !ftpState->haveControlChannel("ftpSendEPRT"))
++        return;
++
+     if (Config.Ftp.epsv_all && ftpState->flags.epsv_all_sent) {
+         debugs(9, DBG_IMPORTANT, "FTP does not allow EPRT method after 'EPSV ALL' has been sent.");
+         return;
+     }
+ 
+     if (!Config.Ftp.eprt) {
+         /* Disabled. Switch immediately to attempting old PORT command. */
+         debugs(9, 3, "EPRT disabled by local administrator");
+         ftpSendPORT(ftpState);
+         return;
+     }
+ 
+     debugs(9, 3, HERE);
+     ftpState->flags.pasv_supported = 0;
+ 
+     ftpOpenListenSocket(ftpState, 0);
+     debugs(9, 3, "Listening for FTP data connection with FD " << ftpState->data.conn);
+     if (!Comm::IsConnOpen(ftpState->data.conn)) {
+         /* XXX Need to set error message */
+         ftpFail(ftpState);
+         return;
+     }
+ 
+     char buf[MAX_IPSTRLEN];
+ 
+     /* RFC 2428 defines EPRT as IPv6 equivalent to IPv4 PORT command. */
+     /* Which can be used by EITHER protocol. */
+     snprintf(cbuf, CTRL_BUFLEN, "EPRT |%d|%s|%d|\r\n",
+              ( ftpState->data.listenConn->local.isIPv6() ? 2 : 1 ),
+              ftpState->data.listenConn->local.toStr(buf,MAX_IPSTRLEN),
+              ftpState->data.listenConn->local.port() );
+ 
+     ftpState->writeCommand(cbuf);
+     ftpState->state = Ftp::Client::SENT_EPRT;
+ }
++#endif
+ 
+ static void
+ ftpReadEPRT(Ftp::Gateway * ftpState)
+ {
+     int code = ftpState->ctrl.replycode;
+     debugs(9, 3, HERE);
+ 
+     if (code != 200) {
+         /* Failover to attempting old PORT command. */
+         debugs(9, 3, "EPRT not supported by remote end");
+         ftpSendPORT(ftpState);
+         return;
+     }
+ 
+     ftpRestOrList(ftpState);
+ }
+ 
+ /** "read" handler to accept FTP data connections.
+  *
+  \param io    comm accept(2) callback parameters
+  */
+ void
+ Ftp::Gateway::ftpAcceptDataConnection(const CommAcceptCbParams &io)
+ {
+     debugs(9, 3, HERE);
+ 
+-    if (EBIT_TEST(entry->flags, ENTRY_ABORTED)) {
+-        abortAll("entry aborted when accepting data conn");
+-        data.listenConn->close();
+-        data.listenConn = NULL;
++    if (!Comm::IsConnOpen(ctrl.conn)) { /*Close handlers will cleanup*/
++        debugs(9, 5, "The control connection to the remote end is closed");
+         return;
+     }
+ 
+     if (io.flag != Comm::OK) {
+         data.listenConn->close();
+         data.listenConn = NULL;
+         debugs(9, DBG_IMPORTANT, "FTP AcceptDataConnection: " << io.conn << ": " << xstrerr(io.xerrno));
+         /** \todo Need to send error message on control channel*/
+         ftpFail(this);
+         return;
+     }
+ 
++    if (EBIT_TEST(entry->flags, ENTRY_ABORTED)) {
++        abortAll("entry aborted when accepting data conn");
++        data.listenConn->close();
++        data.listenConn = NULL;
++        io.conn->close();
++        return;
++    }
++
+     /* data listening conn is no longer even open. abort. */
+     if (!Comm::IsConnOpen(data.listenConn)) {
+         data.listenConn = NULL; // ensure that it's cleared and not just closed.
+         return;
+     }
+ 
+     /* data listening conn is no longer even open. abort. */
+     if (!Comm::IsConnOpen(data.conn)) {
+         data.clear(); // ensure that it's cleared and not just closed.
+         return;
+     }
+ 
+     /** \par
+      * When squid.conf ftp_sanitycheck is enabled, check the new connection is actually being
+      * made by the remote client which is connected to the FTP control socket.
+      * Or the one which we were told to listen for by control channel messages (may differ under NAT).
+      * This prevents third-party hacks, but also third-party load balancing handshakes.
+      */
+     if (Config.Ftp.sanitycheck) {
+         // accept if either our data or ctrl connection is talking to this remote peer.
+@@ -2688,42 +2714,42 @@
+  * Call this when there is data from the origin server
+  * which should be sent to either StoreEntry, or to ICAP...
+  */
+ void
+ Ftp::Gateway::writeReplyBody(const char *dataToWrite, size_t dataLength)
+ {
+     debugs(9, 5, HERE << "writing " << dataLength << " bytes to the reply");
+     addVirginReplyBody(dataToWrite, dataLength);
+ }
+ 
+ /**
+  * A hack to ensure we do not double-complete on the forward entry.
+  *
+  \todo Ftp::Gateway logic should probably be rewritten to avoid
+  *  double-completion or FwdState should be rewritten to allow it.
+  */
+ void
+ Ftp::Gateway::completeForwarding()
+ {
+     if (fwd == NULL || flags.completed_forwarding) {
+-        debugs(9, 3, HERE << "completeForwarding avoids " <<
+-               "double-complete on FD " << ctrl.conn->fd << ", Data FD " << data.conn->fd <<
++        debugs(9, 3, "avoid double-complete on FD " <<
++               (ctrl.conn != NULL ? ctrl.conn->fd : -1) << ", Data FD " << data.conn->fd <<
+                ", this " << this << ", fwd " << fwd);
+         return;
+     }
+ 
+     flags.completed_forwarding = true;
+     Client::completeForwarding();
+ }
+ 
+ /**
+  * Have we lost the FTP server control channel?
+  *
+  \retval true   The server control channel is available.
+  \retval false  The server control channel is not available.
+  */
+ bool
+ Ftp::Gateway::haveControlChannel(const char *caller_name) const
+ {
+     if (doneWithServer())
+         return false;
+ 
+

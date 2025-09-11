@@ -1,0 +1,162 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] High memory usage associated with ssl_bump and broken	clients
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20High%20memory%20usage%20associated%20with%20ssl_bump%20and%20broken%0A%09clients&In-Reply-To=%3C3c26ade2-8ab7-c11a-e3a6-5f4690def2a0%40opendium.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="009281.html">
+   <LINK REL="Next"  HREF="009283.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] High memory usage associated with ssl_bump and broken	clients</H1>
+    <B>Steve Hill</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20High%20memory%20usage%20associated%20with%20ssl_bump%20and%20broken%0A%09clients&In-Reply-To=%3C3c26ade2-8ab7-c11a-e3a6-5f4690def2a0%40opendium.com%3E"
+       TITLE="[squid-dev] High memory usage associated with ssl_bump and broken	clients">steve at opendium.com
+       </A><BR>
+    <I>Mon Sep 11 11:05:42 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009281.html">[squid-dev] Build failed in Jenkins: 4-matrix » gcc,d-opensuse-tumbleweed #85
+</A></li>
+        <LI>Next message: <A HREF="009283.html">[squid-dev] High memory usage associated with ssl_bump and broken clients
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9282">[ date ]</a>
+              <a href="thread.html#9282">[ thread ]</a>
+              <a href="subject.html#9282">[ subject ]</a>
+              <a href="author.html#9282">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+This was originally posted on squid-users, but Amos asked me to send it 
+to squid-dev.  This email has been slightly updated from the original.
+
+I've identified a problem with Squid 3.5.26 using a lot of memory when 
+some broken clients are on the network.  Strictly speaking this isn't 
+really Squid's fault, but it is a denial of service mechanism so I 
+wonder if Squid can help mitigate it.
+
+The situation is this:
+
+Squid is set up as a transparent proxy performing SSL bumping.
+A client makes an HTTPS connection, which Squid intercepts.  The client 
+sends a TLS client handshake and squid responds with a handshake and the 
+bumped certificate.  The client doesn't like the bumped certificate, but 
+rather than cleanly aborting the TLS session and then sending a TCP FIN, 
+it just tears down the connection with a TCP RST packet.
+
+Ordinarily, Squid's side of the connection would be torn down in 
+response to the RST, so there would be no problem.  But unfortunately, 
+under high network loads the RST packet sometimes gets dropped and as 
+far as Squid is concerned the connection never gets closed.
+
+The busted clients I'm seeing the most problems with retry the 
+connection immediately rather than waiting for a retry timer.
+
+
+Problems:
+1. A connection that hasn't completed the TLS handshake doesn't appear 
+to ever time out (in this case, the server handshake and certificate 
+exchange has been completed, but the key exchange never starts).
+
+2. If the client sends an RST and the RST is lost, the client won't send 
+another RST until Squid sends some data to it on the aborted connection. 
+   In this case, Squid is waiting for data from the client, which will 
+never come, and will not send any new data to the client.  Squid will 
+never know that the client aborted the connection.
+
+3. There is a lot of memory associated with each connection - my tests 
+suggest around 1MB.  In normal operation these kinds of dead connections 
+can gradually stack up, leading to a slow but significant memory &quot;leak&quot;; 
+when a really badly behaved client is on the network it can open tens of 
+thousands of connections per minute and the memory consumption brings 
+down the server.
+
+4. We can expect similar problems with devices on flakey network 
+connections, even when the clients are well behaved.
+
+
+My thoughts:
+Connections should have a reasonably short timeout during the TLS 
+handshake - if a client hasn't completed the handshake and made an HTTP 
+request over the encrypted connection within a few seconds, something is 
+broken and Squid should tear down the connection.  These connections 
+certainly shouldn't be able to persist forever with neither side sending 
+any data.
+
+
+Testing:
+I wrote a Python script (attached) that makes 1000 concurrent 
+connections as quickly as it can and send a TLS client handshake over 
+them.  Once all of the connections are open, it then waits for responses 
+from Squid (which would contain the server handshake and certificate) 
+and quits, tearing down all of the the connections with an RST.
+
+It seems that the RST packets for around 150-300 of those connections 
+were dropped - this sounds surprising, but since all 1000 connections 
+were aborted simultaneously, there would be a flood of RST packets and 
+its probably reasonable to expect a significant number to be dropped. 
+The end result was that netstat showed Squid still had about 150-300 
+established connections, which would never go away.
+
+Amos has said he believes the connections should eventually time out 
+(via the request_timeout option) but I don't think this is the case. 
+request_timeout apparently defaults to 5 minutes, but these connections 
+are still present on the Squid end over 2.5 hours after they were 
+aborted.  Example from the netstat output:
+tcp        0      0 ::ffff:34.233.104.170:443   ::ffff:192.168.8.5:51070 
+    ESTABLISHED 29317/(squid-1)
+
+
+-- 
+   - Steve Hill
+     Technical Director
+     Opendium    Online Safety / Web Filtering    <A HREF="http://www.opendium.com">http://www.opendium.com</A>
+
+     Enquiries                 Support
+     ---------                 -------
+     <A HREF="http://lists.squid-cache.org/listinfo/squid-dev">sales at opendium.com</A>        <A HREF="http://lists.squid-cache.org/listinfo/squid-dev">support at opendium.com</A>
+     +44-1792-824568           +44-1792-825748
+_______________________________________________
+squid-users mailing list
+<A HREF="http://lists.squid-cache.org/listinfo/squid-dev">squid-users at lists.squid-cache.org</A>
+<A HREF="http://lists.squid-cache.org/listinfo/squid-users">http://lists.squid-cache.org/listinfo/squid-users</A>
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: ssl-test.py
+Type: text/x-python
+Size: 2405 bytes
+Desc: not available
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/attachments/20170911/6fcd4ac1/attachment.py">http://lists.squid-cache.org/pipermail/squid-dev/attachments/20170911/6fcd4ac1/attachment.py</A>&gt;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009281.html">[squid-dev] Build failed in Jenkins: 4-matrix » gcc,d-opensuse-tumbleweed #85
+</A></li>
+	<LI>Next message: <A HREF="009283.html">[squid-dev] High memory usage associated with ssl_bump and broken clients
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9282">[ date ]</a>
+              <a href="thread.html#9282">[ thread ]</a>
+              <a href="subject.html#9282">[ subject ]</a>
+              <a href="author.html#9282">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

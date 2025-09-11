@@ -1,0 +1,1176 @@
+External ACL helpers error handling & caching
+
+The helper protocol for external ACLs [1] defines three possible return values:
+   OK - Success. ACL test matches.
+   ERR - Success. ACL test fails to match.
+   BH - Failure. The helper encountered a problem.
+
+The external acl helpers distributed with squid currently doesn't follow this
+definition. For example, upon connection error, ERR is returned:
+
+   $ ext_ldap_group_acl ... -d
+   ext_ldap_group_acl: WARNING: could not bind to binddn 'Can't contact LDAP server'
+   ERR
+
+ This is does not allow to distinguish "no match" and "error" either and
+therefore negative caches "ERR", also in the case of an error.
+
+Moreover there are multiple problems inside squid when trying to handle BH
+responses:
+  - Squid-5 and squid-4 retries requests for BH responses but crashes after the
+    maximum retry number (currently 2) is reached.
+  - If an external acl helper return always BH (eg because the LDAP server is
+    down) squid sends infinitely new request to the helper.
+
+This is a Measurement Factory project
+
+=== modified file 'src/acl/external/AD_group/ext_ad_group_acl.cc'
+--- src/acl/external/AD_group/ext_ad_group_acl.cc	2017-01-01 00:12:22 +0000
++++ src/acl/external/AD_group/ext_ad_group_acl.cc	2017-01-09 10:02:17 +0000
+@@ -802,58 +802,58 @@
+             DefaultDomain = xstrdup(machinedomain);
+     }
+     debug("%s " VERSION " " SQUID_BUILD_INFO " starting up...\n", argv[0]);
+     if (use_global)
+         debug("Domain Global group mode enabled using '%s' as default domain.\n", DefaultDomain);
+     if (use_case_insensitive_compare)
+         debug("Warning: running in case insensitive mode !!!\n");
+ 
+     atexit(CloseCOM);
+ 
+     /* Main Loop */
+     while (fgets(buf, HELPER_INPUT_BUFFER, stdin)) {
+         if (NULL == strchr(buf, '\n')) {
+             /* too large message received.. skip and deny */
+             fprintf(stderr, "%s: ERROR: Too large: %s\n", argv[0], buf);
+             while (fgets(buf, HELPER_INPUT_BUFFER, stdin)) {
+                 fprintf(stderr, "%s: ERROR: Too large..: %s\n", argv[0], buf);
+                 if (strchr(buf, '\n') != NULL)
+                     break;
+             }
+-            SEND_ERR("Invalid Request. Too Long.");
++            SEND_BH(HLP_MSG("Invalid Request. Too Long."));
+             continue;
+         }
+         if ((p = strchr(buf, '\n')) != NULL)
+             *p = '\0';      /* strip \n */
+         if ((p = strchr(buf, '\r')) != NULL)
+             *p = '\0';      /* strip \r */
+ 
+         debug("Got '%s' from Squid (length: %d).\n", buf, strlen(buf));
+ 
+         if (buf[0] == '\0') {
+-            SEND_ERR("Invalid Request. No Input.");
++            SEND_BH(HLP_MSG("Invalid Request. No Input."));
+             continue;
+         }
+         username = strtok(buf, " ");
+         for (n = 0; (group = strtok(NULL, " ")) != NULL; ++n) {
+             rfc1738_unescape(group);
+             groups[n] = group;
+         }
+         groups[n] = NULL;
+         numberofgroups = n;
+ 
+         if (NULL == username) {
+-            SEND_ERR("Invalid Request. No Username.");
++            SEND_BH(HLP_MSG("Invalid Request. No Username."));
+             continue;
+         }
+         rfc1738_unescape(username);
+ 
+         if ((use_global ? Valid_Global_Groups(username, groups) : Valid_Local_Groups(username, groups))) {
+             SEND_OK("");
+         } else {
+             SEND_ERR("");
+         }
+         err = 0;
+     }
+     return 0;
+ }
+ 
+
+=== modified file 'src/acl/external/LDAP_group/ext_ldap_group_acl.cc'
+--- src/acl/external/LDAP_group/ext_ldap_group_acl.cc	2017-01-01 00:12:22 +0000
++++ src/acl/external/LDAP_group/ext_ldap_group_acl.cc	2017-01-09 10:44:19 +0000
+@@ -454,166 +454,175 @@
+         HMODULE WLDAP32Handle;
+ 
+         WLDAP32Handle = GetModuleHandle("wldap32");
+         if ((Win32_ldap_start_tls_s = (PFldap_start_tls_s) GetProcAddress(WLDAP32Handle, LDAP_START_TLS_S)) == NULL) {
+             fprintf(stderr, PROGRAM_NAME ": FATAL: TLS (-Z) not supported on this platform.\n");
+             exit(1);
+         }
+     }
+ #endif
+ 
+     while (fgets(buf, HELPER_INPUT_BUFFER, stdin) != NULL) {
+         int found = 0;
+         if (!strchr(buf, '\n')) {
+             /* too large message received.. skip and deny */
+             fprintf(stderr, "%s: ERROR: Input Too large: %s\n", argv[0], buf);
+             while (fgets(buf, sizeof(buf), stdin)) {
+                 fprintf(stderr, "%s: ERROR: Input Too large..: %s\n", argv[0], buf);
+                 if (strchr(buf, '\n') != NULL)
+                     break;
+             }
+-            SEND_ERR("");
++            SEND_BH(HLP_MSG("Input too large"));
+             continue;
+         }
+         user = strtok(buf, " \n");
+         if (!user) {
+             debug("%s: Invalid request: No Username given\n", argv[0]);
+-            SEND_ERR("Invalid request. No Username");
++            SEND_BH(HLP_MSG("Invalid request. No Username"));
+             continue;
+         }
+         rfc1738_unescape(user);
+         if (strip_nt_domain) {
+             char *u = strrchr(user, '\\');
+             if (!u)
+                 u = strrchr(user, '/');
+             if (!u)
+                 u = strrchr(user, '+');
+             if (u && u[1])
+                 user = u + 1;
+         }
+         if (strip_kerberos_realm) {
+             char *u = strchr(user, '@');
+             if (u != NULL) {
+                 *u = '\0';
+             }
+         }
+         if (use_extension_dn) {
+             extension_dn = strtok(NULL, " \n");
+             if (!extension_dn) {
+                 debug("%s: Invalid request: Extension DN configured, but none sent.\n", argv[0]);
+-                SEND_ERR("Invalid Request. Extension DN required.");
++                SEND_BH(HLP_MSG("Invalid Request. Extension DN required"));
+                 continue;
+             }
+             rfc1738_unescape(extension_dn);
+         }
++        const char *broken = nullptr;
+         while (!found && user && (group = strtok(NULL, " \n")) != NULL) {
+             rfc1738_unescape(group);
+ 
+ recover:
+             if (ld == NULL) {
+ #if HAS_URI_SUPPORT
+                 if (strstr(ldapServer, "://") != NULL) {
+                     rc = ldap_initialize(&ld, ldapServer);
+                     if (rc != LDAP_SUCCESS) {
++                        broken = HLP_MSG("Unable to connect to LDAP server");
+                         fprintf(stderr, "%s: ERROR: Unable to connect to LDAPURI:%s\n", argv[0], ldapServer);
+                         break;
+                     }
+                 } else
+ #endif
+ #if NETSCAPE_SSL
+                     if (sslpath) {
+                         if (!sslinit && (ldapssl_client_init(sslpath, NULL) != LDAP_SUCCESS)) {
+                             fprintf(stderr, "FATAL: Unable to initialise SSL with cert path %s\n", sslpath);
+                             exit(1);
+                         } else {
+                             ++sslinit;
+                         }
+                         if ((ld = ldapssl_init(ldapServer, port, 1)) == NULL) {
+                             fprintf(stderr, "FATAL: Unable to connect to SSL LDAP server: %s port:%d\n",
+                                     ldapServer, port);
+                             exit(1);
+                         }
+                     } else
+ #endif
+                         if ((ld = ldap_init(ldapServer, port)) == NULL) {
+-                            fprintf(stderr, "ERROR: Unable to connect to LDAP server:%s port:%d\n", ldapServer, port);
++                            broken = HLP_MSG("Unable to connect to LDAP server");
++                            fprintf(stderr, "ERROR: %s:%s port:%d\n", broken, ldapServer, port);
+                             break;
+                         }
+                 if (connect_timeout)
+                     squid_ldap_set_connect_timeout(ld, connect_timeout);
+ 
+ #ifdef LDAP_VERSION3
+                 if (version == -1) {
+                     version = LDAP_VERSION3;
+                 }
+                 if (ldap_set_option(ld, LDAP_OPT_PROTOCOL_VERSION, &version) != LDAP_SUCCESS) {
+-                    fprintf(stderr, "ERROR: Could not set LDAP_OPT_PROTOCOL_VERSION %d\n",
+-                            version);
++                    broken = HLP_MSG("Could not set LDAP_OPT_PROTOCOL_VERSION");
++                    fprintf(stderr, "ERROR: %s %d\n", broken, version);
+                     ldap_unbind(ld);
+                     ld = NULL;
+                     break;
+                 }
+                 if (use_tls) {
+ #ifdef LDAP_OPT_X_TLS
+                     if (version != LDAP_VERSION3) {
+                         fprintf(stderr, "FATAL: TLS requires LDAP version 3\n");
+                         exit(1);
+                     } else if (ldap_start_tls_s(ld, NULL, NULL) != LDAP_SUCCESS) {
+-                        fprintf(stderr, "ERROR: Could not Activate TLS connection\n");
++                        broken = HLP_MSG("Could not Activate TLS connection");
++                        fprintf(stderr, "ERROR: %s\n", broken);
+                         ldap_unbind(ld);
+                         ld = NULL;
+                         break;
+                     }
+ #else
+                     fprintf(stderr, "FATAL: TLS not supported with your LDAP library\n");
+                     exit(1);
+ #endif
+                 }
+ #endif
+                 squid_ldap_set_timelimit(ld, timelimit);
+                 squid_ldap_set_referrals(ld, !noreferrals);
+                 squid_ldap_set_aliasderef(ld, aliasderef);
+                 if (binddn && bindpasswd && *binddn && *bindpasswd) {
+                     rc = ldap_simple_bind_s(ld, binddn, bindpasswd);
+                     if (rc != LDAP_SUCCESS) {
+-                        fprintf(stderr, PROGRAM_NAME ": WARNING: could not bind to binddn '%s'\n", ldap_err2string(rc));
++                        broken = HLP_MSG("could not bind");
++                        fprintf(stderr, PROGRAM_NAME ": WARNING: %s to binddn '%s'\n", broken, ldap_err2string(rc));
+                         ldap_unbind(ld);
+                         ld = NULL;
+                         break;
+                     }
+                 }
+                 debug("Connected OK\n");
+             }
+-            if (searchLDAP(ld, group, user, extension_dn) == 0) {
++            int searchResult = searchLDAP(ld, group, user, extension_dn);
++            if (searchResult == 0) {
+                 found = 1;
+                 break;
+-            } else {
++            } else if (searchResult < 0){
+                 if (tryagain) {
+                     tryagain = 0;
+                     ldap_unbind(ld);
+                     ld = NULL;
+                     goto recover;
+                 }
++                broken = HLP_MSG("LDAP search error");
+             }
+         }
+         if (found)
+             SEND_OK("");
++        else if (broken)
++            SEND_BH(broken);
+         else {
+             SEND_ERR("");
+         }
+ 
+         if (ld != NULL) {
+             if (!persistent || (squid_ldap_errno(ld) != LDAP_SUCCESS && squid_ldap_errno(ld) != LDAP_INVALID_CREDENTIALS)) {
+                 ldap_unbind(ld);
+                 ld = NULL;
+             } else {
+                 tryagain = 1;
+             }
+         }
+     }
+     if (ld)
+         ldap_unbind(ld);
+     return 0;
+ }
+ 
+ static std::string
+ ldap_escape_value(const std::string &src)
+@@ -705,83 +714,83 @@
+                   ldapssl_err2string(sslerr) << ")" << std::endl;
+     }
+ #endif
+     return false;
+ }
+ 
+ typedef const std::unique_ptr<LDAPMessage, decltype(&ldap_msgfree)> LdapResult;
+ 
+ static int
+ searchLDAPGroup(LDAP * ld, const char *group, const char *member, const char *extension_dn)
+ {
+     std::string filter;
+     LDAPMessage *res = NULL;
+     int rc;
+     char *searchattr[] = {(char *) LDAP_NO_ATTRS, NULL};
+ 
+     const std::string searchbase = build_searchbase(extension_dn, basedn);
+     if (!build_filter(filter, searchfilter, member, group)) {
+         std::cerr << PROGRAM_NAME  << ": ERROR: Failed to construct LDAP search filter. filter=\"" <<
+                   filter.c_str() << "\", user=\"" << member << "\", group=\"" << group << "\"" << std::endl;
+-        return 1;
++        return -1;
+     }
+     debug("group filter '%s', searchbase '%s'\n", filter.c_str(), searchbase.c_str());
+ 
+     rc = ldap_search_s(ld, searchbase.c_str(), searchscope, filter.c_str(), searchattr, 1, &res);
+     LdapResult ldapRes(res, ldap_msgfree);
+     if (!ldap_search_ok(rc))
+-        return 1;
++        return -1;
+ 
+     return ldap_first_entry(ld, ldapRes.get()) ? 0 : 1;
+ }
+ 
+ static void
+ formatWithString(std::string &formatted, const std::string &value)
+ {
+     size_t start_pos = 0;
+     while ((start_pos = formatted.find("%s", start_pos)) != std::string::npos) {
+         formatted.replace(start_pos, 2, value);
+         start_pos += 2;
+     }
+ }
+ 
+ static int
+ searchLDAP(LDAP * ld, char *group, char *login, char *extension_dn)
+ {
+ 
+     const char *current_userdn = userbasedn ? userbasedn : basedn;
+     if (usersearchfilter) {
+         LDAPMessage *res = NULL;
+         LDAPMessage *entry;
+         int rc;
+         char *userdn;
+         char *searchattr[] = {(char *) LDAP_NO_ATTRS, NULL};
+         const std::string searchbase = build_searchbase(extension_dn, current_userdn);
+         std::string filter(usersearchfilter);
+         const std::string escaped_login = ldap_escape_value(login);
+         formatWithString(filter, escaped_login);
+ 
+         debug("user filter '%s', searchbase '%s'\n", filter.c_str(), searchbase.c_str());
+         rc = ldap_search_s(ld, searchbase.c_str(), searchscope, filter.c_str(), searchattr, 1, &res);
+         LdapResult ldapRes(res, ldap_msgfree);
+         if (!ldap_search_ok(rc))
+-            return 1;
++            return -1;
+         entry = ldap_first_entry(ld, ldapRes.get());
+         if (!entry) {
+             std::cerr << PROGRAM_NAME << ": WARNING: User '" << login <<
+                       " not found in '" << searchbase.c_str() << "'" << std::endl;
+             return 1;
+         }
+         userdn = ldap_get_dn(ld, entry);
+         rc = searchLDAPGroup(ld, group, userdn, extension_dn);
+         squid_ldap_memfree(userdn);
+         return rc;
+     } else if (userdnattr) {
+         std::stringstream str;
+         str << userdnattr << "=" << login << ", ";
+         if (extension_dn && *extension_dn)
+             str << extension_dn << ", ";
+         str << current_userdn;
+         return searchLDAPGroup(ld, group, str.str().c_str(), extension_dn);
+     } else {
+         return searchLDAPGroup(ld, group, login, extension_dn);
+     }
+
+=== modified file 'src/acl/external/LM_group/ext_lm_group_acl.cc'
+--- src/acl/external/LM_group/ext_lm_group_acl.cc	2017-01-01 00:12:22 +0000
++++ src/acl/external/LM_group/ext_lm_group_acl.cc	2017-01-09 09:59:00 +0000
+@@ -544,56 +544,56 @@
+     if (use_global) {
+         debug("Domain Global group mode enabled using '%s' as default domain.\n", DefaultDomain);
+     }
+     if (use_case_insensitive_compare) {
+         debug("Warning: running in case insensitive mode !!!\n");
+     }
+     if (use_PDC_only) {
+         debug("Warning: using only PDCs for group validation !!!\n");
+     }
+ 
+     /* Main Loop */
+     while (fgets(buf, HELPER_INPUT_BUFFER, stdin)) {
+         if (NULL == strchr(buf, '\n')) {
+             /* too large message received.. skip and deny */
+             debug("%s: ERROR: Too large: %s\n", argv[0], buf);
+             while (fgets(buf, HELPER_INPUT_BUFFER, stdin)) {
+                 debug("%s: ERROR: Too large..: %s\n", argv[0], buf);
+                 if (strchr(buf, '\n') != NULL)
+                     break;
+             }
+-            SEND_ERR("Input Too Long.");
++            SEND_BH(HLP_MSG("Input Too Long."));
+             continue;
+         }
+         if ((p = strchr(buf, '\n')) != NULL)
+             *p = '\0';      /* strip \n */
+         if ((p = strchr(buf, '\r')) != NULL)
+             *p = '\0';      /* strip \r */
+ 
+         debug("Got '%s' from Squid (length: %d).\n", buf, strlen(buf));
+ 
+         if (buf[0] == '\0') {
+-            SEND_ERR("Invalid Request.");
++            SEND_BH(HLP_MSG("Invalid Request."));
+             continue;
+         }
+         username = strtok(buf, " ");
+         for (n = 0; (group = strtok(NULL, " ")) != NULL; ++n) {
+             rfc1738_unescape(group);
+             groups[n] = group;
+         }
+         groups[n] = NULL;
+ 
+         if (NULL == username) {
+-            SEND_ERR("Invalid Request. No Username.");
++            SEND_BH(HLP_MSG("Invalid Request. No Username."));
+             continue;
+         }
+         rfc1738_unescape(username);
+ 
+         if ((use_global ? Valid_Global_Groups(username, groups) : Valid_Local_Groups(username, groups))) {
+             SEND_OK("");
+         } else {
+             SEND_ERR("");
+         }
+     }
+     return 0;
+ }
+ 
+
+=== modified file 'src/acl/external/SQL_session/ext_sql_session_acl.pl.in'
+--- src/acl/external/SQL_session/ext_sql_session_acl.pl.in	2017-01-01 00:12:22 +0000
++++ src/acl/external/SQL_session/ext_sql_session_acl.pl.in	2017-01-05 11:01:47 +0000
+@@ -178,31 +178,31 @@
+ 	close_db();
+ 	open_db() || return undef;
+ 	$sth->execute($uid) || return undef;;
+     }
+     return $sth;
+ }
+ my $status;
+ 
+ $|=1;
+ while (<>) {
+     my $string = $_;
+     $string =~ m/^(\d+)\s(.*)$/;
+     my ($cid, $uid) = ($1, $2);
+ 
+     $status = "ERR";
+     $cid =~ s/%(..)/pack("H*", $1)/ge;
+     $uid =~ s/%(..)/pack("H*", $1)/ge;
+ 
+     print(stderr "Received: Channel=".$cid.", UID='".$uid."'\n") if ($debug);
+ 
+-    $status = $cid . " ERR message=\"database error\"";
++    $status = $cid . " BH message=\"database error\"";
+     my $sth = query_db($uid) || next;
+     print(stderr "Rows: ". $sth->rows()."\n") if ($debug);
+     $status = $cid . " ERR message=\"unknown UID '".$uid."'\"";
+     my $row = $sth->fetchrow_hashref() || next;
+     $status = $cid . " OK" . ($row->{'user'} ne "" ? " user=" . $row->{'user'} : "" ) . ($row->{'tag'} ne "" ? " tag=" . $row->{'tag'} : "" );
+     $sth->finish();
+ } continue {
+     close_db() if (!$persist);
+     print $status . "\n";
+ }
+
+=== modified file 'src/acl/external/eDirectory_userip/ext_edirectory_userip_acl.cc'
+--- src/acl/external/eDirectory_userip/ext_edirectory_userip_acl.cc	2017-01-01 00:12:22 +0000
++++ src/acl/external/eDirectory_userip/ext_edirectory_userip_acl.cc	2017-01-05 11:05:44 +0000
+@@ -1741,41 +1741,41 @@
+             edui_elap = 0;
+         k = strlen(bufa);
+         /* BINARY DEBUGGING *
+                     local_printfx("while() -> bufa[%" PRIuSIZE "]: %s", k, bufa);
+                     for (i = 0; i < k; ++i)
+                       local_printfx("%02X", bufa[i]);
+                     local_printfx("\n");
+         * BINARY DEBUGGING */
+         /* Check for CRLF */
+         p = strchr(bufa, '\n');
+         if (p != NULL)
+             *p = '\0';
+         p = strchr(bufa, '\r');
+         if (p != NULL)
+             *p = '\0';
+         p = strchr(bufa, ' ');
+ 
+         /* No space given, but group string is required --> ERR */
+         if ((edui_conf.mode & EDUI_MODE_GROUP) && (p == NULL)) {
+             debug("while() -> Search group is missing. (required)\n");
+-            local_printfx("ERR message=\"(Search Group Required)\"\n");
++            local_printfx("BH message=\"(Search Group Required)\"\n");
+             continue;
+         }
+         x = 0;
+ 
+         /* Open LDAP connection */
+         if (!(edui_ldap.status & LDAP_INIT_S)) {
+             InitLDAP(&edui_ldap);
+             debug("InitLDAP() -> %s\n", ErrLDAP(LDAP_ERR_SUCCESS));
+             if (edui_conf.mode & EDUI_MODE_PERSIST)                 /* Setup persistant mode */
+                 edui_ldap.status |= LDAP_PERSIST_S;
+         }
+         if ((edui_ldap.status & LDAP_IDLE_S) && (edui_elap > 0)) {
+             edui_ldap.idle_time = edui_ldap.idle_time + edui_elap;
+         }
+         if ((edui_ldap.status & LDAP_PERSIST_S) && (edui_ldap.status & LDAP_IDLE_S) && (edui_ldap.idle_time > edui_conf.persist_timeout)) {
+             debug("while() -> Connection timed out after %d seconds\n", (int)(edui_ldap.idle_time));
+             x = CloseLDAP(&edui_ldap);
+             debug("CloseLDAP(-) -> %s\n", ErrLDAP(x));
+         }
+         edui_ldap.err = -1;
+@@ -1784,161 +1784,167 @@
+             if (x != LDAP_ERR_SUCCESS) {
+                 /* Failed to connect */
+                 debug("OpenLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
+             } else {
+                 debug("OpenLDAP(-, %s, %d) -> %s\n", edui_conf.host, edui_conf.port, ErrLDAP(x));
+                 x = SetVerLDAP(&edui_ldap, edui_conf.ver);
+                 if (x != LDAP_ERR_SUCCESS) {
+                     /* Failed to set version */
+                     debug("SetVerLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
+                 } else
+                     debug("SetVerLDAP(-, %d) -> %s\n", edui_conf.ver, ErrLDAP(x));
+             }
+         }
+         edui_ldap.err = -1;
+         if (!(edui_ldap.status & LDAP_BIND_S) && (edui_conf.mode & EDUI_MODE_TLS)) {
+             /* TLS binding */
+             x = BindLDAP(&edui_ldap, edui_conf.dn, edui_conf.passwd, LDAP_AUTH_TLS);
+             if (x != LDAP_ERR_SUCCESS) {
+                 /* Unable to bind */
+                 debug("BindLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
+-                local_printfx("ERR message=\"(BindLDAP: %s - %s)\"\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
++                local_printfx("BH message=\"(BindLDAP: %s - %s)\"\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
+                 continue;
+             } else
+                 debug("BindLDAP(-, %s, %s, (LDAP_AUTH_TLS)) -> %s\n", edui_conf.dn, edui_conf.passwd, ErrLDAP(x));
+         } else if (!(edui_ldap.status & LDAP_BIND_S)) {
+             if (edui_conf.dn[0] != '\0') {
+                 /* Simple binding - using dn / passwd for authorization */
+                 x = BindLDAP(&edui_ldap, edui_conf.dn, edui_conf.passwd, LDAP_AUTH_SIMPLE);
+                 if (x != LDAP_ERR_SUCCESS) {
+                     /* Unable to bind */
+                     debug("BindLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
+-                    local_printfx("ERR message=\"(BindLDAP: %s - %s)\"\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
++                    local_printfx("BH message=\"(BindLDAP: %s - %s)\"\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
+                     continue;
+                 } else
+                     debug("BindLDAP(-, %s, %s, (LDAP_AUTH_SIMPLE)) -> %s\n", edui_conf.dn, edui_conf.passwd, ErrLDAP(x));
+             } else {
+                 /* Anonymous binding */
+                 x = BindLDAP(&edui_ldap, edui_conf.dn, edui_conf.passwd, LDAP_AUTH_NONE);
+                 if (x != LDAP_ERR_SUCCESS) {
+                     /* Unable to bind */
+                     debug("BindLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
+-                    local_printfx("ERR message=\"(BindLDAP: %s - %s)\"\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
++                    local_printfx("BH message=\"(BindLDAP: %s - %s)\"\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
+                     continue;
+                 } else
+                     debug("BindLDAP(-, -, -, (LDAP_AUTH_NONE)) -> %s\n", ErrLDAP(x));
+             }
+         }
+         edui_ldap.err = -1;
+         if (edui_ldap.status & LDAP_PERSIST_S) {
+             x = ResetLDAP(&edui_ldap);
+             if (x != LDAP_ERR_SUCCESS) {
+                 /* Unable to reset */
+                 debug("ResetLDAP() -> %s\n", ErrLDAP(x));
+             } else
+                 debug("ResetLDAP() -> %s\n", ErrLDAP(x));
+         }
+         if (x != LDAP_ERR_SUCCESS) {
+             /* Everything failed --> ERR */
+             debug("while() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
+             CloseLDAP(&edui_ldap);
+-            local_printfx("ERR message=\"(General Failure: %s)\"\n", ErrLDAP(x));
++            local_printfx("BH message=\"(General Failure: %s)\"\n", ErrLDAP(x));
+             continue;
+         }
+         edui_ldap.err = -1;
+         /* If we got a group string, split it */
+         if (p != NULL) {
+             /* Split string */
+             debug("StringSplit(%s, ' ', %s, %" PRIuSIZE ")\n", bufa, bufb, sizeof(bufb));
+             i = StringSplit(bufa, ' ', bufb, sizeof(bufb));
+             if (i > 0) {
+                 debug("StringSplit(%s, %s) done.  Result: %" PRIuSIZE "\n", bufa, bufb, i);
+                 /* Got a group to match against */
+                 x = ConvertIP(&edui_ldap, bufb);
+                 if (x < 0) {
+                     debug("ConvertIP() -> %s\n", ErrLDAP(x));
+-                    local_printfx("ERR message=\"(ConvertIP: %s)\"\n", ErrLDAP(x));
++                    local_printfx("BH message=\"(ConvertIP: %s)\"\n", ErrLDAP(x));
+                 } else {
+                     edui_ldap.err = -1;
+                     debug("ConvertIP(-, %s) -> Result[%d]: %s\n", bufb, x, edui_ldap.search_ip);
+                     x = SearchFilterLDAP(&edui_ldap, bufa);
+                     if (x < 0) {
+                         debug("SearchFilterLDAP() -> %s\n", ErrLDAP(x));
+-                        local_printfx("ERR message=\"(SearchFilterLDAP: %s)\"\n", ErrLDAP(x));
++                        local_printfx("BH message=\"(SearchFilterLDAP: %s)\"\n", ErrLDAP(x));
+                     } else {
+                         /* Do Search */
+                         edui_ldap.err = -1;
+                         debug("SearchFilterLDAP(-, %s) -> Length: %u\n", bufa, x);
+                         x = SearchLDAP(&edui_ldap, edui_ldap.scope, edui_ldap.search_filter, (char **) &search_attrib);
+                         if (x != LDAP_ERR_SUCCESS) {
+                             debug("SearchLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
+-                            local_printfx("ERR message=\"(SearchLDAP: %s)\"\n", ErrLDAP(x));
++                            local_printfx("BH message=\"(SearchLDAP: %s)\"\n", ErrLDAP(x));
+                         } else {
+                             edui_ldap.err = -1;
+                             debug("SearchLDAP(-, %d, %s, -) -> %s\n", edui_conf.scope, edui_ldap.search_filter, ErrLDAP(x));
+                             x = SearchIPLDAP(&edui_ldap);
+-                            if (x != LDAP_ERR_SUCCESS) {
+-                                debug("SearchIPLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
++                            if (x == LDAP_ERR_NOTFOUND) {
++                                debug("SearchIPLDAP() -> %s\n", ErrLDAP(x));
+                                 local_printfx("ERR message=\"(SearchIPLDAP: %s)\"\n", ErrLDAP(x));
+-                            } else {
++                            } else if (x == LDAP_ERR_SUCCESS) {
+                                 debug("SearchIPLDAP(-, %s) -> %s\n", edui_ldap.userid, ErrLDAP(x));
+                                 local_printfx("OK user=%s\n", edui_ldap.userid);            /* Got userid --> OK user=<userid> */
++                            } else {
++                                debug("SearchIPLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
++                                local_printfx("BH message=\"(SearchIPLDAP: %s)\"\n", ErrLDAP(x));
+                             }
+                         }
+                         /* Clear for next query */
+                         memset(bufc, '\0', sizeof(bufc));
+                     }
+                 }
+             } else {
+                 debug("StringSplit() -> Error: %" PRIuSIZE "\n", i);
+-                local_printfx("ERR message=\"(StringSplit Error %" PRIuSIZE ")\"\n", i);
++                local_printfx("BH message=\"(StringSplit Error %" PRIuSIZE ")\"\n", i);
+             }
+         } else {
+             /* No group to match against, only an IP */
+             x = ConvertIP(&edui_ldap, bufa);
+             if (x < 0) {
+                 debug("ConvertIP() -> %s\n", ErrLDAP(x));
+-                local_printfx("ERR message=\"(ConvertIP: %s)\"\n", ErrLDAP(x));
++                local_printfx("BH message=\"(ConvertIP: %s)\"\n", ErrLDAP(x));
+             } else {
+                 debug("ConvertIP(-, %s) -> Result[%d]: %s\n", bufa, x, edui_ldap.search_ip);
+                 /* Do search */
+                 x = SearchFilterLDAP(&edui_ldap, NULL);
+                 if (x < 0) {
+                     debug("SearchFilterLDAP() -> %s\n", ErrLDAP(x));
+-                    local_printfx("ERR message=\"(SearchFilterLDAP: %s)\"\n", ErrLDAP(x));
++                    local_printfx("BH message=\"(SearchFilterLDAP: %s)\"\n", ErrLDAP(x));
+                 } else {
+                     edui_ldap.err = -1;
+                     debug("SearchFilterLDAP(-, NULL) -> Length: %u\n", x);
+                     x = SearchLDAP(&edui_ldap, edui_ldap.scope, edui_ldap.search_filter, (char **) &search_attrib);
+                     if (x != LDAP_ERR_SUCCESS) {
+                         debug("SearchLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(x));
+-                        local_printfx("ERR message=\"(SearchLDAP: %s)\"\n", ErrLDAP(x));
++                        local_printfx("BH message=\"(SearchLDAP: %s)\"\n", ErrLDAP(x));
+                     } else {
+                         edui_ldap.err = -1;
+                         debug("SearchLDAP(-, %d, %s, -) -> %s\n", edui_conf.scope, edui_ldap.search_filter, ErrLDAP(x));
+                         x = SearchIPLDAP(&edui_ldap);
+-                        if (x != LDAP_ERR_SUCCESS) {
+-                            debug("SearchIPLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
++                        if (x == LDAP_ERR_NOTFOUND) {
++                            debug("SearchIPLDAP() -> %s\n", ErrLDAP(x));
+                             local_printfx("ERR message=\"(SearchIPLDAP: %s)\"\n", ErrLDAP(x));
+-                        } else {
++                        } else if (x == LDAP_ERR_SUCCESS) {
+                             debug("SearchIPLDAP(-, %s) -> %s\n", edui_ldap.userid, ErrLDAP(x));
+                             local_printfx("OK user=%s\n", edui_ldap.userid);                /* Got a userid --> OK user=<userid> */
++                        } else if (x != LDAP_ERR_SUCCESS) {
++                            debug("SearchIPLDAP() -> %s (LDAP: %s)\n", ErrLDAP(x), ldap_err2string(edui_ldap.err));
++                            local_printfx("BH message=\"(SearchIPLDAP: %s)\"\n", ErrLDAP(x));
+                         }
+                     }
+                 }
+                 /* Clear for next query */
+                 memset(bufc, '\0', sizeof(bufc));
+             }
+         }
+ 
+         /* Clear buffer and close for next data, if not persistent */
+         edui_ldap.err = -1;
+         memset(bufa, '\0', sizeof(bufa));
+         if (!(edui_ldap.status & LDAP_PERSIST_S)) {
+             x = CloseLDAP(&edui_ldap);
+             debug("CloseLDAP(-) -> %s\n", ErrLDAP(x));
+         }
+     }
+ 
+     debug("Terminating.\n");
+     return 1;
+ }
+
+=== modified file 'src/acl/external/file_userip/ext_file_userip_acl.cc'
+--- src/acl/external/file_userip/ext_file_userip_acl.cc	2017-01-01 00:12:22 +0000
++++ src/acl/external/file_userip/ext_file_userip_acl.cc	2017-01-09 10:02:58 +0000
+@@ -249,46 +249,46 @@
+         usage(program_name);
+         exit(1);
+     }
+     FILE *FH = fopen(filename, "r");
+     if (!FH) {
+         int xerrno = errno;
+         fprintf(stderr, "%s: FATAL: Unable to open file '%s': %s", program_name, filename, xstrerr(xerrno));
+         exit(1);
+     }
+     current_entry = load_dict(FH);
+ 
+     while (fgets(line, HELPER_INPUT_BUFFER, stdin)) {
+         if ((cp = strchr (line, '\n')) == NULL) {
+             /* too large message received.. skip and deny */
+             fprintf(stderr, "%s: ERROR: Input Too Large: %s\n", program_name, line);
+             while (fgets(line, sizeof(line), stdin)) {
+                 fprintf(stderr, "%s: ERROR: Input Too Large..: %s\n", program_name, line);
+                 if (strchr(line, '\n') != NULL)
+                     break;
+             }
+-            SEND_ERR("Input Too Large.");
++            SEND_BH(HLP_MSG("Input Too Large."));
+             continue;
+         }
+         *cp = '\0';
+         address = strtok(line, " \t");
+         username = strtok(NULL, " \t");
+         if (!address || !username) {
+             debug("%s: unable to read tokens\n", program_name);
+-            SEND_ERR("Invalid Input.");
++            SEND_BH(HLP_MSG("Invalid Input."));
+             continue;
+         }
+         rfc1738_unescape(address);
+         rfc1738_unescape(username);
+         int result = dict_lookup(current_entry, username, address);
+         debug("%s: result: %d\n", program_name, result);
+         if (result != 0) {
+             SEND_OK("");
+         } else {
+             SEND_ERR("");
+         }
+     }
+ 
+     fclose (FH);
+     return 0;
+ }
+ 
+
+=== modified file 'src/acl/external/time_quota/ext_time_quota_acl.cc'
+--- src/acl/external/time_quota/ext_time_quota_acl.cc	2017-01-01 00:12:22 +0000
++++ src/acl/external/time_quota/ext_time_quota_acl.cc	2017-01-09 09:58:12 +0000
+@@ -435,30 +435,30 @@
+         }
+     }
+ 
+     log_info("Starting %s\n", __FILE__);
+     setbuf(stdout, NULL);
+ 
+     init_db();
+ 
+     if ( optind + 1 != argc ) {
+         usage();
+         exit(1);
+     } else {
+         readConfig(argv[optind]);
+     }
+ 
+     log_info("Waiting for requests...\n");
+     while (fgets(request, HELPER_INPUT_BUFFER, stdin)) {
+         // we expect the following line syntax: %LOGIN
+         const char *user_key = strtok(request, " \n");
+         if (!user_key) {
+-            SEND_BH("message=\"User name missing\"");
++            SEND_BH(HLP_MSG("User name missing"));
+             continue;
+         }
+         processActivity(user_key);
+     }
+     log_info("Ending %s\n", __FILE__);
+     shutdown_db();
+     return 0;
+ }
+ 
+
+=== modified file 'src/acl/external/unix_group/check_group.cc'
+--- src/acl/external/unix_group/check_group.cc	2017-01-01 00:12:22 +0000
++++ src/acl/external/unix_group/check_group.cc	2017-01-09 10:01:32 +0000
+@@ -186,46 +186,46 @@
+         default:
+             usage(argv[0]);
+             exit(1);
+         }
+     }
+     if (optind < argc) {
+         fprintf(stderr, "FATAL: Unknown option '%s'\n", argv[optind]);
+         usage(argv[0]);
+         exit(1);
+     }
+     while (fgets(buf, HELPER_INPUT_BUFFER, stdin)) {
+         j = 0;
+         if ((p = strchr(buf, '\n')) == NULL) {
+             /* too large message received.. skip and deny */
+             fprintf(stderr, "ERROR: %s: Too large: %s\n", argv[0], buf);
+             while (fgets(buf, sizeof(buf), stdin)) {
+                 fprintf(stderr, "ERROR: %s: Too large..: %s\n", argv[0], buf);
+                 if (strchr(buf, '\n') != NULL)
+                     break;
+             }
+-            SEND_ERR("Username Input too large.");
++            SEND_BH(HLP_MSG("Username Input too large."));
+             continue;
+         }
+         *p = '\0';
+         if ((p = strtok(buf, " ")) == NULL) {
+-            SEND_ERR("No username given.");
++            SEND_BH(HLP_MSG("No username given."));
+             continue;
+         } else {
+             user = p;
+             rfc1738_unescape(user);
+             if (strip_dm) {
+                 suser = strchr(user, '\\');
+                 if (!suser) suser = strchr(user, '/');
+                 if (suser && suser[1]) user = suser + 1;
+             }
+             if (strip_rm) {
+                 suser = strchr(user, '@');
+                 if (suser) *suser = '\0';
+             }
+             /* check groups supplied by Squid */
+             while ((p = strtok(NULL, " ")) != NULL) {
+                 rfc1738_unescape(p);
+                 if (check_pw == 1)
+                     j += validate_user_pw(user, p);
+                 j += validate_user_gr(user, p);
+             }
+
+=== modified file 'src/external_acl.cc'
+--- src/external_acl.cc	2017-01-01 00:12:22 +0000
++++ src/external_acl.cc	2017-01-09 08:27:56 +0000
+@@ -699,41 +699,43 @@
+     SBufList rv;
+     rv.push_back(SBuf(acl->def->name));
+ 
+     for (wordlist *arg = acl->arguments; arg; arg = arg->next) {
+         SBuf s;
+         s.Printf(" %s", arg->key);
+         rv.push_back(s);
+     }
+ 
+     return rv;
+ }
+ 
+ /******************************************************************
+  * external_acl cache
+  */
+ 
+ static void
+ external_acl_cache_touch(external_acl * def, const ExternalACLEntryPointer &entry)
+ {
+     // this must not be done when nothing is being cached.
+-    if (def->cache_size <= 0 || (def->ttl <= 0 && entry->result == 1) || (def->negative_ttl <= 0 && entry->result != 1))
++    if (def->cache_size <= 0 ||
++        entry->result == ACCESS_DUNNO ||
++        (def->ttl <= 0 && entry->result == ACCESS_ALLOWED) || (def->negative_ttl <= 0 && entry->result != ACCESS_ALLOWED))
+         return;
+ 
+     dlinkDelete(&entry->lru, &def->lru_list);
+     ExternalACLEntry *e = const_cast<ExternalACLEntry *>(entry.getRaw()); // XXX: make hash a std::map of Pointer.
+     dlinkAdd(e, &entry->lru, &def->lru_list);
+ }
+ 
+ static char *
+ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+ {
+     static MemBuf mb;
+     mb.reset();
+ 
+     // check for special case tokens in the format
+     for (Format::Token *t = acl_data->def->format.format; t ; t = t->next) {
+ 
+         if (t->type == Format::LFT_EXT_ACL_NAME) {
+             // setup for %ACL
+             safe_free(ch->al->lastAclName);
+             ch->al->lastAclName = xstrdup(acl_data->name);
+@@ -765,73 +767,81 @@
+         if (t->type == Format::LFT_USER_IDENT) {
+             if (!*ch->rfc931) {
+                 // if we fail to go async, we still return NULL and the caller
+                 // will detect the failure in ACLExternal::match().
+                 (void)ch->goAsync(IdentLookup::Instance());
+                 return NULL;
+             }
+         }
+ #endif
+     }
+ 
+     // assemble the full helper lookup string
+     acl_data->def->format.assemble(mb, ch->al, 0);
+ 
+     return mb.buf;
+ }
+ 
+ static int
+ external_acl_entry_expired(external_acl * def, const ExternalACLEntryPointer &entry)
+ {
+-    if (def->cache_size <= 0)
++    if (def->cache_size <= 0 || entry->result == ACCESS_DUNNO)
+         return 1;
+ 
+-    if (entry->date + (entry->result == 1 ? def->ttl : def->negative_ttl) < squid_curtime)
++    if (entry->date + (entry->result == ACCESS_ALLOWED ? def->ttl : def->negative_ttl) < squid_curtime)
+         return 1;
+     else
+         return 0;
+ }
+ 
+ static int
+ external_acl_grace_expired(external_acl * def, const ExternalACLEntryPointer &entry)
+ {
+-    if (def->cache_size <= 0)
++    if (def->cache_size <= 0 || entry->result == ACCESS_DUNNO)
+         return 1;
+ 
+     int ttl;
+-    ttl = entry->result == 1 ? def->ttl : def->negative_ttl;
++    ttl = entry->result == ACCESS_ALLOWED ? def->ttl : def->negative_ttl;
+     ttl = (ttl * (100 - def->grace)) / 100;
+ 
+     if (entry->date + ttl <= squid_curtime)
+         return 1;
+     else
+         return 0;
+ }
+ 
+ static ExternalACLEntryPointer
+ external_acl_cache_add(external_acl * def, const char *key, ExternalACLEntryData const & data)
+ {
+     ExternalACLEntryPointer entry;
+ 
++    // do not cache ACCESS_DUNNO results
+     // do not bother caching this result if TTL is going to expire it immediately
+-    if (def->cache_size <= 0 || (def->ttl <= 0 && data.result == 1) || (def->negative_ttl <= 0 && data.result != 1)) {
++    if (def->cache_size <= 0 ||
++        data.result == ACCESS_DUNNO ||
++        (def->ttl <= 0 && data.result == ACCESS_ALLOWED) || (def->negative_ttl <= 0 && data.result != ACCESS_ALLOWED)) {
+         debugs(82,6, HERE);
++
++        if (data.result == ACCESS_DUNNO) {
++            if (const ExternalACLEntryPointer oldentry = static_cast<ExternalACLEntry *>(hash_lookup(def->cache, key)))
++                external_acl_cache_delete(def, oldentry);
++        }
+         entry = new ExternalACLEntry;
+         entry->key = xstrdup(key);
+         entry->update(data);
+         entry->def = def;
+         return entry;
+     }
+ 
+     entry = static_cast<ExternalACLEntry *>(hash_lookup(def->cache, key));
+     debugs(82, 2, "external_acl_cache_add: Adding '" << key << "' = " << data.result);
+ 
+     if (entry != NULL) {
+         debugs(82, 3, "updating existing entry");
+         entry->update(data);
+         external_acl_cache_touch(def, entry);
+         return entry;
+     }
+ 
+     entry = new ExternalACLEntry;
+     entry->key = xstrdup(key);
+     entry->update(data);
+@@ -899,88 +909,81 @@
+  * Keywords:
+  *
+  *   user=      The users name (login)
+  *   message=   Message describing the reason
+  *   tag=   A string tag to be applied to the request that triggered the acl match.
+  *          applies to both OK and ERR responses.
+  *          Won't override existing request tags.
+  *   log=   A string to be used in access logging
+  *
+  * Other keywords may be added to the protocol later
+  *
+  * value needs to be URL-encoded or enclosed in double quotes (")
+  * with \-escaping on any whitespace, quotes, or slashes (\).
+  */
+ static void
+ externalAclHandleReply(void *data, const Helper::Reply &reply)
+ {
+     externalAclState *state = static_cast<externalAclState *>(data);
+     externalAclState *next;
+     ExternalACLEntryData entryData;
+-    entryData.result = ACCESS_DENIED;
+ 
+     debugs(82, 2, HERE << "reply=" << reply);
+ 
+     if (reply.result == Helper::Okay)
+         entryData.result = ACCESS_ALLOWED;
+-    // XXX: handle other non-DENIED results better
++    else if (reply.result == Helper::Error)
++        entryData.result = ACCESS_DENIED;
++    else //BrokenHelper,TimedOut or Unknown. Should not cached.
++        entryData.result = ACCESS_DUNNO;
+ 
+     // XXX: make entryData store a proper Helper::Reply object instead of copying.
+ 
+     entryData.notes.append(&reply.notes);
+ 
+     const char *label = reply.notes.findFirst("tag");
+     if (label != NULL && *label != '\0')
+         entryData.tag = label;
+ 
+     label = reply.notes.findFirst("message");
+     if (label != NULL && *label != '\0')
+         entryData.message = label;
+ 
+     label = reply.notes.findFirst("log");
+     if (label != NULL && *label != '\0')
+         entryData.log = label;
+ 
+ #if USE_AUTH
+     label = reply.notes.findFirst("user");
+     if (label != NULL && *label != '\0')
+         entryData.user = label;
+ 
+     label = reply.notes.findFirst("password");
+     if (label != NULL && *label != '\0')
+         entryData.password = label;
+ #endif
+ 
+     dlinkDelete(&state->list, &state->def->queue);
+ 
+     ExternalACLEntryPointer entry;
+-    if (cbdataReferenceValid(state->def)) {
+-        // only cache OK and ERR results.
+-        if (reply.result == Helper::Okay || reply.result == Helper::Error)
+-            entry = external_acl_cache_add(state->def, state->key, entryData);
+-        else {
+-            const ExternalACLEntryPointer oldentry = static_cast<ExternalACLEntry *>(hash_lookup(state->def->cache, state->key));
+-
+-            if (oldentry != NULL)
+-                external_acl_cache_delete(state->def, oldentry);
+-        }
+-    }
++    if (cbdataReferenceValid(state->def))
++        entry = external_acl_cache_add(state->def, state->key, entryData);
+ 
+     do {
+         void *cbdata;
+         if (state->callback && cbdataReferenceValidDone(state->callback_data, &cbdata))
+             state->callback(cbdata, entry);
+ 
+         next = state->queue;
+         state->queue = NULL;
+ 
+         delete state;
+ 
+         state = next;
+     } while (state);
+ }
+ 
+ void
+ ACLExternal::ExternalAclLookup(ACLChecklist *checklist, ACLExternal * me)
+ {
+     ExternalACLLookup::Start(checklist, me->data, false);
+ }
+
+=== modified file 'src/helper.cc'
+--- src/helper.cc	2017-01-01 00:12:22 +0000
++++ src/helper.cc	2017-01-05 17:14:57 +0000
+@@ -879,52 +879,53 @@
+     return r;
+ }
+ 
+ /// Calls back with a pointer to the buffer with the helper output
+ static void
+ helperReturnBuffer(helper_server * srv, helper * hlp, char * msg, size_t msgSize, char * msgEnd)
+ {
+     if (Helper::Xaction *r = srv->replyXaction) {
+         const bool hasSpace = r->reply.accumulate(msg, msgSize);
+         if (!hasSpace) {
+             debugs(84, DBG_IMPORTANT, "ERROR: Disconnecting from a " <<
+                    "helper that overflowed " << srv->rbuf_sz << "-byte " <<
+                    "Squid input buffer: " << hlp->id_name << " #" << srv->index);
+             srv->closePipesSafely(hlp->id_name);
+             return;
+         }
+ 
+         if (!msgEnd)
+             return; // We are waiting for more data.
+ 
+-        HLPCB *callback = r->request.callback;
+-        r->request.callback = nullptr;
+-
+         bool retry = false;
+-        void *cbdata = nullptr;
+-        if (cbdataReferenceValidDone(r->request.data, &cbdata)) {
++        if (cbdataReferenceValid(r->request.data)) {
+             r->reply.finalize();
+             if (r->reply.result == Helper::BrokenHelper && r->request.retries < MAX_RETRIES) {
+                 debugs(84, DBG_IMPORTANT, "ERROR: helper: " << r->reply << ", attempt #" << (r->request.retries + 1) << " of 2");
+                 retry = true;
+-            } else
++            } else {
++                HLPCB *callback = r->request.callback;
++                r->request.callback = nullptr;
++                void *cbdata = nullptr;
++                cbdataReferenceValidDone(r->request.data, &cbdata);
+                 callback(cbdata, r->reply);
++            }
+         }
+ 
+         -- srv->stats.pending;
+         ++ srv->stats.replies;
+ 
+         ++ hlp->stats.replies;
+ 
+         srv->answer_time = current_time;
+ 
+         srv->dispatch_time = r->request.dispatch_time;
+ 
+         hlp->stats.avg_svc_time =
+             Math::intAverage(hlp->stats.avg_svc_time,
+                              tvSubMsec(r->request.dispatch_time, current_time),
+                              hlp->stats.replies, REDIRECT_AV_FACTOR);
+ 
+         // release or re-submit parsedRequestXaction object
+         srv->replyXaction = nullptr;
+         if (retry) {
+             ++r->request.retries;
+
+=== modified file 'src/helper/protocol_defines.h'
+--- src/helper/protocol_defines.h	2017-01-01 00:12:22 +0000
++++ src/helper/protocol_defines.h	2017-01-09 09:53:45 +0000
+@@ -36,28 +36,31 @@
+  */
+ 
+ #ifndef __SQUID_HELPERS_DEFINES_H
+ #define __SQUID_HELPERS_DEFINES_H
+ 
+ /*
+  * This file contains several macro definitions which are
+  * useful and shared between helpers.
+  */
+ 
+ #include <iostream>
+ 
+ #define HELPER_INPUT_BUFFER 8196
+ 
+ /* send OK result to Squid with a string parameter. */
+ #define SEND_OK(x)  std::cout << "OK " << x << std::endl
+ 
+ /* send ERR result to Squid with a string parameter. */
+ #define SEND_ERR(x) std::cout << "ERR " << x << std::endl
+ 
+-/* send ERR result to Squid with a string parameter. */
++/* send BH result to Squid with a string parameter. */
+ #define SEND_BH(x)  std::cout << "BH " << x << std::endl
+ 
++/* constructs a message to Squid. */
++#define HLP_MSG(text)  "message=\"" text "\""
++
+ /* send TT result to Squid with a string parameter. */
+ #define SEND_TT(x)  std::cout << "TT " << x << std::endl
+ 
+ #endif /* __SQUID_HELPERS_DEFINES_H */
+ 
+

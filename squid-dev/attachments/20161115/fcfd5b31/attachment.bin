@@ -1,0 +1,329 @@
+Fix r14945:  Fixed Write.cc:41 "!ccb->active()" assertion.
+
+The r14945 patch has a major bug: 
+ When the Http::One::Server::writeControlMsgAndCall fails to write the control
+message, schedules a Comm::Write callback using just a ScheduleCallHere command.
+The callback called withtout the CommIoCbParams details and squid is crashes.
+
+This patch fixes the ConnStateData::writeControlMsgAndCall to return false if it
+fails to write the control message and allow the caller to handle the failure.
+
+This is a Measurement Factory project
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-11-15 09:41:26 +0000
++++ src/client_side.cc	2016-11-15 11:40:47 +0000
+@@ -3808,41 +3808,44 @@
+ 
+ // XXX: this is an HTTP/1-only operation
+ void
+ ConnStateData::sendControlMsg(HttpControlMsg msg)
+ {
+     if (!isOpen()) {
+         debugs(33, 3, HERE << "ignoring 1xx due to earlier closure");
+         return;
+     }
+ 
+     // HTTP/1 1xx status messages are only valid when there is a transaction to trigger them
+     if (!pipeline.empty()) {
+         HttpReply::Pointer rep(msg.reply);
+         Must(rep);
+         // remember the callback
+         cbControlMsgSent = msg.cbSuccess;
+ 
+         typedef CommCbMemFunT<HttpControlMsgSink, CommIoCbParams> Dialer;
+         AsyncCall::Pointer call = JobCallback(33, 5, Dialer, this, HttpControlMsgSink::wroteControlMsg);
+ 
+-        writeControlMsgAndCall(rep.getRaw(), call);
++        if (!writeControlMsgAndCall(rep.getRaw(), call)) {
++            // but still inform the caller (so it may resume its operation)
++            wroteControlMsgOK();
++        }
+         return;
+     }
+ 
+     debugs(33, 3, HERE << " closing due to missing context for 1xx");
+     clientConnection->close();
+ }
+ 
+ void
+ ConnStateData::wroteControlMsgOK()
+ {
+     HttpControlMsgSink::wroteControlMsgOK();
+ 
+     if (Http::StreamPointer deferredRequest = pipeline.front()) {
+         debugs(33, 3, clientConnection << ": calling PushDeferredIfNeeded after control msg wrote");
+         ClientSocketContextPushDeferredIfNeeded(deferredRequest, this);
+     }
+ }
+ 
+ /// Our close handler called by Comm when the pinned connection is closed
+ void
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2016-11-15 09:41:26 +0000
++++ src/client_side.h	2016-11-15 11:21:48 +0000
+@@ -247,41 +247,41 @@
+     /// Called when the client sends the first request on a bumped connection.
+     /// Returns false if no [delayed] error should be written to the client.
+     /// Otherwise, writes the error to the client and returns true. Also checks
+     /// for SQUID_X509_V_ERR_DOMAIN_MISMATCH on bumped requests.
+     bool serveDelayedError(Http::Stream *);
+ 
+     Ssl::BumpMode sslBumpMode; ///< ssl_bump decision (Ssl::bumpEnd if n/a).
+ 
+     /// Tls parser to use for client HELLO messages parsing on bumped
+     /// connections.
+     Security::HandshakeParser tlsParser;
+ #else
+     bool switchedToHttps() const { return false; }
+ #endif
+ 
+     /* clt_conn_tag=tag annotation access */
+     const SBuf &connectionTag() const { return connectionTag_; }
+     void connectionTag(const char *aTag) { connectionTag_ = aTag; }
+ 
+     /// handle a control message received by context from a peer and call back
+-    virtual void writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call) = 0;
++    virtual bool writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call) = 0;
+ 
+     /// ClientStream calls this to supply response header (once) and data
+     /// for the current Http::Stream.
+     virtual void handleReply(HttpReply *header, StoreIOBuffer receivedData) = 0;
+ 
+     /// remove no longer needed leading bytes from the input buffer
+     void consumeInput(const size_t byteCount);
+ 
+     /* TODO: Make the methods below (at least) non-public when possible. */
+ 
+     /// stop parsing the request and create context for relaying error info
+     Http::Stream *abortRequestParsing(const char *const errUri);
+ 
+     /// generate a fake CONNECT request with the given payload
+     /// at the beginning of the client I/O buffer
+     bool fakeAConnectRequest(const char *reason, const SBuf &payload);
+ 
+     /// generates and sends to tunnel.cc a fake request with a given payload
+     bool initiateTunneledRequest(HttpRequest::Pointer const &cause, Http::MethodType const method, const char *reason, const SBuf &payload);
+ 
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2016-11-04 16:47:34 +0000
++++ src/servers/FtpServer.cc	2016-11-15 11:23:51 +0000
+@@ -1136,46 +1136,47 @@
+     mb.appendf("%i %s\r\n", scode, reason); // error terminating line
+ 
+     // TODO: errorpage.cc should detect FTP client and use
+     // configurable FTP-friendly error templates which we should
+     // write to the client "as is" instead of hiding most of the info
+ 
+     writeReply(mb);
+ }
+ 
+ /// writes FTP response based on HTTP reply that is not an FTP-response wrapper
+ /// for example, internally-generated Squid "errorpages" end up here (for now)
+ void
+ Ftp::Server::writeForwardedForeign(const HttpReply *reply)
+ {
+     changeState(fssConnected, "foreign reply");
+     closeDataConnection();
+     // 451: We intend to keep the control connection open.
+     writeErrorReply(reply, 451);
+ }
+ 
+-void
++bool
+ Ftp::Server::writeControlMsgAndCall(HttpReply *reply, AsyncCall::Pointer &call)
+ {
+     // the caller guarantees that we are dealing with the current context only
+     // the caller should also make sure reply->header.has(Http::HdrType::FTP_STATUS)
+     writeForwardedReplyAndCall(reply, call);
++    return true;
+ }
+ 
+ void
+ Ftp::Server::writeForwardedReplyAndCall(const HttpReply *reply, AsyncCall::Pointer &call)
+ {
+     assert(reply != NULL);
+     const HttpHeader &header = reply->header;
+ 
+     // without status, the caller must use the writeForwardedForeign() path
+     Must(header.has(Http::HdrType::FTP_STATUS));
+     Must(header.has(Http::HdrType::FTP_REASON));
+     const int scode = header.getInt(Http::HdrType::FTP_STATUS);
+     debugs(33, 7, "scode: " << scode);
+ 
+     // Status 125 or 150 implies upload or data request, but we still check
+     // the state in case the server is buggy.
+     if ((scode == 125 || scode == 150) &&
+             (master->serverState == fssHandleUploadRequest ||
+              master->serverState == fssHandleDataRequest)) {
+         if (checkDataConnPost()) {
+
+=== modified file 'src/servers/FtpServer.h'
+--- src/servers/FtpServer.h	2016-11-04 16:47:34 +0000
++++ src/servers/FtpServer.h	2016-11-15 11:17:31 +0000
+@@ -80,41 +80,41 @@
+     friend void StartListening();
+ 
+     // errors detected before it is possible to create an HTTP request wrapper
+     enum class EarlyErrorKind {
+         HugeRequest,
+         MissingLogin,
+         MissingUsername,
+         MissingHost,
+         UnsupportedCommand,
+         InvalidUri,
+         MalformedCommand
+     };
+ 
+     /* ConnStateData API */
+     virtual Http::Stream *parseOneRequest() override;
+     virtual void processParsedRequest(Http::StreamPointer &context) override;
+     virtual void notePeerConnection(Comm::ConnectionPointer conn) override;
+     virtual void clientPinnedConnectionClosed(const CommCloseCbParams &io) override;
+     virtual void handleReply(HttpReply *header, StoreIOBuffer receivedData) override;
+     virtual int pipelinePrefetchMax() const override;
+-    virtual void writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call) override;
++    virtual bool writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call) override;
+     virtual time_t idleTimeout() const override;
+ 
+     /* BodyPipe API */
+     virtual void noteMoreBodySpaceAvailable(BodyPipe::Pointer) override;
+     virtual void noteBodyConsumerAborted(BodyPipe::Pointer ptr) override;
+ 
+     /* AsyncJob API */
+     virtual void start() override;
+ 
+     /* Comm callbacks */
+     static void AcceptCtrlConnection(const CommAcceptCbParams &params);
+     void acceptDataConnection(const CommAcceptCbParams &params);
+     void readUploadData(const CommIoCbParams &io);
+     void wroteEarlyReply(const CommIoCbParams &io);
+     void wroteReply(const CommIoCbParams &io);
+     void wroteReplyData(const CommIoCbParams &io);
+     void connectedForData(const CommConnectCbParams &params);
+ 
+     unsigned int listenForDataConnection();
+     bool createDataConnection(Ip::Address cltAddr);
+
+=== modified file 'src/servers/Http1Server.cc'
+--- src/servers/Http1Server.cc	2016-11-15 09:41:26 +0000
++++ src/servers/Http1Server.cc	2016-11-15 11:23:09 +0000
+@@ -289,65 +289,64 @@
+                                    !context->startOfOutput();
+     const bool responseFinishedOrFailed = !rep &&
+                                           !receivedData.data &&
+                                           !receivedData.length;
+     if (responseFinishedOrFailed && !mustSendLastChunk) {
+         context->writeComplete(0);
+         return;
+     }
+ 
+     if (!context->startOfOutput()) {
+         context->sendBody(receivedData);
+         return;
+     }
+ 
+     assert(rep);
+     http->al->reply = rep;
+     HTTPMSGLOCK(http->al->reply);
+     context->sendStartOfMessage(rep, receivedData);
+ }
+ 
+-void
++bool
+ Http::One::Server::writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call)
+ {
+     Http::StreamPointer context = pipeline.front();
+     Must(context != nullptr);
+ 
+     // Ignore this late control message if we have started sending a 
+     // reply to the user already (e.g., after an error).
+     if (context->reply) {
+         debugs(11, 2, "drop 1xx made late by " << context->reply);
+-        // but still inform the caller (so it may resume its operation)
+-        ScheduleCallHere(call);
+-        return;
++        return false;
+     }
+ 
+     const ClientHttpRequest *http = context->http;
+ 
+     // apply selected clientReplyContext::buildReplyHeader() mods
+     // it is not clear what headers are required for control messages
+     rep->header.removeHopByHopEntries();
+     rep->header.putStr(Http::HdrType::CONNECTION, "keep-alive");
+     httpHdrMangleList(&rep->header, http->request, http->al, ROR_REPLY);
+ 
+     MemBuf *mb = rep->pack();
+ 
+     debugs(11, 2, "HTTP Client " << clientConnection);
+     debugs(11, 2, "HTTP Client CONTROL MSG:\n---------\n" << mb->buf << "\n----------");
+ 
+     Comm::Write(clientConnection, mb, call);
+ 
+     delete mb;
++    return true;
+ }
+ 
+ ConnStateData *
+ Http::NewServer(MasterXactionPointer &xact)
+ {
+     return new Http1::Server(xact, false);
+ }
+ 
+ ConnStateData *
+ Https::NewServer(MasterXactionPointer &xact)
+ {
+     return new Http1::Server(xact, true);
+ }
+ 
+
+=== modified file 'src/servers/Http1Server.h'
+--- src/servers/Http1Server.h	2016-11-04 16:47:34 +0000
++++ src/servers/Http1Server.h	2016-11-15 11:14:28 +0000
+@@ -15,41 +15,41 @@
+ {
+ namespace One
+ {
+ 
+ /// Manages a connection from an HTTP/1 or HTTP/0.9 client.
+ class Server: public ConnStateData
+ {
+     CBDATA_CLASS(Server);
+ 
+ public:
+     Server(const MasterXaction::Pointer &xact, const bool beHttpsServer);
+     virtual ~Server() {}
+ 
+     void readSomeHttpData();
+ 
+ protected:
+     /* ConnStateData API */
+     virtual Http::Stream *parseOneRequest();
+     virtual void processParsedRequest(Http::StreamPointer &context);
+     virtual void handleReply(HttpReply *rep, StoreIOBuffer receivedData);
+-    virtual void writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call);
++    virtual bool writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call);
+     virtual time_t idleTimeout() const;
+ 
+     /* BodyPipe API */
+     virtual void noteMoreBodySpaceAvailable(BodyPipe::Pointer);
+     virtual void noteBodyConsumerAborted(BodyPipe::Pointer);
+ 
+     /* AsyncJob API */
+     virtual void start();
+ 
+     void proceedAfterBodyContinuation(Http::StreamPointer context);
+ 
+ private:
+     void processHttpRequest(Http::Stream *const context);
+     void handleHttpRequestData();
+ 
+     /// Handles parsing results. May generate and deliver an error reply
+     /// to the client if parsing is failed, or parses the url and build the
+     /// HttpRequest object using parsing results.
+     /// Return false if parsing is failed, true otherwise.
+     bool buildHttpRequest(Http::StreamPointer &context);
+

@@ -1,0 +1,290 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Bug 3875 MimeIcon error handling
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Bug%203875%20MimeIcon%20error%20handling&In-Reply-To=%3C555CA6C5.9080505%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="002359.html">
+   <LINK REL="Next"  HREF="002361.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Bug 3875 MimeIcon error handling</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Bug%203875%20MimeIcon%20error%20handling&In-Reply-To=%3C555CA6C5.9080505%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] Bug 3875 MimeIcon error handling">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Wed May 20 15:22:45 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002359.html">[squid-dev] [RFC] post-cache REQMOD
+</A></li>
+        <LI>Next message: <A HREF="002361.html">[squid-dev] Removing DNS lookups in intercept mode by using client dest IP address
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2360">[ date ]</a>
+              <a href="thread.html#2360">[ thread ]</a>
+              <a href="subject.html#2360">[ subject ]</a>
+              <a href="author.html#2360">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>This is an attempt to improve the MimeIcon reliability when filesystem
+I/O errors or others cause the icon data to not be loadable.
+
+The loading process is re-worked to guarantee that once the
+MimeIon::created callback occurs it will result in a valid StoreEntry in
+the cache representing the wanted icon.
+ * If the image can be loaded without any issues it will be placed in
+the cache as a 200 response.
+ * If errors prevent the image being loaded or necessary parameters
+(size and mtime) being known a 204 object will be placed into the cache.
+
+I have selected 204 as the representation of errors since the bug is not
+in the clients request (eliminating 400, 404, etc), a 500 would be
+revealing details about server internals unnecessarily often and incur
+extra complexity creating the error page. 204 also avoids needing to set
+and emit Content-Length header, and just enough different from 200 to
+use as a special-case test.
+
+
+
+NP: It started with just correcting the errno usage, but other bugs
+promptly started appearing once I got to seriously testing this load
+process. So far it fixes:
+* several assertions resulting from StoreEntry being left invalid in
+cache limbo beween created hash entries and valid mem_obj data.
+* on startup 6+ repeated attempts to load absent icons files which dont
+exist in the filesystem.
+* buffer overfow on misconfigured or corrupt mime.conf file entries
+* incorrect debugs messages about file I/O errors
+* large error pages delivered when icons not installed (when it doesnt
+assert from the StoreEntry)
+
+Amos
+-------------- next part --------------
+=== modified file 'src/mime.cc'
+--- src/mime.cc	2015-01-13 07:25:36 +0000
++++ src/mime.cc	2015-05-20 14:35:05 +0000
+@@ -25,41 +25,43 @@
+ #include &quot;StoreClient.h&quot;
+ 
+ #if HAVE_SYS_STAT_H
+ #include &lt;sys/stat.h&gt;
+ #endif
+ 
+ /* forward declarations */
+ static void mimeFreeMemory(void);
+ static char const *mimeGetIcon(const char *fn);
+ 
+ class MimeIcon : public StoreClient
+ {
+     MEMPROXY_CLASS(MimeIcon);
+ 
+ public:
+     explicit MimeIcon(const char *aName);
+     ~MimeIcon();
+     void setName(char const *);
+     char const * getName() const;
+     void load();
+-    void created(StoreEntry *newEntry);
++
++    /* StoreClient API */
++    virtual void created(StoreEntry *);
+ 
+ private:
+     const char *icon_;
+     char *url_;
+ };
+ 
+ class MimeEntry
+ {
+     MEMPROXY_CLASS(MimeEntry);
+ 
+ public:
+     explicit MimeEntry(const char *aPattern, const regex_t &amp;compiledPattern,
+                        const char *aContentType,
+                        const char *aContentEncoding, const char *aTransferMode,
+                        bool optionViewEnable, bool optionDownloadEnable,
+                        const char *anIconName);
+     ~MimeEntry();
+ 
+     const char *pattern;
+     regex_t compiled_pattern;
+@@ -341,99 +343,117 @@
+     while ((m = MimeTable)) {
+         MimeTable = m-&gt;next;
+         delete m;
+     }
+ 
+     MimeTableTail = &MimeTable;
+ }
+ 
+ void
+ MimeIcon::load()
+ {
+     const char *type = mimeGetContentType(icon_);
+ 
+     if (type == NULL)
+         fatal(&quot;Unknown icon format while reading mime.conf\n&quot;);
+ 
+     StoreEntry::getPublic(this, url_, Http::METHOD_GET);
+ }
+ 
+ void
+-MimeIcon::created (StoreEntry *newEntry)
++MimeIcon::created(StoreEntry *newEntry)
+ {
+     /* if the icon is already in the store, do nothing */
+     if (!newEntry-&gt;isNull())
+         return;
++    // XXX: if a 204 is cached due to earlier load 'failure' we should try to reload.
+ 
+-    int fd;
+-    int n;
+-    RequestFlags flags;
+-    struct stat sb;
+-    LOCAL_ARRAY(char, path, MAXPATHLEN);
+-    char *buf;
+-
+-    snprintf(path, MAXPATHLEN, &quot;%s/%s&quot;, Config.icons.directory, icon_);
++    // default is a 200 object with image data.
++    // set to the backup value of 204 on image loading errors
++    Http::StatusCode status = Http::scOkay;
++
++    static char path[MAXPATHLEN];
++    *path = 0;
++    if (snprintf(path, sizeof(path)-1, &quot;%s/%s&quot;, Config.icons.directory, icon_) &lt; 0) {
++        debugs(25, DBG_CRITICAL, &quot;ERROR: icon file '&quot; &lt;&lt; Config.icons.directory &lt;&lt; &quot;/&quot; &lt;&lt; icon_ &lt;&lt; &quot;' path is longer than &quot; &lt;&lt; MAXPATHLEN &lt;&lt; &quot; bytes&quot;);
++        status = Http::scNoContent;
++    }
+ 
+-    fd = file_open(path, O_RDONLY | O_BINARY);
+-    if (fd &lt; 0) {
+-        debugs(25, DBG_CRITICAL, &quot;Problem opening icon file &quot; &lt;&lt; path &lt;&lt; &quot;: &quot; &lt;&lt; xstrerror());
+-        return;
++    int fd = -1;
++    errno = 0;
++    if (status == Http::scOkay &amp;&amp; (fd = file_open(path, O_RDONLY | O_BINARY)) &lt; 0) {
++        int xerrno = errno;
++        debugs(25, DBG_CRITICAL, &quot;ERROR: opening icon file &quot; &lt;&lt; path &lt;&lt; &quot;: &quot; &lt;&lt; xstrerr(xerrno));
++        status = Http::scNoContent;
+     }
+-    if (fstat(fd, &amp;sb) &lt; 0) {
+-        debugs(25, DBG_CRITICAL, &quot;Problem opening icon file. Fd: &quot; &lt;&lt; fd &lt;&lt; &quot;, fstat error &quot; &lt;&lt; xstrerror());
++
++    struct stat sb;
++    errno = 0;
++    if (status == Http::scOkay &amp;&amp; fstat(fd, &amp;sb) &lt; 0) {
++        int xerrno = errno;
++        debugs(25, DBG_CRITICAL, &quot;ERROR: opening icon file &quot; &lt;&lt; path &lt;&lt; &quot; FD &quot; &lt;&lt; fd &lt;&lt; &quot;, fstat error &quot; &lt;&lt; xstrerr(xerrno));
+         file_close(fd);
+-        return;
++        status = Http::scNoContent;
+     }
+ 
++    // fill newEntry with a canned 2xx response object
++    RequestFlags flags;
+     flags.cachable = true;
+     StoreEntry *e = storeCreateEntry(url_,url_,flags,Http::METHOD_GET);
+     assert(e != NULL);
+     EBIT_SET(e-&gt;flags, ENTRY_SPECIAL);
+     e-&gt;setPublicKey();
+     e-&gt;buffer();
+     HttpRequest *r = HttpRequest::CreateFromUrl(url_);
+ 
+     if (NULL == r)
+-        fatal(&quot;mimeLoadIcon: cannot parse internal URL&quot;);
++        fatalf(&quot;mimeLoadIcon: cannot parse internal URL: %s&quot;, url_);
+ 
+     e-&gt;mem_obj-&gt;request = r;
+     HTTPMSGLOCK(e-&gt;mem_obj-&gt;request);
+ 
+     HttpReply *reply = new HttpReply;
+ 
+-    reply-&gt;setHeaders(Http::scOkay, NULL, mimeGetContentType(icon_), sb.st_size, sb.st_mtime, -1);
++    if (status == Http::scNoContent)
++        reply-&gt;setHeaders(status, NULL, NULL, 0, -1, -1);
++    else
++        reply-&gt;setHeaders(status, NULL, mimeGetContentType(icon_), sb.st_size, sb.st_mtime, -1);
+     reply-&gt;cache_control = new HttpHdrCc();
+     reply-&gt;cache_control-&gt;maxAge(86400);
+     reply-&gt;header.putCc(reply-&gt;cache_control);
+     e-&gt;replaceHttpReply(reply);
+ 
+-    /* read the file into the buffer and append it to store */
+-    buf = (char *)memAllocate(MEM_4K_BUF);
+-    while ((n = FD_READ_METHOD(fd, buf, 4096)) &gt; 0)
+-        e-&gt;append(buf, n);
++    if (status == Http::scOkay) {
++        /* read the file into the buffer and append it to store */
++        int n;
++        char *buf = (char *)memAllocate(MEM_4K_BUF);
++        while ((n = FD_READ_METHOD(fd, buf, sizeof(*buf))) &gt; 0)
++            e-&gt;append(buf, n);
++
++        file_close(fd);
++        memFree(buf, MEM_4K_BUF);
++    }
+ 
+-    file_close(fd);
+     e-&gt;flush();
+     e-&gt;complete();
+     e-&gt;timestampsSet();
+     e-&gt;unlock(&quot;MimeIcon::created&quot;);
+-    memFree(buf, MEM_4K_BUF);
+     debugs(25, 3, &quot;Loaded icon &quot; &lt;&lt; url_);
+ }
+ 
+ MimeEntry::~MimeEntry()
+ {
+     xfree(pattern);
+     xfree(content_type);
+     xfree(content_encoding);
+     regfree(&amp;compiled_pattern);
+ }
+ 
+ MimeEntry::MimeEntry(const char *aPattern, const regex_t &amp;compiledPattern,
+                      const char *aContentType, const char *aContentEncoding,
+                      const char *aTransferMode, bool optionViewEnable,
+                      bool optionDownloadEnable, const char *anIconName) :
+     pattern(xstrdup(aPattern)),
+     compiled_pattern(compiledPattern),
+     content_type(xstrdup(aContentType)),
+     content_encoding(xstrdup(aContentEncoding)),
+     view_option(optionViewEnable),
+
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002359.html">[squid-dev] [RFC] post-cache REQMOD
+</A></li>
+	<LI>Next message: <A HREF="002361.html">[squid-dev] Removing DNS lookups in intercept mode by using client dest IP address
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2360">[ date ]</a>
+              <a href="thread.html#2360">[ thread ]</a>
+              <a href="subject.html#2360">[ subject ]</a>
+              <a href="author.html#2360">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

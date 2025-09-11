@@ -1,0 +1,206 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] ftruncate() failures on OS X (Darwin)
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20ftruncate%28%29%20failures%20on%20OS%20X%20%28Darwin%29&In-Reply-To=%3CCANEuBv7wQBg-bSBy7ieDZXO7ooO8G0Li9by_A6PYZ5KfeO2PkA%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="004828.html">
+   <LINK REL="Next"  HREF="004832.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] ftruncate() failures on OS X (Darwin)</H1>
+    <B>Markus Mayer</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20ftruncate%28%29%20failures%20on%20OS%20X%20%28Darwin%29&In-Reply-To=%3CCANEuBv7wQBg-bSBy7ieDZXO7ooO8G0Li9by_A6PYZ5KfeO2PkA%40mail.gmail.com%3E"
+       TITLE="[squid-dev] ftruncate() failures on OS X (Darwin)">code at mmayer.net
+       </A><BR>
+    <I>Thu Jan 21 05:34:15 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004828.html">[squid-dev] Jenkins build is back to normal : trunk-full-matrix » gcc,d-ubuntu-vivid #87
+</A></li>
+        <LI>Next message: <A HREF="004832.html">[squid-dev] ftruncate() failures on OS X (Darwin)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4831">[ date ]</a>
+              <a href="thread.html#4831">[ thread ]</a>
+              <a href="subject.html#4831">[ subject ]</a>
+              <a href="author.html#4831">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>There are several bug reports out there that squid is failing to start up
+on OS X with an error similar to this:
+
+Ipc::Mem::Segment::create failed to ftruncate(/squid-cf__metadata.shm):
+(22) Invalid argument
+
+It may be one of the other shared memory segments that is failing, but the
+problem is always the same: upon restarting squid, ftruncate() bails with
+EINVAL and squid subsequently aborts. If one is lucky and waits long
+enough, restarting squid may eventually succeed. Or one may need to reboot.
+
+&gt;<i>From what I was able to find, the root cause for this has never really been
+</I>determined, and there hasn't been a fix in squid that addresses this. (It
+was still happening to me intermittently on OS X 10.11.2 and the most
+recent squid from GIT.)
+
+So, I took some time to dig into this, down to first looking at the Darwin
+kernel sources (
+<A HREF="http://www.opensource.apple.com/source/xnu/xnu-3248.20.55/bsd/kern/posix_shm.c">http://www.opensource.apple.com/source/xnu/xnu-3248.20.55/bsd/kern/posix_shm.c</A>)
+and subsequently downloading XNU, instrumenting posix_shm.c and running my
+own custom built Darwin kernel (which was surprisingly straight forward).
+Since there are several places where ftruncate() and, specifically,
+pshm_truncate() can return EINVAL, instrumenting the kernel seemed to be
+the most promising way of figuring out which EINVAL squid is hitting and
+why.
+
+Turns out it's this one:
+
+if ((pinfo-&gt;pshm_flags &amp; (PSHM_DEFINED|PSHM_ALLOCATING|PSHM_ALLOCATED))
+!= PSHM_DEFINED) {
+PSHM_SUBSYS_UNLOCK();
+return(EINVAL);
+}
+
+It happens because PSHM_ALLOCATED is already set. Luckily, the only place
+where PSHM_ALLOCATED gets set is at the end of pshm_truncate() itself. So,
+finding the culprit for setting it was easy.
+
+What this means is that OS X will only support ftruncate() *ONCE* on a shm
+segment, and this is done fully on purpose. The first time pshm_truncate()
+is called, it'll do all the required mapping and so forth, then set
+PSHM_ALLOCATED for that segment. When one tries to call ftruncate() on the
+same shm region again, it'll return EINVAL, because PSHM_ALLOCATED is set.
+
+There are cases where shm regions don't get removed when squid terminates.
+So, upon restarting squid, shm_open() will return the already existing shm
+segment (or segments) which will have been &quot;allocated&quot; already. squid will
+try to call ftruncate() anyway -- and fail.
+
+Now, one could argue that OS X should really be able to handle ftruncate()
+on an existing shm segment (like other POSIX systems do), and it probably
+should. Convincing Apple of that is likely not going to be easy. Even if it
+were to succeed, it would only fix future releases, not the current OS X
+releases.
+
+So, I see the following solutions squid could implement, which could be
+Darwin-only code, so as to not burden other OSes with this workaround.
+
+- Try to ensure squid can't leave shm segments behind when it terminates.
+Not sure how realistic this is. It could always fail in a way that prevents
+it from cleaning up after itself. Or somebody could send it a SIGKILL, in
+which case it definitely couldn't clean up after itself.
+- Simply accepting ftruncate() failing with EINVAL as non fatal condition
+on OS X and continue. This would be easy to do, but there are several
+different reasons why EINVAL may be returned. It wouldn't be a good idea to
+continue in all those cases. So this won't really work reliably.
+- Run statSize() on the memory segment after successfully opening it. If
+the size returned is greater than 0, we know ftruncate() will fail on OS X,
+because the segment isn't a new one. So, squid could call ftruncate() only
+if size is 0 and maybe call memset() otherwise to zero it out.
+- Just unconditionally call unlink() before shm_open(). If the segment
+didn't exist, unlink() will fail, but that won't really matter. This would
+likely take the least amount of code.
+- Call shm_open with O_EXCL, so that it'll fail if the shm segment already
+exists. If the call fails with EEXIST, unlink the shm segment and retry.
+This one may not even need to be Darwin-specific. Would be unnecessary on
+other platforms, but wouldn't really hurt.
+
+I did create a sample implementation of the last option. According to my
+tests, it does seem to work as intended.
+
+--- a/src/ipc/mem/Segment.cc
++++ b/src/ipc/mem/Segment.cc
+@@ -85,12 +85,31 @@ Ipc::Mem::Segment::Enabled()
+ void
+ Ipc::Mem::Segment::create(const off_t aSize)
+ {
++    bool do_retry = false;
++
+     assert(aSize &gt; 0);
+     assert(theFD &lt; 0);
+
+-    // OS X does not allow using O_TRUNC here.
+-    theFD = shm_open(theName.termedBuf(), O_CREAT | O_RDWR,
+-                     S_IRUSR | S_IWUSR);
++    do {
++        // OS X does not allow using O_TRUNC with shm_open.
++        // Also, OS X only permits ftruncate() on new shared memory areas.
++        // Therefore, we know that ftruncate() will fail if the shared
+memory
++        // area already exists. To prevent this, we delete and re-create
+the
++        // area if it exsisted previously (i.e. from an unclean shutdown).
++        theFD = shm_open(theName.termedBuf(), O_CREAT | O_EXCL | O_RDWR,
++                         S_IRUSR | S_IWUSR);
++        if (theFD &lt; 0 &amp;&amp; errno == EEXIST) {
++            int old_errno = errno;
++            unlink();
++            // We want to report the shm_open failure, not the unlink
+failure.
++            errno = old_errno;
++            // Retry once, but only once.
++            do_retry = !do_retry;
++        } else {
++            do_retry = false;
++        }
++    } while (do_retry);
++
+     if (theFD &lt; 0) {
+         debugs(54, 5, HERE &lt;&lt; &quot;shm_open &quot; &lt;&lt; theName &lt;&lt; &quot;: &quot; &lt;&lt;
+xstrerror());
+         fatalf(&quot;Ipc::Mem::Segment::create failed to shm_open(%s): %s\n&quot;,
+
+
+Regards,
+-Markus
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/attachments/20160120/09c528f2/attachment.html">http://lists.squid-cache.org/pipermail/squid-dev/attachments/20160120/09c528f2/attachment.html</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004828.html">[squid-dev] Jenkins build is back to normal : trunk-full-matrix » gcc,d-ubuntu-vivid #87
+</A></li>
+	<LI>Next message: <A HREF="004832.html">[squid-dev] ftruncate() failures on OS X (Darwin)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4831">[ date ]</a>
+              <a href="thread.html#4831">[ thread ]</a>
+              <a href="subject.html#4831">[ subject ]</a>
+              <a href="author.html#4831">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

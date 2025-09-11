@@ -1,0 +1,2880 @@
+url_rewrite_timeout directive
+
+This patch adds the url_rewrite_timeout directive.
+
+When configured, Squid keeps track of active requests and treats timed out
+requests to redirector as failed requests. 
+
+url_rewrite_timeout format:
+
+  url_rewrite_timeout timeout time-units on_timeout=<fail|bypass|retry|use_configured_response> [response=<quoted-string>]
+
+The url_rewrite_timeout directive can accept the on_timeout argument to allow
+user configure the action when the helper request times out.
+The available actions are:
+
+     fail: squid return a ERR_GATEWAY_FAILURE error page
+     bypass: the url is not rewritten.
+     retry: retry the request to helper
+     use_configured_response: use a response which can be configured using the
+         the response= option
+
+Example usage:
+    url_rewrite_timeout 30 seconds \
+        on_timeout=use_configured_response \
+        response="OK url=http://example.com/support"
+
+This is a Measurement Factory project
+=== modified file 'doc/release-notes/release-3.6.sgml'
+--- doc/release-notes/release-3.6.sgml	2014-11-15 07:42:32 +0000
++++ doc/release-notes/release-3.6.sgml	2014-11-21 16:05:39 +0000
+@@ -21,78 +21,96 @@
+ <p>While this release is not deemed ready for production use, we believe it is ready for wider testing by the community.
+ 
+ <p>We welcome feedback and bug reports. If you find a bug, please see <url url="http://wiki.squid-cache.org/SquidFaq/BugReporting">
+    for how to submit a report with a stack trace.
+ 
+ <sect1>Known issues
+ <p>
+ Although this release is deemed good enough for use in many setups, please note the existence of 
+ <url url="http://bugs.squid-cache.org/buglist.cgi?query_format=advanced&amp;product=Squid&amp;bug_status=UNCONFIRMED&amp;bug_status=NEW&amp;bug_status=ASSIGNED&amp;bug_status=REOPENED&amp;version=3.6" name="open bugs against Squid-3.6">.
+ 
+ <sect1>Changes since earlier releases of Squid-3.6
+ <p>
+ The 3.6 change history can be <url url="http://www.squid-cache.org/Versions/v3/3.6/changesets/" name="viewed here">.
+ 
+ 
+ <sect>Major new features since Squid-3.5
+ <p>Squid 3.6 represents a new feature release above 3.5.
+ 
+ <p>The most important of these new features are:
+ <itemize>
++	<item>Helper concurrency channels changes
+ 	<item>Configurable helper queue size
+ 	<item>SSLv2 support removal
+ </itemize>
+ 
+ Most user-facing changes are reflected in squid.conf (see below).
+ 
+ 
+ <sect1>Configurable helper queue size
+ <p>The new queue-size=N option to helpers configuration, allows users 
+ to configure the maximum number of queued requests to busy helpers.
+ 
++<sect1>Helper concurrency channels changes
++<p> helper-mux.pl we have been distributing for the past few years to
++    encourage use of concurrency is no longer compatible with Squid. If
++    used it will spawn up to 2^64 helpers and DoS the Squid server.
++
++<p> Helpers utilizing arrays to handle fixed amounts of concurrency
++    channels MUST be re-written to use queues and capable of handling a
++    64-bit int as index or they will be vulnerable to buffer overrun and
++    arbitrary memory accesses.
++
++<p> 32-bit helpers need re-writing to handle the concurrency channel ID
++    as a 64-bit integer value. If not updated they will cause proxies to
++    return unexpected results or timeout once crossing the 32-bit wrap
++    boundary. Leading to undefined behaviour in the client HTTP traffic.
+ 
+ <sect1>SSLv2 support removal
+ <p>Details in <url url="https://tools.ietf.org/html/rfc6176" name="RFC 6176">
+ 
+ <p>SSLv2 is not fit for purpose. Squid no longer supports being configured with
+ any settings regarding this protocol. That includes settings manually disabling
+ its use since it is now forced to disable by default. Also settings enabling
+ various client/server workarounds specific to SSLv2 are removed.
+ 
+ 
+ <sect>Changes to squid.conf since Squid-3.5
+ <p>
+ There have been changes to Squid's configuration file since Squid-3.5.
+ 
+ This section gives a thorough account of those changes in three categories:
+ 
+ <itemize>
+ 	<item><ref id="newtags" name="New tags">
+ 	<item><ref id="modifiedtags" name="Changes to existing tags">
+ 	<item><ref id="removedtags" name="Removed tags">
+ </itemize>
+ <p>
+ 
+ <sect1>New tags<label id="newtags">
+ <p>
+ <descrip>
+-
++         <tag> url_rewrite_timeout </tag>
++         <p> Squid times active requests to redirector. This option sets
++             the timeout value and the Squid reaction to a timed out
++             request. </p>
+ </descrip>
+ 
+ <sect1>Changes to existing tags<label id="modifiedtags">
+ <p>
+ <descrip>
+ 	<tag>auth_param</tag>
+ 	<p>New parameter <em>queue-size=</em> to set the maximum number
+ 	   of queued requests.
+ 
+ 	<tag>cache_peer</tag>
+ 	<p>All <em>ssloption=</em> and <em>sslversion=</em> values for
+ 	   SSLv2 configuration or disabling have been removed.
+ 	<p>Manual squid.conf update may be required on upgrade.
+ 
+ 	<tag>external_acl_type<tag>
+ 	<p>New parameter <em>queue-size=</em> to set the maximum number
+ 	   of queued requests.
+ 
+ 	<tag>http_port</tag>
+ 	<p>All <em>version=</em> <em>option=</em> values for SSLv2
+
+=== modified file 'src/ClientRequestContext.h'
+--- src/ClientRequestContext.h	2014-11-02 00:10:01 +0000
++++ src/ClientRequestContext.h	2014-11-23 19:20:23 +0000
+@@ -47,49 +47,40 @@
+ #if USE_ADAPTATION
+ 
+     void adaptationAccessCheck();
+ #endif
+ #if USE_OPENSSL
+     /**
+      * Initiates and start the acl checklist to check if the a CONNECT
+      * request must be bumped.
+      \retval true if the acl check scheduled, false if no ssl-bump required
+      */
+     bool sslBumpAccessCheck();
+     /// The callback function for ssl-bump access check list
+     void sslBumpAccessCheckDone(const allow_t &answer);
+ #endif
+ 
+     ClientHttpRequest *http;
+     ACLChecklist *acl_checklist;        /* need ptr back so we can unreg if needed */
+     int redirect_state;
+     int store_id_state;
+ 
+-    /**
+-     * URL-rewrite/redirect helper may return BH for internal errors.
+-     * We attempt to recover by trying the lookup again, but limit the
+-     * number of retries to prevent lag and lockups.
+-     * This tracks the number of previous failures for the current context.
+-     */
+-    uint8_t redirect_fail_count;
+-    uint8_t store_id_fail_count;
+-
+     bool host_header_verify_done;
+     bool http_access_done;
+     bool adapted_http_access_done;
+ #if USE_ADAPTATION
+     bool adaptation_acl_check_done;
+ #endif
+     bool redirect_done;
+     bool store_id_done;
+     bool no_cache_done;
+     bool interpreted_req_hdrs;
+     bool tosToClientDone;
+     bool nfmarkToClientDone;
+ #if USE_OPENSSL
+     bool sslBumpCheckDone;
+ #endif
+     ErrorState *error; ///< saved error page for centralized/delayed processing
+     bool readNextRequest; ///< whether Squid should read after error handling
+ };
+ 
+ #endif /* SQUID_CLIENTREQUESTCONTEXT_H */
+
+=== modified file 'src/ConfigParser.cc'
+--- src/ConfigParser.cc	2014-11-17 10:04:18 +0000
++++ src/ConfigParser.cc	2014-11-21 16:04:40 +0000
+@@ -6,40 +6,42 @@
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "cache_cf.h"
+ #include "ConfigParser.h"
+ #include "Debug.h"
+ #include "fatal.h"
+ #include "globals.h"
+ 
+ bool ConfigParser::RecognizeQuotedValues = true;
+ bool ConfigParser::StrictMode = true;
+ std::stack<ConfigParser::CfgFile *> ConfigParser::CfgFiles;
+ ConfigParser::TokenType ConfigParser::LastTokenType = ConfigParser::SimpleToken;
+ const char *ConfigParser::CfgLine = NULL;
+ const char *ConfigParser::CfgPos = NULL;
+ std::queue<char *> ConfigParser::CfgLineTokens_;
+ std::queue<std::string> ConfigParser::Undo_;
+ bool ConfigParser::AllowMacros_ = false;
+ bool ConfigParser::ParseQuotedOrToEol_ = false;
++bool ConfigParser::ParseKvPair_ = false;
++ConfigParser::ParsingStates ConfigParser::KvPairState_ = ConfigParser::atParseKey;
+ bool ConfigParser::PreviewMode_ = false;
+ 
+ static const char *SQUID_ERROR_TOKEN = "[invalid token]";
+ 
+ void
+ ConfigParser::destruct()
+ {
+     shutting_down = 1;
+     if (!CfgFiles.empty()) {
+         std::ostringstream message;
+         CfgFile *f = CfgFiles.top();
+         message << "Bungled " << f->filePath << " line " << f->lineNo <<
+         ": " << f->currentLine << std::endl;
+         CfgFiles.pop();
+         delete f;
+         while (!CfgFiles.empty()) {
+             f = CfgFiles.top();
+             message << " included from " << f->filePath << " line " <<
+             f->lineNo << ": " << f->currentLine << std::endl;
+             CfgFiles.pop();
+@@ -242,41 +244,46 @@
+ char *
+ ConfigParser::TokenParse(const char * &nextToken, ConfigParser::TokenType &type)
+ {
+     if (!nextToken || *nextToken == '\0')
+         return NULL;
+     type = ConfigParser::SimpleToken;
+     nextToken += strspn(nextToken, w_space);
+ 
+     if (*nextToken == '#')
+         return NULL;
+ 
+     if (ConfigParser::RecognizeQuotedValues && (*nextToken == '"' || *nextToken == '\'')) {
+         type = ConfigParser::QuotedToken;
+         char *token = xstrdup(UnQuote(nextToken, &nextToken));
+         CfgLineTokens_.push(token);
+         return token;
+     }
+ 
+     const char *tokenStart = nextToken;
+     const char *sep;
+-    if (ConfigParser::ParseQuotedOrToEol_)
++    if (ConfigParser::ParseKvPair_) {
++        if (ConfigParser::KvPairState_ == ConfigParser::atParseKey)
++            sep = "=";
++        else
++            sep = w_space;
++    } else if (ConfigParser::ParseQuotedOrToEol_)
+         sep = "\n";
+     else if (!ConfigParser::RecognizeQuotedValues || *nextToken == '(')
+         sep = w_space;
+     else
+         sep = w_space "(";
+     nextToken += strcspn(nextToken, sep);
+ 
+     if (ConfigParser::RecognizeQuotedValues && *nextToken == '(') {
+         if (strncmp(tokenStart, "parameters", nextToken - tokenStart) == 0)
+             type = ConfigParser::FunctionParameters;
+         else {
+             if (PreviewMode_) {
+                 char *err = xstrdup(SQUID_ERROR_TOKEN);
+                 CfgLineTokens_.push(err);
+                 return err;
+             } else {
+                 debugs(3, DBG_CRITICAL, "FATAL: Unknown cfg function: " << tokenStart);
+                 self_destruct();
+             }
+         }
+@@ -408,40 +415,62 @@
+ }
+ 
+ char *
+ ConfigParser::NextQuotedOrToEol()
+ {
+     ParseQuotedOrToEol_ = true;
+     char *token = NextToken();
+     ParseQuotedOrToEol_ = false;
+ 
+     // Assume end of current config line
+     // Close all open configuration files for this config line
+     while (!CfgFiles.empty()) {
+         ConfigParser::CfgFile *wordfile = CfgFiles.top();
+         CfgFiles.pop();
+         delete wordfile;
+     }
+ 
+     return token;
+ }
+ 
++bool
++ConfigParser::NextKvPair(char * &key, char * &value)
++{
++    key = value = NULL;
++    ParseKvPair_ = true;
++    KvPairState_ = ConfigParser::atParseKey;
++    if ((key = NextToken()) != NULL) {
++        KvPairState_ = ConfigParser::atParseValue;
++        value = NextQuotedToken();
++    }
++    ParseKvPair_ = false;
++
++    if (!key)
++        return false;
++    if (!value) {
++        debugs(3, DBG_CRITICAL, "Error while parsing key=value token. Value missing after: " << key);
++        return false;
++    }
++
++    return true;
++}
++
+ char *
+ ConfigParser::RegexStrtokFile()
+ {
+     if (ConfigParser::RecognizeQuotedValues) {
+         debugs(3, DBG_CRITICAL, "FATAL: Can not read regex expression while configuration_includes_quoted_values is enabled");
+         self_destruct();
+     }
+     char * token = strtokFile();
+     return token;
+ }
+ 
+ char *
+ ConfigParser::RegexPattern()
+ {
+     if (ConfigParser::RecognizeQuotedValues) {
+         debugs(3, DBG_CRITICAL, "FATAL: Can not read regex expression while configuration_includes_quoted_values is enabled");
+         self_destruct();
+     }
+ 
+     char * token = NextToken();
+
+=== modified file 'src/ConfigParser.h'
+--- src/ConfigParser.h	2014-09-13 13:59:43 +0000
++++ src/ConfigParser.h	2014-11-17 14:29:25 +0000
+@@ -80,40 +80,46 @@
+      */
+     static char *RegexPattern();
+ 
+     /**
+      * Parse the next token with support for quoted values enabled even if
+      * the configuration_includes_quoted_values is set to off
+      */
+     static char *NextQuotedToken();
+ 
+     /// \return true if the last parsed token was quoted
+     static bool LastTokenWasQuoted() {return (LastTokenType == ConfigParser::QuotedToken);}
+ 
+     /**
+      * \return the next quoted string or the raw string data until the end of line.
+      * This method allows %macros in unquoted strings to keep compatibility
+      * for the logformat option.
+      */
+     static char *NextQuotedOrToEol();
+ 
+     /**
++     * the next key value pair which must be separated by "="
++     * \return true on success, false otherwise
++     */
++    static bool NextKvPair(char * &key, char * &value);
++
++    /**
+      * Preview the next token. The next NextToken() and strtokFile() call
+      * will return the same token.
+      * On parse error (eg invalid characters in token) will return an
+      * error message as token.
+      */
+     static char *PeekAtToken();
+ 
+     /**
+      * The next NextToken call will return the token as next element
+      * It can be used repeatedly to add more than one tokens in a FIFO list.
+      */
+     static void TokenPutBack(const char *token);
+ 
+     /// Set the configuration file line to parse.
+     static void SetCfgLine(char *line);
+ 
+     /// Allow %macros inside quoted strings
+     static void EnableMacros() {AllowMacros_ = true;}
+ 
+     /// Do not allow %macros inside quoted strings
+@@ -185,25 +191,27 @@
+     /**
+      * Does the real tokens parsing job: Ignore comments, unquote an
+      * element if required.
+      * \return the next token, or NULL if there are no available tokens in the nextToken string.
+      * \param nextToken updated to point to the pos after parsed token.
+      * \param type      The token type
+      */
+     static char *TokenParse(const char * &nextToken, TokenType &type);
+ 
+     /// Wrapper method for TokenParse.
+     static char *NextElement(TokenType &type);
+     static std::stack<CfgFile *> CfgFiles; ///< The stack of open cfg files
+     static TokenType LastTokenType; ///< The type of last parsed element
+     static const char *CfgLine; ///< The current line to parse
+     static const char *CfgPos; ///< Pointer to the next element in cfgLine string
+     static std::queue<char *> CfgLineTokens_; ///< Store the list of tokens for current configuration line
+     static std::queue<std::string> Undo_; ///< The list with TokenPutBack() queued elements
+     static bool AllowMacros_;
+     static bool ParseQuotedOrToEol_; ///< The next tokens will be handled as quoted or to_eol token
+     static bool PreviewMode_; ///< The next token will not poped from cfg files, will just previewd.
++    static bool ParseKvPair_; ///<The next token will be handled as kv-pair token 
++    static enum ParsingStates {atParseKey, atParseValue} KvPairState_; ///< Parsing state while parsing kv-pair tokens
+ };
+ 
+ int parseConfigFile(const char *file_name);
+ 
+ #endif /* SQUID_CONFIGPARSER_H */
+
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2014-11-10 11:45:36 +0000
++++ src/SquidConfig.h	2014-11-14 17:58:47 +0000
+@@ -80,40 +80,41 @@
+ 
+     struct {
+         time_t read;
+         time_t write;
+         time_t lifetime;
+         time_t connect;
+         time_t forward;
+         time_t peer_connect;
+         time_t request;
+         time_t clientIdlePconn;
+         time_t serverIdlePconn;
+         time_t ftpClientIdle;
+         time_t siteSelect;
+         time_t deadPeer;
+         int icp_query;      /* msec */
+         int icp_query_max;  /* msec */
+         int icp_query_min;  /* msec */
+         int mcast_icp_query;    /* msec */
+         time_msec_t idns_retransmit;
+         time_msec_t idns_query;
++        time_t urlRewrite;
+     } Timeout;
+     size_t maxRequestHeaderSize;
+     int64_t maxRequestBodySize;
+     int64_t maxChunkedRequestBodySize;
+     size_t maxRequestBufferSize;
+     size_t maxReplyHeaderSize;
+     AclSizeLimit *ReplyBodySize;
+ 
+     struct {
+         unsigned short icp;
+ #if USE_HTCP
+ 
+         unsigned short htcp;
+ #endif
+ #if SQUID_SNMP
+ 
+         unsigned short snmp;
+ #endif
+     } Port;
+ 
+@@ -510,40 +511,45 @@
+         SSL_CTX *sslContext;
+         sslproxy_cert_sign *cert_sign;
+         sslproxy_cert_adapt *cert_adapt;
+     } ssl_client;
+ #endif
+ 
+     char *accept_filter;
+     int umask;
+     int max_filedescriptors;
+     int workers;
+     CpuAffinityMap *cpuAffinityMap;
+ 
+ #if USE_LOADABLE_MODULES
+     wordlist *loadable_module_names;
+ #endif
+ 
+     int client_ip_max_connections;
+ 
+     char *redirector_extras;
+ 
++    struct {
++        int action;
++        char *response;
++    } onUrlRewriteTimeout;
++
+     char *storeId_extras;
+ 
+     struct {
+         int v4_first;       ///< Place IPv4 first in the order of DNS results.
+         ssize_t packet_max; ///< maximum size EDNS advertised for DNS replies.
+     } dns;
+ 
+ };
+ 
+ extern SquidConfig Config;
+ 
+ class SquidConfig2
+ {
+ public:
+     struct {
+         int enable_purge;
+         int mangle_request_headers;
+     } onoff;
+     uid_t effectiveUserID;
+     gid_t effectiveGroupID;
+
+=== modified file 'src/auth/digest/UserRequest.cc'
+--- src/auth/digest/UserRequest.cc	2014-09-28 18:35:47 +0000
++++ src/auth/digest/UserRequest.cc	2014-11-17 14:30:37 +0000
+@@ -351,44 +351,44 @@
+ 
+     case Helper::Okay: {
+         /* allow this because the digest_request pointer is purely local */
+         Auth::Digest::User *digest_user = dynamic_cast<Auth::Digest::User *>(auth_user_request->user().getRaw());
+         assert(digest_user != NULL);
+ 
+         const char *ha1Note = reply.notes.findFirst("ha1");
+         if (ha1Note != NULL) {
+             CvtBin(ha1Note, digest_user->HA1);
+             digest_user->HA1created = 1;
+         } else {
+             debugs(29, DBG_IMPORTANT, "ERROR: Digest auth helper did not produce a HA1. Using the wrong helper program? received: " << reply);
+         }
+     }
+     break;
+ 
+     case Helper::TT:
+         debugs(29, DBG_IMPORTANT, "ERROR: Digest auth does not support the result code received. Using the wrong helper program? received: " << reply);
+         // fall through to next case. Handle this as an ERR response.
+ 
++    case Helper::TimedOut:
+     case Helper::BrokenHelper:
+         // TODO retry the broken lookup on another helper?
+         // fall through to next case for now. Handle this as an ERR response silently.
+-
+     case Helper::Error: {
+         /* allow this because the digest_request pointer is purely local */
+         Auth::Digest::UserRequest *digest_request = dynamic_cast<Auth::Digest::UserRequest *>(auth_user_request.getRaw());
+         assert(digest_request);
+ 
+         digest_request->user()->credentials(Auth::Failed);
+         digest_request->flags.invalid_password = true;
+ 
+         const char *msgNote = reply.notes.find("message");
+         if (msgNote != NULL) {
+             digest_request->setDenyMessage(msgNote);
+         } else if (reply.other().hasContent()) {
+             // old helpers did send ERR result but a bare message string instead of message= key name.
+             digest_request->setDenyMessage(reply.other().content());
+             if (!oldHelperWarningDone) {
+                 debugs(29, DBG_IMPORTANT, "WARNING: Digest auth helper returned old format ERR response. It needs to be upgraded.");
+                 oldHelperWarningDone=true;
+             }
+         }
+     }
+
+=== modified file 'src/auth/negotiate/UserRequest.cc'
+--- src/auth/negotiate/UserRequest.cc	2014-09-25 10:34:22 +0000
++++ src/auth/negotiate/UserRequest.cc	2014-10-23 17:37:53 +0000
+@@ -345,40 +345,41 @@
+         const char *tokenNote = reply.notes.findFirst("token");
+ 
+         /* authentication failure (wrong password, etc.) */
+         if (messageNote != NULL)
+             auth_user_request->denyMessage(messageNote);
+         else
+             auth_user_request->denyMessage("Negotiate Authentication denied with no reason given");
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         if (tokenNote != NULL)
+             lm_request->server_blob = xstrdup(tokenNote);
+         lm_request->releaseAuthServer();
+         debugs(29, 4, "Failed validating user via Negotiate. Result: " << reply);
+     }
+     break;
+ 
+     case Helper::Unknown:
+         debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication Helper '" << reply.whichServer << "' crashed!.");
+         /* continue to the next case */
+ 
++    case Helper::TimedOut:
+     case Helper::BrokenHelper: {
+         /* TODO kick off a refresh process. This can occur after a YR or after
+          * a KK. If after a YR release the helper and resubmit the request via
+          * Authenticate Negotiate start.
+          * If after a KK deny the user's request w/ 407 and mark the helper as
+          * Needing YR. */
+         const char *errNote = reply.notes.find("message");
+         if (reply.result == Helper::Unknown)
+             auth_user_request->denyMessage("Internal Error");
+         else if (errNote != NULL)
+             auth_user_request->denyMessage(errNote);
+         else
+             auth_user_request->denyMessage("Negotiate Authentication failed with no reason given");
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+         debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication validating user. Result: " << reply);
+     } // break;
+     }
+ 
+
+=== modified file 'src/auth/ntlm/UserRequest.cc'
+--- src/auth/ntlm/UserRequest.cc	2014-09-25 10:34:22 +0000
++++ src/auth/ntlm/UserRequest.cc	2014-11-14 16:19:10 +0000
+@@ -335,40 +335,41 @@
+     break;
+ 
+     case Helper::Error: {
+         /* authentication failure (wrong password, etc.) */
+         const char *errNote = reply.notes.find("message");
+         if (errNote != NULL)
+             auth_user_request->denyMessage(errNote);
+         else
+             auth_user_request->denyMessage("NTLM Authentication denied with no reason given");
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+         debugs(29, 4, "Failed validating user via NTLM. Result: " << reply);
+     }
+     break;
+ 
+     case Helper::Unknown:
+         debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication Helper '" << reply.whichServer << "' crashed!.");
+         /* continue to the next case */
+ 
++    case Helper::TimedOut:
+     case Helper::BrokenHelper: {
+         /* TODO kick off a refresh process. This can occur after a YR or after
+          * a KK. If after a YR release the helper and resubmit the request via
+          * Authenticate NTLM start.
+          * If after a KK deny the user's request w/ 407 and mark the helper as
+          * Needing YR. */
+         const char *errNote = reply.notes.find("message");
+         if (reply.result == Helper::Unknown)
+             auth_user_request->denyMessage("Internal Error");
+         else if (errNote != NULL)
+             auth_user_request->denyMessage(errNote);
+         else
+             auth_user_request->denyMessage("NTLM Authentication failed with no reason given");
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+         debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication validating user. Result: " << reply);
+     }
+     break;
+     }
+
+=== modified file 'src/cache_cf.cc'
+--- src/cache_cf.cc	2014-09-14 12:43:00 +0000
++++ src/cache_cf.cc	2014-11-17 17:04:47 +0000
+@@ -31,40 +31,41 @@
+ #include "ExternalACL.h"
+ #include "format/Format.h"
+ #include "ftp/Elements.h"
+ #include "globals.h"
+ #include "HttpHeaderTools.h"
+ #include "ident/Config.h"
+ #include "ip/Intercept.h"
+ #include "ip/QosConfig.h"
+ #include "ip/tools.h"
+ #include "ipc/Kids.h"
+ #include "log/Config.h"
+ #include "log/CustomLog.h"
+ #include "Mem.h"
+ #include "MemBuf.h"
+ #include "mgr/ActionPasswordList.h"
+ #include "mgr/Registration.h"
+ #include "neighbors.h"
+ #include "NeighborTypeDomainList.h"
+ #include "Parsing.h"
+ #include "pconn.h"
++#include "redirect.h"
+ #include "PeerDigest.h"
+ #include "PeerPoolMgr.h"
+ #include "RefreshPattern.h"
+ #include "rfc1738.h"
+ #include "SBufList.h"
+ #include "SquidConfig.h"
+ #include "SquidString.h"
+ #include "ssl/ProxyCerts.h"
+ #include "Store.h"
+ #include "StoreFileSystem.h"
+ #include "SwapDir.h"
+ #include "tools.h"
+ #include "wordlist.h"
+ /* wccp2 has its own conditional definitions */
+ #include "wccp2.h"
+ #if USE_ADAPTATION
+ #include "adaptation/Config.h"
+ #endif
+ #if ICAP_CLIENT
+ #include "adaptation/icap/Config.h"
+@@ -144,41 +145,41 @@
+ static const char *const T_MONTH_STR = "month";
+ static const char *const T_YEAR_STR = "year";
+ static const char *const T_DECADE_STR = "decade";
+ 
+ static const char *const B_BYTES_STR = "bytes";
+ static const char *const B_KBYTES_STR = "KB";
+ static const char *const B_MBYTES_STR = "MB";
+ static const char *const B_GBYTES_STR = "GB";
+ 
+ static const char *const list_sep = ", \t\n\r";
+ 
+ static void parse_access_log(CustomLog ** customlog_definitions);
+ static int check_null_access_log(CustomLog *customlog_definitions);
+ static void dump_access_log(StoreEntry * entry, const char *name, CustomLog * definitions);
+ static void free_access_log(CustomLog ** definitions);
+ static bool setLogformat(CustomLog *cl, const char *name, const bool dieWhenMissing);
+ 
+ static void configDoConfigure(void);
+ static void parse_refreshpattern(RefreshPattern **);
+ static uint64_t parseTimeUnits(const char *unit,  bool allowMsec);
+-static void parseTimeLine(time_msec_t * tptr, const char *units, bool allowMsec);
++static void parseTimeLine(time_msec_t * tptr, const char *units, bool allowMsec, bool expectMoreArguments);
+ static void parse_u_short(unsigned short * var);
+ static void parse_string(char **);
+ static void default_all(void);
+ static void defaults_if_none(void);
+ static void defaults_postscriptum(void);
+ static int parse_line(char *);
+ static void parse_obsolete(const char *);
+ static void parseBytesLine(size_t * bptr, const char *units);
+ #if USE_OPENSSL
+ static void parseBytesOptionValue(size_t * bptr, const char *units, char const * value);
+ #endif
+ static void parseBytesLineSigned(ssize_t * bptr, const char *units);
+ static size_t parseBytesUnits(const char *unit);
+ static void free_all(void);
+ void requirePathnameExists(const char *name, const char *path);
+ static OBJH dump_config;
+ #if USE_HTTP_VIOLATIONS
+ static void free_HeaderManglers(HeaderManglers **pm);
+ static void dump_http_header_access(StoreEntry * entry, const char *name, const HeaderManglers *manglers);
+ static void parse_http_header_access(HeaderManglers **manglers);
+@@ -219,40 +220,44 @@
+ static void dump_sslproxy_cert_adapt(StoreEntry *entry, const char *name, sslproxy_cert_adapt *cert_adapt);
+ static void free_sslproxy_cert_adapt(sslproxy_cert_adapt **cert_adapt);
+ static void parse_sslproxy_ssl_bump(acl_access **ssl_bump);
+ static void dump_sslproxy_ssl_bump(StoreEntry *entry, const char *name, acl_access *ssl_bump);
+ static void free_sslproxy_ssl_bump(acl_access **ssl_bump);
+ #endif /* USE_OPENSSL */
+ 
+ static void parse_ftp_epsv(acl_access **ftp_epsv);
+ static void dump_ftp_epsv(StoreEntry *entry, const char *name, acl_access *ftp_epsv);
+ static void free_ftp_epsv(acl_access **ftp_epsv);
+ 
+ static void parse_b_size_t(size_t * var);
+ static void parse_b_int64_t(int64_t * var);
+ 
+ static bool parseNamedIntList(const char *data, const String &name, std::vector<int> &list);
+ 
+ static void parse_CpuAffinityMap(CpuAffinityMap **const cpuAffinityMap);
+ static void dump_CpuAffinityMap(StoreEntry *const entry, const char *const name, const CpuAffinityMap *const cpuAffinityMap);
+ static void free_CpuAffinityMap(CpuAffinityMap **const cpuAffinityMap);
+ 
++static void parse_url_rewrite_timeout(SquidConfig *);
++static void dump_url_rewrite_timeout(StoreEntry *, const char *, SquidConfig &);
++static void free_url_rewrite_timeout(SquidConfig *);
++
+ static int parseOneConfigFile(const char *file_name, unsigned int depth);
+ 
+ static void parse_configuration_includes_quoted_values(bool *recognizeQuotedValues);
+ static void dump_configuration_includes_quoted_values(StoreEntry *const entry, const char *const name, bool recognizeQuotedValues);
+ static void free_configuration_includes_quoted_values(bool *recognizeQuotedValues);
+ 
+ /*
+  * LegacyParser is a parser for legacy code that uses the global
+  * approach.  This is static so that it is only exposed to cache_cf.
+  * Other modules needing access to a ConfigParser should have it
+  * provided to them in their parserFOO methods.
+  */
+ static ConfigParser LegacyParser = ConfigParser();
+ 
+ void
+ self_destruct(void)
+ {
+     LegacyParser.destruct();
+ }
+ 
+@@ -959,65 +964,73 @@
+     }
+ 
+     if (!strcmp(name, "log_access"))
+         self_destruct();
+ 
+     if (!strcmp(name, "log_icap"))
+         self_destruct();
+ 
+     if (!strcmp(name, "ignore_ims_on_miss")) {
+         // the replacement directive cache_revalidate_on_miss has opposite meanings for ON/OFF value
+         // than the 2.7 directive. We need to parse and invert the configured value.
+         int temp = 0;
+         parse_onoff(&temp);
+         Config.onoff.cache_miss_revalidate = !temp;
+     }
+ }
+ 
+ /* Parse a time specification from the config file.  Store the
+  * result in 'tptr', after converting it to 'units' */
+ static void
+-parseTimeLine(time_msec_t * tptr, const char *units,  bool allowMsec)
++parseTimeLine(time_msec_t * tptr, const char *units,  bool allowMsec,  bool expectMoreArguments = false)
+ {
+     char *token;
+     double d;
+     time_msec_t m;
+     time_msec_t u;
+ 
+     if ((u = parseTimeUnits(units, allowMsec)) == 0)
+         self_destruct();
+ 
+     if ((token = ConfigParser::NextToken()) == NULL)
+         self_destruct();
+ 
+     d = xatof(token);
+ 
+     m = u;			/* default to 'units' if none specified */
+ 
++    bool hasUnits = false;
+     if (0 == d)
+         (void) 0;
+-    else if ((token = ConfigParser::NextToken()) == NULL)
++    else if ((token = ConfigParser::PeekAtToken()) == NULL)
++        (void) 0;
++    else if ((m = parseTimeUnits(token, allowMsec)) == 0) {
++        if (!expectMoreArguments)
++            self_destruct();
++    } else { //pop the token
++        (void)ConfigParser::NextToken();
++        hasUnits = true;
++    }
++    if (!hasUnits)
+         debugs(3, DBG_CRITICAL, "WARNING: No units on '" <<
+                config_input_line << "', assuming " <<
+                d << " " << units  );
+-    else if ((m = parseTimeUnits(token, allowMsec)) == 0)
+-        self_destruct();
+ 
+     *tptr = static_cast<time_msec_t>(m * d);
+ 
+     if (static_cast<double>(*tptr) * 2 != m * d * 2) {
+         debugs(3, DBG_CRITICAL, "ERROR: Invalid value '" <<
+                d << " " << token << ": integer overflow (time_msec_t).");
+         self_destruct();
+     }
+ }
+ 
+ static uint64_t
+ parseTimeUnits(const char *unit, bool allowMsec)
+ {
+     if (allowMsec && !strncasecmp(unit, T_MILLISECOND_STR, strlen(T_MILLISECOND_STR)))
+         return 1;
+ 
+     if (!strncasecmp(unit, T_SECOND_STR, strlen(T_SECOND_STR)))
+         return 1000;
+ 
+     if (!strncasecmp(unit, T_MINUTE_STR, strlen(T_MINUTE_STR)))
+@@ -4884,40 +4897,105 @@
+             *ftp_epsv = NULL;
+         FtpEspvDeprecated = true;
+     } else {
+         aclParseAccessLine(cfg_directive, LegacyParser, ftp_epsv);
+     }
+ }
+ 
+ static void dump_ftp_epsv(StoreEntry *entry, const char *name, acl_access *ftp_epsv)
+ {
+     if (ftp_epsv)
+         dump_SBufList(entry, ftp_epsv->treeDump(name, NULL));
+ }
+ 
+ static void free_ftp_epsv(acl_access **ftp_epsv)
+ {
+     free_acl_access(ftp_epsv);
+     FtpEspvDeprecated = false;
+ }
+ 
+ static void
++parse_url_rewrite_timeout(SquidConfig *config)
++{
++    time_msec_t tval;
++    parseTimeLine(&tval, T_SECOND_STR, false, true);
++    Config.Timeout.urlRewrite = static_cast<time_t>(tval/1000);
++
++    char *key, *value;
++    while(ConfigParser::NextKvPair(key, value)) {
++        if (strcasecmp(key, "on_timeout") == 0) {
++            if (strcasecmp(value, "bypass") == 0)
++                Config.onUrlRewriteTimeout.action = toutActBypass;
++            else if (strcasecmp(value, "fail") == 0)
++                Config.onUrlRewriteTimeout.action = toutActFail;
++            else if (strcasecmp(value, "retry") == 0)
++                Config.onUrlRewriteTimeout.action = toutActRetry;
++            else if (strcasecmp(value, "use_configured_response") == 0) {
++                Config.onUrlRewriteTimeout.action = toutActUseConfiguredResponse;
++            } else {
++                debugs(3, DBG_CRITICAL, "FATAL: unsuported \"on_timeout\"  action:" << value);
++                self_destruct();
++            }
++        } else if (strcasecmp(key, "response") == 0) {
++            Config.onUrlRewriteTimeout.response = xstrdup(value);
++        } else {
++            debugs(3, DBG_CRITICAL, "FATAL: unsuported option " << key);
++            self_destruct();
++        }
++    }
++
++    if (Config.onUrlRewriteTimeout.action == toutActUseConfiguredResponse && !Config.onUrlRewriteTimeout.response) {
++        debugs(3, DBG_CRITICAL, "FATAL: Expected 'response=' option after 'on_timeout=use_configured_response' option");
++        self_destruct();
++    }
++
++    if (Config.onUrlRewriteTimeout.action != toutActUseConfiguredResponse && Config.onUrlRewriteTimeout.response) {
++        debugs(3, DBG_CRITICAL, "FATAL: 'response=' option is valid only when used with the  'on_timeout=use_configured_response' option");
++        self_destruct();
++    }
++}
++
++static void
++dump_url_rewrite_timeout(StoreEntry *entry, const char *name, SquidConfig &config)
++{
++    const char  *onTimedOutActions[] = {"bypass", "fail", "retry", "use_configured_response"};
++    assert(Config.onUrlRewriteTimeout.action >= 0 && Config.onUrlRewriteTimeout.action <= toutActUseConfiguredResponse);
++
++    dump_time_t(entry, name, Config.Timeout.urlRewrite);
++    storeAppendPrintf(entry, " on_timeout=%s", onTimedOutActions[Config.onUrlRewriteTimeout.action]);
++
++    if (Config.onUrlRewriteTimeout.response)
++        storeAppendPrintf(entry, " response=\"%s\"", Config.onUrlRewriteTimeout.response);
++
++    storeAppendPrintf(entry, "\n");
++}
++
++static void
++free_url_rewrite_timeout(SquidConfig *config)
++{
++    Config.Timeout.urlRewrite = 0;
++    Config.onUrlRewriteTimeout.action = 0;
++    xfree(Config.onUrlRewriteTimeout.response);
++    Config.onUrlRewriteTimeout.response = NULL;
++}
++
++static void
+ parse_configuration_includes_quoted_values(bool *recognizeQuotedValues)
+ {
+     int val = 0;
+     parse_onoff(&val);
+ 
+     // If quoted values is set to on then enable new strict mode parsing
+     if (val) {
+         ConfigParser::RecognizeQuotedValues = true;
+         ConfigParser::StrictMode = true;
+     } else {
+         ConfigParser::RecognizeQuotedValues = false;
+         ConfigParser::StrictMode = false;
+     }
+ }
+ 
+ static void
+ dump_configuration_includes_quoted_values(StoreEntry *const entry, const char *const name, bool recognizeQuotedValues)
+ {
+     int val = ConfigParser::RecognizeQuotedValues ? 1 : 0;
+     dump_onoff(entry, name, val);
+
+=== modified file 'src/cf.data.depend'
+--- src/cf.data.depend	2014-09-02 01:08:58 +0000
++++ src/cf.data.depend	2014-10-23 15:05:06 +0000
+@@ -49,31 +49,32 @@
+ memcachemode
+ note			acl
+ obsolete
+ onoff
+ peer
+ peer_access		cache_peer acl
+ pipelinePrefetch
+ PortCfg
+ QosConfig
+ TokenOrQuotedString
+ refreshpattern
+ removalpolicy
+ size_t
+ IpAddress_list
+ string
+ string
+ time_msec
+ time_t
+ tristate
+ uri_whitespace
++url_rewrite_timeout
+ u_short
+ wccp2_method
+ wccp2_amethod
+ wccp2_service
+ wccp2_service_info
+ wordlist
+ sslproxy_ssl_bump	acl
+ sslproxy_ssl_bump_peeked acl
+ sslproxy_cert_sign	acl
+ sslproxy_cert_adapt	acl
+ ftp_epsv                acl
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2014-11-20 15:36:59 +0000
++++ src/cf.data.pre	2014-11-21 16:04:40 +0000
+@@ -4955,40 +4955,63 @@
+ 	are not critical to your caching system.  If you use
+ 	redirectors for access control, and you enable this option,
+ 	users may have access to pages they should not
+ 	be allowed to request.
+ 	This options sets default queue-size option of the url_rewrite_children
+ 	to 0.
+ DOC_END
+ 
+ NAME: url_rewrite_extras
+ TYPE: TokenOrQuotedString
+ LOC: Config.redirector_extras
+ DEFAULT: "%>a/%>A %un %>rm myip=%la myport=%lp"
+ DOC_START
+ 	Specifies a string to be append to request line format for the
+ 	rewriter helper. "Quoted" format values may contain spaces and
+ 	logformat %macros. In theory, any logformat %macro can be used.
+ 	In practice, a %macro expands as a dash (-) if the helper request is
+ 	sent before the required macro information is available to Squid.
+ DOC_END
+ 
++NAME: url_rewrite_timeout
++TYPE: url_rewrite_timeout
++LOC: Config
++DEFAULT: none
++DEFAULT_DOC: Squid waits for the helper response forever
++DOC_START
++	Squid times active requests to redirector. The timeout value and Squid
++	reaction to a timed out request are configurable using the following
++	format:
++
++	url_rewrite_timeout timeout time-units  on_timeout=<action> [response=<quoted-response>]
++
++	supported timeout actions:
++			fail  Squid return a ERR_GATEWAY_FAILURE error page
++
++			bypass  Do not re-write the URL
++
++			retry  Send the lookup to the helper again
++
++			use_configured_response  Use the <quoted-response> as
++			helper response
++DOC_END
++
+ COMMENT_START
+  OPTIONS FOR STORE ID
+  -----------------------------------------------------------------------------
+ COMMENT_END
+ 
+ NAME: store_id_program storeurl_rewrite_program
+ TYPE: wordlist
+ LOC: Config.Program.store_id
+ DEFAULT: none
+ DOC_START
+ 	Specify the location of the executable StoreID helper to use.
+ 	Since they can perform almost any function there isn't one included.
+ 
+ 	For each requested URL, the helper will receive one line with the format
+ 
+ 	  [channel-ID <SP>] URL [<SP> extras]<NL>
+ 
+ 
+ 	After processing the request the helper must reply using the following format:
+ 
+
+=== modified file 'src/client_side_request.cc'
+--- src/client_side_request.cc	2014-11-04 08:47:03 +0000
++++ src/client_side_request.cc	2014-11-24 10:17:11 +0000
+@@ -102,43 +102,41 @@
+ static void checkFailureRatio(err_type, hier_code);
+ 
+ ClientRequestContext::~ClientRequestContext()
+ {
+     /*
+      * Release our "lock" on our parent, ClientHttpRequest, if we
+      * still have one
+      */
+ 
+     if (http)
+         cbdataReferenceDone(http);
+ 
+     delete error;
+     debugs(85,3, HERE << this << " ClientRequestContext destructed");
+ }
+ 
+ ClientRequestContext::ClientRequestContext(ClientHttpRequest *anHttp) : http(cbdataReference(anHttp)), acl_checklist (NULL), redirect_state (REDIRECT_NONE), store_id_state(REDIRECT_NONE),error(NULL), readNextRequest(false)
+ {
+     http_access_done = false;
+     redirect_done = false;
+-    redirect_fail_count = 0;
+     store_id_done = false;
+-    store_id_fail_count = 0;
+     no_cache_done = false;
+     interpreted_req_hdrs = false;
+ #if USE_OPENSSL
+     sslBumpCheckDone = false;
+ #endif
+     debugs(85,3, HERE << this << " ClientRequestContext constructed");
+ }
+ 
+ CBDATA_CLASS_INIT(ClientHttpRequest);
+ 
+ ClientHttpRequest::ClientHttpRequest(ConnStateData * aConn) :
+ #if USE_ADAPTATION
+         AsyncJob("ClientHttpRequest"),
+ #endif
+         loggingEntry_(NULL)
+ {
+     setConn(aConn);
+     al = new AccessLogEntry;
+     al->cache.start_time = current_time;
+     al->tcpClient = clientConnection = aConn->clientConnection;
+@@ -1199,54 +1197,56 @@
+ 
+     calloutContext->clientStoreIdDone(result);
+ }
+ 
+ void
+ ClientRequestContext::clientRedirectDone(const Helper::Reply &reply)
+ {
+     HttpRequest *old_request = http->request;
+     debugs(85, 5, HERE << "'" << http->uri << "' result=" << reply);
+     assert(redirect_state == REDIRECT_PENDING);
+     redirect_state = REDIRECT_DONE;
+ 
+     // Put helper response Notes into the transaction state record (ALE) eventually
+     // do it early to ensure that no matter what the outcome the notes are present.
+     if (http->al != NULL)
+         (void)SyncNotes(*http->al, *old_request);
+ 
+     UpdateRequestNotes(http->getConn(), *old_request, reply.notes);
+ 
+     switch (reply.result) {
++    case Helper::TimedOut:
++        if (Config.onUrlRewriteTimeout.action != toutActBypass) {
++            http->calloutsError(ERR_GATEWAY_FAILURE, ERR_DETAIL_REDIRECTOR_TIMEDOUT);
++            debugs(85, DBG_IMPORTANT, "ERROR: URL rewrite helper: Timedout");
++        }
++        break;
++
+     case Helper::Unknown:
+     case Helper::TT:
+         // Handler in redirect.cc should have already mapped Unknown
+         // IF it contained valid entry for the old URL-rewrite helper protocol
+         debugs(85, DBG_IMPORTANT, "ERROR: URL rewrite helper returned invalid result code. Wrong helper? " << reply);
+         break;
+ 
+     case Helper::BrokenHelper:
+-        debugs(85, DBG_IMPORTANT, "ERROR: URL rewrite helper: " << reply << ", attempt #" << (redirect_fail_count+1) << " of 2");
+-        if (redirect_fail_count < 2) { // XXX: make this configurable ?
+-            ++redirect_fail_count;
+-            // reset state flag to try redirector again from scratch.
+-            redirect_done = false;
+-        }
++        debugs(85, DBG_IMPORTANT, "ERROR: URL rewrite helper: " << reply);
+         break;
+ 
+     case Helper::Error:
+         // no change to be done.
+         break;
+ 
+     case Helper::Okay: {
+         // #1: redirect with a specific status code    OK status=NNN url="..."
+         // #2: redirect with a default status code     OK url="..."
+         // #3: re-write the URL                        OK rewrite-url="..."
+ 
+         const char *statusNote = reply.notes.findFirst("status");
+         const char *urlNote = reply.notes.findFirst("url");
+ 
+         if (urlNote != NULL) {
+             // HTTP protocol redirect to be done.
+ 
+             // TODO: change default redirect status for appropriate requests
+             // Squid defaults to 302 status for now for better compatibility with old clients.
+             // HTTP/1.0 client should get 302 (Http::scFound)
+@@ -1327,47 +1327,44 @@
+     HttpRequest *old_request = http->request;
+     debugs(85, 5, "'" << http->uri << "' result=" << reply);
+     assert(store_id_state == REDIRECT_PENDING);
+     store_id_state = REDIRECT_DONE;
+ 
+     // Put helper response Notes into the transaction state record (ALE) eventually
+     // do it early to ensure that no matter what the outcome the notes are present.
+     if (http->al != NULL)
+         (void)SyncNotes(*http->al, *old_request);
+ 
+     UpdateRequestNotes(http->getConn(), *old_request, reply.notes);
+ 
+     switch (reply.result) {
+     case Helper::Unknown:
+     case Helper::TT:
+         // Handler in redirect.cc should have already mapped Unknown
+         // IF it contained valid entry for the old helper protocol
+         debugs(85, DBG_IMPORTANT, "ERROR: storeID helper returned invalid result code. Wrong helper? " << reply);
+         break;
+ 
++    case Helper::TimedOut:
++        // Timeouts for storeID are not implemented
+     case Helper::BrokenHelper:
+-        debugs(85, DBG_IMPORTANT, "ERROR: storeID helper: " << reply << ", attempt #" << (store_id_fail_count+1) << " of 2");
+-        if (store_id_fail_count < 2) { // XXX: make this configurable ?
+-            ++store_id_fail_count;
+-            // reset state flag to try StoreID again from scratch.
+-            store_id_done = false;
+-        }
++        debugs(85, DBG_IMPORTANT, "ERROR: storeID helper: " << reply);
+         break;
+ 
+     case Helper::Error:
+         // no change to be done.
+         break;
+ 
+     case Helper::Okay: {
+         const char *urlNote = reply.notes.findFirst("store-id");
+ 
+         // prevent broken helpers causing too much damage. If old URL == new URL skip the re-write.
+         if (urlNote != NULL && strcmp(urlNote, http->uri) ) {
+             // Debug section required for some very specific cases.
+             debugs(85, 9, "Setting storeID with: " << urlNote );
+             http->request->store_id = urlNote;
+             http->store_id = urlNote;
+         }
+     }
+     break;
+     }
+ 
+@@ -2021,46 +2018,55 @@
+ {
+     debugs(85,3, HERE << "handleAdaptationFailure(" << bypassable << ")");
+ 
+     const bool usedStore = storeEntry() && !storeEntry()->isEmpty();
+     const bool usedPipe = request->body_pipe != NULL &&
+                           request->body_pipe->consumedSize() > 0;
+ 
+     if (bypassable && !usedStore && !usedPipe) {
+         debugs(85,3, HERE << "ICAP REQMOD callout failed, bypassing: " << calloutContext);
+         if (calloutContext)
+             doCallouts();
+         return;
+     }
+ 
+     debugs(85,3, HERE << "ICAP REQMOD callout failed, responding with error");
+ 
+     clientStreamNode *node = (clientStreamNode *)client_stream.tail->prev->data;
+     clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+     assert(repContext);
+ 
++    calloutsError(ERR_ICAP_FAILURE, errDetail);
++
++    if (calloutContext)
++        doCallouts();
++}
++
++// XXX: modify and use with ClientRequestContext::clientAccessCheckDone too.
++void
++ClientHttpRequest::calloutsError(const err_type error, const int errDetail)
++{
+     // The original author of the code also wanted to pass an errno to
+     // setReplyToError, but it seems unlikely that the errno reflects the
+     // true cause of the error at this point, so I did not pass it.
+     if (calloutContext) {
+         Ip::Address noAddr;
+         noAddr.setNoAddr();
+         ConnStateData * c = getConn();
+-        calloutContext->error = clientBuildError(ERR_ICAP_FAILURE, Http::scInternalServerError,
++        calloutContext->error = clientBuildError(error, Http::scInternalServerError,
+                                 NULL,
+                                 c != NULL ? c->clientConnection->remote : noAddr,
+                                 request
+                                                 );
+ #if USE_AUTH
+         calloutContext->error->auth_user_request =
+             c != NULL && c->getAuth() != NULL ? c->getAuth() : request->auth_user_request;
+ #endif
+         calloutContext->error->detailError(errDetail);
+         calloutContext->readNextRequest = true;
+         if (c != NULL)
+             c->expectNoForwarding();
+-        doCallouts();
+     }
+     //else if(calloutContext == NULL) is it possible?
+ }
+ 
+ #endif
+
+=== modified file 'src/client_side_request.h'
+--- src/client_side_request.h	2014-11-02 00:10:01 +0000
++++ src/client_side_request.h	2014-11-24 10:16:35 +0000
+@@ -91,78 +91,82 @@
+         bool accel;
+         //bool intercepted; //XXX: it's apparently never used.
+         //bool spoof_client_ip; //XXX: it's apparently never used.
+         bool internal;
+         bool done_copying;
+         bool purging;
+     } flags;
+ 
+     struct {
+         Http::StatusCode status;
+         char *location;
+     } redirect;
+ 
+     dlink_node active;
+     dlink_list client_stream;
+     int mRangeCLen();
+ 
+     ClientRequestContext *calloutContext;
+     void doCallouts();
+ 
++    /// Build an error reply. For use with the callouts.
++    void calloutsError(const err_type error, const int errDetail);
++
+ #if USE_ADAPTATION
+     // AsyncJob virtual methods
+     virtual bool doneAll() const {
+         return Initiator::doneAll() &&
+                BodyConsumer::doneAll() && false;
+     }
+ #endif
+ 
+ private:
+     int64_t maxReplyBodySize_;
+     StoreEntry *entry_;
+     StoreEntry *loggingEntry_;
+     ConnStateData * conn_;
+ 
+ #if USE_OPENSSL
+     /// whether (and how) the request needs to be bumped
+     Ssl::BumpMode sslBumpNeed_;
+ 
+ public:
+     /// returns raw sslBump mode value
+     Ssl::BumpMode sslBumpNeed() const { return sslBumpNeed_; }
+     /// returns true if and only if the request needs to be bumped
+     bool sslBumpNeeded() const { return sslBumpNeed_ == Ssl::bumpServerFirst || sslBumpNeed_ == Ssl::bumpClientFirst || sslBumpNeed_ == Ssl::bumpBump || sslBumpNeed_ == Ssl::bumpPeek || sslBumpNeed_ == Ssl::bumpStare; }
+     /// set the sslBumpNeeded state
+     void sslBumpNeed(Ssl::BumpMode mode);
+     void sslBumpStart();
+     void sslBumpEstablish(Comm::Flag errflag);
+ #endif
+ 
+ #if USE_ADAPTATION
+ 
+ public:
+     void startAdaptation(const Adaptation::ServiceGroupPointer &g);
+ 
+-    // private but exposed for ClientRequestContext
++private:
++    /// Handles an adaptation client request failure. 
++    /// Bypasses the error if possible, or build an error reply.
+     void handleAdaptationFailure(int errDetail, bool bypassable = false);
+ 
+-private:
+     // Adaptation::Initiator API
+     virtual void noteAdaptationAnswer(const Adaptation::Answer &answer);
+     void handleAdaptedHeader(HttpMsg *msg);
+     void handleAdaptationBlock(const Adaptation::Answer &answer);
+     virtual void noteAdaptationAclCheckDone(Adaptation::ServiceGroupPointer group);
+ 
+     // BodyConsumer API, called by BodyPipe
+     virtual void noteMoreBodyDataAvailable(BodyPipe::Pointer);
+     virtual void noteBodyProductionEnded(BodyPipe::Pointer);
+     virtual void noteBodyProducerAborted(BodyPipe::Pointer);
+ 
+     void endRequestSatisfaction();
+     /// called by StoreEntry when it has more buffer space available
+     void resumeBodyStorage();
+ 
+ private:
+     CbcPointer<Adaptation::Initiate> virginHeadSource;
+     BodyPipe::Pointer adaptedBodySource;
+ 
+     bool request_satisfaction_mode;
+
+=== modified file 'src/err_detail_type.h'
+--- src/err_detail_type.h	2014-09-22 19:06:19 +0000
++++ src/err_detail_type.h	2014-10-27 10:29:33 +0000
+@@ -1,34 +1,35 @@
+ /*
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef _SQUID_ERR_DETAIL_H
+ #define  _SQUID_ERR_DETAIL_H
+ 
+ typedef enum {
+     ERR_DETAIL_NONE,
+     ERR_DETAIL_START = 100000, // to avoid clashes with most OS error numbers
++    ERR_DETAIL_REDIRECTOR_TIMEDOUT, // External redirector request timed-out
+     ERR_DETAIL_CLT_REQMOD_ABORT = ERR_DETAIL_START, // client-facing code detected transaction abort
+     ERR_DETAIL_CLT_REQMOD_REQ_BODY, // client-facing code detected REQMOD request body adaptation failure
+     ERR_DETAIL_CLT_REQMOD_RESP_BODY, // client-facing code detected REQMOD satisfaction reply body failure
+     ERR_DETAIL_SRV_REQMOD_REQ_BODY, // server-facing code detected REQMOD request body abort
+     ERR_DETAIL_ICAP_RESPMOD_EARLY, // RESPMOD failed w/o store entry
+     ERR_DETAIL_ICAP_RESPMOD_LATE,  // RESPMOD failed with a store entry
+     ERR_DETAIL_REQMOD_BLOCK, // REQMOD denied client access
+     ERR_DETAIL_RESPMOD_BLOCK_EARLY, // RESPMOD denied client access to HTTP response, before any part of the response was sent
+     ERR_DETAIL_RESPMOD_BLOCK_LATE, // RESPMOD denied client access to HTTP response, after [a part of] the response was sent
+     ERR_DETAIL_ICAP_XACT_START, // transaction start failure
+     ERR_DETAIL_ICAP_XACT_BODY_CONSUMER_ABORT, // transaction body consumer gone
+     ERR_DETAIL_ICAP_INIT_GONE, // initiator gone
+     ERR_DETAIL_ICAP_XACT_CLOSE, // ICAP connection closed unexpectedly
+     ERR_DETAIL_ICAP_XACT_OTHER, // other ICAP transaction errors
+     ERR_DETAIL_EXCEPTION_OTHER, //other errors ( eg std C++ lib errors)
+     ERR_DETAIL_MAX,
+     ERR_DETAIL_EXCEPTION_START = 110000 // offset for exception ID details
+ } err_detail_type;
+ 
+ extern const char *err_detail_type_str[];
+
+=== modified file 'src/helper.cc'
+--- src/helper.cc	2014-11-09 21:21:15 +0000
++++ src/helper.cc	2014-11-24 09:43:57 +0000
+@@ -5,48 +5,52 @@
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 84    Helper process maintenance */
+ 
+ #include "squid.h"
+ #include "base/AsyncCbdataCalls.h"
+ #include "comm.h"
+ #include "comm/Connection.h"
+ #include "comm/Read.h"
+ #include "comm/Write.h"
+ #include "fd.h"
+ #include "fde.h"
+ #include "format/Quoting.h"
+ #include "helper.h"
+ #include "helper/Reply.h"
+ #include "helper/Request.h"
+ #include "Mem.h"
+ #include "MemBuf.h"
++#include "SquidConfig.h"
+ #include "SquidIpc.h"
+ #include "SquidMath.h"
+ #include "SquidTime.h"
+ #include "Store.h"
+ #include "wordlist.h"
+ 
+ #define HELPER_MAX_ARGS 64
+ 
++/// The maximum allowed request retries.
++#define MAX_RETRIES 2
++
+ /** Initial Squid input buffer size. Helper responses may exceed this, and
+  * Squid will grow the input buffer as needed, up to ReadBufMaxSize.
+  */
+ const size_t ReadBufMinSize(4*1024);
+ 
+ /** Maximum safe size of a helper-to-Squid response message plus one.
+  * Squid will warn and close the stream if a helper sends a too-big response.
+  * ssl_crtd helper is known to produce responses of at least 10KB in size.
+  * Some undocumented helpers are known to produce responses exceeding 8KB.
+  */
+ const size_t ReadBufMaxSize(32*1024);
+ 
+ static IOCB helperHandleRead;
+ static IOCB helperStatefulHandleRead;
+ static void helperServerFree(helper_server *srv);
+ static void helperStatefulServerFree(helper_stateful_server *srv);
+ static void Enqueue(helper * hlp, Helper::Request *);
+ static Helper::Request *Dequeue(helper * hlp);
+ static Helper::Request *StatefulDequeue(statefulhelper * hlp);
+ static helper_server *GetFirstAvailable(helper * hlp);
+@@ -56,40 +60,41 @@
+ static void helperKickQueue(helper * hlp);
+ static void helperStatefulKickQueue(statefulhelper * hlp);
+ static void helperStatefulServerDone(helper_stateful_server * srv);
+ static void StatefulEnqueue(statefulhelper * hlp, Helper::Request * r);
+ static bool helperStartStats(StoreEntry *sentry, void *hlp, const char *label);
+ 
+ CBDATA_CLASS_INIT(helper);
+ CBDATA_CLASS_INIT(helper_server);
+ CBDATA_CLASS_INIT(statefulhelper);
+ CBDATA_CLASS_INIT(helper_stateful_server);
+ 
+ InstanceIdDefinitions(HelperServerBase, "Hlpr");
+ 
+ void
+ HelperServerBase::initStats()
+ {
+     stats.uses=0;
+     stats.replies=0;
+     stats.pending=0;
+     stats.releases=0;
++    stats.timedout = 0;
+ }
+ 
+ void
+ HelperServerBase::closePipesSafely(const char *id_name)
+ {
+ #if _SQUID_WINDOWS_
+     shutdown(writePipe->fd, SD_BOTH);
+ #endif
+ 
+     flags.closing = true;
+     if (readPipe->fd == writePipe->fd)
+         readPipe->fd = -1;
+     else
+         readPipe->close();
+     writePipe->close();
+ 
+ #if _SQUID_WINDOWS_
+     if (hIpc) {
+         if (WaitForSingleObject(hIpc, 5000) != WAIT_OBJECT_0) {
+             getCurrentTime();
+@@ -193,62 +198,69 @@
+ 
+         if (pid < 0) {
+             debugs(84, DBG_IMPORTANT, "WARNING: Cannot run '" << progname << "' process.");
+             continue;
+         }
+ 
+         ++ hlp->childs.n_running;
+         ++ hlp->childs.n_active;
+         srv = new helper_server;
+         srv->hIpc = hIpc;
+         srv->pid = pid;
+         srv->initStats();
+         srv->addr = hlp->addr;
+         srv->readPipe = new Comm::Connection;
+         srv->readPipe->fd = rfd;
+         srv->writePipe = new Comm::Connection;
+         srv->writePipe->fd = wfd;
+         srv->rbuf = (char *)memAllocBuf(ReadBufMinSize, &srv->rbuf_sz);
+         srv->wqueue = new MemBuf;
+         srv->roffset = 0;
+-        srv->requests = (Helper::Request **)xcalloc(hlp->childs.concurrency ? hlp->childs.concurrency : 1, sizeof(*srv->requests));
++        srv->nextRequestId = 0;
+         srv->parent = cbdataReference(hlp);
+         dlinkAddTail(srv, &srv->link, &hlp->servers);
+ 
+         if (rfd == wfd) {
+             snprintf(fd_note_buf, FD_DESC_SZ, "%s #%d", shortname, k + 1);
+             fd_note(rfd, fd_note_buf);
+         } else {
+             snprintf(fd_note_buf, FD_DESC_SZ, "reading %s #%d", shortname, k + 1);
+             fd_note(rfd, fd_note_buf);
+             snprintf(fd_note_buf, FD_DESC_SZ, "writing %s #%d", shortname, k + 1);
+             fd_note(wfd, fd_note_buf);
+         }
+ 
+         commSetNonBlocking(rfd);
+ 
+         if (wfd != rfd)
+             commSetNonBlocking(wfd);
+ 
+         AsyncCall::Pointer closeCall = asyncCall(5,4, "helperServerFree", cbdataDialer(helperServerFree, srv));
+         comm_add_close_handler(rfd, closeCall);
+ 
++        if (hlp->timeout && hlp->childs.concurrency){
++            AsyncCall::Pointer timeoutCall = commCbCall(84, 4, "helper_server::requestTimeout",
++                                                        CommTimeoutCbPtrFun(helper_server::requestTimeout, srv));
++            commSetConnTimeout(srv->readPipe, hlp->timeout, timeoutCall);
++        }
++
++
+         AsyncCall::Pointer call = commCbCall(5,4, "helperHandleRead",
+                                              CommIoCbPtrFun(helperHandleRead, srv));
+         comm_read(srv->readPipe, srv->rbuf, srv->rbuf_sz - 1, call);
+     }
+ 
+     hlp->last_restart = squid_curtime;
+     safe_free(shortname);
+     safe_free(procname);
+     helperKickQueue(hlp);
+ }
+ 
+ /**
+  * DPW 2007-05-08
+  *
+  * helperStatefulOpenServers: create the stateful child helper processes
+  */
+ void
+ helperStatefulOpenServers(statefulhelper * hlp)
+ {
+     char *shortname;
+@@ -349,40 +361,58 @@
+         commSetNonBlocking(rfd);
+ 
+         if (wfd != rfd)
+             commSetNonBlocking(wfd);
+ 
+         AsyncCall::Pointer closeCall = asyncCall(5,4, "helperStatefulServerFree", cbdataDialer(helperStatefulServerFree, srv));
+         comm_add_close_handler(rfd, closeCall);
+ 
+         AsyncCall::Pointer call = commCbCall(5,4, "helperStatefulHandleRead",
+                                              CommIoCbPtrFun(helperStatefulHandleRead, srv));
+         comm_read(srv->readPipe, srv->rbuf, srv->rbuf_sz - 1, call);
+     }
+ 
+     hlp->last_restart = squid_curtime;
+     safe_free(shortname);
+     safe_free(procname);
+     helperStatefulKickQueue(hlp);
+ }
+ 
+ void
++helper::submitRequest(Helper::Request *r)
++{
++    helper_server *srv;
++
++    if ((srv = GetFirstAvailable(this)))
++        helperDispatch(srv, r);
++    else
++        Enqueue(this, r);
++
++    if (!queueFull()) {
++        full_time = 0;
++    } else if (!full_time) {
++        debugs(84, 3, id_name << " queue became full");
++        full_time = squid_curtime;
++    }
++}
++
++void
+ helperSubmit(helper * hlp, const char *buf, HLPCB * callback, void *data)
+ {
+     if (hlp == NULL) {
+         debugs(84, 3, "helperSubmit: hlp == NULL");
+         Helper::Reply nilReply;
+         callback(data, nilReply);
+         return;
+     }
+     hlp->prepSubmit();
+     hlp->submit(buf, callback, data);
+ }
+ 
+ bool
+ helper::queueFull() const {
+     return stats.queue_size > static_cast<int>(childs.queue_size);
+ }
+ 
+ /// prepares the helper for request submission via trySubmit() or helperSubmit()
+ /// currently maintains full_time and kills Squid if the helper remains full for too long
+ void
+@@ -398,55 +428,42 @@
+ 
+ bool
+ helper::trySubmit(const char *buf, HLPCB * callback, void *data)
+ {
+     prepSubmit();
+ 
+     if (queueFull()) {
+         debugs(84, DBG_IMPORTANT, id_name << " drops request due to a full queue");
+         return false; // request was ignored
+     }
+ 
+     submit(buf, callback, data); // will send or queue
+     return true; // request submitted or queued
+ }
+ 
+ /// dispatches or enqueues a helper requests; does not enforce queue limits
+ void
+ helper::submit(const char *buf, HLPCB * callback, void *data)
+ {
+     Helper::Request *r = new Helper::Request(callback, data, buf);
+-    helper_server *srv;
+-
+-    if ((srv = GetFirstAvailable(this)))
+-        helperDispatch(srv, r);
+-    else
+-        Enqueue(this, r);
+-
++    submitRequest(r);
+     debugs(84, DBG_DATA, Raw("buf", buf, strlen(buf)));
+-
+-    if (!queueFull()) {
+-        full_time = 0;
+-    } else if (!full_time) {
+-        debugs(84, 3, id_name << " queue became full");
+-        full_time = squid_curtime;
+-    }
+ }
+ 
+ /// lastserver = "server last used as part of a reserved request sequence"
+ void
+ helperStatefulSubmit(statefulhelper * hlp, const char *buf, HLPCB * callback, void *data, helper_stateful_server * lastserver)
+ {
+     if (hlp == NULL) {
+         debugs(84, 3, "helperStatefulSubmit: hlp == NULL");
+         Helper::Reply nilReply;
+         callback(data, nilReply);
+         return;
+     }
+     hlp->prepSubmit();
+     hlp->submit(buf, callback, data, lastserver);
+ }
+ 
+ void statefulhelper::submit(const char *buf, HLPCB * callback, void *data, helper_stateful_server * lastserver)
+ {
+     Helper::Request *r = new Helper::Request(callback, data, buf);
+ 
+@@ -505,72 +522,77 @@
+     return srv->data;
+ }
+ 
+ /**
+  * Dump some stats about the helper states to a StoreEntry
+  */
+ void
+ helperStats(StoreEntry * sentry, helper * hlp, const char *label)
+ {
+     if (!helperStartStats(sentry, hlp, label))
+         return;
+ 
+     storeAppendPrintf(sentry, "program: %s\n",
+                       hlp->cmdline->key);
+     storeAppendPrintf(sentry, "number active: %d of %d (%d shutting down)\n",
+                       hlp->childs.n_active, hlp->childs.n_max, (hlp->childs.n_running - hlp->childs.n_active) );
+     storeAppendPrintf(sentry, "requests sent: %d\n",
+                       hlp->stats.requests);
+     storeAppendPrintf(sentry, "replies received: %d\n",
+                       hlp->stats.replies);
++    storeAppendPrintf(sentry, "requests timedout: %d\n",
++                      hlp->stats.timedout);
+     storeAppendPrintf(sentry, "queue length: %d\n",
+                       hlp->stats.queue_size);
+     storeAppendPrintf(sentry, "avg service time: %d msec\n",
+                       hlp->stats.avg_svc_time);
+     storeAppendPrintf(sentry, "\n");
+-    storeAppendPrintf(sentry, "%7s\t%7s\t%7s\t%11s\t%11s\t%s\t%7s\t%7s\t%7s\n",
++    storeAppendPrintf(sentry, "%7s\t%7s\t%7s\t%11s\t%11s\t%11s\t%s\t%7s\t%7s\t%7s\n",
+                       "ID #",
+                       "FD",
+                       "PID",
+                       "# Requests",
+                       "# Replies",
++                      "# Timed-out",
+                       "Flags",
+                       "Time",
+                       "Offset",
+                       "Request");
+ 
+     for (dlink_node *link = hlp->servers.head; link; link = link->next) {
+         helper_server *srv = (helper_server*)link->data;
+-        double tt = 0.001 * (srv->requests[0] ? tvSubMsec(srv->requests[0]->dispatch_time, current_time) : tvSubMsec(srv->dispatch_time, srv->answer_time));
+-        storeAppendPrintf(sentry, "%7u\t%7d\t%7d\t%11" PRIu64 "\t%11" PRIu64 "\t%c%c%c%c\t%7.3f\t%7d\t%s\n",
++        Helper::Request *request = srv->requests.empty() ? NULL : srv->requests.front();
++        double tt = 0.001 * (request ? tvSubMsec(request->dispatch_time, current_time) : tvSubMsec(srv->dispatch_time, srv->answer_time));
++        storeAppendPrintf(sentry, "%7u\t%7d\t%7d\t%11" PRIu64 "\t%11" PRIu64 "\t%11" PRIu64 "\t%c%c%c%c\t%7.3f\t%7d\t%s\n",
+                           srv->index.value,
+                           srv->readPipe->fd,
+                           srv->pid,
+                           srv->stats.uses,
+                           srv->stats.replies,
++                          srv->stats.timedout,
+                           srv->stats.pending ? 'B' : ' ',
+                           srv->flags.writing ? 'W' : ' ',
+                           srv->flags.closing ? 'C' : ' ',
+                           srv->flags.shutdown ? 'S' : ' ',
+                           tt < 0.0 ? 0.0 : tt,
+                           (int) srv->roffset,
+-                          srv->requests[0] ? Format::QuoteMimeBlob(srv->requests[0]->buf) : "(none)");
++                          request ? Format::QuoteMimeBlob(request->buf) : "(none)");
+     }
+ 
+     storeAppendPrintf(sentry, "\nFlags key:\n\n");
+     storeAppendPrintf(sentry, "   B = BUSY\n");
+     storeAppendPrintf(sentry, "   W = WRITING\n");
+     storeAppendPrintf(sentry, "   C = CLOSING\n");
+     storeAppendPrintf(sentry, "   S = SHUTDOWN PENDING\n");
+ }
+ 
+ void
+ helperStatefulStats(StoreEntry * sentry, statefulhelper * hlp, const char *label)
+ {
+     if (!helperStartStats(sentry, hlp, label))
+         return;
+ 
+     storeAppendPrintf(sentry, "program: %s\n",
+                       hlp->cmdline->key);
+     storeAppendPrintf(sentry, "number active: %d of %d (%d shutting down)\n",
+                       hlp->childs.n_active, hlp->childs.n_max, (hlp->childs.n_running - hlp->childs.n_active) );
+     storeAppendPrintf(sentry, "requests sent: %d\n",
+@@ -704,41 +726,41 @@
+     }
+ }
+ 
+ helper::~helper()
+ {
+     /* note, don't free id_name, it probably points to static memory */
+ 
+     if (queue.head)
+         debugs(84, DBG_CRITICAL, "WARNING: freeing " << id_name << " helper with " << stats.queue_size << " requests queued");
+ }
+ 
+ /* ====================================================================== */
+ /* LOCAL FUNCTIONS */
+ /* ====================================================================== */
+ 
+ static void
+ helperServerFree(helper_server *srv)
+ {
+     helper *hlp = srv->parent;
+     Helper::Request *r;
+-    int i, concurrency = hlp->childs.concurrency;
++    int concurrency = hlp->childs.concurrency;
+ 
+     if (!concurrency)
+         concurrency = 1;
+ 
+     if (srv->rbuf) {
+         memFreeBuf(srv->rbuf_sz, srv->rbuf);
+         srv->rbuf = NULL;
+     }
+ 
+     srv->wqueue->clean();
+     delete srv->wqueue;
+ 
+     if (srv->writebuf) {
+         srv->writebuf->clean();
+         delete srv->writebuf;
+         srv->writebuf = NULL;
+     }
+ 
+     if (Comm::IsConnOpen(srv->writePipe))
+         srv->closeWritePipeSafely(hlp->id_name);
+@@ -751,56 +773,54 @@
+     if (!srv->flags.shutdown) {
+         assert(hlp->childs.n_active > 0);
+         -- hlp->childs.n_active;
+         debugs(84, DBG_CRITICAL, "WARNING: " << hlp->id_name << " #" << srv->index << " exited");
+ 
+         if (hlp->childs.needNew() > 0) {
+             debugs(80, DBG_IMPORTANT, "Too few " << hlp->id_name << " processes are running (need " << hlp->childs.needNew() << "/" << hlp->childs.n_max << ")");
+ 
+             if (hlp->childs.n_active < hlp->childs.n_startup && hlp->last_restart > squid_curtime - 30) {
+                 if (srv->stats.replies < 1)
+                     fatalf("The %s helpers are crashing too rapidly, need help!\n", hlp->id_name);
+                 else
+                     debugs(80, DBG_CRITICAL, "ERROR: The " << hlp->id_name << " helpers are crashing too rapidly, need help!");
+             }
+ 
+             debugs(80, DBG_IMPORTANT, "Starting new helpers");
+             helperOpenServers(hlp);
+         }
+     }
+ 
+-    for (i = 0; i < concurrency; ++i) {
++    while (!srv->requests.empty()) {
+         // XXX: re-schedule these on another helper?
+-        if ((r = srv->requests[i])) {
+-            void *cbdata;
+-
+-            if (cbdataReferenceValidDone(r->data, &cbdata)) {
+-                Helper::Reply nilReply;
+-                r->callback(cbdata, nilReply);
+-            }
+-
+-            delete r;
++        r = srv->requests.front();
++        srv->requests.pop_front();
++        void *cbdata;
+ 
+-            srv->requests[i] = NULL;
++        if (cbdataReferenceValidDone(r->data, &cbdata)) {
++            Helper::Reply nilReply;
++            r->callback(cbdata, nilReply);
+         }
++
++        delete r;
+     }
+-    safe_free(srv->requests);
++    srv->requestsIndex.clear();
+ 
+     cbdataReferenceDone(srv->parent);
+     delete srv;
+ }
+ 
+ static void
+ helperStatefulServerFree(helper_stateful_server *srv)
+ {
+     statefulhelper *hlp = srv->parent;
+     Helper::Request *r;
+ 
+     if (srv->rbuf) {
+         memFreeBuf(srv->rbuf_sz, srv->rbuf);
+         srv->rbuf = NULL;
+     }
+ 
+ #if 0
+     srv->wqueue->clean();
+ 
+     delete srv->wqueue;
+@@ -845,111 +865,137 @@
+             r->callback(cbdata, nilReply);
+         }
+ 
+         delete r;
+ 
+         srv->request = NULL;
+     }
+ 
+     if (srv->data != NULL)
+         hlp->datapool->freeOne(srv->data);
+ 
+     cbdataReferenceDone(srv->parent);
+ 
+     delete srv;
+ }
+ 
+ /// Calls back with a pointer to the buffer with the helper output
+ static void
+ helperReturnBuffer(int request_number, helper_server * srv, helper * hlp, char * msg, char * msg_end)
+ {
+-    Helper::Request *r = srv->requests[request_number];
++    Helper::Request *r = NULL;
++    helper_server::RequestIndex::iterator it;
++    if (hlp->childs.concurrency) {
++        // If concurency supported retrieve request from ID
++        it = srv->requestsIndex.find(request_number);
++        if (it != srv->requestsIndex.end()) {
++            r = *(it->second);
++            srv->requests.erase(it->second);
++            srv->requestsIndex.erase(it);
++        }
++    } else if(!srv->requests.empty()) {
++        // Else get the first request from queue, if any
++        r = srv->requests.front();
++        srv->requests.pop_front();
++    }
++
+     if (r) {
+         HLPCB *callback = r->callback;
+-
+-        srv->requests[request_number] = NULL;
+-
+         r->callback = NULL;
+ 
+         void *cbdata = NULL;
++        bool retry = false;
+         if (cbdataReferenceValidDone(r->data, &cbdata)) {
+             Helper::Reply response(msg, (msg_end-msg));
+-            callback(cbdata, response);
++            if (response.result == Helper::BrokenHelper && r->retries < MAX_RETRIES) {
++                debugs(84, DBG_IMPORTANT, "ERROR: helper: " << response << ", attempt #" << (r->retries + 1) << " of 2");
++                retry = true;
++            } else
++                callback(cbdata, response);
+         }
+ 
+         -- srv->stats.pending;
+         ++ srv->stats.replies;
+ 
+         ++ hlp->stats.replies;
+ 
+         srv->answer_time = current_time;
+ 
+         srv->dispatch_time = r->dispatch_time;
+ 
+         hlp->stats.avg_svc_time =
+             Math::intAverage(hlp->stats.avg_svc_time,
+                              tvSubMsec(r->dispatch_time, current_time),
+                              hlp->stats.replies, REDIRECT_AV_FACTOR);
+ 
+-        delete r;
++        if (retry) {
++            ++r->retries;
++            hlp->submitRequest(r);
++        } else
++            delete r;
++    } else if (srv->stats.timedout){
++        debugs(84, 3, "Timedout reply received for request-ID: " << request_number << " , ignore");
+     } else {
+         debugs(84, DBG_IMPORTANT, "helperHandleRead: unexpected reply on channel " <<
+                request_number << " from " << hlp->id_name << " #" << srv->index <<
+                " '" << srv->rbuf << "'");
+     }
+ 
++    if (hlp->timeout && hlp->childs.concurrency)
++        srv->checkForTimedOutRequests(hlp->retryTimedOut);
++
+     if (!srv->flags.shutdown) {
+         helperKickQueue(hlp);
+     } else if (!srv->flags.closing && !srv->stats.pending) {
+         srv->flags.closing=true;
+         srv->writePipe->close();
+     }
+ }
+ 
+ static void
+ helperHandleRead(const Comm::ConnectionPointer &conn, char *buf, size_t len, Comm::Flag flag, int xerrno, void *data)
+ {
+     char *t = NULL;
+     helper_server *srv = (helper_server *)data;
+     helper *hlp = srv->parent;
+     assert(cbdataReferenceValid(data));
+ 
+     /* Bail out early on Comm::ERR_CLOSING - close handlers will tidy up for us */
+ 
+     if (flag == Comm::ERR_CLOSING) {
+         return;
+     }
+ 
+     assert(conn->fd == srv->readPipe->fd);
+ 
+     debugs(84, 5, "helperHandleRead: " << len << " bytes from " << hlp->id_name << " #" << srv->index);
+ 
+     if (flag != Comm::OK || len == 0) {
+         srv->closePipesSafely(hlp->id_name);
+         return;
+     }
+ 
+     srv->roffset += len;
+     srv->rbuf[srv->roffset] = '\0';
+     debugs(84, DBG_DATA, Raw("accumulated", srv->rbuf, srv->roffset));
+ 
+-    if (!srv->stats.pending) {
++    if (!srv->stats.pending && !srv->stats.timedout) {
+         /* someone spoke without being spoken to */
+         debugs(84, DBG_IMPORTANT, "helperHandleRead: unexpected read from " <<
+                hlp->id_name << " #" << srv->index << ", " << (int)len <<
+                " bytes '" << srv->rbuf << "'");
+ 
+         srv->roffset = 0;
+         srv->rbuf[0] = '\0';
+     }
+ 
+     while ((t = strchr(srv->rbuf, hlp->eom))) {
+         /* end of reply found */
+         char *msg = srv->rbuf;
+         int i = 0;
+         int skip = 1;
+         debugs(84, 3, "helperHandleRead: end of reply found");
+ 
+         if (t > srv->rbuf && t[-1] == '\r' && hlp->eom == '\n') {
+             *t = '\0';
+             // rewind to the \r octet which is the real terminal now
+             // and remember that we have to skip forward 2 places now.
+@@ -1304,66 +1350,60 @@
+     if (flag != Comm::OK) {
+         /* Helper server has crashed */
+         debugs(84, DBG_CRITICAL, "helperDispatch: Helper " << srv->parent->id_name << " #" << srv->index << " has crashed");
+         return;
+     }
+ 
+     if (!srv->wqueue->isNull()) {
+         srv->writebuf = srv->wqueue;
+         srv->wqueue = new MemBuf;
+         srv->flags.writing = true;
+         AsyncCall::Pointer call = commCbCall(5,5, "helperDispatchWriteDone",
+                                              CommIoCbPtrFun(helperDispatchWriteDone, srv));
+         Comm::Write(srv->writePipe, srv->writebuf->content(), srv->writebuf->contentSize(), call, NULL);
+     }
+ }
+ 
+ static void
+ helperDispatch(helper_server * srv, Helper::Request * r)
+ {
+     helper *hlp = srv->parent;
+-    Helper::Request **ptr = NULL;
+-    unsigned int slot;
++    const uint64_t reqId = ++srv->nextRequestId;
+ 
+     if (!cbdataReferenceValid(r->data)) {
+         debugs(84, DBG_IMPORTANT, "helperDispatch: invalid callback data");
+         delete r;
+         return;
+     }
+ 
+-    for (slot = 0; slot < (hlp->childs.concurrency ? hlp->childs.concurrency : 1); ++slot) {
+-        if (!srv->requests[slot]) {
+-            ptr = &srv->requests[slot];
+-            break;
+-        }
+-    }
+-
+-    assert(ptr);
+-    *ptr = r;
++    r->Id = reqId;
++    helper_server::Requests::iterator it = srv->requests.insert(srv->requests.end(), r);
+     r->dispatch_time = current_time;
+ 
+     if (srv->wqueue->isNull())
+         srv->wqueue->init();
+ 
+-    if (hlp->childs.concurrency)
+-        srv->wqueue->Printf("%d %s", slot, r->buf);
+-    else
++    if (hlp->childs.concurrency) {
++        srv->requestsIndex.insert(helper_server::RequestIndex::value_type(reqId, it));
++        assert(srv->requestsIndex.size() == srv->requests.size());
++        srv->wqueue->Printf("%" PRIu64 " %s", reqId, r->buf);
++    } else
+         srv->wqueue->append(r->buf, strlen(r->buf));
+ 
+     if (!srv->flags.writing) {
+         assert(NULL == srv->writebuf);
+         srv->writebuf = srv->wqueue;
+         srv->wqueue = new MemBuf;
+         srv->flags.writing = true;
+         AsyncCall::Pointer call = commCbCall(5,5, "helperDispatchWriteDone",
+                                              CommIoCbPtrFun(helperDispatchWriteDone, srv));
+         Comm::Write(srv->writePipe, srv->writebuf->content(), srv->writebuf->contentSize(), call, NULL);
+     }
+ 
+     debugs(84, 5, "helperDispatch: Request sent to " << hlp->id_name << " #" << srv->index << ", " << strlen(r->buf) << " bytes");
+ 
+     ++ srv->stats.uses;
+     ++ srv->stats.pending;
+     ++ hlp->stats.requests;
+ }
+ 
+ static void
+@@ -1449,20 +1489,77 @@
+         srv->closeWritePipeSafely(srv->parent->id_name);
+         return;
+     }
+ }
+ 
+ // TODO: should helper_ and helper_stateful_ have a common parent?
+ static bool
+ helperStartStats(StoreEntry *sentry, void *hlp, const char *label)
+ {
+     if (!hlp) {
+         if (label)
+             storeAppendPrintf(sentry, "%s: unavailable\n", label);
+         return false;
+     }
+ 
+     if (label)
+         storeAppendPrintf(sentry, "%s:\n", label);
+ 
+     return true;
+ }
++
++void
++helper_server::checkForTimedOutRequests(bool const retry)
++{
++    assert(parent->childs.concurrency);
++    while(!requests.empty() && requests.front()->timedOut(parent->timeout)) {
++        Helper::Request *r = requests.front();
++        RequestIndex::iterator it;
++        it = requestsIndex.find(r->Id);
++        assert(it != requestsIndex.end());
++        requestsIndex.erase(it);
++        requests.pop_front();
++        debugs(84, 2, "Request " << r->Id << " timed-out, remove it from queue");
++        void *cbdata;
++        bool retried = false;
++        if (retry && r->retries < MAX_RETRIES && cbdataReferenceValid(r->data)) {
++            debugs(84, 2, "Retry request " << r->Id);
++            ++r->retries;
++            parent->submitRequest(r);
++            retried = true;
++        } else if (cbdataReferenceValidDone(r->data, &cbdata)) {
++            if (!parent->onTimedOutResponse.isEmpty()) {
++                // Helper::Reply needs a non const buffer
++                char *replyMsg = xstrdup(parent->onTimedOutResponse.c_str()); 
++                r->callback(cbdata, Helper::Reply(replyMsg, strlen(replyMsg)));
++                xfree(replyMsg);
++            } else
++                r->callback(cbdata, Helper::Reply(Helper::TimedOut));
++        }
++        --stats.pending;
++        ++stats.timedout;
++        ++parent->stats.timedout;
++        if (!retried)
++            delete r;
++    }
++}
++
++void
++helper_server::requestTimeout(const CommTimeoutCbParams &io)
++{
++    debugs(26, 3, HERE << io.conn);
++    helper_server *srv = static_cast<helper_server *>(io.data);
++
++    if (!cbdataReferenceValid(srv))
++        return;
++
++    srv->checkForTimedOutRequests(srv->parent->retryTimedOut);
++
++    debugs(84, 3, HERE << io.conn << " establish new helper_server::requestTimeout");
++    AsyncCall::Pointer timeoutCall = commCbCall(84, 4, "helper_server::requestTimeout",
++                                                CommTimeoutCbPtrFun(helper_server::requestTimeout, srv));
++
++    const int timeSpent = srv->requests.empty() ? 0 : (squid_curtime - srv->requests.front()->dispatch_time.tv_sec);
++    const int timeLeft = max(1, (static_cast<int>(srv->parent->timeout) - timeSpent));
++
++    commSetConnTimeout(io.conn, timeLeft, timeoutCall);
++}
+
+=== modified file 'src/helper.h'
+--- src/helper.h	2014-11-09 21:21:15 +0000
++++ src/helper.h	2014-11-23 18:54:56 +0000
+@@ -2,95 +2,110 @@
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 84    Helper process maintenance */
+ 
+ #ifndef SQUID_HELPER_H
+ #define SQUID_HELPER_H
+ 
+ #include "base/AsyncCall.h"
+ #include "base/InstanceId.h"
+ #include "cbdata.h"
+ #include "comm/forward.h"
+ #include "dlink.h"
+ #include "helper/ChildConfig.h"
+ #include "helper/forward.h"
+ #include "ip/Address.h"
++#include "SBuf.h"
++
++#include <list>
++#include <map>
+ 
+ /**
+  * Managers a set of individual helper processes with a common queue of requests.
+  *
+  * With respect to load, a helper goes through these states (roughly):
+  *   idle:   no processes are working on requests (and no requests are queued);
+  *   normal: some, but not all processes are working (and no requests are queued);
+  *   busy:   all processes are working (and some requests are possibly queued);
+  *   full:   all processes are working and at least 2*#processes requests are queued.
+  *
+  * A "busy" helper queues new requests and issues a WARNING every 10 minutes or so.
+  * A "full" helper either drops new requests or keeps queuing them, depending on
+  *   whether the caller can handle dropped requests (trySubmit vs helperSubmit APIs).
+  * An attempt to use a "full" helper that has been "full" for 3+ minutes kills worker.
+  *   Given enough load, all helpers except for external ACL will make such attempts.
+  */
+ class helper
+ {
+     CBDATA_CLASS(helper);
+ 
+ public:
+     inline helper(const char *name) :
+             cmdline(NULL),
+             id_name(name),
+             ipc_type(0),
+             full_time(0),
+             last_queue_warn(0),
+             last_restart(0),
++            timeout(0),
++            retryTimedOut(false),
++            retryBrokenHelper(false),
+             eom('\n') {
+         memset(&stats, 0, sizeof(stats));
+     }
+     ~helper();
+ 
+     ///< whether at least one more request can be successfully submitted
+     bool queueFull() const;
+ 
+     ///< If not full, submit request. Otherwise, either kill Squid or return false.
+     bool trySubmit(const char *buf, HLPCB * callback, void *data);
+ 
++    /// Submits a request to the helper or add it to the queue if none of 
++    /// the servers is available.
++    void submitRequest(Helper::Request *r);
+ public:
+     wordlist *cmdline;
+     dlink_list servers;
+     dlink_list queue;
+     const char *id_name;
+     Helper::ChildConfig childs;    ///< Configuration settings for number running.
+     int ipc_type;
+     Ip::Address addr;
+     time_t full_time; ///< when a full helper became full (zero for non-full helpers)
+     time_t last_queue_warn;
+     time_t last_restart;
++    time_t timeout; ///< Requests timeout
++    bool retryTimedOut; ///< Whether the timed-out requests must retried
++    bool retryBrokenHelper; ///< Whether the requests must retried on BH replies
++    SBuf onTimedOutResponse; ///< The response to use when helper response timedout
+     char eom;   ///< The char which marks the end of (response) message, normally '\n'
+ 
+     struct _stats {
+         int requests;
+         int replies;
++        int timedout;
+         int queue_size;
+         int avg_svc_time;
+     } stats;
+ 
+ protected:
+     friend void helperSubmit(helper * hlp, const char *buf, HLPCB * callback, void *data);
+     void prepSubmit();
+     void submit(const char *buf, HLPCB * callback, void *data);
+ };
+ 
+ class statefulhelper : public helper
+ {
+     CBDATA_CLASS(statefulhelper);
+ 
+ public:
+     inline statefulhelper(const char *name) : helper(name), datapool(NULL), IsAvailable(NULL), OnEmptyQueue(NULL) {}
+     inline ~statefulhelper() {}
+ 
+ public:
+     MemAllocator *datapool;
+@@ -137,56 +152,73 @@
+     size_t rbuf_sz;
+     size_t roffset;
+ 
+     struct timeval dispatch_time;
+     struct timeval answer_time;
+ 
+     dlink_node link;
+ 
+     struct _helper_flags {
+         bool writing;
+         bool closing;
+         bool shutdown;
+         bool reserved;
+     } flags;
+ 
+     struct {
+         uint64_t uses;     //< requests sent to this helper
+         uint64_t replies;  //< replies received from this helper
+         uint64_t pending;  //< queued lookups waiting to be sent to this helper
+         uint64_t releases; //< times release() has been called on this helper (if stateful)
++        uint64_t timedout; //< requests which timed-out
+     } stats;
+     void initStats();
+ };
+ 
+ class MemBuf;
++class CommTimeoutCbParams;
+ 
+ class helper_server : public HelperServerBase
+ {
+     CBDATA_CLASS(helper_server);
+ 
+ public:
++    uint64_t nextRequestId;
++
+     MemBuf *wqueue;
+     MemBuf *writebuf;
+ 
+     helper *parent;
+-    Helper::Request **requests;
++
++    typedef std::list<Helper::Request *> Requests;
++    Requests requests; ///< requests in order of submission/expiration
++
++    // STL says storing std::list iterators is safe when changing the list
++    typedef std::map<uint64_t, Requests::iterator> RequestIndex;
++    RequestIndex requestsIndex; ///< maps request IDs to requests
++
++    /// Run over the active requests lists and forces a retry, or timedout reply
++    /// or the configured "on timeout response" for timedout requests.
++    void checkForTimedOutRequests(bool const retry);
++
++    /// Read timeout handler 
++    static void requestTimeout(const CommTimeoutCbParams &io);
+ };
+ 
+ class helper_stateful_server : public HelperServerBase
+ {
+     CBDATA_CLASS(helper_stateful_server);
+ 
+ public:
+     /* MemBuf wqueue; */
+     /* MemBuf writebuf; */
+ 
+     statefulhelper *parent;
+     Helper::Request *request;
+ 
+     void *data;			/* State data used by the calling routines */
+ };
+ 
+ /* helper.c */
+ void helperOpenServers(helper * hlp);
+ void helperStatefulOpenServers(statefulhelper * hlp);
+ void helperSubmit(helper * hlp, const char *buf, HLPCB * callback, void *data);
+
+=== modified file 'src/helper/Reply.cc'
+--- src/helper/Reply.cc	2014-09-25 10:34:22 +0000
++++ src/helper/Reply.cc	2014-11-17 16:18:23 +0000
+@@ -186,39 +186,42 @@
+     }
+ }
+ 
+ std::ostream &
+ operator <<(std::ostream &os, const Helper::Reply &r)
+ {
+     os << "{result=";
+     switch (r.result) {
+     case Helper::Okay:
+         os << "OK";
+         break;
+     case Helper::Error:
+         os << "ERR";
+         break;
+     case Helper::BrokenHelper:
+         os << "BH";
+         break;
+     case Helper::TT:
+         os << "TT";
+         break;
++    case Helper::TimedOut:
++        os << "Timeout";
++        break;
+     case Helper::Unknown:
+         os << "Unknown";
+         break;
+     }
+ 
+     // dump the helper key=pair "notes" list
+     if (!r.notes.empty()) {
+         os << ", notes={";
+         os << r.notes.toString("; ");
+         os << "}";
+     }
+ 
+     if (r.other().hasContent())
+         os << ", other: \"" << r.other().content() << '\"';
+ 
+     os << '}';
+ 
+     return os;
+ }
+
+=== modified file 'src/helper/Reply.h'
+--- src/helper/Reply.h	2014-09-25 10:34:22 +0000
++++ src/helper/Reply.h	2014-11-14 17:35:55 +0000
+@@ -16,41 +16,41 @@
+ #include "Notes.h"
+ 
+ #include <ostream>
+ 
+ namespace Helper
+ {
+ 
+ /**
+  * This object stores the reply message from a helper lookup
+  * It provides parser routing to accept a raw buffer and process the
+  * helper reply into fields for easy access by callers
+  */
+ class Reply
+ {
+ private:
+     // copy are prohibited for now
+     Reply(const Helper::Reply &r);
+     Reply &operator =(const Helper::Reply &r);
+ 
+ public:
+-    Reply() : result(Helper::Unknown), notes(), whichServer(NULL) {
++    explicit Reply(Helper::ResultCode res = Helper::Unknown) : result(res), notes(), whichServer(NULL) {
+         other_.init(1,1);
+         other_.terminate();
+     }
+ 
+     // create/parse details from the msg buffer provided
+     // XXX: buf should be const but parse() needs non-const for now
+     Reply(char *buf, size_t len);
+ 
+     const MemBuf &other() const { return other_; }
+ 
+     /// backward compatibility:
+     /// access to modifiable blob, required by redirectHandleReply()
+     /// and by urlParse() in ClientRequestContext::clientRedirectDone()
+     /// and by token blob/arg parsing in Negotiate auth handler
+     MemBuf &modifiableOther() const { return *const_cast<MemBuf*>(&other_); }
+ 
+     /** parse a helper response line format:
+      *   line     := [ result ] *#( kv-pair )
+      *   kv-pair := OWS token '=' ( quoted-string | token )
+      *
+
+=== modified file 'src/helper/Request.h'
+--- src/helper/Request.h	2014-10-20 06:58:59 +0000
++++ src/helper/Request.h	2014-11-23 19:19:55 +0000
+@@ -1,46 +1,58 @@
+ /*
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef _SQUID_SRC_HELPER_REQUEST_H
+ #define _SQUID_SRC_HELPER_REQUEST_H
+ 
+ #include "helper/forward.h"
++#include "SquidTime.h"
+ 
+ namespace Helper
+ {
+ 
+ class Request
+ {
+     MEMPROXY_CLASS(Helper::Request);
+ 
+ public:
+     Request(HLPCB *c, void *d, const char *b) :
+             buf(b ? xstrdup(b) : NULL),
+             callback(c),
+             data(cbdataReference(d)),
+-            placeholder(b == NULL)
++            placeholder(b == NULL),
++            Id(0),
++            retries(0)
+     {
+         memset(&dispatch_time, 0, sizeof(dispatch_time));
+     }
+ 
+     ~Request() {
+         cbdataReferenceDone(data);
+         xfree(buf);
+     }
+ 
+     char *buf;
+     HLPCB *callback;
+     void *data;
+ 
+     int placeholder;            /* if 1, this is a dummy request waiting for a stateful helper to become available */
+     struct timeval dispatch_time;
++    uint64_t Id;
++    /**
++     * A helper may configured to retry timed out requests or on BH replies.
++     * We attempt to recover by trying the lookup again, but limit the
++     * number of retries to prevent lag and lockups.
++     * This tracks the number of previous failures for the request.
++     */
++    int retries;
++    bool timedOut(time_t timeout) {return (squid_curtime - dispatch_time.tv_sec) > timeout;}
+ };
+ 
+ } // namespace Helper
+ 
+ #endif /* _SQUID_SRC_HELPER_REQUEST_H */
+
+=== modified file 'src/helper/ResultCode.h'
+--- src/helper/ResultCode.h	2014-09-24 14:07:55 +0000
++++ src/helper/ResultCode.h	2014-10-27 10:31:23 +0000
+@@ -1,29 +1,30 @@
+ /*
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef _SQUID_SRC_HELPER_RESULTCODE_H
+ #define _SQUID_SRC_HELPER_RESULTCODE_H
+ 
+ namespace Helper
+ {
+ 
+ /// enumeration value for the helper response 'result' field.
+ enum ResultCode {
+     Unknown,      // no result code received, or unknown result code
+     Okay,         // "OK" indicating success/positive result
+     Error,        // "ERR" indicating success/negative result
+     BrokenHelper, // "BH" indicating failure due to helper internal problems.
++    TimedOut,     // Request timedout
+ 
+     // result codes for backward compatibility with NTLM/Negotiate
+     // TODO: migrate to a variant of the above results with kv-pair parameters
+     TT
+ };
+ 
+ } // namespace Helper
+ 
+ #endif /* _SQUID_SRC_HELPER_RESULTCODE_H */
+
+=== modified file 'src/redirect.cc'
+--- src/redirect.cc	2014-11-09 21:21:15 +0000
++++ src/redirect.cc	2014-11-23 19:22:32 +0000
+@@ -1,32 +1,33 @@
+ /*
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 61    Redirector */
+ 
+ #include "squid.h"
+ #include "acl/Checklist.h"
++#include "cache_cf.h"
+ #include "client_side.h"
+ #include "client_side_reply.h"
+ #include "client_side_request.h"
+ #include "comm/Connection.h"
+ #include "fde.h"
+ #include "format/Format.h"
+ #include "globals.h"
+ #include "helper.h"
+ #include "helper/Reply.h"
+ #include "HttpRequest.h"
+ #include "mgr/Registration.h"
+ #include "redirect.h"
+ #include "rfc1738.h"
+ #include "SBuf.h"
+ #include "SquidConfig.h"
+ #include "Store.h"
+ #if USE_AUTH
+ #include "auth/UserRequest.h"
+ #endif
+ #if USE_OPENSSL
+@@ -338,59 +339,69 @@
+         Mgr::RegisterAction("redirector", "URL Redirector Stats", redirectStats, 0, 1);
+         Mgr::RegisterAction("store_id", "StoreId helper Stats", storeIdStats, 0, 1);
+     }
+ 
+     if (Config.Program.redirect) {
+ 
+         if (redirectors == NULL)
+             redirectors = new helper("redirector");
+ 
+         redirectors->cmdline = Config.Program.redirect;
+ 
+         // BACKWARD COMPATIBILITY:
+         // if redirectot_bypass is set then use queue_size=0 as default size
+         if (Config.onoff.redirector_bypass && Config.redirectChildren.defaultQueueSize)
+             Config.redirectChildren.queue_size = 0;
+ 
+         redirectors->childs.updateLimits(Config.redirectChildren);
+ 
+         redirectors->ipc_type = IPC_STREAM;
+ 
++        redirectors->timeout = Config.Timeout.urlRewrite;
++
++        redirectors->retryTimedOut = (Config.onUrlRewriteTimeout.action == toutActRetry);
++        redirectors->retryBrokenHelper = true; // XXX: make this configurable ?
++        redirectors->onTimedOutResponse.clear();
++        if (Config.onUrlRewriteTimeout.action == toutActUseConfiguredResponse)
++            redirectors->onTimedOutResponse.assign(Config.onUrlRewriteTimeout.response);
++
+         helperOpenServers(redirectors);
+     }
+ 
+     if (Config.Program.store_id) {
+ 
+         if (storeIds == NULL)
+             storeIds = new helper("store_id");
+ 
+         storeIds->cmdline = Config.Program.store_id;
+ 
+         // BACKWARD COMPATIBILITY:
+         // if store_id_bypass is set then use queue_size=0 as default size
+         if (Config.onoff.store_id_bypass && Config.storeIdChildren.defaultQueueSize)
+             Config.storeIdChildren.queue_size = 0;
+ 
+         storeIds->childs.updateLimits(Config.storeIdChildren);
+ 
+         storeIds->ipc_type = IPC_STREAM;
+ 
++        storeIds->retryBrokenHelper = true; // XXX: make this configurable ?
++
+         helperOpenServers(storeIds);
+     }
+ 
+     if (Config.redirector_extras) {
+         redirectorExtrasFmt = new ::Format::Format("url_rewrite_extras");
+         (void)redirectorExtrasFmt->parse(Config.redirector_extras);
+     }
+ 
+     if (Config.storeId_extras) {
+         storeIdExtrasFmt = new ::Format::Format("store_id_extras");
+         (void)storeIdExtrasFmt->parse(Config.storeId_extras);
+     }
+ 
+     init = true;
+ }
+ 
+ void
+ redirectShutdown(void)
+ {
+     /** FIXME: Temporary unified helpers Shutdown
+
+=== modified file 'src/redirect.h'
+--- src/redirect.h	2014-09-13 13:59:43 +0000
++++ src/redirect.h	2014-11-14 17:43:10 +0000
+@@ -1,23 +1,25 @@
+ /*
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 61    Redirector */
+ 
+ #ifndef SQUID_REDIRECT_H_
+ #define SQUID_REDIRECT_H_
+ 
+ #include "helper.h"
+ 
++enum TimeoutAction {toutActBypass, toutActFail, toutActRetry, toutActUseConfiguredResponse};
++
+ class ClientHttpRequest;
+ 
+ void redirectInit(void);
+ void redirectShutdown(void);
+ void redirectStart(ClientHttpRequest *, HLPCB *, void *);
+ void storeIdStart(ClientHttpRequest *, HLPCB *, void *);
+ 
+ #endif /* SQUID_REDIRECT_H_ */
+
+=== modified file 'tools/helper-mux/helper-mux.pl.in'
+--- tools/helper-mux/helper-mux.pl.in	2014-11-01 05:04:05 +0000
++++ tools/helper-mux/helper-mux.pl.in	2014-11-23 11:50:39 +0000
+@@ -75,131 +75,145 @@
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
+ 
+ =cut
+ 
+ #mux-ed format: "slot_num non_muxed_request"
+ 
+ # options handling
+ my %opts=();
+ $Getopt::Std::STANDARD_HELP_VERSION=1;
+ getopts('h', \%opts) or die ("unrecognized options");
+ if (defined $opts{h}) {
+ 	HELP_MESSAGE();
+ 	exit 0;
+ }
+ my $actual_helper_cmd=join(" ",@ARGV);
+ 
+ # variables initialization
+ my %helpers=();
++my $helpers_running = 0;
+ my $rvec='';
+ vec($rvec,0,1)=1; #stdin
+ my $nfound;
+ my ($rd,$wr,$cl);
+ 
+ # signal handlers
+ $SIG{'HUP'}=\&dump_state;
+ $SIG{'CHLD'}=\&reaper;
+ # TODO: signal handling for child dying
+ 
+ # main loop
+ $|=1;
+ while(1) {
+ 	print STDERR "selecting\n";
+ 	$nfound=select($rd=$rvec,undef,undef,undef);
+ 	#$nfound=select($rd=$rvec,undef,$cl=$rvec,undef);
+ 	print STDERR "nfound: $nfound\n";
+ 	if ($nfound == -1 ) {
+ 		print STDERR "error in select: $!\n";
+ 		if ($!{ERESTART} || $!{EAGAIN} || $!{EINTR}) {
+ 			next;
+ 		}
+ 		exit 1;
+ 	}
+ 	#print STDERR "cl: ", unpack("b*", $cl) ,"\n";
+ 	print STDERR "rd: ", unpack("b*", $rd) ,"\n";
+ 	# stdin is special
+ 	#if (vec($cl,0,1)==1) { #stdin was closed
+ 	#	print STDERR "stdin closed\n";
+ 	#	exit(0);
+ 	#}
+ 	if (vec($rd,0,1)==1) { #got stuff from stdin
+ 		#TODO: handle leftover buffers? I hope that 40kb are enough..
+ 		$nread=sysread(STDIN,$_,40960); # read 40kb
+ 		# clear the signal-bit, stdin is special
+ 		vec($rd,0,1)=0;
+ 		if ($nread==0) {
+ 			print STDERR "nothing read from stdin\n";
+ 			exit 0;
+ 		}
+-		foreach $req (split("\n",$_)) {
+-			dispatch_request($_);
++		foreach $req (split("\n",$_ )) {
++			dispatch_request($req);
+ 		}
+ 	}
+ 	# find out if any filedesc was closed
+ 	if ($cl != 0) {
+ 		#TODO: better handle helper restart
+ 		print STDERR "helper crash?";
+ 		exit 1;
+ 	}
+ 	#TODO: is it possible to test the whole bitfield in one go?
+ 	#      != won't work.
+ 	foreach $h (keys %helpers) {
+ 		my %hlp=%{$helpers{$h}};
+ 		#print STDERR "examining helper slot $h, fileno $hlp{fno}, filemask ", vec($rd,$hlp{fno},1) , "\n";
+ 		if (vec($rd,$hlp{fno},1)==1) {
+ 			#print STDERR "found\n";
+ 			handle_helper_response($h);
+ 		}
+ 		#no need to clear, it will be reset when iterating
+ 	}
+ }
+ 
+ sub dispatch_request {
+ 	my $line=$_[0];
+ 	my %h;
+ 
+ 	#print STDERR "dispatching request $_";
+ 	$line =~ /^(\d+) (.*)$/;
+-	my $slot=$1;
++	my $reqId=$1;
+ 	my $req=$2;
+ 
+-	if (!exists($helpers{$slot})) {
+-		$helpers{$slot}=init_subprocess();
++        undef $h;
++	# Find a free helper
++	foreach $slot ( 1 .. ($helpers_running)) {
++		if (!defined($helpers{$slot}->{lastcmd})) {
++			$h = $helpers{$slot};
++			last;
++		}
++	}
++	# If none create one
++	if (!defined($h)) {
++		$helpers_running = $helpers_running + 1;
++		$helpers{$helpers_running}=init_subprocess();
++		$h = $helpers{$helpers_running};
++		# print STDERR "Now $helpers_running helpers running\n";
+ 	}
+-	$h=$helpers{$slot};
++
+ 	$wh=$h->{wh};
+ 	$rh=$h->{rh};
+ 	$h->{lastcmd}=$req;
++	$h->{reqId}=$reqId;
+ 	print $wh "$req\n";
+ }
+ 
+ # gets in a slot number having got some response.
+ # reads the response from the helper and sends it back to squid
+ # prints the response back
+ sub handle_helper_response {
+ 	my $h=$_[0];
+ 	my ($nread,$resp);
+ 	$nread=sysread($helpers{$h}->{rh},$resp,40960);
+ 	#print STDERR "got $resp from slot $h\n";
+-	print $h, " ", $resp;
++	print $helpers{$h}->{reqId}, " ", $resp;
+ 	delete $helpers{$h}->{lastcmd};
+ }
+ 
+ # a subprocess is a hash with members:
+ #  pid => $pid
+ #  rh => read handle
+ #  wh => write handle
+ #  fno => file number of the read handle
+ #  lastcmd => the command "in flight"
+ # a ref to such a hash is returned by this call
+ sub init_subprocess {
+ 	my %rv=();
+ 	my ($rh,$wh,$pid);
+ 	$pid=open2($rh,$wh,$actual_helper_cmd);
+ 	if ($pid == 0) {
+ 		die "Failed to fork helper process";
+ 	}
+ 	select($rh); $|=1;
+ 	select($wh); $|=1;
+ 	select(STDOUT);
+

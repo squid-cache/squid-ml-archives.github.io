@@ -1,0 +1,279 @@
+FtpServer.cc:1024: "reply != NULL" assertion
+
+Handle nil HttpReply pointer inside various handlers called from
+Ftp::Server::handleReply(). For example, when the related StoreEntry
+object is aborted, the client_side_reply.cc code may call the
+Ftp::Server::handleReply() method with a nil reply pointer.
+
+The Ftp::Server::handleReply() methods itself cannot handle nil replies
+because they are valid in many states. Only state-specific handlers know
+whether they need the reply.
+
+The Ftp::Server::handleReply() method is called [via Store] from Client code.
+Thus, exceptions in handleReply() are handled by the Ftp::Client job. That job
+does not have enough information to know whether the client-to-Squid connection
+should be closed; the job keeps the connection open. When the reply is nil,
+that open connection becomes unusable, leading to more problems.
+
+This patch fixes the Ftp::Server::handleReply() to handle exceptions,
+including closing the connections in the case of an exception. It also
+adds Must(reply) checks to check for nil HttpReply pointers where the
+reply is required. Eventually, Store should start using async calls to
+protect jobs waiting for Store updates. Meanwhile, this should help.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2015-01-13 09:13:49 +0000
++++ src/servers/FtpServer.cc	2015-08-18 15:09:20 +0000
+@@ -768,55 +768,61 @@
+             !context->http->al->reply && reply) {
+         context->http->al->reply = reply;
+         HTTPMSGLOCK(context->http->al->reply);
+     }
+ 
+     static ReplyHandler handlers[] = {
+         NULL, // fssBegin
+         NULL, // fssConnected
+         &Ftp::Server::handleFeatReply, // fssHandleFeat
+         &Ftp::Server::handlePasvReply, // fssHandlePasv
+         &Ftp::Server::handlePortReply, // fssHandlePort
+         &Ftp::Server::handleDataReply, // fssHandleDataRequest
+         &Ftp::Server::handleUploadReply, // fssHandleUploadRequest
+         &Ftp::Server::handleEprtReply,// fssHandleEprt
+         &Ftp::Server::handleEpsvReply,// fssHandleEpsv
+         NULL, // fssHandleCwd
+         NULL, // fssHandlePass
+         NULL, // fssHandleCdup
+         &Ftp::Server::handleErrorReply // fssError
+     };
+-    const Server &server = dynamic_cast<const Ftp::Server&>(*context->getConn());
+-    if (const ReplyHandler handler = handlers[server.master->serverState])
+-        (this->*handler)(reply, data);
+-    else
+-        writeForwardedReply(reply);
++    try {
++        const Server &server = dynamic_cast<const Ftp::Server&>(*context->getConn());
++        if (const ReplyHandler handler = handlers[server.master->serverState])
++            (this->*handler)(reply, data);
++        else
++            writeForwardedReply(reply);
++    } catch (const std::exception &e) {
++        callException(e);
++        throw TexcHere(e.what());
++    }
+ }
+ 
+ void
+ Ftp::Server::handleFeatReply(const HttpReply *reply, StoreIOBuffer)
+ {
+     if (getCurrentContext()->http->request->errType != ERR_NONE) {
+         writeCustomReply(502, "Server does not support FEAT", reply);
+         return;
+     }
+ 
++    Must(reply);
+     HttpReply::Pointer featReply = Ftp::HttpReplyWrapper(211, "End", Http::scNoContent, 0);
+     HttpHeader const &serverReplyHeader = reply->header;
+ 
+     HttpHeaderPos pos = HttpHeaderInitPos;
+     bool hasEPRT = false;
+     bool hasEPSV = false;
+     int prependSpaces = 1;
+ 
+     featReply->header.putStr(HDR_FTP_PRE, "\"211-Features:\"");
+     const int scode = serverReplyHeader.getInt(HDR_FTP_STATUS);
+     if (scode == 211) {
+         while (const HttpHeaderEntry *e = serverReplyHeader.getEntry(&pos)) {
+             if (e->id == HDR_FTP_PRE) {
+                 // assume RFC 2389 FEAT response format, quoted by Squid:
+                 // <"> SP NAME [SP PARAMS] <">
+                 // but accommodate MS servers sending four SPs before NAME
+ 
+                 // command name ends with (SP parameter) or quote
+                 static const CharacterSet AfterFeatNameChars("AfterFeatName", " \"");
+                 static const CharacterSet FeatNameChars = AfterFeatNameChars.complement("FeatName");
+@@ -1004,41 +1010,42 @@
+         debugs(33, 3, "FTP reply data transfer failed: STREAM_FAILED");
+         writeCustomReply(451, "Server error; transfer aborted");
+         break;
+     default:
+         fatal("unreachable code");
+     }
+ 
+     closeDataConnection();
+ }
+ 
+ void
+ Ftp::Server::handleUploadReply(const HttpReply *reply, StoreIOBuffer)
+ {
+     writeForwardedReply(reply);
+     // note that the client data connection may already be closed by now
+ }
+ 
+ void
+ Ftp::Server::writeForwardedReply(const HttpReply *reply)
+ {
+-    assert(reply != NULL);
++    Must(reply);
++
+     const HttpHeader &header = reply->header;
+     // adaptation and forwarding errors lack HDR_FTP_STATUS
+     if (!header.has(HDR_FTP_STATUS)) {
+         writeForwardedForeign(reply); // will get to Ftp::Server::wroteReply
+         return;
+     }
+ 
+     typedef CommCbMemFunT<Server, CommIoCbParams> Dialer;
+     AsyncCall::Pointer call = JobCallback(33, 5, Dialer, this, Ftp::Server::wroteReply);
+     writeForwardedReplyAndCall(reply, call);
+ }
+ 
+ void
+ Ftp::Server::handleEprtReply(const HttpReply *reply, StoreIOBuffer)
+ {
+     if (getCurrentContext()->http->request->errType != ERR_NONE) {
+         writeCustomReply(502, "Server does not support PASV (converted from EPRT)", reply);
+         return;
+     }
+ 
+@@ -1085,41 +1092,41 @@
+     if (request->errDetail > 0) {
+         // XXX: > 0 may not always mean that this is an errno
+         mb.Printf("%i-Error: (%d) %s\r\n", scode,
+                   request->errDetail,
+                   strerror(request->errDetail));
+     }
+ 
+ #if USE_ADAPTATION
+     // XXX: Remove hard coded names. Use an error page template instead.
+     const Adaptation::History::Pointer ah = request->adaptHistory();
+     if (ah != NULL) { // XXX: add adapt::<all_h but use lastMeta here
+         const String info = ah->allMeta.getByName("X-Response-Info");
+         const String desc = ah->allMeta.getByName("X-Response-Desc");
+         if (info.size())
+             mb.Printf("%i-Information: %s\r\n", scode, info.termedBuf());
+         if (desc.size())
+             mb.Printf("%i-Description: %s\r\n", scode, desc.termedBuf());
+     }
+ #endif
+ 
+-    assert(reply != NULL);
++    Must(reply);
+     const char *reason = reply->header.has(HDR_FTP_REASON) ?
+                          reply->header.getStr(HDR_FTP_REASON):
+                          reply->sline.reason();
+ 
+     mb.Printf("%i %s\r\n", scode, reason); // error terminating line
+ 
+     // TODO: errorpage.cc should detect FTP client and use
+     // configurable FTP-friendly error templates which we should
+     // write to the client "as is" instead of hiding most of the info
+ 
+     writeReply(mb);
+ }
+ 
+ /// writes FTP response based on HTTP reply that is not an FTP-response wrapper
+ /// for example, internally-generated Squid "errorpages" end up here (for now)
+ void
+ Ftp::Server::writeForwardedForeign(const HttpReply *reply)
+ {
+     changeState(fssConnected, "foreign reply");
+     closeDataConnection();
+@@ -1659,37 +1666,48 @@
+     ClientHttpRequest *const http = context->http;
+     assert(http != NULL);
+     assert(http->storeEntry() == NULL);
+ 
+     HttpReply *const reply = Ftp::HttpReplyWrapper(code, msg, Http::scNoContent, 0);
+ 
+     setLogUri(http, urlCanonicalClean(http->request));
+ 
+     clientStreamNode *const node = context->getClientReplyContext();
+     clientReplyContext *const repContext =
+         dynamic_cast<clientReplyContext *>(node->data.getRaw());
+     assert(repContext != NULL);
+ 
+     RequestFlags reqFlags;
+     reqFlags.cachable = false; // force releaseRequest() in storeCreateEntry()
+     reqFlags.noCache = true;
+     repContext->createStoreEntry(http->request->method, reqFlags);
+     http->storeEntry()->replaceHttpReply(reply);
+ }
+ 
++void
++Ftp::Server::callException(const std::exception &e)
++{
++    debugs(33, 2, "FTP::Server job caught: " << e.what());
++    closeDataConnection();
++    unpinConnection(true);
++    if (Comm::IsConnOpen(clientConnection))
++        clientConnection->close();
++    AsyncJob::callException(e);
++}
++
+ /// Whether Squid FTP Relay supports a named feature (e.g., a command).
+ static bool
+ Ftp::SupportedCommand(const SBuf &name)
+ {
+     static std::set<SBuf> BlackList;
+     if (BlackList.empty()) {
+         /* Add FTP commands that Squid cannot relay correctly. */
+ 
+         // We probably do not support AUTH TLS.* and AUTH SSL,
+         // but let's disclaim all AUTH support to KISS, for now.
+         BlackList.insert(cmdAuth());
+     }
+ 
+     // we claim support for all commands that we do not know about
+     return BlackList.find(name) == BlackList.end();
+ }
+ 
+
+=== modified file 'src/servers/FtpServer.h'
+--- src/servers/FtpServer.h	2015-01-13 09:13:49 +0000
++++ src/servers/FtpServer.h	2015-08-18 15:08:26 +0000
+@@ -38,40 +38,42 @@
+ /// Transaction information shared among our FTP client and server jobs.
+ class MasterState: public RefCountable
+ {
+ public:
+     typedef RefCount<MasterState> Pointer;
+ 
+     MasterState(): serverState(fssBegin), clientReadGreeting(false) {}
+ 
+     Ip::Address clientDataAddr; ///< address of our FTP client data connection
+     SBuf workingDir; ///< estimated current working directory for URI formation
+     ServerState serverState; ///< what our FTP server is doing
+     bool clientReadGreeting; ///< whether our FTP client read their FTP server greeting
+ };
+ 
+ /// Manages a control connection from an FTP client.
+ class Server: public ConnStateData
+ {
+ public:
+     explicit Server(const MasterXaction::Pointer &xact);
+     virtual ~Server();
++    /* AsyncJob API */
++    virtual void callException(const std::exception &e) override;
+ 
+     // This is a pointer in hope to minimize future changes when MasterState
+     // becomes a part of MasterXaction. Guaranteed not to be nil.
+     MasterState::Pointer master; ///< info shared among our FTP client and server jobs
+ 
+ protected:
+     friend void StartListening();
+ 
+     // errors detected before it is possible to create an HTTP request wrapper
+     typedef enum {
+         eekHugeRequest,
+         eekMissingLogin,
+         eekMissingUsername,
+         eekMissingHost,
+         eekUnsupportedCommand,
+         eekInvalidUri,
+         eekMalformedCommand
+     } EarlyErrorKind;
+ 
+     /* ConnStateData API */
+

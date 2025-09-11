@@ -1,0 +1,425 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] initial GnuTLS support for encrypted server connections
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20initial%20GnuTLS%20support%20for%20encrypted%20server%0A%20connections&In-Reply-To=%3C3ebb620d-de72-a462-99da-40a7de275982%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="007788.html">
+   <LINK REL="Next"  HREF="007796.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20initial%20GnuTLS%20support%20for%20encrypted%20server%0A%20connections&In-Reply-To=%3C3ebb620d-de72-a462-99da-40a7de275982%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Thu Jan 19 07:16:09 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007788.html">[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections
+</A></li>
+        <LI>Next message: <A HREF="007796.html">[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7795">[ date ]</a>
+              <a href="thread.html#7795">[ thread ]</a>
+              <a href="subject.html#7795">[ subject ]</a>
+              <a href="author.html#7795">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 15/01/2017 8:09 p.m., Alex Rousskov wrote:
+&gt;<i> On 01/14/2017 10:16 AM, Amos Jeffries wrote:
+</I>&gt;<i> 
+</I>&gt;&gt;<i> The Security::SessionPointer is converted to std::shared_ptr. This is
+</I>&gt;&gt;<i> required because GnuTLS does not expose the locking like OpenSSL. Since
+</I>&gt;&gt;<i> we store the SessionPointer to fd_table[].ssl we can always access it
+</I>&gt;&gt;<i> from there one way or another and there is actually no need for OpenSSL
+</I>&gt;&gt;<i> locking sessions now.
+</I>&gt;<i> 
+</I>&gt;&gt;<i> -typedef Security::LockingPointer&lt;SSL, Security::SSL_free_cpp, HardFun&lt;int, SSL *, SSL_up_ref&gt; &gt; SessionPointer;
+</I>&gt;&gt;<i> +typedef std::shared_ptr&lt;SSL&gt; SessionPointer;
+</I>&gt;<i> 
+</I>&gt;<i> I am trying to understand how a standard std::shared_ptr can co-exist
+</I>&gt;<i> with OpenSSL locking. Even if Squid does not lock the SSL object,
+</I>&gt;<i> OpenSSL would still lock and unlock it, destroying the SSL object when
+</I>&gt;<i> its OpenSSL lock counter reaches zero, regardless of our
+</I>&gt;<i> std::shared_ptr&lt;SSL&gt; state. What am I missing?
+</I>
+OpenSSL itself registers one lock when SSL_new() is called, and only
+unlocks that when SSL_free() is called by the last shared_ptr being
+cleared/deleted/dropped/de-referenced.
+
+When our CreateSession() function calls the library SSL_new()
+function we pass the result immediately to a shared_ptr constructor,
+along with a lambda which calls the matching SSL_free() function.
+
+So long as the shared_ptr has references it does not call the Deletor.
+
+In other words; whenever the shared_ptr has a non-nil value the library
+lock count is &gt;= 1.
+
+Meaning we no longer perform the detailed lock management ourselves,
+just use share_ptr the way it is designed to be used.
+
+
+&gt;<i> 
+</I>&gt;<i> Also, if OpenSSL requires that the SSL object is freed using an
+</I>&gt;<i> SSL_free() function, how can std::shared_ptr&lt;SSL&gt; be compatible with
+</I>&gt;<i> OpenSSL without that knowledge?
+</I>
+Via the custom Deletor lambda.
+
+&gt;<i> 
+</I>&gt;<i> Does the patched code continue to work well with OpenSSL?
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;&gt;<i>      // Our job is done. The callabck recepient will probably close the failed
+</I>&gt;&gt;<i>      // peer connection and try another peer or go direct (if possible). We
+</I>&gt;&gt;<i>      // can close the connection ourselves (our error notification would reach
+</I>&gt;&gt;<i>      // the recepient before the fd-closure notification), but we would rather
+</I>&gt;&gt;<i>      // minimize the number of fd-closure notifications and let the recepient
+</I>&gt;&gt;<i>      // manage the TCP state of the connection.
+</I>&gt;&gt;<i> +
+</I>&gt;&gt;<i> +#if USE_GNUTLS
+</I>&gt;&gt;<i> +    // but we do need to release the bad TLS related details in fd_table
+</I>&gt;&gt;<i> +    // ... or GnuTLS will SEGFAULT.
+</I>&gt;&gt;<i> +    const int fd = serverConnection()-&gt;fd;
+</I>&gt;&gt;<i> +    Security::SessionClose(fd_table[fd].ssl, fd);
+</I>&gt;&gt;<i> +#endif
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> The &quot;or GnuTLS will SEGFAULT&quot; part is a red flag for me. Squid may close
+</I>&gt;<i> the connection without or before reaching this particular method (for a
+</I>&gt;<i> variety of reasons). A connection closure should always be safe. Please
+</I>&gt;<i> explain why the usual connection closing steps cannot &quot;release the bad
+</I>&gt;<i> TLS related details in fd_table&quot; [but the above code can].
+</I>&gt;<i> 
+</I>&gt;<i> And why should GnuTLS be treated as a special case here compared to OpenSSL?
+</I>&gt;<i> 
+</I>
+Since I wrote that I have fixed some crashes related to priorities not
+being set.  Re-testing has not repeated that particular crash, so removing.
+
+However, I think long term we should probably do something along these
+lines anyway when bailing out of PeerConnector. The fd_table is left in
+a horrible state with some things added (or not) by failed Job.
+
+
+&gt;<i> 
+</I>&gt;&gt;<i> +#if !USE_OPENSSL &amp;&amp; USE_GNUTLS
+</I>&gt;&gt;<i> +typedef std::unique_ptr&lt;struct gnutls_priority_st, HardFun&lt;void, gnutls_priority_t, &amp;gnutls_priority_deinit&gt;&gt; ParsedOptionsPointer;
+</I>&gt;&gt;<i> +#else
+</I>&gt;&gt;<i> +typedef std::unique_ptr&lt;long&gt; ParsedOptionsPointer;
+</I>&gt;&gt;<i> +#endif
+</I>&gt;<i> 
+</I>&gt;<i> It looks strange that GnuTLS is OK with std::unique_ptr&lt;long&gt; as a
+</I>&gt;<i> ParsedOptionsPointer when built together with OpenSSL but not when built
+</I>&gt;<i> alone. I doubt that is what you meant, but that is how this #if
+</I>&gt;<i> statement reads.
+</I>
+That is exactly what I meant there and elsewhere with the same.
+
+Squid _can_ be built with both libraries --with-* statements. In that
+case the OpenSSL logic should be used where possible since it is the
+more well-tested code. But there are some features (like squidclient)
+that are only using GnuTLS even when the main binary uses OpenSSL.
+
+So I/we need to enforce the 'only one library' thing explicitly with the
+USE_* macros. The USE_GNUTLS code block should always be either an #elif
+after a USE_OPENSSL block, or used in a way that prevents it being
+enabled when OpenSSL is linked and does the same feature.
+
+Double-checking that I've found a few that were not. They are now also
+fixed in this updated patch.
+
+
+&gt;<i> 
+</I>&gt;&gt;<i> +    // 'options=' value being set to session is a GnuTLS specific thing.
+</I>&gt;&gt;<i> +#if !USE_OPENSSL &amp;&amp; USE_GNUTLS
+</I>&gt;<i> 
+</I>&gt;<i> A similar concern here: If options value being set to session is a
+</I>&gt;<i> GnuTLS-specific thing, why is the code not executed for GnuTLS when it
+</I>&gt;<i> is built together with OpenSSL? In other words, why mention OpenSSL in a
+</I>&gt;<i> GnuTLS-specific code?
+</I>&gt;<i> 
+</I>&gt;<i> I suspect that we can never build with both OpenSSL and GnuTLS enabled
+</I>&gt;<i> at the same time. If that assumption is correct, then please remove the
+</I>&gt;<i> !USE_OPENSSL part from these (and any similar) conditions. They only
+</I>&gt;<i> create unnecessary doubts. And add an OpenSSL-specific conditions
+</I>&gt;<i> elsewhere as/if needed, of course.
+</I>
+see above.
+
+&gt;<i> 
+</I>&gt;&gt;<i> +#if !USE_OPENSSL &amp;&amp; USE_GNUTLS
+</I>&gt;&gt;<i> +typedef std::unique_ptr&lt;struct gnutls_priority_st, HardFun&lt;void, gnutls_priority_t, &amp;gnutls_priority_deinit&gt;&gt; ParsedOptionsPointer;
+</I>&gt;&gt;<i> +#else
+</I>&gt;&gt;<i> +typedef std::unique_ptr&lt;long&gt; ParsedOptionsPointer;
+</I>&gt;&gt;<i> +#endif
+</I>&gt;<i> 
+</I>&gt;<i> Why does OpenSSL need a pointer here? 
+</I>
+Doesn't. Reverted to a plain long as suggested.
+
+&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> What if parsedOptions is nil here? parseOptions() are not called if
+</I>&gt;<i> sslOptions are empty and if there are no options=... in configuration so
+</I>&gt;<i> parsedOptions might be nil in some cases. I do not know whether we are
+</I>&gt;<i> lucky that they are never nil in these particular cases.
+</I>
+
+Good catch. Probably just lucky. I was (badly) trying to make the
+generic code just always use Pointer. But as you mention this one is
+rarely used outside of that library-specific code anyway.
+
+&gt;<i> 
+</I>&gt;<i> Moreover, should not the options always be initialized, even when
+</I>&gt;<i> sslOptions are empty, so that we do not need to worry about their
+</I>&gt;<i> pointer being nil? For OpenSSL where there is no
+</I>&gt;<i> gnutls_set_default_priority(), but even that code can use empty
+</I>&gt;<i> sslOptions string to detect that defaults are in use. After all, OpenSSL
+</I>&gt;<i> was fine with non-pointer options before these changes...
+</I>&gt;<i> 
+</I>
+Since we need to initialize memory from the library in the case of
+GnuTLS it seems to be better to simply do nothing in that case and use
+the absence of a pointer value as the flag.
+
+This also works a bit cleaner with the sslOptions.isEmpty() case in
+parseOptions() for the below issue.
+
+&gt;<i> 
+</I>&gt;&gt;<i> +    const char *priorities = (sslOptions.isEmpty() ? nullptr : sslOptions.c_str());
+</I>&gt;&gt;<i> +    int x = gnutls_priority_init(&amp;op, priorities, &amp;err);
+</I>&gt;<i> 
+</I>&gt;<i> Are you sure gnutls_priority_init() can handle nil priorities c-string?
+</I>&gt;<i> Just checking -- the manual page does not say...
+</I>
+Good point. Making it skip this and fallback on the default priorities
+use-case when sslOptions is empty.
+
+&gt;<i> 
+</I>&gt;<i> BTW, you can make &quot;x&quot; constant here. Giving it a more telling name like
+</I>&gt;<i> &quot;result&quot; here and in similar code would be nice too.
+</I>&gt;<i> 
+</I>
+Shuffled the function call so x no longer exists.
+
+&gt;<i> 
+</I>&gt;&gt;<i> +        fatalf(&quot;Unknown TLS option '%s'&quot;, err);
+</I>&gt;<i> 
+</I>&gt;<i> s/option/option near/ -- the err does not isolate the unknown option name.
+</I>
+The err is pointed to the start of the option(s) which is unknown.
+Simple test shows that is correct:
+
+ 2017/01/17 01:42:28| Processing: tls_outgoing_options
+options=NORMAL:fooo_broken
+ 2017/01/17 01:42:29| Not currently OK to rewrite swap log.
+ 2017/01/17 01:42:29| storeDirWriteCleanLogs: Operation aborted.
+ FATAL: Unknown TLS option 'fooo_broken'
+
+The equivalent OpenSSL logic does the same output, but for each
+individual broken option as an ERROR message. And does not exit with
+fatal. Which is unfortunately not [yet] possible for GnuTLS.
+
+&gt;<i> 
+</I>&gt;&gt;<i> +        debugs(83, 1, &quot;Failed to set TLS options. error: &quot; &lt;&lt; Security::ErrorString(x));
+</I>&gt;<i> 
+</I>&gt;<i> Use DBG_IMPORTANT instead of 1?
+</I>&gt;<i> 
+</I>&gt;<i> It would be nice to print sslOptions that we failed to set (in case of
+</I>&gt;<i> non-nil parsedOptions) or mention that they were &quot;default&quot; (otherwise).
+</I>&gt;<i> 
+</I>
+Done.
+
+&gt;&gt;<i>  {
+</I>&gt;&gt;<i> +    if (!sslOptions.isEmpty())
+</I>&gt;&gt;<i> +        parseOptions(parsedOptions); // re-parse after sslOptions copied.
+</I>&gt;&gt;<i>      memcpy(&amp;flags, &amp;p.flags, sizeof(flags));
+</I>&gt;&gt;<i>  }
+</I>&gt;<i> 
+</I>&gt;<i> Have you considered using a shared_ptr for GnuTLS so that we do not have
+</I>&gt;<i> to reparse when copying?
+</I>
+Now done the required research, and yes we can use shared_ptr there.
+
+We cannot go the whole way to avoiding pointers entirely like OpenSSL
+does since priority_t is a raw-pointer to a struct with complex setter
+functionality hidden away internally.
+
+&gt;<i> 
+</I>&gt;&gt;<i> +Security::PeerOptions::operator =(const Security::PeerOptions &amp;p)
+</I>&gt;&gt;<i> +{
+</I>&gt;&gt;<i> +    sslOptions = p.sslOptions;
+</I>&gt;&gt;<i> +    if (!sslOptions.isEmpty())
+</I>&gt;&gt;<i> +        parseOptions(parsedOptions); // re-parse after sslOptions copied.
+</I>&gt;<i> 
+</I>&gt;<i> Missing parseOptions reset when p.sslOptions are empty but
+</I>&gt;<i> this-&gt;sslOptions where not.
+</I>
+Done by removing the if and using shared_ptr. Same in copy-constructor.
+
+&gt;<i> 
+</I>&gt;&gt;<i>  #if USE_OPENSSL
+</I>&gt;&gt;<i> +        // NP: GnuTLS uses 'priorities' which are set per-session instead.
+</I>&gt;&gt;<i> +        SSL_CTX_set_options(t.get(), (setOptions ? *parsedOptions : 0));
+</I>&gt;&gt;<i> +
+</I>&gt;&gt;<i>          // XXX: temporary performance regression. c_str() data copies and prevents this being a const method
+</I>&gt;&gt;<i> -        Ssl::InitClientContext(t, *this, (setOptions ? parsedOptions : 0), parsedFlags);
+</I>&gt;&gt;<i> +        Ssl::InitClientContext(t, *this, parsedFlags);
+</I>&gt;&gt;<i>  #endif
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> It feels like the SSL_CTX_set_options() call belongs to the
+</I>&gt;<i> InitClientContext() function. I can easily imagine somebody moving the
+</I>&gt;<i> InitClientContext() call while forgetting to move the
+</I>&gt;<i> SSL_CTX_set_options() call with it. InitClientContext() is supposed to
+</I>&gt;<i> initialize the context and setting options is one of the initialization
+</I>&gt;<i> steps...
+</I>
+I am in the process of decomposing Ssl::InitClientContext() down into
+methods of PeerOptions. So in future there wont be a
+Ssl::InitClientContext(). Instead one will use the generic
+cfg.secure.createClientContext().
+
+That is already allowing a lot of de-duplication between the code
+initialization of client and server contexts, and the ssl-bump vs accel
+server contexts creation.
+
+
+&gt;<i> 
+</I>&gt;<i> BTW, is that XXX comment about c_str() stale? I do not see a c_str in
+</I>&gt;<i> this code...
+</I>&gt;<i> 
+</I>
+It refers to a c_str() which still exists inside the
+Ssl::InitClientContext and affects the const-ness of the method calling
+that function. When the decomposing is done so will die that XXX.
+
+&gt;<i> 
+</I>&gt;&gt;<i> +        BIO_TO_CLIENT = GNUTLS_SERVER,
+</I>&gt;&gt;<i> +        BIO_TO_SERVER = GNUTLS_CLIENT
+</I>&gt;<i> 
+</I>&gt;<i> BIO_WITH_CLIENT and BIO_WITH_SERVER may be better names for
+</I>&gt;<i> _bidirectional_ I/O. Might as well fix this if you have to touch all the
+</I>&gt;<i> code using these names anyway.
+</I>&gt;<i> 
+</I>
+Nod. Though I would like to drop the &quot;BIO&quot; part and keep the &quot;TO&quot;.
+ For now I left is as-was to reduce the impact on Christos.
+
+The directional property of the word &quot;TO&quot; seems a more clear indicator
+about the situation where the enum are used. By comparision, creating
+credentials context &quot;WITH_X&quot; has silent implication that it is *our*
+side of things that has/is the X.
+
+And now the enum is outsde of class Bio, it could be used for
+other non-bidirectional things as well.
+
+Left this as-was for now.
+
+&gt;<i> 
+</I>&gt;&gt;<i> +Security::PeerOptions::parseOptions(Security::ParsedOptionsPointer &amp;theOut)
+</I>&gt;<i> 
+</I>&gt;<i> Please do not use the prefix &quot;the&quot; for parameter names. The prefix is
+</I>&gt;<i> used for [older] class data member names so naming method parameters
+</I>&gt;<i> with that prefix confuses the reader of the method who keeps looking for
+</I>&gt;<i> a data member named theOut.
+</I>
+Done.
+
+&gt;<i> 
+</I>&gt;<i> Moreover, if the parseOptions() method is always called with the
+</I>&gt;<i> parsedOptions argument that is a data member of the same PeerOptions
+</I>&gt;<i> class, then why do you need to pass parsedOptions as a parameter at all?
+</I>&gt;<i> The method can just reset parsedOptions directly.
+</I>&gt;<i> 
+</I>
+Done.
+
+&gt;<i> 
+</I>&gt;&gt;<i> +/// close an active TLS session.
+</I>&gt;&gt;<i> +/// set fdOnError to the connection FD when the session is being closed
+</I>&gt;&gt;<i> +/// due to an encryption error, otherwise omit.
+</I>&gt;&gt;<i> +void SessionClose(const Security::SessionPointer &amp;, int fdOnError = -1);
+</I>&gt;<i> 
+</I>&gt;<i> Please split SessionClose() into two different functions, one for each
+</I>&gt;<i> use case (initiating proper SSL connection closure vs. immediate SSL
+</I>&gt;<i> connection state destruction). Mixing the two actions results in
+</I>&gt;<i> confusing API instructions and dangerous usage/implementation IMO.
+</I>&gt;<i> 
+</I>
+Well, there is no such thing as a &quot;SSL connection&quot; - it is security
+added onto some *other* Transport Protocol's layer.
+&lt;<A HREF="http://www.gnutls.org/manual/gnutls.html#TLS-layers">http://www.gnutls.org/manual/gnutls.html#TLS-layers</A>&gt;
+
+I agree 'close' is a bad word there, but doing what you suggest assumes
+there is a connection to close and/or data is being destroyed.
+Neither of those is actually happening.
+
+Since the only case where (fd != -1) has been removed in the above
+alterations I dropped the FD stuff and named it SessionSendGoodbye() -
+which is all it does now.
+
+
+&gt;<i> I suggest StartSessionClosing() and DestroySession() names (while going
+</I>&gt;<i> along with the current terrible choice of calling both SSL connections
+</I>&gt;<i> and SSL sessions &quot;sessions&quot; which leads to code that close an SSL
+</I>&gt;<i> &quot;session&quot; while reusing the associated SSL session!).
+</I>&gt;<i> 
+</I>
+There is no explicit destroy for SSL sessions. They can timeout of the
+resume cache or be stopped from performing I/O on a particular Transport
+FD/socket. The shutdown/goodbye action appears to be a temporary state
+in the presence of resuming sessions.
+
+Amos
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007788.html">[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections
+</A></li>
+	<LI>Next message: <A HREF="007796.html">[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7795">[ date ]</a>
+              <a href="thread.html#7795">[ thread ]</a>
+              <a href="subject.html#7795">[ subject ]</a>
+              <a href="author.html#7795">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,235 @@
+MUST respond with 414 (URI Too Long) when request target exceeds limits.
+
+Before the fix, Squid simply closed client connection after receiving a
+huge URI (or a huge request-line), violating the RFC 7230 MUST. This
+happened because a high-level Must(have buffer space) check in
+ConnStateData::clientParseRequests() would throw an exception. Now these
+problems are detected inside the low-level RequestParser code, where we
+can distinguish huge URIs from huge methods.
+
+=== modified file 'src/http/one/RequestParser.cc'
+--- src/http/one/RequestParser.cc	2016-05-20 08:28:33 +0000
++++ src/http/one/RequestParser.cc	2016-08-22 22:14:35 +0000
+@@ -45,68 +45,63 @@
+  * Parsing state is stored between calls to avoid repeating buffer scans.
+  * If garbage is found the parsing offset is incremented.
+  */
+ void
+ Http::One::RequestParser::skipGarbageLines()
+ {
+     if (Config.onoff.relaxed_header_parser) {
+         if (Config.onoff.relaxed_header_parser < 0 && (buf_[0] == '\r' || buf_[0] == '\n'))
+             debugs(74, DBG_IMPORTANT, "WARNING: Invalid HTTP Request: " <<
+                    "CRLF bytes received ahead of request-line. " <<
+                    "Ignored due to relaxed_header_parser.");
+         // Be tolerant of prefix empty lines
+         // ie any series of either \n or \r\n with no other characters and no repeated \r
+         while (!buf_.isEmpty() && (buf_[0] == '\n' || (buf_[0] == '\r' && buf_[1] == '\n'))) {
+             buf_.consume(1);
+         }
+     }
+ }
+ 
+ /**
+  * Attempt to parse the method field out of an HTTP message request-line.
+  *
+  * Governed by:
+  *  RFC 1945 section 5.1
+  *  RFC 7230 section 2.6, 3.1 and 3.5
+  */
+ bool
+ Http::One::RequestParser::parseMethodField(Http1::Tokenizer &tok)
+ {
+     // method field is a sequence of TCHAR.
+-    // Limit to 32 characters to prevent overly long sequences of non-HTTP
+-    // being sucked in before mismatch is detected. 32 is itself annoyingly
+-    // big but there are methods registered by IANA that reach 17 bytes:
+-    //  http://www.iana.org/assignments/http-methods
+-    static const size_t maxMethodLength = 32; // TODO: make this configurable?
+ 
+     SBuf methodFound;
+-    if (!tok.prefix(methodFound, CharacterSet::TCHAR, maxMethodLength)) {
++    if (!tok.prefix(methodFound, CharacterSet::TCHAR, MaxMethodLength)) {
+         debugs(33, ErrorLevel(), "invalid request-line: missing or malformed method");
+         parseStatusCode = Http::scBadRequest;
+         return false;
+     }
+     method_ = HttpRequestMethod(methodFound);
+     return true;
+ }
+ 
+ /// the characters which truly are valid within URI
+ static const CharacterSet &
+ UriValidCharacters()
+ {
+     /* RFC 3986 section 2:
+      * "
+      *   A URI is composed from a limited set of characters consisting of
+      *   digits, letters, and a few graphic symbols.
+      * "
+      */
+     static const CharacterSet UriChars =
+         CharacterSet("URI-Chars","") +
+         // RFC 3986 section 2.2 - reserved characters
+         CharacterSet("gen-delims", ":/?#[]@") +
+         CharacterSet("sub-delims", "!$&'()*+,;=") +
+         // RFC 3986 section 2.3 - unreserved characters
+         CharacterSet::ALPHA +
+         CharacterSet::DIGIT +
+         CharacterSet("unreserved", "-._~") +
+         // RFC 3986 section 2.1 - percent encoding "%" HEXDIG
+         CharacterSet("pct-encoded", "%") +
+         CharacterSet::HEXDIG;
+@@ -242,67 +237,83 @@
+             parseStatusCode = Http::scBadRequest;
+             return false;
+         }
+     }
+     return true;
+ }
+ 
+ /**
+  * Attempt to parse the first line of a new request message.
+  *
+  * Governed by:
+  *  RFC 1945 section 5.1
+  *  RFC 7230 section 2.6, 3.1 and 3.5
+  *
+  * \retval -1  an error occurred. parseStatusCode indicates HTTP status result.
+  * \retval  1  successful parse. member fields contain the request-line items
+  * \retval  0  more data is needed to complete the parse
+  */
+ int
+ Http::One::RequestParser::parseRequestFirstLine()
+ {
+     debugs(74, 5, "parsing possible request: buf.length=" << buf_.length());
+     debugs(74, DBG_DATA, buf_);
+ 
+     SBuf line;
+ 
+     // Earlier, skipGarbageLines() took care of any leading LFs (if allowed).
+     // Now, the request line has to end at the first LF.
+     static const CharacterSet lineChars = CharacterSet::LF.complement("notLF");
+     ::Parser::Tokenizer lineTok(buf_);
++    const CharacterSet &delimiters = DelimiterCharacters();
++
+     if (!lineTok.prefix(line, lineChars) || !lineTok.skip('\n')) {
++        if (buf_.length() >= Config.maxRequestHeaderSize) {
++            Http1::Tokenizer methodTok(buf_);
++            // check whether request method is too long
++            if (parseMethodField(methodTok) && methodTok.skipAll(delimiters)) {
++                debugs(74, ErrorLevel(), "invalid request-line exceeds " <<
++                        Config.maxRequestHeaderSize << "-byte limit");
++                parseStatusCode = Http::scUriTooLong;
++            } else if (parseStatusCode == Http::scNone) {
++                debugs(74, ErrorLevel(), "invalid request-line: method exceeds " <<
++                        MaxMethodLength << "-byte limit");
++                parseStatusCode = Http::scBadRequest;
++            }
++            assert(parseStatusCode != Http::scNone);
++            return -1;
++        }
+         debugs(74, 5, "Parser needs more data");
+         return 0;
+     }
+ 
+     Http1::Tokenizer tok(line);
+-    const CharacterSet &delimiters = DelimiterCharacters();
+ 
+     if (!parseMethodField(tok))
+         return -1;
+ 
+     if (!skipDelimiter(tok.skipAll(delimiters)))
+         return -1;
+ 
+     /* now parse backwards, to leave just the URI */
+     if (!skipTrailingCrs(tok))
+         return -1;
+ 
+     if (!parseHttpVersionField(tok))
+         return -1;
+ 
+     if (!http0() && !skipDelimiter(tok.skipAllTrailing(delimiters)))
+         return -1;
+ 
+     /* parsed everything before and after the URI */
+ 
+     if (!parseUriField(tok))
+         return -1;
+ 
+     if (!tok.atEnd()) {
+         debugs(33, ErrorLevel(), "invalid request-line: garbage after URI");
+         parseStatusCode = Http::scBadRequest;
+         return -1;
+     }
+ 
+     parseStatusCode = Http::scOkay;
+     buf_ = lineTok.remaining(); // incremental parse checkpoint
+
+=== modified file 'src/http/one/RequestParser.h'
+--- src/http/one/RequestParser.h	2016-05-20 08:28:33 +0000
++++ src/http/one/RequestParser.h	2016-08-22 16:29:11 +0000
+@@ -17,56 +17,62 @@
+ }
+ 
+ namespace Http {
+ namespace One {
+ 
+ /** HTTP/1.x protocol request parser
+  *
+  * Works on a raw character I/O buffer and tokenizes the content into
+  * the major CRLF delimited segments of an HTTP/1 request message:
+  *
+  * \item request-line (method, URL, protocol, version)
+  * \item mime-header (set of RFC2616 syntax header fields)
+  */
+ class RequestParser : public Http1::Parser
+ {
+ public:
+     RequestParser();
+     virtual ~RequestParser() {}
+ 
+     /* Http::One::Parser API */
+     virtual void clear() {*this = RequestParser();}
+     virtual Http1::Parser::size_type firstLineSize() const;
+     virtual bool parse(const SBuf &aBuf);
+ 
+     /// the HTTP method if this is a request message
+     const HttpRequestMethod & method() const {return method_;}
+ 
+     /// the request-line URI if this is a request message, or an empty string.
+     const SBuf &requestUri() const {return uri_;}
+ 
++    // Limit to 32 characters to prevent overly long sequences of non-HTTP
++    // being sucked in before mismatch is detected. 32 is itself annoyingly
++    // big but there are methods registered by IANA that reach 17 bytes:
++    //  http://www.iana.org/assignments/http-methods
++    static const size_t MaxMethodLength = 32; // TODO: make this configurable?
++
+ private:
+     void skipGarbageLines();
+     int parseRequestFirstLine();
+ 
+     /* all these return false and set parseStatusCode on parsing failures */
+     bool parseMethodField(Http1::Tokenizer &);
+     bool parseUriField(Http1::Tokenizer &);
+     bool parseHttpVersionField(Http1::Tokenizer &);
+     bool skipDelimiter(const size_t count);
+     bool skipTrailingCrs(Http1::Tokenizer &tok);
+ 
+     bool http0() const {return !msgProtocol_.major;}
+     static const CharacterSet &RequestTargetCharacters();
+ 
+     /// what request method has been found on the first line
+     HttpRequestMethod method_;
+ 
+     /// raw copy of the original client request-line URI field
+     SBuf uri_;
+ };
+ 
+ } // namespace One
+ } // namespace Http
+ 
+ #endif /*  _SQUID_SRC_HTTP_ONE_REQUESTPARSER_H */
+ 
+

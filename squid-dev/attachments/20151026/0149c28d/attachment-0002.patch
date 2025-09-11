@@ -1,0 +1,309 @@
+To avoid crashes, prohibit pointless reconfiguration during shutdown.
+
+Also consolidated and polished signal action handling code:
+
+1. For any executed action X, clear do_X at the beginning of action X
+   code because once we start X, we should accept/queue more X
+   requests (or inform the admin if we reject them).
+
+2. Delay any action X requested during startup or reconfiguration
+   because the latter two actions modify global state that X depends
+   on. Inform the admin that the requested action is being delayed.
+
+3. Cancel any action X requested during shutdown. We cannot run X
+   during shutdown because shutdown modifies global state that X
+   depends on, and we never come back from shutdown so there is no
+   point in delaying X. Inform the admin that the requested action is
+   canceled.
+
+The child signal handling action is exempt from rules #2 and #3
+because its code does not depend on Squid state.
+
+Repeated failed attempts to fix crashes related to various overlapping
+actions confirm that this code is a lot trickier than it looks. This
+change introduces a more systematic/comprehensive approach to
+resolving associated conflicts compared to previous ad hoc attempts.
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2015-10-12 01:38:02 +0000
++++ src/main.cc	2015-10-25 17:13:45 +0000
+@@ -220,100 +220,126 @@ private:
+         Auth::Scheme::FreeAll();
+ #endif
+ 
+         eventAdd("SquidTerminate", &StopEventLoop, NULL, 0, 1, false);
+     }
+ 
+     void doShutdown(time_t wait);
+     void handleStoppedChild();
+ 
+ #if KILL_PARENT_OPT
+     bool parentKillNotified;
+     pid_t parentPid;
+ #endif
+ };
+ 
+ int
+ SignalEngine::checkEvents(int)
+ {
+     PROF_start(SignalEngine_checkEvents);
+ 
+-    if (do_reconfigure) {
+-        if (!reconfiguring && configured_once) {
+-            mainReconfigureStart();
+-            do_reconfigure = 0;
+-        } // else wait until previous reconfigure is done
+-    } else if (do_rotate) {
++    if (do_reconfigure)
++        mainReconfigureStart();
++    else if (do_rotate)
+         mainRotate();
+-        do_rotate = 0;
+-    } else if (do_shutdown) {
++    else if (do_shutdown)
+         doShutdown(do_shutdown > 0 ? (int) Config.shutdownLifetime : 0);
+-        do_shutdown = 0;
+-    }
+-    if (do_handle_stopped_child) {
+-        do_handle_stopped_child = 0;
++    if (do_handle_stopped_child)
+         handleStoppedChild();
+-    }
+     PROF_stop(SignalEngine_checkEvents);
+     return EVENT_IDLE;
+ }
+ 
++/// Decides whether the signal-controlled action X should be delayed, canceled,
++/// or executed immediately. Clears do_X (via signalVar) as needed.
++static bool
++AvoidSignalAction(const char *description, volatile int &signalVar)
++{
++    const char *avoiding = "delaying";
++    const char *currentEvent = "none";
++    if (shutting_down) {
++        currentEvent = "shutdown";
++        avoiding = "canceling";
++        signalVar = 0;
++    }
++    else if (!configured_once)
++        currentEvent = "startup";
++    else if (reconfiguring)
++        currentEvent = "reconfiguration";
++    else {
++        signalVar = 0;
++        return false; // do not avoid (i.e., execute immediately)
++        // the caller may produce a signal-specific debugging message
++    }
++
++    debugs(1, DBG_IMPORTANT, avoiding << ' ' << description <<
++           " request during " << currentEvent);
++    return true;
++}
++
+ void
+ SignalEngine::doShutdown(time_t wait)
+ {
++    if (AvoidSignalAction("shutdown", do_shutdown))
++        return;
++
+     debugs(1, DBG_IMPORTANT, "Preparing for shutdown after " << statCounter.client_http.requests << " requests");
+     debugs(1, DBG_IMPORTANT, "Waiting " << wait << " seconds for active connections to finish");
+ 
+ #if KILL_PARENT_OPT
+     if (!IamMasterProcess() && !parentKillNotified && ShutdownSignal > 0 && parentPid > 1) {
+         debugs(1, DBG_IMPORTANT, "Killing master process, pid " << parentPid);
+         if (kill(parentPid, ShutdownSignal) < 0)
+             debugs(1, DBG_IMPORTANT, "kill " << parentPid << ": " << xstrerror());
+         parentKillNotified = true;
+     }
+ #endif
+ 
+     if (shutting_down) {
+ #if !KILL_PARENT_OPT
+         // Already a shutdown signal has received and shutdown is in progress.
+         // Shutdown as soon as possible.
+         wait = 0;
+ #endif
+     } else {
+         shutting_down = 1;
+ 
+         /* run the closure code which can be shared with reconfigure */
+         serverConnectionsClose();
+ 
+         RunRegisteredHere(RegisteredRunner::startShutdown);
+     }
+ 
+ #if USE_WIN32_SERVICE
+     WIN32_svcstatusupdate(SERVICE_STOP_PENDING, (wait + 1) * 1000);
+ #endif
+ 
+     eventAdd("SquidShutdown", &FinalShutdownRunners, this, (double) (wait + 1), 1, false);
+ }
+ 
+ void
+ SignalEngine::handleStoppedChild()
+ {
++    // no AvoidSignalAction() call: This code can run at any time because it
++    // does not depend on Squid state. It does not need debugging because it
++    // handles an "internal" signal, not an external/admin command.
++    do_handle_stopped_child = 0;
+ #if !_SQUID_WINDOWS_
+     PidStatus status;
+     pid_t pid;
+ 
+     do {
+         pid = WaitForAnyPid(status, WNOHANG);
+ 
+ #if HAVE_SIGACTION
+ 
+     } while (pid > 0);
+ 
+ #else
+ 
+     }
+     while (pid > 0 || (pid < 0 && errno == EINTR));
+ #endif
+ #endif
+ }
+ 
+ static void
+@@ -788,40 +814,43 @@ serverConnectionsClose(void)
+     }
+     if (IamWorkerProcess()) {
+         clientConnectionsClose();
+         icpConnectionShutdown();
+ #if USE_HTCP
+         htcpSocketShutdown();
+ #endif
+ 
+         icmpEngine.Close();
+ #if SQUID_SNMP
+         snmpClosePorts();
+ #endif
+ 
+         asnFreeMemory();
+     }
+ }
+ 
+ static void
+ mainReconfigureStart(void)
+ {
++    if (AvoidSignalAction("reconfiguration", do_reconfigure))
++        return;
++
+     debugs(1, DBG_IMPORTANT, "Reconfiguring Squid Cache (version " << version_string << ")...");
+     reconfiguring = 1;
+ 
+     // Initiate asynchronous closing sequence
+     serverConnectionsClose();
+     icpClosePorts();
+ #if USE_HTCP
+     htcpClosePorts();
+ #endif
+     Dns::Shutdown();
+ #if USE_SSL_CRTD
+     Ssl::Helper::GetInstance()->Shutdown();
+ #endif
+ #if USE_OPENSSL
+     if (Ssl::CertValidationHelper::GetInstance())
+         Ssl::CertValidationHelper::GetInstance()->Shutdown();
+     Ssl::TheGlobalContextStorage.reconfigureStart();
+ #endif
+     redirectShutdown();
+ #if USE_AUTH
+@@ -945,49 +974,48 @@ mainReconfigureFinish(void *)
+ 
+     if (unlinkdNeeded())
+         unlinkdInit();
+ 
+ #if USE_DELAY_POOLS
+     Config.ClientDelay.finalize();
+ #endif
+ 
+     if (Config.onoff.announce) {
+         if (!eventFind(start_announce, NULL))
+             eventAdd("start_announce", start_announce, NULL, 3600.0, 1);
+     } else {
+         if (eventFind(start_announce, NULL))
+             eventDelete(start_announce, NULL);
+     }
+ 
+     if (!InDaemonMode())
+         writePidFile(); /* write PID file */
+ 
+     reconfiguring = 0;
+-
+-    // ignore any pending re-reconfigure signals if shutdown received
+-    if (do_shutdown)
+-        do_reconfigure = 0;
+ }
+ 
+ static void
+ mainRotate(void)
+ {
++    if (AvoidSignalAction("log rotation", do_rotate))
++        return;
++
+     icmpEngine.Close();
+     redirectShutdown();
+ #if USE_AUTH
+     authenticateRotate();
+ #endif
+     externalAclShutdown();
+ 
+     _db_rotate_log();       /* cache.log */
+     storeDirWriteCleanLogs(1);
+     storeLogRotate();       /* store.log */
+     accessLogRotate();      /* access.log */
+ #if ICAP_CLIENT
+     icapLogRotate();               /*icap.log*/
+ #endif
+     icmpEngine.Open();
+     redirectInit();
+ #if USE_AUTH
+     authenticateInit(&Auth::TheConfig);
+ #endif
+     externalAclInit();
+@@ -1459,41 +1487,40 @@ SquidMain(int argc, char **argv)
+ 
+         storeFsInit();      /* required for config parsing */
+ 
+         /* TODO: call the FS::Clean() in shutdown to do Fs cleanups */
+         Fs::Init();
+ 
+         /* May not be needed for parsing, have not audited for such */
+         DiskIOModule::SetupAllModules();
+ 
+         /* Shouldn't be needed for config parsing, but have not audited for such */
+         StoreFileSystem::SetupAllFs();
+ 
+         /* we may want the parsing process to set this up in the future */
+         Store::Root(new StoreController);
+         Auth::Init();      /* required for config parsing. NOP if !USE_AUTH */
+         Ip::ProbeTransport(); // determine IPv4 or IPv6 capabilities before parsing.
+ 
+         Format::Token::Init(); // XXX: temporary. Use a runners registry of pre-parse runners instead.
+ 
+         try {
+-            do_reconfigure = 0; // ignore any early (boot/startup) reconfigure signals
+             parse_err = parseConfigFile(ConfigFile);
+         } catch (...) {
+             // for now any errors are a fatal condition...
+             debugs(1, DBG_CRITICAL, "FATAL: Unhandled exception parsing config file." <<
+                    (opt_parse_cfg_only ? " Run squid -k parse and check for errors." : ""));
+             parse_err = 1;
+         }
+ 
+         Mem::Report();
+ 
+         if (opt_parse_cfg_only || parse_err > 0)
+             return parse_err;
+     }
+     setUmask(Config.umask);
+     if (-1 == opt_send_signal)
+         if (checkRunningPid())
+             exit(0);
+ 
+ #if TEST_ACCESS
+ 
+

@@ -1,0 +1,156 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] LockingPointer API update
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20LockingPointer%20API%20update&In-Reply-To=%3C576AC3C0.4080908%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006028.html">
+   <LINK REL="Next"  HREF="006032.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] LockingPointer API update</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20LockingPointer%20API%20update&In-Reply-To=%3C576AC3C0.4080908%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] LockingPointer API update">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Wed Jun 22 16:58:40 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006028.html">[squid-dev] [PATCH] LockingPointer API update
+</A></li>
+        <LI>Next message: <A HREF="006032.html">[squid-dev] [PATCH] LockingPointer API update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6031">[ date ]</a>
+              <a href="thread.html#6031">[ thread ]</a>
+              <a href="subject.html#6031">[ subject ]</a>
+              <a href="author.html#6031">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 06/22/2016 05:29 AM, Amos Jeffries wrote:
+&gt;<i> On 22/06/2016 10:42 p.m., Christos Tsantilas wrote:
+</I>&gt;&gt;<i> On 06/22/2016 07:32 AM, Amos Jeffries wrote:
+</I>&gt;&gt;&gt;<i> 1) PeekingPeerConnector::handleServerCertificate() doing
+</I>&gt;&gt;&gt;<i> serverBump-&gt;serverCert.reset(serverCert.release())
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> On much closer inspection it appears not a bug. But is doing move
+</I>&gt;&gt;&gt;<i> semantics without a move operator relying heavily on specific
+</I>&gt;&gt;&gt;<i> implementation detail of TidyPointer API exposure.
+</I>
+&gt;&gt;<i> This is not bug. The call
+</I>&gt;&gt;<i> newServerCertPointer.reset(oldServerCertPointer.release())
+</I>&gt;&gt;<i> just moves the X509 object with the current locks to the
+</I>&gt;&gt;<i> newServerCertPointer.
+</I>
+&gt;<i> Yeah. Thats move semantics.
+</I>
+Agreed.
+
+
+&gt;<i> LockingPointer has a move assignment operator for doing that in clearer
+</I>&gt;<i> way now in trunk - and 3.5 when built with C++11 compiler.
+</I>
+At the risk of sounding like a broken record, I have to note that a move
+assignment operator is an _optimization_. It is _not_ a clearer way of
+doing anything. It is a cheaper way. It is not triggered except in some
+special circumstances [that are usually absent in the current
+LockingPointer code]. A move method alone is neither necessary nor
+usually sufficient for move semantics support.
+
+Even if all non-clearing LockingPointer::reset() calls are there to
+_move_ things, we still cannot merge reset() and resetAndLock() because
+it would be trivial for the code to accidentally call the assignment
+operator (that locks) instead of the move assignment operator (that does
+not lock).
+
+
+&gt;<i> The above code becomes:
+</I>&gt;<i> 
+</I>&gt;<i>   Security::CertPointer serverCert;
+</I>&gt;<i>   if (...) {
+</I>&gt;<i>     // We need to lock here because the destructor of
+</I>&gt;<i>     // serverCert will call X509_free and decrease the lock
+</I>&gt;<i> 
+</I>&gt;<i>     // operator =() copy-assign does the lock stuff
+</I>&gt;<i> 
+</I>&gt;<i>     serverCert = serverBump-&gt;serverCert;
+</I>&gt;<i>
+</I>&gt;<i>   } else {
+</I>&gt;<i>     // We do not need to lock here, the SSL_get_peer_certificate
+</I>&gt;<i>     // already increases the clock counter and we have to
+</I>&gt;<i>     // free with X509_free.
+</I>&gt;<i> 
+</I>&gt;<i>     // CertPointer() constructor builds object without locking it
+</I>&gt;<i>     // assuming SSL_get_peer_certificate() did the lock for it.
+</I>&gt;<i> 
+</I>&gt;<i>     // operator =() move-assign or copy-assign does the lock stuff
+</I>&gt;<i> 
+</I>&gt;<i>     serverCert = Security::CertPointer(SSL_get_peer_certificate(ssl)));
+</I>&gt;<i>   }
+</I>&gt;<i>   // serverCert::~serverCert() called on function
+</I>&gt;<i>   // leave, calling X509_free.
+</I>
+As Christos has said or implied, this approach assumes that
+Security::CertPointer is an assignable pointer (e.g., LockingPointer)
+and not a TidyPointer that does not have an assignment operator (by
+design). There is nothing wrong with that approach per se, but this is
+not what your patch (and approach known as #1) was about.
+
+If you are switching to approach #2, then I agree with Christos that we
+should remove TidyPointer as a LockingPointer parent. LockingPointer
+should use TidyPointer as the type of its pointer data member instead:
+
+  template &lt;...&gt;
+  class LockingPointer {
+  ...
+  private:
+      TidyPointer&lt;...&gt; pointer; ///&lt; owns the object we lock
+  };
+
+
+&gt;<i> But, the GnuTLS builds will need an equivalent Pointer with a different
+</I>&gt;<i> lock action to handle session pointers.
+</I>
+Besides the TidyPointer disassociation sketched above, I suggest
+replacing the &quot;int lock&quot; LockingPointer template parameter with a
+locking function parameter. With some [trivial] wrappers for OpenSSL's
+&quot;CRYPTO_add(..., lock)&quot;, it might work well for both GnuTLS and OpenSSL
+needs.
+
+
+HTH,
+
+Alex.
+
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006028.html">[squid-dev] [PATCH] LockingPointer API update
+</A></li>
+	<LI>Next message: <A HREF="006032.html">[squid-dev] [PATCH] LockingPointer API update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6031">[ date ]</a>
+              <a href="thread.html#6031">[ thread ]</a>
+              <a href="subject.html#6031">[ subject ]</a>
+              <a href="author.html#6031">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

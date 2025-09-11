@@ -1,0 +1,169 @@
+=== modified file 'src/CachePeer.h'
+--- src/CachePeer.h	2015-03-23 10:20:17 +0000
++++ src/CachePeer.h	2015-11-09 09:14:36 +0000
+@@ -119,6 +119,7 @@
+ #if PEER_MULTICAST_SIBLINGS
+         bool mcast_siblings;
+ #endif
++        bool auth_no_keytab;
+     } options;
+ 
+     int weight;
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2015-10-27 03:45:40 +0000
++++ src/FwdState.cc	2015-11-09 09:45:50 +0000
+@@ -964,11 +964,13 @@
+         ++ serverConnection()->getPeer()->stats.fetches;
+         request->peer_login = serverConnection()->getPeer()->login;
+         request->peer_domain = serverConnection()->getPeer()->domain;
++        request->flags.auth_no_keytab = serverConnection()->getPeer()->options.auth_no_keytab;
+         httpStart(this);
+     } else {
+         assert(!request->flags.sslPeek);
+         request->peer_login = NULL;
+         request->peer_domain = NULL;
++        request->flags.auth_no_keytab = 0;
+ 
+         switch (request->url.getScheme()) {
+ #if USE_OPENSSL
+
+=== modified file 'src/RequestFlags.h'
+--- src/RequestFlags.h	2015-01-13 07:25:36 +0000
++++ src/RequestFlags.h	2015-11-09 09:14:36 +0000
+@@ -30,6 +30,8 @@
+     bool ims :1;
+     /** request is authenticated */
+     bool auth :1;
++    /** do not use keytabs for peer Kerberos authentication */
++    bool auth_no_keytab :1;
+     /** he response to the request may be stored in the cache */
+     bool cachable :1;
+     /** the request can be forwarded through the hierarchy */
+
+=== modified file 'src/cache_cf.cc'
+--- src/cache_cf.cc	2015-11-04 16:42:55 +0000
++++ src/cache_cf.cc	2015-11-09 09:39:40 +0000
+@@ -2165,6 +2165,8 @@
+         } else if (!strncmp(token, "login=", 6)) {
+             p->login = xstrdup(token + 6);
+             rfc1738_unescape(p->login);
++        } else if (!strcmp(token, "auth-no-keytab")) {
++            p->options.auth_no_keytab = 1;
+         } else if (!strncmp(token, "connect-timeout=", 16)) {
+             p->connect_timeout = xatoi(token + 16);
+         } else if (!strncmp(token, "connect-fail-limit=", 19)) {
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2015-11-05 15:50:04 +0000
++++ src/cf.data.pre	2015-11-09 09:14:36 +0000
+@@ -3175,6 +3175,12 @@
+ 			Default is auto to automatically determine the status
+ 			of the peer.
+ 	
++	auth-no-keytab
++			Do not use a keytab to authenticate to a peer when
++			login=NEGOTIATE is specified. Let the GSSAPI
++			implementation determine which already existing
++			credentials cache to use instead.
++	
+ 	
+ 	==== SSL / HTTPS / TLS OPTIONS ====
+ 	
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2015-10-15 02:52:58 +0000
++++ src/http.cc	2015-11-09 09:14:36 +0000
+@@ -1722,10 +1722,15 @@
+     if (strncmp(request->peer_login, "NEGOTIATE",strlen("NEGOTIATE")) == 0) {
+         char *Token=NULL;
+         char *PrincipalName=NULL,*p;
++        int negotiate_flags = 0;
++
+         if ((p=strchr(request->peer_login,':')) != NULL ) {
+             PrincipalName=++p;
+         }
+-        Token = peer_proxy_negotiate_auth(PrincipalName, request->peer_host);
++        if (request->flags.auth_no_keytab) {
++            negotiate_flags |= PEER_PROXY_NEGOTIATE_NOKEYTAB;
++        }
++        Token = peer_proxy_negotiate_auth(PrincipalName, request->peer_host, negotiate_flags);
+         if (Token) {
+             httpHeaderPutStrf(hdr_out, header, "Negotiate %s",Token);
+         }
+
+=== modified file 'src/peer_proxy_negotiate_auth.cc'
+--- src/peer_proxy_negotiate_auth.cc	2015-04-21 04:50:22 +0000
++++ src/peer_proxy_negotiate_auth.cc	2015-11-09 09:14:36 +0000
+@@ -499,7 +499,7 @@
+  * peer_proxy_negotiate_auth gets a GSSAPI token for principal_name
+  * and base64 encodes it.
+  */
+-char *peer_proxy_negotiate_auth(char *principal_name, char *proxy) {
++char *peer_proxy_negotiate_auth(char *principal_name, char *proxy, int flags) {
+     int rc = 0;
+     OM_uint32 major_status, minor_status;
+     gss_ctx_id_t gss_context = GSS_C_NO_CONTEXT;
+@@ -517,16 +517,18 @@
+         return NULL;
+     }
+ 
+-    if (principal_name)
+-        debugs(11, 5,
+-               HERE << "Creating credential cache for " << principal_name);
+-    else
+-        debugs(11, 5, HERE << "Creating credential cache");
+-    rc = krb5_create_cache(NULL, principal_name);
+-    if (rc) {
+-        debugs(11, 5, HERE << "Error : Failed to create Kerberos cache");
+-        krb5_cleanup();
+-        return NULL;
++    if (!(flags & PEER_PROXY_NEGOTIATE_NOKEYTAB)) {
++        if (principal_name)
++            debugs(11, 5,
++                   HERE << "Creating credential cache for " << principal_name);
++        else
++            debugs(11, 5, HERE << "Creating credential cache");
++        rc = krb5_create_cache(NULL, principal_name);
++        if (rc) {
++            debugs(11, 5, HERE << "Error : Failed to create Kerberos cache");
++            krb5_cleanup();
++            return NULL;
++        }
+     }
+ 
+     service.value = (void *) xmalloc(strlen("HTTP") + strlen(proxy) + 2);
+
+=== modified file 'src/peer_proxy_negotiate_auth.h'
+--- src/peer_proxy_negotiate_auth.h	2015-01-13 07:25:36 +0000
++++ src/peer_proxy_negotiate_auth.h	2015-11-09 09:14:36 +0000
+@@ -10,8 +10,11 @@
+ #define SQUID_PEER_PROXY_NEGOTIATE_AUTH_H_
+ 
+ #if HAVE_AUTH_MODULE_NEGOTIATE && HAVE_KRB5 && HAVE_GSSAPI
++
++#define PEER_PROXY_NEGOTIATE_NOKEYTAB	1
++
+ /* upstream proxy authentication */
+-SQUIDCEXTERN char *peer_proxy_negotiate_auth(char *principal_name, char *proxy);
++SQUIDCEXTERN char *peer_proxy_negotiate_auth(char *principal_name, char *proxy, int flags);
+ #endif
+ 
+ #endif /* SQUID_PEER_PROXY_NEGOTIATE_AUTH_H_ */
+
+=== modified file 'src/tunnel.cc'
+--- src/tunnel.cc	2015-11-07 12:08:33 +0000
++++ src/tunnel.cc	2015-11-09 09:45:33 +0000
+@@ -992,9 +992,11 @@
+     debugs(26, 4, HERE << "determine post-connect handling pathway.");
+     if (conn->getPeer()) {
+         tunnelState->request->peer_login = conn->getPeer()->login;
++        tunnelState->request->flags.auth_no_keytab = conn->getPeer()->options.auth_no_keytab;
+         tunnelState->request->flags.proxying = !(conn->getPeer()->options.originserver);
+     } else {
+         tunnelState->request->peer_login = NULL;
++        tunnelState->request->flags.auth_no_keytab = 0;
+         tunnelState->request->flags.proxying = false;
+     }
+ 
+

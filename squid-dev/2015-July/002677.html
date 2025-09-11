@@ -1,0 +1,667 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] shutdown sequence client connection handling
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20shutdown%20sequence%20client%20connection%20handling&In-Reply-To=%3C55A89D98.9040909%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="002687.html">
+   <LINK REL="Next"  HREF="002678.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] shutdown sequence client connection handling</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20shutdown%20sequence%20client%20connection%20handling&In-Reply-To=%3C55A89D98.9040909%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] shutdown sequence client connection handling">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Fri Jul 17 06:15:52 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002687.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » clang,d-centos-7 #253
+</A></li>
+        <LI>Next message: <A HREF="002678.html">[squid-dev] [PATCH] shutdown sequence client connection handling
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2677">[ date ]</a>
+              <a href="thread.html#2677">[ thread ]</a>
+              <a href="subject.html#2677">[ subject ]</a>
+              <a href="author.html#2677">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>When Squid which are processing a lot of traffic, using persistent
+client connections, or dealing with long duration requests are shutdown
+they can exit with a lot of connections still open. The
+shutdown_lifetime directive exists to allow time for existing
+transactions to complete, but this is not always possible and has no
+effect on idle connections.
+
+The result is a large dump of aborted FD entries being logged as the TCP
+sockets get abruptly reset. Potentially active transactions cache
+objects being &quot;corrupted&quot; in the process.
+
+
+This makes ConnStateData and its children implement Runner API callbacks
+to receive signals about Squid shutdown. Which allows their close()
+handlers to be run properly and make use of AsyncCalls API. Idle client
+connections are closed immediately on the startShutdown() signal, so
+their closure CPU cycles happens during the shutdown grace period.
+
+An extra 0-delay event step is added to SignalEngine shutdown sequence
+with a new Runner registry hook 'endingShutdown' is added to signal that
+the shutdown_lifetime grace period is over for closure of active
+transactions. All network FD sockets should be considered unusable fro
+read()/write() at that point since close handlers may have already been
+scheduled by other Runners. AsyncCall's may still be scheduled to
+release resources.
+
+Also adds a DeregisterRunner() API action to remove Runners dynamically
+from the registered set.
+
+The Squid shutdown sequence is now:
+
+* shutdown signal received:
+ - listening sockets closed
+ - idle client connections closed
+
+* shutdown grace period ends:
+ - remaining client connections closed
+
+* shutdown finishes:
+ - main signal and Async loop halted
+ - all memory free'd
+
+
+Server connections which are PINNED or in active use during the
+endingShutdown execution will be closed cleanly as a side-effect of the
+client closures. Otherwise there is no change to server connections or
+other FD sockets behaviour on shutdown.
+
+
+Amos
+-------------- next part --------------
+Shutdown close client connections cleanly
+
+This makes ConnStateData and its children implement Runner API
+callbacks to receive signals about Squid shutdown. Which allows
+their close() handlers to make use of AsyncCalls API on shutdown.
+
+A new Runner registry hook 'endingShutdown' is added to signal
+that the shutdown_lifetime grace period is over. All FD sockets
+should be considered unusable at that point. AsyncCall's may
+still be scheduled. An extra 0-delay event step is added to
+SignalEngine shutdown sequence to accommodate this.
+
+Also adds a DeregisterRunner() API action to remove Runners
+dynamically from the registered set.
+
+The Squid shutdown sequence is now:
+
+* shutdown signal received:
+ - listening sockets closed
+ - idle client connections closed
+
+* shutdown grace period ends:
+ - remaining client connections closed
+
+* shutdown finishes:
+ - main signal and Async loop halted
+ - all memory free'd
+
+
+Server connections which are PINNED or in active use during the
+endingShutdown execution will be closed cleanly as a side-effect
+of the client closures. Otherwise there is no change to server
+connections or other FD sockets behaviour on shutdown.
+
+=== modified file 'src/base/RunnersRegistry.cc'
+--- src/base/RunnersRegistry.cc	2015-01-13 07:25:36 +0000
++++ src/base/RunnersRegistry.cc	2015-07-16 11:28:18 +0000
+@@ -15,40 +15,48 @@
+ /// all known runners
+ static Runners *TheRunners = NULL;
+ 
+ /// safely returns registered runners, initializing structures as needed
+ static Runners &amp;
+ GetRunners()
+ {
+     if (!TheRunners)
+         TheRunners = new Runners;
+     return *TheRunners;
+ }
+ 
+ int
+ RegisterRunner(RegisteredRunner *rr)
+ {
+     Runners &amp;runners = GetRunners();
+     runners.insert(rr);
+     return runners.size();
+ }
+ 
++int
++DeregisterRunner(RegisteredRunner *rr)
++{
++    Runners &amp;runners = GetRunners();
++    runners.erase(rr);
++    return runners.size();
++}
++
+ void
+ RunRegistered(const RegisteredRunner::Method &amp;m)
+ {
+     Runners &amp;runners = GetRunners();
+     typedef Runners::iterator RRI;
+     for (RRI i = runners.begin(); i != runners.end(); ++i)
+         ((*i)-&gt;*m)();
+ 
+     if (m == &amp;RegisteredRunner::finishShutdown) {
+         delete TheRunners;
+         TheRunners = NULL;
+     }
+ }
+ 
+ bool
+ UseThisStatic(const void *)
+ {
+     return true;
+ }
+ 
+
+=== modified file 'src/base/RunnersRegistry.h'
+--- src/base/RunnersRegistry.h	2015-01-13 07:25:36 +0000
++++ src/base/RunnersRegistry.h	2015-07-16 17:09:01 +0000
+@@ -51,54 +51,63 @@
+     virtual void claimMemoryNeeds() {}
+ 
+     /// Called after claimMemoryNeeds().
+     /// Meant for activating modules and features using a finalized
+     /// configuration with known memory requirements.
+     virtual void useConfig() {}
+ 
+     /* Reconfiguration events */
+ 
+     /// Called after parsing squid.conf during reconfiguration.
+     /// Meant for adjusting the module state based on configuration changes.
+     virtual void syncConfig() {}
+ 
+     /* Shutdown events */
+ 
+     /// Called after receiving a shutdown request and before stopping the main
+     /// loop. At least one main loop iteration is guaranteed after this call.
+     /// Meant for cleanup and state saving that may require other modules.
+     virtual void startShutdown() {}
+ 
++    /// Called after shutdown_lifetime grace period ends and before stopping
++    /// the main loop. At least one main loop iteration is guaranteed after
++    /// this call.
++    /// Meant for cleanup and state saving that may require other modules.
++    virtual void endingShutdown() {}
++
+     /// Called after stopping the main loop and before releasing memory.
+     /// Meant for quick/basic cleanup that does not require any other modules.
+     virtual ~RegisteredRunner() {}
+     /// exists to simplify caller interface; override the destructor instead
+     void finishShutdown() { delete this; }
+ 
+     /// a pointer to one of the above notification methods
+     typedef void (RegisteredRunner::*Method)();
+ 
+ };
+ 
+ /// registers a given runner with the given registry and returns registry count
+ int RegisterRunner(RegisteredRunner *rr);
+ 
++/// de-registers a given runner with the given registry and returns registry count
++int DeregisterRunner(RegisteredRunner *rr);
++
+ /// Calls a given method of all runners.
+ /// All runners are destroyed after the finishShutdown() call.
+ void RunRegistered(const RegisteredRunner::Method &amp;m);
+ 
+ /// convenience macro to describe/debug the caller and the method being called
+ #define RunRegisteredHere(m) \
+     debugs(1, 2, &quot;running &quot; # m); \
+     RunRegistered(&amp;m)
+ 
+ /// convenience function to &quot;use&quot; an otherwise unreferenced static variable
+ bool UseThisStatic(const void *);
+ 
+ /// convenience macro: register one RegisteredRunner kid as early as possible
+ #define RunnerRegistrationEntry(Who) \
+     static const bool Who ## _Registered_ = \
+         RegisterRunner(new Who) &gt; 0 &amp;&amp; \
+         UseThisStatic(&amp; Who ## _Registered_);
+ 
+ #endif /* SQUID_BASE_RUNNERSREGISTRY_H */
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2015-07-13 16:04:07 +0000
++++ src/client_side.cc	2015-07-17 05:46:10 +0000
+@@ -792,40 +792,41 @@
+     if (aur != auth_) {
+         debugs(33, 2, &quot;ERROR: Closing &quot; &lt;&lt; clientConnection &lt;&lt; &quot; due to change of connection-auth from &quot; &lt;&lt; by);
+         auth_-&gt;releaseAuthServer();
+         auth_ = NULL;
+         // this is a fatal type of problem.
+         // Close the connection immediately with TCP RST to abort all traffic flow
+         comm_reset_close(clientConnection);
+         return;
+     }
+ 
+     /* NOT REACHABLE */
+ }
+ #endif
+ 
+ // cleans up before destructor is called
+ void
+ ConnStateData::swanSong()
+ {
+     debugs(33, 2, HERE &lt;&lt; clientConnection);
+     flags.readMore = false;
++    DeregisterRunner(this);
+     clientdbEstablished(clientConnection-&gt;remote, -1);  /* decrement */
+     assert(areAllContextsForThisConnection());
+     freeAllContexts();
+ 
+     unpinConnection(true);
+ 
+     if (Comm::IsConnOpen(clientConnection))
+         clientConnection-&gt;close();
+ 
+ #if USE_AUTH
+     // NP: do this bit after closing the connections to avoid side effects from unwanted TCP RST
+     setAuth(NULL, &quot;ConnStateData::SwanSong cleanup&quot;);
+ #endif
+ 
+     BodyProducer::swanSong();
+     flags.swanSang = true;
+ }
+ 
+ bool
+ ConnStateData::isOpen() const
+@@ -1862,40 +1863,66 @@
+     }
+ }
+ 
+ ClientSocketContext *
+ ConnStateData::abortRequestParsing(const char *const uri)
+ {
+     ClientHttpRequest *http = new ClientHttpRequest(this);
+     http-&gt;req_sz = in.buf.length();
+     http-&gt;uri = xstrdup(uri);
+     setLogUri (http, uri);
+     ClientSocketContext *context = new ClientSocketContext(clientConnection, http);
+     StoreIOBuffer tempBuffer;
+     tempBuffer.data = context-&gt;reqbuf;
+     tempBuffer.length = HTTP_REQBUF_SZ;
+     clientStreamInit(&amp;http-&gt;client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, new clientReplyContext(http), clientSocketRecipient,
+                      clientSocketDetach, context, tempBuffer);
+     return context;
+ }
+ 
++void
++ConnStateData::startShutdown()
++{
++    // RegisteredRunner API callback - Squid has been shut down
++
++    // if connection is idle terminate it now,
++    // otherwise wait for grace period to end
++    if (!getConcurrentRequestCount())
++        endingShutdown();
++}
++
++void
++ConnStateData::endingShutdown()
++{
++    // RegisteredRunner API callback - Squid shutdown grace period is over
++
++    // force the client connection to close immediately
++    // swanSong() in the close handler will cleanup.
++    if (Comm::IsConnOpen(clientConnection))
++        clientConnection-&gt;close();
++
++    // deregister now to ensure finalShutdown() does not kill us prematurely.
++    // fd_table purge will cleanup if close handler was not fast enough.
++    DeregisterRunner(this);
++}
++
+ char *
+ skipLeadingSpace(char *aString)
+ {
+     char *result = aString;
+ 
+     while (xisspace(*aString))
+         ++aString;
+ 
+     return result;
+ }
+ 
+ /**
+  * 'end' defaults to NULL for backwards compatibility
+  * remove default value if we ever get rid of NULL-terminated
+  * request buffers.
+  */
+ const char *
+ findTrailingHTTPVersion(const char *uriAndHTTPVersion, const char *end)
+ {
+     if (NULL == end) {
+@@ -3375,40 +3402,44 @@
+     stoppedSending_(NULL),
+     stoppedReceiving_(NULL),
+     receivedFirstByte_(false)
+ {
+     flags.readMore = true; // kids may overwrite
+     flags.swanSang = false;
+ 
+     pinning.host = NULL;
+     pinning.port = -1;
+     pinning.pinned = false;
+     pinning.auth = false;
+     pinning.zeroReply = false;
+     pinning.peer = NULL;
+ 
+     // store the details required for creating more MasterXaction objects as new requests come in
+     clientConnection = xact-&gt;tcpClient;
+     port = xact-&gt;squidPort;
+     transferProtocol = port-&gt;transport; // default to the *_port protocol= setting. may change later.
+     log_addr = xact-&gt;tcpClient-&gt;remote;
+     log_addr.applyMask(Config.Addrs.client_netmask);
++
++    // register to receive notice of Squid signal events
++    // which may affect long persisting client connections
++    RegisterRunner(this);
+ }
+ 
+ void
+ ConnStateData::start()
+ {
+     BodyProducer::start();
+     HttpControlMsgSink::start();
+ 
+     if (port-&gt;disable_pmtu_discovery != DISABLE_PMTU_OFF &amp;&amp;
+             (transparent() || port-&gt;disable_pmtu_discovery == DISABLE_PMTU_ALWAYS)) {
+ #if defined(IP_MTU_DISCOVER) &amp;&amp; defined(IP_PMTUDISC_DONT)
+         int i = IP_PMTUDISC_DONT;
+         if (setsockopt(clientConnection-&gt;fd, SOL_IP, IP_MTU_DISCOVER, &amp;i, sizeof(i)) &lt; 0)
+             debugs(33, 2, &quot;WARNING: Path MTU discovery disabling failed on &quot; &lt;&lt; clientConnection &lt;&lt; &quot; : &quot; &lt;&lt; xstrerror());
+ #else
+         static bool reported = false;
+ 
+         if (!reported) {
+             debugs(33, DBG_IMPORTANT, &quot;NOTICE: Path MTU discovery disabling is not supported on your platform.&quot;);
+             reported = true;
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2015-07-13 16:04:07 +0000
++++ src/client_side.h	2015-07-17 04:56:11 +0000
+@@ -1,33 +1,34 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 33    Client-side Routines */
+ 
+ #ifndef SQUID_CLIENTSIDE_H
+ #define SQUID_CLIENTSIDE_H
+ 
++#include &quot;base/RunnersRegistry.h&quot;
+ #include &quot;clientStreamForward.h&quot;
+ #include &quot;comm.h&quot;
+ #include &quot;helper/forward.h&quot;
+ #include &quot;http/forward.h&quot;
+ #include &quot;HttpControlMsg.h&quot;
+ #include &quot;ipc/FdNotes.h&quot;
+ #include &quot;SBuf.h&quot;
+ #if USE_AUTH
+ #include &quot;auth/UserRequest.h&quot;
+ #endif
+ #if USE_OPENSSL
+ #include &quot;ssl/support.h&quot;
+ #endif
+ 
+ class ConnStateData;
+ class ClientHttpRequest;
+ class clientStreamNode;
+ namespace AnyP
+ {
+ class PortCfg;
+@@ -150,41 +151,41 @@
+ #if USE_OPENSSL
+ namespace Ssl
+ {
+ class ServerBump;
+ }
+ #endif
+ /**
+  * Manages a connection to a client.
+  *
+  * Multiple requests (up to pipeline_prefetch) can be pipelined. This object is responsible for managing
+  * which one is currently being fulfilled and what happens to the queue if the current one
+  * causes the client connection to be closed early.
+  *
+  * Act as a manager for the connection and passes data in buffer to the current parser.
+  * the parser has ambiguous scope at present due to being made from global functions
+  * I believe this object uses the parser to identify boundaries and kick off the
+  * actual HTTP request handling objects (ClientSocketContext, ClientHttpRequest, HttpRequest)
+  *
+  * If the above can be confirmed accurate we can call this object PipelineManager or similar
+  */
+-class ConnStateData : public BodyProducer, public HttpControlMsgSink
++class ConnStateData : public BodyProducer, public HttpControlMsgSink, public RegisteredRunner
+ {
+ 
+ public:
+     explicit ConnStateData(const MasterXaction::Pointer &amp;xact);
+     virtual ~ConnStateData();
+ 
+     void readSomeData();
+     bool areAllContextsForThisConnection() const;
+     void freeAllContexts();
+     void notifyAllContexts(const int xerrno); ///&lt; tell everybody about the err
+     /// Traffic parsing
+     bool clientParseRequests();
+     void readNextRequest();
+     ClientSocketContext::Pointer getCurrentContext() const;
+     void addContextToQueue(ClientSocketContext * context);
+     int getConcurrentRequestCount() const;
+     bool isOpen() const;
+ 
+     /// Update flags and timeout after the first byte received
+     void receivedFirstByte();
+@@ -401,40 +402,45 @@
+     void connectionTag(const char *aTag) { connectionTag_ = aTag; }
+ 
+     /// handle a control message received by context from a peer and call back
+     virtual void writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &amp;call) = 0;
+ 
+     /// ClientStream calls this to supply response header (once) and data
+     /// for the current ClientSocketContext.
+     virtual void handleReply(HttpReply *header, StoreIOBuffer receivedData) = 0;
+ 
+     /// remove no longer needed leading bytes from the input buffer
+     void consumeInput(const size_t byteCount);
+ 
+     /* TODO: Make the methods below (at least) non-public when possible. */
+ 
+     /// stop parsing the request and create context for relaying error info
+     ClientSocketContext *abortRequestParsing(const char *const errUri);
+ 
+     /// client data which may need to forward as-is to server after an
+     /// on_unsupported_protocol tunnel decision.
+     SBuf preservedClientData;
++
++    /* Registered Runner API */
++    virtual void startShutdown();
++    virtual void endingShutdown();
++
+ protected:
+     void startDechunkingRequest();
+     void finishDechunkingRequest(bool withSuccess);
+     void abortChunkedRequestBody(const err_type error);
+     err_type handleChunkedRequestBody();
+ 
+     void startPinnedConnectionMonitoring();
+     void clientPinnedConnectionRead(const CommIoCbParams &amp;io);
+ 
+     /// parse input buffer prefix into a single transfer protocol request
+     /// return NULL to request more header bytes (after checking any limits)
+     /// use abortRequestParsing() to handle parsing errors w/o creating request
+     virtual ClientSocketContext *parseOneRequest() = 0;
+ 
+     /// start processing a freshly parsed request
+     virtual void processParsedRequest(ClientSocketContext *context) = 0;
+ 
+     /// returning N allows a pipeline of 1+N requests (see pipeline_prefetch)
+     virtual int pipelinePrefetchMax() const;
+ 
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2015-05-22 09:59:09 +0000
++++ src/main.cc	2015-07-16 17:16:21 +0000
+@@ -194,40 +194,52 @@
+ };
+ 
+ class SignalEngine: public AsyncEngine
+ {
+ 
+ public:
+ #if KILL_PARENT_OPT
+     SignalEngine(): parentKillNotified(false) {
+         parentPid = getppid();
+     }
+ #endif
+ 
+     virtual int checkEvents(int timeout);
+ 
+ private:
+     static void StopEventLoop(void *) {
+         if (EventLoop::Running)
+             EventLoop::Running-&gt;stop();
+     }
+ 
++    static void FinalShutdownRunners(void *) {
++        RunRegisteredHere(RegisteredRunner::endingShutdown);
++
++        // XXX: this should be a Runner.
++#if USE_AUTH
++        /* detach the auth components (only do this on full shutdown) */
++        Auth::Scheme::FreeAll();
++#endif
++
++        eventAdd(&quot;SquidTerminate&quot;, &amp;StopEventLoop, NULL, 0, 1, false);
++    }
++
+     void doShutdown(time_t wait);
+     void handleStoppedChild();
+ 
+ #if KILL_PARENT_OPT
+     bool parentKillNotified;
+     pid_t parentPid;
+ #endif
+ };
+ 
+ int
+ SignalEngine::checkEvents(int)
+ {
+     PROF_start(SignalEngine_checkEvents);
+ 
+     if (do_reconfigure) {
+         mainReconfigureStart();
+         do_reconfigure = 0;
+     } else if (do_rotate) {
+         mainRotate();
+         do_rotate = 0;
+@@ -252,53 +264,49 @@
+ #if KILL_PARENT_OPT
+     if (!IamMasterProcess() &amp;&amp; !parentKillNotified &amp;&amp; ShutdownSignal &gt; 0 &amp;&amp; parentPid &gt; 1) {
+         debugs(1, DBG_IMPORTANT, &quot;Killing master process, pid &quot; &lt;&lt; parentPid);
+         if (kill(parentPid, ShutdownSignal) &lt; 0)
+             debugs(1, DBG_IMPORTANT, &quot;kill &quot; &lt;&lt; parentPid &lt;&lt; &quot;: &quot; &lt;&lt; xstrerror());
+         parentKillNotified = true;
+     }
+ #endif
+ 
+     if (shutting_down) {
+ #if !KILL_PARENT_OPT
+         // Already a shutdown signal has received and shutdown is in progress.
+         // Shutdown as soon as possible.
+         wait = 0;
+ #endif
+     } else {
+         shutting_down = 1;
+ 
+         /* run the closure code which can be shared with reconfigure */
+         serverConnectionsClose();
+-#if USE_AUTH
+-        /* detach the auth components (only do this on full shutdown) */
+-        Auth::Scheme::FreeAll();
+-#endif
+ 
+         RunRegisteredHere(RegisteredRunner::startShutdown);
+     }
+ 
+ #if USE_WIN32_SERVICE
+     WIN32_svcstatusupdate(SERVICE_STOP_PENDING, (wait + 1) * 1000);
+ #endif
+ 
+-    eventAdd(&quot;SquidShutdown&quot;, &amp;StopEventLoop, this, (double) (wait + 1), 1, false);
++    eventAdd(&quot;SquidShutdown&quot;, &amp;FinalShutdownRunners, this, (double) (wait + 1), 1, false);
+ }
+ 
+ void
+ SignalEngine::handleStoppedChild()
+ {
+ #if !_SQUID_WINDOWS_
+     PidStatus status;
+     pid_t pid;
+ 
+     do {
+         pid = WaitForAnyPid(status, WNOHANG);
+ 
+ #if HAVE_SIGACTION
+ 
+     } while (pid &gt; 0);
+ 
+ #else
+ 
+     }
+     while (pid &gt; 0 || (pid &lt; 0 &amp;&amp; errno == EINTR));
+
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002687.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » clang,d-centos-7 #253
+</A></li>
+	<LI>Next message: <A HREF="002678.html">[squid-dev] [PATCH] shutdown sequence client connection handling
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2677">[ date ]</a>
+              <a href="thread.html#2677">[ thread ]</a>
+              <a href="subject.html#2677">[ subject ]</a>
+              <a href="author.html#2677">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,3517 @@
+Do not use direct comparisons with ACCESS_DENIED and ACCESS_ALLOWED.
+
+This patch introduces new allow_t API, substituting direct checks
+against ACCESS_ALLOWED and ACCESS_DENIED and helping to better
+distinguish between them. No functionality changes expected.
+
+Since most of existing ACL directives check against ACCESS_ALLOWED, the
+initial intention was to unify these checks, removing checking against
+ACCESS_DENIED for "miss_access" and "cache" directives. However, this
+idea was rejected, because different Squid installations could suddenly
+stop caching or start receiving 403s. For details see squid-dev
+discussion:
+
+http://lists.squid-cache.org/pipermail/squid-dev/2017-May/008576.html
+
+=== modified file 'src/DelayId.cc'
+--- src/DelayId.cc	2017-01-01 00:12:22 +0000
++++ src/DelayId.cc	2017-06-11 09:33:23 +0000
+@@ -74,61 +74,61 @@ DelayId::DelayClient(ClientHttpRequest *
+     if (r->client_addr.isNoAddr()) {
+         debugs(77, 2, "delayClient: WARNING: Called with 'NO_ADDR' address, ignoring");
+         return DelayId();
+     }
+ 
+     for (pool = 0; pool < DelayPools::pools(); ++pool) {
+ 
+         /* pools require explicit 'allow' to assign a client into them */
+         if (!DelayPools::delay_data[pool].access) {
+             debugs(77, DBG_IMPORTANT, "delay_pool " << pool <<
+                    " has no delay_access configured. This means that no clients will ever use it.");
+             continue;
+         }
+ 
+         ACLFilledChecklist ch(DelayPools::delay_data[pool].access, r, NULL);
+         if (reply) {
+             ch.reply = reply;
+             HTTPMSGLOCK(reply);
+         }
+ #if FOLLOW_X_FORWARDED_FOR
+         if (Config.onoff.delay_pool_uses_indirect_client)
+             ch.src_addr = r->indirect_client_addr;
+         else
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+             ch.src_addr = r->client_addr;
+         ch.my_addr = r->my_addr;
+ 
+         if (http->getConn() != NULL)
+             ch.conn(http->getConn());
+ 
+-        if (DelayPools::delay_data[pool].theComposite().getRaw() && ch.fastCheck() == ACCESS_ALLOWED) {
++        if (DelayPools::delay_data[pool].theComposite().getRaw() && ch.fastCheck().allowed()) {
+ 
+             DelayId result (pool + 1);
+             CompositePoolNode::CompositeSelectionDetails details;
+             details.src_addr = ch.src_addr;
+ #if USE_AUTH
+             details.user = r->auth_user_request;
+ #endif
+             details.tag = r->tag;
+             result.compositePosition(DelayPools::delay_data[pool].theComposite()->id(details));
+             return result;
+         }
+     }
+ 
+     return DelayId();
+ }
+ 
+ void
+ DelayId::setNoDelay(bool const newValue)
+ {
+     markedAsNoDelay = newValue;
+ }
+ 
+ /*
+  * this returns the number of bytes the client is permitted. it does not take
+  * into account bytes already buffered - that is up to the caller.
+  */
+ int
+ DelayId::bytesWanted(int minimum, int maximum) const
+ {
+     /* unlimited */
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2017-06-09 04:38:40 +0000
++++ src/FwdState.cc	2017-06-12 10:53:49 +0000
+@@ -305,61 +305,61 @@ FwdState::~FwdState()
+         closeServerConnection("~FwdState");
+ 
+     serverDestinations.clear();
+ 
+     debugs(17, 3, "FwdState destructed, this=" << this);
+ }
+ 
+ /**
+  * This is the entry point for client-side to start forwarding
+  * a transaction.  It is a static method that may or may not
+  * allocate a FwdState.
+  */
+ void
+ FwdState::Start(const Comm::ConnectionPointer &clientConn, StoreEntry *entry, HttpRequest *request, const AccessLogEntryPointer &al)
+ {
+     /** \note
+      * client_addr == no_addr indicates this is an "internal" request
+      * from peer_digest.c, asn.c, netdb.c, etc and should always
+      * be allowed.  yuck, I know.
+      */
+ 
+     if ( Config.accessList.miss && !request->client_addr.isNoAddr() &&
+             !request->flags.internal && request->url.getScheme() != AnyP::PROTO_CACHE_OBJECT) {
+         /**
+          * Check if this host is allowed to fetch MISSES from us (miss_access).
+          * Intentionally replace the src_addr automatically selected by the checklist code
+          * we do NOT want the indirect client address to be tested here.
+          */
+         ACLFilledChecklist ch(Config.accessList.miss, request, NULL);
+         ch.src_addr = request->client_addr;
+-        if (ch.fastCheck() == ACCESS_DENIED) {
++        if (ch.fastCheck().denied()) {
+             err_type page_id;
+             page_id = aclGetDenyInfoPage(&Config.denyInfoList, AclMatchedName, 1);
+ 
+             if (page_id == ERR_NONE)
+                 page_id = ERR_FORWARDING_DENIED;
+ 
+             ErrorState *anErr = new ErrorState(page_id, Http::scForbidden, request);
+             errorAppendEntry(entry, anErr); // frees anErr
+             return;
+         }
+     }
+ 
+     debugs(17, 3, HERE << "'" << entry->url() << "'");
+     /*
+      * This seems like an odd place to bind mem_obj and request.
+      * Might want to assert that request is NULL at this point
+      */
+     entry->mem_obj->request = request;
+ #if URL_CHECKSUM_DEBUG
+ 
+     entry->mem_obj->checkUrlChecksum();
+ #endif
+ 
+     if (shutting_down) {
+         /* more yuck */
+         ErrorState *anErr = new ErrorState(ERR_SHUTTING_DOWN, Http::scServiceUnavailable, request);
+         errorAppendEntry(entry, anErr); // frees anErr
+         return;
+     }
+ 
+@@ -1191,176 +1191,176 @@ FwdState::reforwardableStatus(const Http
+ 
+     default:
+         return false;
+     }
+ 
+     /* NOTREACHED */
+ }
+ 
+ /**
+  * Decide where details need to be gathered to correctly describe a persistent connection.
+  * What is needed:
+  *  -  the address/port details about this link
+  *  -  domain name of server at other end of this link (either peer or requested host)
+  */
+ void
+ FwdState::pconnPush(Comm::ConnectionPointer &conn, const char *domain)
+ {
+     if (conn->getPeer()) {
+         fwdPconnPool->push(conn, NULL);
+     } else {
+         fwdPconnPool->push(conn, domain);
+     }
+ }
+ 
+ Comm::ConnectionPointer
+ FwdState::pconnPop(const Comm::ConnectionPointer &dest, const char *domain)
+ {
+     bool retriable = checkRetriable();
+     if (!retriable && Config.accessList.serverPconnForNonretriable) {
+         ACLFilledChecklist ch(Config.accessList.serverPconnForNonretriable, request, NULL);
+-        retriable = (ch.fastCheck() == ACCESS_ALLOWED);
++        retriable = ch.fastCheck().allowed();
+     }
+     // always call shared pool first because we need to close an idle
+     // connection there if we have to use a standby connection.
+     Comm::ConnectionPointer conn = fwdPconnPool->pop(dest, domain, retriable);
+     if (!Comm::IsConnOpen(conn)) {
+         // either there was no pconn to pop or this is not a retriable xaction
+         if (CachePeer *peer = dest->getPeer()) {
+             if (peer->standby.pool)
+                 conn = peer->standby.pool->pop(dest, domain, true);
+         }
+     }
+     return conn; // open, closed, or nil
+ }
+ 
+ void
+ FwdState::initModule()
+ {
+     RegisterWithCacheManager();
+ }
+ 
+ void
+ FwdState::RegisterWithCacheManager(void)
+ {
+     Mgr::RegisterAction("forward", "Request Forwarding Statistics", fwdStats, 0, 1);
+ }
+ 
+ void
+ FwdState::logReplyStatus(int tries, const Http::StatusCode status)
+ {
+     if (status > Http::scInvalidHeader)
+         return;
+ 
+     assert(tries >= 0);
+ 
+     if (tries > MAX_FWD_STATS_IDX)
+         tries = MAX_FWD_STATS_IDX;
+ 
+     ++ FwdReplyCodes[tries][status];
+ }
+ 
+ /**** PRIVATE NON-MEMBER FUNCTIONS ********************************************/
+ 
+ /*
+  * DPW 2007-05-19
+  * Formerly static, but now used by client_side_request.cc
+  */
+ /// Checks for a TOS value to apply depending on the ACL
+ tos_t
+ aclMapTOS(acl_tos * head, ACLChecklist * ch)
+ {
+     for (acl_tos *l = head; l; l = l->next) {
+-        if (!l->aclList || ch->fastCheck(l->aclList) == ACCESS_ALLOWED)
++        if (!l->aclList || ch->fastCheck(l->aclList).allowed())
+             return l->tos;
+     }
+ 
+     return 0;
+ }
+ 
+ /// Checks for a netfilter mark value to apply depending on the ACL
+ nfmark_t
+ aclMapNfmark(acl_nfmark * head, ACLChecklist * ch)
+ {
+     for (acl_nfmark *l = head; l; l = l->next) {
+-        if (!l->aclList || ch->fastCheck(l->aclList) == ACCESS_ALLOWED)
++        if (!l->aclList || ch->fastCheck(l->aclList).allowed())
+             return l->nfmark;
+     }
+ 
+     return 0;
+ }
+ 
+ void
+ getOutgoingAddress(HttpRequest * request, Comm::ConnectionPointer conn)
+ {
+     // skip if an outgoing address is already set.
+     if (!conn->local.isAnyAddr()) return;
+ 
+     // ensure that at minimum the wildcard local matches remote protocol
+     if (conn->remote.isIPv4())
+         conn->local.setIPv4();
+ 
+     // maybe use TPROXY client address
+     if (request && request->flags.spoofClientIp) {
+         if (!conn->getPeer() || !conn->getPeer()->options.no_tproxy) {
+ #if FOLLOW_X_FORWARDED_FOR && LINUX_NETFILTER
+             if (Config.onoff.tproxy_uses_indirect_client)
+                 conn->local = request->indirect_client_addr;
+             else
+ #endif
+                 conn->local = request->client_addr;
+             // some flags need setting on the socket to use this address
+             conn->flags |= COMM_DOBIND;
+             conn->flags |= COMM_TRANSPARENT;
+             return;
+         }
+         // else no tproxy today ...
+     }
+ 
+     if (!Config.accessList.outgoing_address) {
+         return; // anything will do.
+     }
+ 
+     ACLFilledChecklist ch(NULL, request, NULL);
+     ch.dst_peer_name = conn->getPeer() ? conn->getPeer()->name : NULL;
+     ch.dst_addr = conn->remote;
+ 
+     // TODO use the connection details in ACL.
+     // needs a bit of rework in ACLFilledChecklist to use Comm::Connection instead of ConnStateData
+ 
+     for (Acl::Address *l = Config.accessList.outgoing_address; l; l = l->next) {
+ 
+         /* check if the outgoing address is usable to the destination */
+         if (conn->remote.isIPv4() != l->addr.isIPv4()) continue;
+ 
+         /* check ACLs for this outgoing address */
+-        if (!l->aclList || ch.fastCheck(l->aclList) == ACCESS_ALLOWED) {
++        if (!l->aclList || ch.fastCheck(l->aclList).allowed()) {
+             conn->local = l->addr;
+             return;
+         }
+     }
+ }
+ 
+ tos_t
+ GetTosToServer(HttpRequest * request)
+ {
+     ACLFilledChecklist ch(NULL, request, NULL);
+     return aclMapTOS(Ip::Qos::TheConfig.tosToServer, &ch);
+ }
+ 
+ nfmark_t
+ GetNfmarkToServer(HttpRequest * request)
+ {
+     ACLFilledChecklist ch(NULL, request, NULL);
+     return aclMapNfmark(Ip::Qos::TheConfig.nfmarkToServer, &ch);
+ }
+ 
+ void
+ GetMarkingsToServer(HttpRequest * request, Comm::Connection &conn)
+ {
+     // Get the server side TOS and Netfilter mark to be set on the connection.
+     if (Ip::Qos::TheConfig.isAclTosActive()) {
+         conn.tos = GetTosToServer(request);
+         debugs(17, 3, "from " << conn.local << " tos " << int(conn.tos));
+     }
+ 
+ #if SO_MARK && USE_LIBCAP
+
+=== modified file 'src/HttpHeaderTools.cc'
+--- src/HttpHeaderTools.cc	2017-05-23 06:46:26 +0000
++++ src/HttpHeaderTools.cc	2017-06-11 09:34:36 +0000
+@@ -262,61 +262,61 @@ httpHeaderQuoteString(const char *raw)
+ 
+     quotedStr.append('"');
+     return quotedStr;
+ }
+ 
+ /**
+  * Checks the anonymizer (header_access) configuration.
+  *
+  * \retval 0    Header is explicitly blocked for removal
+  * \retval 1    Header is explicitly allowed
+  * \retval 1    Header has been replaced, the current version can be used.
+  * \retval 1    Header has no access controls to test
+  */
+ static int
+ httpHdrMangle(HttpHeaderEntry * e, HttpRequest * request, HeaderManglers *hms)
+ {
+     int retval;
+ 
+     assert(e);
+ 
+     const headerMangler *hm = hms->find(*e);
+ 
+     /* mangler or checklist went away. default allow */
+     if (!hm || !hm->access_list) {
+         debugs(66, 7, "couldn't find mangler or access list. Allowing");
+         return 1;
+     }
+ 
+     ACLFilledChecklist checklist(hm->access_list, request, NULL);
+ 
+-    if (checklist.fastCheck() == ACCESS_ALLOWED) {
++    if (checklist.fastCheck().allowed()) {
+         /* aclCheckFast returns true for allow. */
+         debugs(66, 7, "checklist for mangler is positive. Mangle");
+         retval = 1;
+     } else if (NULL == hm->replacement) {
+         /* It was denied, and we don't have any replacement */
+         debugs(66, 7, "checklist denied, we have no replacement. Pass");
+         retval = 0;
+     } else {
+         /* It was denied, but we have a replacement. Replace the
+          * header on the fly, and return that the new header
+          * is allowed.
+          */
+         debugs(66, 7, "checklist denied but we have replacement. Replace");
+         e->value = hm->replacement;
+         retval = 1;
+     }
+ 
+     return retval;
+ }
+ 
+ /** Mangles headers for a list of headers. */
+ void
+ httpHdrMangleList(HttpHeader *l, HttpRequest *request, const AccessLogEntryPointer &al, req_or_rep_t req_or_rep)
+ {
+     HttpHeaderEntry *e;
+     HttpHeaderPos p = HttpHeaderInitPos;
+ 
+     /* check with anonymizer tables */
+     HeaderManglers *hms = nullptr;
+     HeaderWithAclList *headersAdd = nullptr;
+@@ -452,52 +452,52 @@ HeaderManglers::find(const HttpHeaderEnt
+             known[e.id].access_list)
+         return &known[e.id];
+ 
+     // a custom header
+     if (e.id == Http::HdrType::OTHER) {
+         // does it have an ACL list configured?
+         // Optimize: use a name type that we do not need to convert to here
+         SBuf tmp(e.name); // XXX: performance regression. c_str() reallocates
+         const ManglersByName::const_iterator i = custom.find(tmp.c_str());
+         if (i != custom.end())
+             return &i->second;
+     }
+ 
+     // Next-to-last resort: "Other" rules match any custom header
+     if (e.id == Http::HdrType::OTHER && known[Http::HdrType::OTHER].access_list)
+         return &known[Http::HdrType::OTHER];
+ 
+     // Last resort: "All" rules match any header
+     if (all.access_list)
+         return &all;
+ 
+     return NULL;
+ }
+ 
+ void
+ httpHdrAdd(HttpHeader *heads, HttpRequest *request, const AccessLogEntryPointer &al, HeaderWithAclList &headersAdd)
+ {
+     ACLFilledChecklist checklist(NULL, request, NULL);
+ 
+     for (HeaderWithAclList::const_iterator hwa = headersAdd.begin(); hwa != headersAdd.end(); ++hwa) {
+-        if (!hwa->aclList || checklist.fastCheck(hwa->aclList) == ACCESS_ALLOWED) {
++        if (!hwa->aclList || checklist.fastCheck(hwa->aclList).allowed()) {
+             const char *fieldValue = NULL;
+             MemBuf mb;
+             if (hwa->quoted) {
+                 if (al != NULL) {
+                     mb.init();
+                     hwa->valueFormat->assemble(mb, al, 0);
+                     fieldValue = mb.content();
+                 }
+             } else {
+                 fieldValue = hwa->fieldValue.c_str();
+             }
+ 
+             if (!fieldValue || fieldValue[0] == '\0')
+                 fieldValue = "-";
+ 
+             HttpHeaderEntry *e = new HttpHeaderEntry(hwa->fieldId, SBuf(hwa->fieldName), fieldValue);
+             heads->addEntry(e);
+         }
+     }
+ }
+ 
+
+=== modified file 'src/HttpReply.cc'
+--- src/HttpReply.cc	2017-05-23 06:46:26 +0000
++++ src/HttpReply.cc	2017-06-11 09:33:23 +0000
+@@ -490,61 +490,61 @@ HttpReply::expectedBodyTooLarge(HttpRequ
+     int64_t expectedSize = -1;
+     if (!expectingBody(request.method, expectedSize))
+         return false;
+ 
+     debugs(58, 6, HERE << expectedSize << " >? " << bodySizeMax);
+ 
+     if (expectedSize < 0) // expecting body of an unknown length
+         return false;
+ 
+     return expectedSize > bodySizeMax;
+ }
+ 
+ void
+ HttpReply::calcMaxBodySize(HttpRequest& request) const
+ {
+     // hack: -2 is used as "we have not calculated max body size yet" state
+     if (bodySizeMax != -2) // already tried
+         return;
+     bodySizeMax = -1;
+ 
+     // short-circuit ACL testing if there are none configured
+     if (!Config.ReplyBodySize)
+         return;
+ 
+     ACLFilledChecklist ch(NULL, &request, NULL);
+     // XXX: cont-cast becomes irrelevant when checklist is HttpReply::Pointer
+     ch.reply = const_cast<HttpReply *>(this);
+     HTTPMSGLOCK(ch.reply);
+     for (AclSizeLimit *l = Config.ReplyBodySize; l; l = l -> next) {
+         /* if there is no ACL list or if the ACLs listed match use this size value */
+-        if (!l->aclList || ch.fastCheck(l->aclList) == ACCESS_ALLOWED) {
++        if (!l->aclList || ch.fastCheck(l->aclList).allowed()) {
+             debugs(58, 4, HERE << "bodySizeMax=" << bodySizeMax);
+             bodySizeMax = l->size; // may be -1
+             break;
+         }
+     }
+ }
+ 
+ // XXX: check that this is sufficient for eCAP cloning
+ HttpReply *
+ HttpReply::clone() const
+ {
+     HttpReply *rep = new HttpReply();
+     rep->sline = sline; // used in hdrCacheInit() call below
+     rep->header.append(&header);
+     rep->hdrCacheInit();
+     rep->hdr_sz = hdr_sz;
+     rep->http_ver = http_ver;
+     rep->pstate = pstate;
+     rep->body_pipe = body_pipe;
+ 
+     // keep_alive is handled in hdrCacheInit()
+     return rep;
+ }
+ 
+ bool
+ HttpReply::inheritProperties(const Http::Message *aMsg)
+ {
+     const HttpReply *aRep = dynamic_cast<const HttpReply*>(aMsg);
+     if (!aRep)
+         return false;
+
+=== modified file 'src/HttpRequest.cc'
+--- src/HttpRequest.cc	2017-05-05 19:23:07 +0000
++++ src/HttpRequest.cc	2017-06-11 09:33:23 +0000
+@@ -577,61 +577,61 @@ HttpRequest::conditional() const
+ }
+ 
+ void
+ HttpRequest::recordLookup(const Dns::LookupDetails &dns)
+ {
+     if (dns.wait >= 0) { // known delay
+         if (dnsWait >= 0) // have recorded DNS wait before
+             dnsWait += dns.wait;
+         else
+             dnsWait = dns.wait;
+     }
+ }
+ 
+ int64_t
+ HttpRequest::getRangeOffsetLimit()
+ {
+     /* -2 is the starting value of rangeOffsetLimit.
+      * If it is -2, that means we haven't checked it yet.
+      *  Otherwise, return the current value */
+     if (rangeOffsetLimit != -2)
+         return rangeOffsetLimit;
+ 
+     rangeOffsetLimit = 0; // default value for rangeOffsetLimit
+ 
+     ACLFilledChecklist ch(NULL, this, NULL);
+     ch.src_addr = client_addr;
+     ch.my_addr =  my_addr;
+ 
+     for (AclSizeLimit *l = Config.rangeOffsetLimit; l; l = l -> next) {
+         /* if there is no ACL list or if the ACLs listed match use this limit value */
+-        if (!l->aclList || ch.fastCheck(l->aclList) == ACCESS_ALLOWED) {
++        if (!l->aclList || ch.fastCheck(l->aclList).allowed()) {
+             debugs(58, 4, HERE << "rangeOffsetLimit=" << rangeOffsetLimit);
+             rangeOffsetLimit = l->size; // may be -1
+             break;
+         }
+     }
+ 
+     return rangeOffsetLimit;
+ }
+ 
+ void
+ HttpRequest::ignoreRange(const char *reason)
+ {
+     if (range) {
+         debugs(73, 3, static_cast<void*>(range) << " for " << reason);
+         delete range;
+         range = NULL;
+     }
+     // Some callers also reset isRanged but it may not be safe for all callers:
+     // isRanged is used to determine whether a weak ETag comparison is allowed,
+     // and that check should not ignore the Range header if it was present.
+     // TODO: Some callers also delete HDR_RANGE, HDR_REQUEST_RANGE. Should we?
+ }
+ 
+ bool
+ HttpRequest::canHandle1xx() const
+ {
+     // old clients do not support 1xx unless they sent Expect: 100-continue
+     // (we reject all other Http::HdrType::EXPECT values so just check for Http::HdrType::EXPECT)
+     if (http_ver <= Http::ProtocolVersion(1,0) && !header.has(Http::HdrType::EXPECT))
+         return false;
+
+=== modified file 'src/Notes.cc'
+--- src/Notes.cc	2017-02-14 02:03:27 +0000
++++ src/Notes.cc	2017-06-11 10:40:57 +0000
+@@ -48,64 +48,64 @@ Note::Value::Value(const char *aVal, con
+ const SBuf &
+ Note::Value::format(const AccessLogEntryPointer &al)
+ {
+     if (al && valueFormat) {
+         static MemBuf mb;
+         mb.reset();
+         valueFormat->assemble(mb, al, 0);
+         theFormattedValue.assign(mb.content());
+         return theFormattedValue;
+     }
+     return theValue;
+ }
+ 
+ Note::Value::Pointer
+ Note::addValue(const char *value, const bool quoted, const char *descr, const Value::Method m)
+ {
+     values.push_back(new Value(value, quoted, descr, m));
+     return values.back();
+ }
+ 
+ bool
+ Note::match(HttpRequest *request, HttpReply *reply, const AccessLogEntry::Pointer &al, SBuf &matched)
+ {
+     ACLFilledChecklist ch(nullptr, request, nullptr);
+     ch.reply = reply;
+     if (reply)
+         HTTPMSGLOCK(ch.reply);
+ 
+     for (auto v: values) {
+         assert(v->aclList);
+-        const int ret = ch.fastCheck(v->aclList);
++        const auto ret = ch.fastCheck(v->aclList);
+         debugs(93, 5, "Check for header name: " << theKey << ": " << v->value() <<
+                ", HttpRequest: " << request << " HttpReply: " << reply << " matched: " << ret);
+-        if (ret == ACCESS_ALLOWED) {
++        if (ret.allowed()) {
+             matched = v->format(al);
+             return true;
+         }
+     }
+     matched.clear();
+     return false;
+ }
+ 
+ void
+ Note::updateNotePairs(NotePairs::Pointer pairs, const CharacterSet *delimiters, const AccessLogEntryPointer &al)
+ {
+     for (auto v: values) {
+         const SBuf &formatted = v->format(al);
+         if (!pairs->empty() && v->method() == Value::mhReplace)
+             pairs->remove(theKey);
+         if (delimiters)
+             pairs->addStrList(key(), formatted, *delimiters);
+         else
+             pairs->add(key(), formatted);
+     }
+ }
+ 
+ void
+ Note::dump(StoreEntry *entry, const char *k)
+ {
+     for (auto v: values) {
+         storeAppendPrintf(entry, "%s %.*s %s",
+                           k, key().length(), key().rawContent(), ConfigParser::QuoteString(SBufToString(v->value())));
+         dump_acl_list(entry, v->aclList);
+         storeAppendPrintf(entry, "\n");
+
+=== modified file 'src/acl/Acl.h'
+--- src/acl/Acl.h	2017-01-30 12:46:15 +0000
++++ src/acl/Acl.h	2017-06-12 09:08:10 +0000
+@@ -1,48 +1,49 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ACL_H
+ #define SQUID_ACL_H
+ 
+ #include "acl/forward.h"
+ #include "base/CharacterSet.h"
+ #include "cbdata.h"
+ #include "defines.h"
+ #include "dlink.h"
+ #include "sbuf/List.h"
+ 
++#include <algorithm>
+ #include <map>
+ #include <ostream>
+ #include <string>
+ #include <vector>
+ 
+ class ConfigParser;
+ 
+ typedef char ACLFlag;
+ // ACLData Flags
+ #define ACL_F_REGEX_CASE 'i'
+ #define ACL_F_NO_LOOKUP 'n'
+ #define ACL_F_STRICT 's'
+ #define ACL_F_SUBSTRING 'm'
+ #define ACL_F_END '\0'
+ 
+ /**
+  * \ingroup ACLAPI
+  * Used to hold a list of one-letter flags which can be passed as parameters
+  * to acls  (eg '-i', '-n' etc)
+  */
+ class ACLFlags
+ {
+ public:
+     enum Status
+     {
+         notSupported,
+         noParameter,
+         parameterOptional,
+         parameterRequired
+     };
+@@ -211,60 +212,85 @@ typedef enum {
+     // Authentication ACL result states
+     ACCESS_AUTH_REQUIRED,    // Missing Credentials
+ } aclMatchCode;
+ 
+ /// \ingroup ACLAPI
+ /// ACL check answer; TODO: Rename to Acl::Answer
+ class allow_t
+ {
+ public:
+     // not explicit: allow "aclMatchCode to allow_t" conversions (for now)
+     allow_t(const aclMatchCode aCode, int aKind = 0): code(aCode), kind(aKind) {}
+ 
+     allow_t(): code(ACCESS_DUNNO), kind(0) {}
+ 
+     bool operator ==(const aclMatchCode aCode) const {
+         return code == aCode;
+     }
+ 
+     bool operator !=(const aclMatchCode aCode) const {
+         return !(*this == aCode);
+     }
+ 
+     bool operator ==(const allow_t allow) const {
+         return code == allow.code && kind == allow.kind;
+     }
+ 
+     operator aclMatchCode() const {
+         return code;
+     }
+ 
++    /*
++       The following two methods help to interpret an ACL check result,
++       i.e., determine whether we should 'allow' or 'block'.  Select
++       between them depending on that how intermediate outcomes such as
++       ACCESS_DUNNO or ACCESS_AUTH_REQUIRED should be treated in the
++       caller context.
++    */
++
++    /// Whether an 'allow' rule matched.
++    /// Use it if you need also to block on intermediate outcomes such as
++    /// ACCESS_DUNNO or ACCESS_AUTH_REQUIRED (as most of existing ACL
++    /// checks do).
++    bool allowed() const { return code == ACCESS_ALLOWED; }
++
++    /// Whether an 'deny' rule matched.
++    /// Use it if you need also to allow on intermediate outcomes such as
++    /// ACCESS_DUNNO or ACCESS_AUTH_REQUIRED (only few of existing ACL
++    /// checks act so).
++    bool denied() const { return code == ACCESS_DENIED; }
++
++    /// whether there is a matched rule in 'codes' vector
++    bool someRuleMatched(const std::vector<aclMatchCode> &codes) const {
++        return std::find(codes.begin(), codes.end(), code) != codes.end();
++    }
++
+     aclMatchCode code; ///< ACCESS_* code
+     int kind; ///< which custom access list verb matched
+ };
+ 
+ inline std::ostream &
+ operator <<(std::ostream &o, const allow_t a)
+ {
+     switch (a) {
+     case ACCESS_DENIED:
+         o << "DENIED";
+         break;
+     case ACCESS_ALLOWED:
+         o << "ALLOWED";
+         break;
+     case ACCESS_DUNNO:
+         o << "DUNNO";
+         break;
+     case ACCESS_AUTH_REQUIRED:
+         o << "AUTH_REQUIRED";
+         break;
+     }
+     return o;
+ }
+ 
+ /// \ingroup ACLAPI
+ class acl_proxy_auth_match_cache
+ {
+     MEMPROXY_CLASS(acl_proxy_auth_match_cache);
+ 
+ public:
+
+=== modified file 'src/acl/Tree.h'
+--- src/acl/Tree.h	2017-04-17 21:24:33 +0000
++++ src/acl/Tree.h	2017-06-11 09:33:23 +0000
+@@ -25,61 +25,61 @@ class Tree: public OrNode
+ 
+ public:
+     /// dumps <name, action, rule, new line> tuples
+     /// the supplied converter maps action.kind to a string
+     template <class ActionToStringConverter>
+     SBufList treeDump(const char *name, ActionToStringConverter converter) const;
+ 
+     /// Returns the corresponding action after a successful tree match.
+     allow_t winningAction() const;
+ 
+     /// what action to use if no nodes matched
+     allow_t lastAction() const;
+ 
+     /// appends and takes control over the rule with a given action
+     void add(ACL *rule, const allow_t &action);
+     void add(ACL *rule); ///< same as InnerNode::add()
+ 
+ protected:
+     /// Acl::OrNode API
+     virtual bool bannedAction(ACLChecklist *, Nodes::const_iterator) const override;
+     allow_t actionAt(const Nodes::size_type pos) const;
+ 
+     /// if not empty, contains actions corresponding to InnerNode::nodes
+     typedef std::vector<allow_t> Actions;
+     Actions actions;
+ };
+ 
+ inline const char *
+ AllowOrDeny(const allow_t &action)
+ {
+-    return action == ACCESS_ALLOWED ? "allow" : "deny";
++    return action.allowed() ? "allow" : "deny";
+ }
+ 
+ template <class ActionToStringConverter>
+ inline SBufList
+ Tree::treeDump(const char *prefix, ActionToStringConverter converter) const
+ {
+     SBufList text;
+     Actions::const_iterator action = actions.begin();
+     typedef Nodes::const_iterator NCI;
+     for (NCI node = nodes.begin(); node != nodes.end(); ++node) {
+ 
+         text.push_back(SBuf(prefix));
+ 
+         if (action != actions.end()) {
+             static const SBuf DefaultActString("???");
+             const char *act = converter(*action);
+             text.push_back(act ? SBuf(act) : DefaultActString);
+             ++action;
+         }
+ 
+         text.splice(text.end(), (*node)->dump());
+         text.push_back(SBuf("\n"));
+     }
+     return text;
+ }
+ 
+ } // namespace Acl
+ 
+ #endif /* SQUID_ACL_TREE_H */
+ 
+
+=== modified file 'src/adaptation/AccessCheck.cc'
+--- src/adaptation/AccessCheck.cc	2017-01-01 00:12:22 +0000
++++ src/adaptation/AccessCheck.cc	2017-06-11 09:33:23 +0000
+@@ -147,61 +147,61 @@ Adaptation::AccessCheck::checkCandidates
+     Must(done());
+ }
+ 
+ void
+ Adaptation::AccessCheck::AccessCheckCallbackWrapper(allow_t answer, void *data)
+ {
+     debugs(93, 8, HERE << "callback answer=" << answer);
+     AccessCheck *ac = (AccessCheck*)data;
+ 
+     /** \todo AYJ 2008-06-12: If answer == ACCESS_AUTH_REQUIRED
+      * we should be kicking off an authentication before continuing
+      * with this request. see bug 2400 for details.
+      */
+ 
+     // convert to async call to get async call protections and features
+     typedef UnaryMemFunT<AccessCheck, allow_t> MyDialer;
+     AsyncCall::Pointer call =
+         asyncCall(93,7, "Adaptation::AccessCheck::noteAnswer",
+                   MyDialer(ac, &Adaptation::AccessCheck::noteAnswer, answer));
+     ScheduleCallHere(call);
+ 
+ }
+ 
+ /// process the results of the ACL check
+ void
+ Adaptation::AccessCheck::noteAnswer(allow_t answer)
+ {
+     Must(!candidates.empty()); // the candidate we were checking must be there
+     debugs(93,5, HERE << topCandidate() << " answer=" << answer);
+ 
+-    if (answer == ACCESS_ALLOWED) { // the rule matched
++    if (answer.allowed()) { // the rule matched
+         ServiceGroupPointer g = topGroup();
+         if (g != NULL) { // the corresponding group found
+             callBack(g);
+             Must(done());
+             return;
+         }
+     }
+ 
+     // no match or the group disappeared during reconfiguration
+     candidates.erase(candidates.begin());
+     checkCandidates();
+ }
+ 
+ /// call back with a possibly nil group; the job ends here because all failures
+ /// at this point are fatal to the access check process
+ void
+ Adaptation::AccessCheck::callBack(const ServiceGroupPointer &g)
+ {
+     debugs(93,3, HERE << g);
+     CallJobHere1(93, 5, theInitiator, Adaptation::Initiator,
+                  noteAdaptationAclCheckDone, g);
+     mustStop("done"); // called back or will never be able to call back
+ }
+ 
+ Adaptation::ServiceGroupPointer
+ Adaptation::AccessCheck::topGroup() const
+ {
+     ServiceGroupPointer g;
+     if (candidates.size()) {
+         if (AccessRule *r = FindRule(topCandidate())) {
+
+=== modified file 'src/adaptation/icap/Launcher.cc'
+--- src/adaptation/icap/Launcher.cc	2017-02-16 11:51:56 +0000
++++ src/adaptation/icap/Launcher.cc	2017-06-11 09:33:23 +0000
+@@ -118,61 +118,61 @@ bool Adaptation::Icap::Launcher::canRetr
+     // We do not check and can exceed zero repeat limit when retrying.
+     // This is by design as the limit does not apply to pconn retrying.
+     return !shutting_down && info.isRetriable;
+ }
+ 
+ bool Adaptation::Icap::Launcher::canRepeat(Adaptation::Icap::XactAbortInfo &info) const
+ {
+     debugs(93,9, HERE << shutting_down);
+     if (theLaunches >= TheConfig.repeat_limit || shutting_down)
+         return false;
+ 
+     debugs(93,9, HERE << info.isRepeatable); // TODO: update and use status()
+     if (!info.isRepeatable)
+         return false;
+ 
+     debugs(93,9, HERE << info.icapReply);
+     if (!info.icapReply) // did not get to read an ICAP reply; a timeout?
+         return true;
+ 
+     debugs(93,9, info.icapReply->sline.status());
+     // XXX: Http::scNone is not the only sign of parse error
+     // XXX: if there is a specific HTTP error code describing the problem, that may be set
+     if (info.icapReply->sline.status() == Http::scNone) // failed to parse the reply; I/O err
+         return true;
+ 
+     ACLFilledChecklist *cl =
+         new ACLFilledChecklist(TheConfig.repeat, info.icapRequest, dash_str);
+     cl->reply = info.icapReply;
+     HTTPMSGLOCK(cl->reply);
+ 
+-    bool result = cl->fastCheck() == ACCESS_ALLOWED;
++    bool result = cl->fastCheck().allowed();
+     delete cl;
+     return result;
+ }
+ 
+ /* ICAPXactAbortInfo */
+ 
+ Adaptation::Icap::XactAbortInfo::XactAbortInfo(HttpRequest *anIcapRequest,
+         HttpReply *anIcapReply, bool beRetriable, bool beRepeatable):
+     icapRequest(anIcapRequest),
+     icapReply(anIcapReply),
+     isRetriable(beRetriable),
+     isRepeatable(beRepeatable)
+ {
+     if (icapRequest)
+         HTTPMSGLOCK(icapRequest);
+     if (icapReply)
+         HTTPMSGLOCK(icapReply);
+ }
+ 
+ Adaptation::Icap::XactAbortInfo::XactAbortInfo(const Adaptation::Icap::XactAbortInfo &i):
+     icapRequest(i.icapRequest),
+     icapReply(i.icapReply),
+     isRetriable(i.isRetriable),
+     isRepeatable(i.isRepeatable)
+ {
+     if (icapRequest)
+         HTTPMSGLOCK(icapRequest);
+     if (icapReply)
+         HTTPMSGLOCK(icapReply);
+ }
+
+=== modified file 'src/auth/UserRequest.cc'
+--- src/auth/UserRequest.cc	2017-05-31 03:03:31 +0000
++++ src/auth/UserRequest.cc	2017-06-11 09:35:18 +0000
+@@ -442,61 +442,61 @@ Auth::UserRequest::tryToAuthenticateAndS
+     if (t != NULL && t->lastReply != AUTH_ACL_CANNOT_AUTHENTICATE && t->lastReply != AUTH_ACL_HELPER) {
+         if (*aUR == NULL)
+             *aUR = t;
+ 
+         if (request->auth_user_request == NULL && t->lastReply == AUTH_AUTHENTICATED) {
+             request->auth_user_request = t;
+         }
+         return t->lastReply;
+     }
+ 
+     // ok, call the actual authenticator routine.
+     AuthAclState result = authenticate(aUR, headertype, request, conn, src_addr, al);
+ 
+     // auth process may have changed the UserRequest we are dealing with
+     t = authTryGetUser(*aUR, conn, request);
+ 
+     if (t != NULL && result != AUTH_ACL_CANNOT_AUTHENTICATE && result != AUTH_ACL_HELPER)
+         t->lastReply = result;
+ 
+     return result;
+ }
+ 
+ static Auth::ConfigVector &
+ schemesConfig(HttpRequest *request, HttpReply *rep)
+ {
+     if (!Auth::TheConfig.schemeLists.empty() && Auth::TheConfig.schemeAccess) {
+         ACLFilledChecklist ch(NULL, request, NULL);
+         ch.reply = rep;
+         HTTPMSGLOCK(ch.reply);
+         const allow_t answer = ch.fastCheck(Auth::TheConfig.schemeAccess);
+-        if (answer == ACCESS_ALLOWED)
++        if (answer.allowed())
+             return Auth::TheConfig.schemeLists.at(answer.kind).authConfigs;
+     }
+     return Auth::TheConfig.schemes;
+ }
+ 
+ void
+ Auth::UserRequest::AddReplyAuthHeader(HttpReply * rep, Auth::UserRequest::Pointer auth_user_request, HttpRequest * request, int accelerated, int internal)
+ /* send the auth types we are configured to support (and have compiled in!) */
+ {
+     Http::HdrType type;
+ 
+     switch (rep->sline.status()) {
+ 
+     case Http::scProxyAuthenticationRequired:
+         /* Proxy authorisation needed */
+         type = Http::HdrType::PROXY_AUTHENTICATE;
+         break;
+ 
+     case Http::scUnauthorized:
+         /* WWW Authorisation needed */
+         type = Http::HdrType::WWW_AUTHENTICATE;
+         break;
+ 
+     default:
+         /* Keep GCC happy */
+         /* some other HTTP status */
+         type = Http::HdrType::BAD_HDR;
+         break;
+     }
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2017-05-07 21:53:15 +0000
++++ src/client_side.cc	2017-06-11 09:38:15 +0000
+@@ -435,61 +435,61 @@ ClientHttpRequest::logRequest()
+         for (auto h: Config.notes) {
+             if (h->match(request, al->reply, NULL, matched)) {
+                 request->notes()->add(h->key(), matched);
+                 debugs(33, 3, h->key() << " " << matched);
+             }
+         }
+         // The al->notes and request->notes must point to the same object.
+         al->syncNotes(request);
+     }
+ 
+     ACLFilledChecklist checklist(NULL, request, NULL);
+     if (al->reply) {
+         checklist.reply = al->reply;
+         HTTPMSGLOCK(checklist.reply);
+     }
+ 
+     if (request) {
+         HTTPMSGUNLOCK(al->adapted_request);
+         al->adapted_request = request;
+         HTTPMSGLOCK(al->adapted_request);
+     }
+     accessLogLog(al, &checklist);
+ 
+     bool updatePerformanceCounters = true;
+     if (Config.accessList.stats_collection) {
+         ACLFilledChecklist statsCheck(Config.accessList.stats_collection, request, NULL);
+         if (al->reply) {
+             statsCheck.reply = al->reply;
+             HTTPMSGLOCK(statsCheck.reply);
+         }
+-        updatePerformanceCounters = (statsCheck.fastCheck() == ACCESS_ALLOWED);
++        updatePerformanceCounters = statsCheck.fastCheck().allowed();
+     }
+ 
+     if (updatePerformanceCounters) {
+         if (request)
+             updateCounters();
+ 
+         if (getConn() != NULL && getConn()->clientConnection != NULL)
+             clientdbUpdate(getConn()->clientConnection->remote, logType, AnyP::PROTO_HTTP, out.size);
+     }
+ }
+ 
+ void
+ ClientHttpRequest::freeResources()
+ {
+     safe_free(uri);
+     safe_free(log_uri);
+     safe_free(redirect.location);
+     range_iter.boundary.clean();
+     HTTPMSGUNLOCK(request);
+ 
+     if (client_stream.tail)
+         clientStreamAbort((clientStreamNode *)client_stream.tail->data, this);
+ }
+ 
+ void
+ httpRequestFree(void *data)
+ {
+     ClientHttpRequest *http = (ClientHttpRequest *)data;
+     assert(http != NULL);
+     delete http;
+@@ -1500,115 +1500,115 @@ bool ConnStateData::serveDelayedError(Ht
+         clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+         assert(repContext);
+         debugs(33, 5, "Responding with delated error for " << http->uri);
+         repContext->setReplyToStoreEntry(sslServerBump->entry, "delayed SslBump error");
+ 
+         // save the original request for logging purposes
+         if (!context->http->al->request) {
+             context->http->al->request = http->request;
+             HTTPMSGLOCK(context->http->al->request);
+         }
+ 
+         // Get error details from the fake certificate-peeking request.
+         http->request->detailError(sslServerBump->request->errType, sslServerBump->request->errDetail);
+         context->pullData();
+         return true;
+     }
+ 
+     // In bump-server-first mode, we have not necessarily seen the intended
+     // server name at certificate-peeking time. Check for domain mismatch now,
+     // when we can extract the intended name from the bumped HTTP request.
+     if (const Security::CertPointer &srvCert = sslServerBump->serverCert) {
+         HttpRequest *request = http->request;
+         if (!Ssl::checkX509ServerValidity(srvCert.get(), request->url.host())) {
+             debugs(33, 2, "SQUID_X509_V_ERR_DOMAIN_MISMATCH: Certificate " <<
+                    "does not match domainname " << request->url.host());
+ 
+             bool allowDomainMismatch = false;
+             if (Config.ssl_client.cert_error) {
+                 ACLFilledChecklist check(Config.ssl_client.cert_error, request, dash_str);
+                 check.sslErrors = new Security::CertErrors(Security::CertError(SQUID_X509_V_ERR_DOMAIN_MISMATCH, srvCert));
+-                allowDomainMismatch = (check.fastCheck() == ACCESS_ALLOWED);
++                allowDomainMismatch = check.fastCheck().allowed();
+                 delete check.sslErrors;
+                 check.sslErrors = NULL;
+             }
+ 
+             if (!allowDomainMismatch) {
+                 quitAfterError(request);
+ 
+                 clientStreamNode *node = context->getClientReplyContext();
+                 clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+                 assert (repContext);
+ 
+                 // Fill the server IP and hostname for error page generation.
+                 HttpRequest::Pointer const & peekerRequest = sslServerBump->request;
+                 request->hier.note(peekerRequest->hier.tcpServer, request->url.host());
+ 
+                 // Create an error object and fill it
+                 ErrorState *err = new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scServiceUnavailable, request);
+                 err->src_addr = clientConnection->remote;
+                 Ssl::ErrorDetail *errDetail = new Ssl::ErrorDetail(
+                     SQUID_X509_V_ERR_DOMAIN_MISMATCH,
+                     srvCert.get(), nullptr);
+                 err->detail = errDetail;
+                 // Save the original request for logging purposes.
+                 if (!context->http->al->request) {
+                     context->http->al->request = request;
+                     HTTPMSGLOCK(context->http->al->request);
+                 }
+                 repContext->setReplyToError(request->method, err);
+                 assert(context->http->out.offset == 0);
+                 context->pullData();
+                 return true;
+             }
+         }
+     }
+ 
+     return false;
+ }
+ #endif // USE_OPENSSL
+ 
+ /**
+  * Check on_unsupported_protocol checklist and return true if tunnel mode selected
+  * or false otherwise
+  */
+ bool
+ clientTunnelOnError(ConnStateData *conn, Http::StreamPointer &context, HttpRequest::Pointer &request, const HttpRequestMethod& method, err_type requestError)
+ {
+     if (conn->mayTunnelUnsupportedProto()) {
+         ACLFilledChecklist checklist(Config.accessList.on_unsupported_protocol, request.getRaw(), nullptr);
+         checklist.requestErrorType = requestError;
+         checklist.src_addr = conn->clientConnection->remote;
+         checklist.my_addr = conn->clientConnection->local;
+         checklist.conn(conn);
+         allow_t answer = checklist.fastCheck();
+-        if (answer == ACCESS_ALLOWED && answer.kind == 1) {
++        if (answer.allowed() && answer.kind == 1) {
+             debugs(33, 3, "Request will be tunneled to server");
+             if (context) {
+                 assert(conn->pipeline.front() == context); // XXX: still assumes HTTP/1 semantics
+                 context->finished(); // Will remove from conn->pipeline queue
+             }
+             Comm::SetSelect(conn->clientConnection->fd, COMM_SELECT_READ, NULL, NULL, 0);
+             return conn->initiateTunneledRequest(request, Http::METHOD_NONE, "unknown-protocol", conn->preservedClientData);
+         } else {
+             debugs(33, 3, "Continue with returning the error: " << requestError);
+         }
+     }
+ 
+     return false;
+ }
+ 
+ void
+ clientProcessRequestFinished(ConnStateData *conn, const HttpRequest::Pointer &request)
+ {
+     /*
+      * DPW 2007-05-18
+      * Moved the TCP_RESET feature from clientReplyContext::sendMoreData
+      * to here because calling comm_reset_close() causes http to
+      * be freed before accessing.
+      */
+     if (request != NULL && request->flags.resetTcp && Comm::IsConnOpen(conn->clientConnection)) {
+         debugs(33, 3, HERE << "Sending TCP RST on " << conn->clientConnection);
+         conn->flags.readMore = false;
+         comm_reset_close(conn->clientConnection);
+     }
+ }
+@@ -1635,61 +1635,61 @@ clientProcessRequest(ConnStateData *conn
+     // setup and body_pipe preparation blobs are needed for FTP.
+ 
+     request->clientConnectionManager = conn;
+ 
+     request->flags.accelerated = http->flags.accel;
+     request->flags.sslBumped=conn->switchedToHttps();
+     request->flags.ignoreCc = conn->port->ignore_cc;
+     // TODO: decouple http->flags.accel from request->flags.sslBumped
+     request->flags.noDirect = (request->flags.accelerated && !request->flags.sslBumped) ?
+                               !conn->port->allow_direct : 0;
+     request->sources |= isFtp ? Http::Message::srcFtp :
+                         ((request->flags.sslBumped || conn->port->transport.protocol == AnyP::PROTO_HTTPS) ? Http::Message::srcHttps : Http::Message::srcHttp);
+ #if USE_AUTH
+     if (request->flags.sslBumped) {
+         if (conn->getAuth() != NULL)
+             request->auth_user_request = conn->getAuth();
+     }
+ #endif
+ 
+     /** \par
+      * If transparent or interception mode is working clone the transparent and interception flags
+      * from the port settings to the request.
+      */
+     if (http->clientConnection != NULL) {
+         request->flags.intercepted = ((http->clientConnection->flags & COMM_INTERCEPTION) != 0);
+         request->flags.interceptTproxy = ((http->clientConnection->flags & COMM_TRANSPARENT) != 0 ) ;
+         static const bool proxyProtocolPort = (conn->port != NULL) ? conn->port->flags.proxySurrogate : false;
+         if (request->flags.interceptTproxy && !proxyProtocolPort) {
+             if (Config.accessList.spoof_client_ip) {
+                 ACLFilledChecklist *checklist = clientAclChecklistCreate(Config.accessList.spoof_client_ip, http);
+-                request->flags.spoofClientIp = (checklist->fastCheck() == ACCESS_ALLOWED);
++                request->flags.spoofClientIp = checklist->fastCheck().allowed();
+                 delete checklist;
+             } else
+                 request->flags.spoofClientIp = true;
+         } else
+             request->flags.spoofClientIp = false;
+     }
+ 
+     if (internalCheck(request->url.path())) {
+         if (internalHostnameIs(request->url.host()) && request->url.port() == getMyPort()) {
+             debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->url.authority(true));
+             http->flags.internal = true;
+         } else if (Config.onoff.global_internal_static && internalStaticCheck(request->url.path())) {
+             debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->url.authority(true) << " (global_internal_static on)");
+             request->url.setScheme(AnyP::PROTO_HTTP, "http");
+             request->url.host(internalHostname());
+             request->url.port(getMyPort());
+             http->flags.internal = true;
+         } else
+             debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->url.authority(true) << " (not this proxy)");
+     }
+ 
+     request->flags.internal = http->flags.internal;
+     setLogUri (http, urlCanonicalClean(request.getRaw()));
+     request->client_addr = conn->clientConnection->remote; // XXX: remove request->client_addr member.
+ #if FOLLOW_X_FORWARDED_FOR
+     // indirect client gets stored here because it is an HTTP header result (from X-Forwarded-For:)
+     // not details about the TCP connection itself
+     request->indirect_client_addr = conn->clientConnection->remote;
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+     request->my_addr = conn->clientConnection->local;
+@@ -1831,61 +1831,61 @@ ConnStateData::concurrentRequestQueueFil
+     const int internalRequest = 0;
+ #endif
+     const int concurrentRequestLimit = pipelinePrefetchMax() + 1 + internalRequest;
+ 
+     // when queue filled already we cant add more.
+     if (existingRequestCount >= concurrentRequestLimit) {
+         debugs(33, 3, clientConnection << " max concurrent requests reached (" << concurrentRequestLimit << ")");
+         debugs(33, 5, clientConnection << " deferring new request until one is done");
+         return true;
+     }
+ 
+     return false;
+ }
+ 
+ /**
+  * Perform proxy_protocol_access ACL tests on the client which
+  * connected to PROXY protocol port to see if we trust the
+  * sender enough to accept their PROXY header claim.
+  */
+ bool
+ ConnStateData::proxyProtocolValidateClient()
+ {
+     if (!Config.accessList.proxyProtocol)
+         return proxyProtocolError("PROXY client not permitted by default ACL");
+ 
+     ACLFilledChecklist ch(Config.accessList.proxyProtocol, NULL, clientConnection->rfc931);
+     ch.src_addr = clientConnection->remote;
+     ch.my_addr = clientConnection->local;
+     ch.conn(this);
+ 
+-    if (ch.fastCheck() != ACCESS_ALLOWED)
++    if (!ch.fastCheck().allowed())
+         return proxyProtocolError("PROXY client not permitted by ACLs");
+ 
+     return true;
+ }
+ 
+ /**
+  * Perform cleanup on PROXY protocol errors.
+  * If header parsing hits a fatal error terminate the connection,
+  * otherwise wait for more data.
+  */
+ bool
+ ConnStateData::proxyProtocolError(const char *msg)
+ {
+     if (msg) {
+         // This is important to know, but maybe not so much that flooding the log is okay.
+ #if QUIET_PROXY_PROTOCOL
+         // display the first of every 32 occurances at level 1, the others at level 2.
+         static uint8_t hide = 0;
+         debugs(33, (hide++ % 32 == 0 ? DBG_IMPORTANT : 2), msg << " from " << clientConnection);
+ #else
+         debugs(33, DBG_IMPORTANT, msg << " from " << clientConnection);
+ #endif
+         mustStop(msg);
+     }
+     return false;
+ }
+ 
+ /// magic octet prefix for PROXY protocol version 1
+ static const SBuf Proxy1p0magic("PROXY ", 6);
+ 
+@@ -2451,89 +2451,89 @@ ConnStateData::start()
+             debugs(33, DBG_IMPORTANT, "NOTICE: Path MTU discovery disabling is not supported on your platform.");
+             reported = true;
+         }
+ #endif
+     }
+ 
+     typedef CommCbMemFunT<ConnStateData, CommCloseCbParams> Dialer;
+     AsyncCall::Pointer call = JobCallback(33, 5, Dialer, this, ConnStateData::connStateClosed);
+     comm_add_close_handler(clientConnection->fd, call);
+ 
+     needProxyProtocolHeader_ = port->flags.proxySurrogate;
+     if (needProxyProtocolHeader_) {
+         if (!proxyProtocolValidateClient()) // will close the connection on failure
+             return;
+     } else
+         whenClientIpKnown();
+ 
+ }
+ 
+ void
+ ConnStateData::whenClientIpKnown()
+ {
+     if (Config.onoff.log_fqdn)
+         fqdncache_gethostbyaddr(clientConnection->remote, FQDN_LOOKUP_IF_MISS);
+ 
+ #if USE_IDENT
+     if (Ident::TheConfig.identLookup) {
+         ACLFilledChecklist identChecklist(Ident::TheConfig.identLookup, NULL, NULL);
+         identChecklist.src_addr = clientConnection->remote;
+         identChecklist.my_addr = clientConnection->local;
+-        if (identChecklist.fastCheck() == ACCESS_ALLOWED)
++        if (identChecklist.fastCheck().allowed())
+             Ident::Start(clientConnection, clientIdentDone, this);
+     }
+ #endif
+ 
+     clientdbEstablished(clientConnection->remote, 1);
+ 
+ #if USE_DELAY_POOLS
+     fd_table[clientConnection->fd].clientInfo = NULL;
+ 
+     if (Config.onoff.client_db) {
+         /* it was said several times that client write limiter does not work if client_db is disabled */
+ 
+         auto &pools = ClientDelayPools::Instance()->pools;
+         ACLFilledChecklist ch(NULL, NULL, NULL);
+ 
+         // TODO: we check early to limit error response bandwith but we
+         // should recheck when we can honor delay_pool_uses_indirect
+         // TODO: we should also pass the port details for myportname here.
+         ch.src_addr = clientConnection->remote;
+         ch.my_addr = clientConnection->local;
+ 
+         for (unsigned int pool = 0; pool < pools.size(); ++pool) {
+ 
+             /* pools require explicit 'allow' to assign a client into them */
+             if (pools[pool]->access) {
+                 ch.changeAcl(pools[pool]->access);
+                 allow_t answer = ch.fastCheck();
+-                if (answer == ACCESS_ALLOWED) {
++                if (answer.allowed()) {
+ 
+                     /*  request client information from db after we did all checks
+                         this will save hash lookup if client failed checks */
+                     ClientInfo * cli = clientdbGetInfo(clientConnection->remote);
+                     assert(cli);
+ 
+                     /* put client info in FDE */
+                     fd_table[clientConnection->fd].clientInfo = cli;
+ 
+                     /* setup write limiter for this request */
+                     const double burst = floor(0.5 +
+                                                (pools[pool]->highwatermark * Config.ClientDelay.initial)/100.0);
+                     cli->setWriteLimiter(pools[pool]->rate, burst, pools[pool]->highwatermark);
+                     break;
+                 } else {
+                     debugs(83, 4, HERE << "Delay pool " << pool << " skipped because ACL " << answer);
+                 }
+             }
+         }
+     }
+ #endif
+ 
+     // kids must extend to actually start doing something (e.g., reading)
+ }
+ 
+ /** Handle a new connection on an HTTP socket. */
+ void
+ httpAccept(const CommAcceptCbParams &params)
+ {
+     MasterXaction::Pointer xact = params.xaction;
+@@ -2711,61 +2711,61 @@ clientNegotiateSSL(int fd, void *data)
+  */
+ static void
+ httpsEstablish(ConnStateData *connState, const Security::ContextPointer &ctx)
+ {
+     assert(connState);
+     const Comm::ConnectionPointer &details = connState->clientConnection;
+ 
+     if (!ctx || !httpsCreate(details, ctx))
+         return;
+ 
+     typedef CommCbMemFunT<ConnStateData, CommTimeoutCbParams> TimeoutDialer;
+     AsyncCall::Pointer timeoutCall = JobCallback(33, 5, TimeoutDialer,
+                                      connState, ConnStateData::requestTimeout);
+     commSetConnTimeout(details, Config.Timeout.request, timeoutCall);
+ 
+     Comm::SetSelect(details->fd, COMM_SELECT_READ, clientNegotiateSSL, connState, 0);
+ }
+ 
+ /**
+  * A callback function to use with the ACLFilledChecklist callback.
+  */
+ static void
+ httpsSslBumpAccessCheckDone(allow_t answer, void *data)
+ {
+     ConnStateData *connState = (ConnStateData *) data;
+ 
+     // if the connection is closed or closing, just return.
+     if (!connState->isOpen())
+         return;
+ 
+-    if (answer == ACCESS_ALLOWED) {
++    if (answer.allowed()) {
+         debugs(33, 2, "sslBump action " << Ssl::bumpMode(answer.kind) << "needed for " << connState->clientConnection);
+         connState->sslBumpMode = static_cast<Ssl::BumpMode>(answer.kind);
+     } else {
+         debugs(33, 3, "sslBump not needed for " << connState->clientConnection);
+         connState->sslBumpMode = Ssl::bumpSplice;
+     }
+ 
+     if (connState->sslBumpMode == Ssl::bumpTerminate) {
+         connState->clientConnection->close();
+         return;
+     }
+ 
+     if (!connState->fakeAConnectRequest("ssl-bump", connState->inBuf))
+         connState->clientConnection->close();
+ }
+ 
+ /** handle a new HTTPS connection */
+ static void
+ httpsAccept(const CommAcceptCbParams &params)
+ {
+     MasterXaction::Pointer xact = params.xaction;
+     const AnyP::PortCfgPointer s = xact->squidPort;
+ 
+     // NP: it is possible the port was reconfigured when the call or accept() was queued.
+ 
+     if (params.flag != Comm::OK) {
+         // Its possible the call was still queued when the client disconnected
+         debugs(33, 2, "httpsAccept: " << s->listenConn << ": accept failure: " << xstrerr(params.xerrno));
+         return;
+     }
+@@ -2865,84 +2865,84 @@ ConnStateData::sslCrtdHandleReply(const
+                 }
+                 return;
+             }
+         }
+     }
+     Security::ContextPointer nil;
+     getSslContextDone(nil);
+ }
+ 
+ void ConnStateData::buildSslCertGenerationParams(Ssl::CertificateProperties &certProperties)
+ {
+     certProperties.commonName =  sslCommonName_.isEmpty() ? sslConnectHostOrIp.termedBuf() : sslCommonName_.c_str();
+ 
+     const bool triedToConnect = sslServerBump && sslServerBump->entry;
+     const bool connectedOK = triedToConnect && sslServerBump->entry->isEmpty();
+     if (connectedOK) {
+         if (X509 *mimicCert = sslServerBump->serverCert.get())
+             certProperties.mimicCert.resetAndLock(mimicCert);
+ 
+         ACLFilledChecklist checklist(NULL, sslServerBump->request.getRaw(),
+                                      clientConnection != NULL ? clientConnection->rfc931 : dash_str);
+         checklist.sslErrors = cbdataReference(sslServerBump->sslErrors());
+ 
+         for (sslproxy_cert_adapt *ca = Config.ssl_client.cert_adapt; ca != NULL; ca = ca->next) {
+             // If the algorithm already set, then ignore it.
+             if ((ca->alg == Ssl::algSetCommonName && certProperties.setCommonName) ||
+                     (ca->alg == Ssl::algSetValidAfter && certProperties.setValidAfter) ||
+                     (ca->alg == Ssl::algSetValidBefore && certProperties.setValidBefore) )
+                 continue;
+ 
+-            if (ca->aclList && checklist.fastCheck(ca->aclList) == ACCESS_ALLOWED) {
++            if (ca->aclList && checklist.fastCheck(ca->aclList).allowed()) {
+                 const char *alg = Ssl::CertAdaptAlgorithmStr[ca->alg];
+                 const char *param = ca->param;
+ 
+                 // For parameterless CN adaptation, use hostname from the
+                 // CONNECT request.
+                 if (ca->alg == Ssl::algSetCommonName) {
+                     if (!param)
+                         param = sslConnectHostOrIp.termedBuf();
+                     certProperties.commonName = param;
+                     certProperties.setCommonName = true;
+                 } else if (ca->alg == Ssl::algSetValidAfter)
+                     certProperties.setValidAfter = true;
+                 else if (ca->alg == Ssl::algSetValidBefore)
+                     certProperties.setValidBefore = true;
+ 
+                 debugs(33, 5, HERE << "Matches certificate adaptation aglorithm: " <<
+                        alg << " param: " << (param ? param : "-"));
+             }
+         }
+ 
+         certProperties.signAlgorithm = Ssl::algSignEnd;
+         for (sslproxy_cert_sign *sg = Config.ssl_client.cert_sign; sg != NULL; sg = sg->next) {
+-            if (sg->aclList && checklist.fastCheck(sg->aclList) == ACCESS_ALLOWED) {
++            if (sg->aclList && checklist.fastCheck(sg->aclList).allowed()) {
+                 certProperties.signAlgorithm = (Ssl::CertSignAlgorithm)sg->alg;
+                 break;
+             }
+         }
+     } else {// did not try to connect (e.g. client-first) or failed to connect
+         // In case of an error while connecting to the secure server, use a
+         // trusted certificate, with no mimicked fields and no adaptation
+         // algorithms. There is nothing we can mimic, so we want to minimize the
+         // number of warnings the user will have to see to get to the error page.
+         // We will close the connection, so that the trust is not extended to
+         // non-Squid content.
+         certProperties.signAlgorithm = Ssl::algSignTrusted;
+     }
+ 
+     assert(certProperties.signAlgorithm != Ssl::algSignEnd);
+ 
+     if (certProperties.signAlgorithm == Ssl::algSignUntrusted) {
+         assert(port->untrustedSigningCert.get());
+         certProperties.signWithX509.resetAndLock(port->untrustedSigningCert.get());
+         certProperties.signWithPkey.resetAndLock(port->untrustedSignPkey.get());
+     } else {
+         assert(port->signingCert.get());
+         certProperties.signWithX509.resetAndLock(port->signingCert.get());
+ 
+         if (port->signPkey.get())
+             certProperties.signWithPkey.resetAndLock(port->signPkey.get());
+     }
+     signAlgorithm = certProperties.signAlgorithm;
+ 
+     certProperties.signHash = Ssl::DefaultSignHash;
+@@ -3174,61 +3174,61 @@ ConnStateData::parseTlsHandshake()
+         sslBumpMode = Ssl::bumpSplice;
+         context->http->al->ssl.bumpMode = Ssl::bumpSplice;
+         if (!clientTunnelOnError(this, context, request, HttpRequestMethod(), ERR_PROTOCOL_UNKNOWN))
+             clientConnection->close();
+         return;
+     }
+ 
+     if (!sslServerBump || sslServerBump->act.step1 == Ssl::bumpClientFirst) { // Either means client-first.
+         getSslContextStart();
+         return;
+     } else if (sslServerBump->act.step1 == Ssl::bumpServerFirst) {
+         // will call httpsPeeked() with certificate and connection, eventually
+         FwdState::fwdStart(clientConnection, sslServerBump->entry, sslServerBump->request.getRaw());
+     } else {
+         Must(sslServerBump->act.step1 == Ssl::bumpPeek || sslServerBump->act.step1 == Ssl::bumpStare);
+         startPeekAndSplice();
+     }
+ }
+ 
+ void httpsSslBumpStep2AccessCheckDone(allow_t answer, void *data)
+ {
+     ConnStateData *connState = (ConnStateData *) data;
+ 
+     // if the connection is closed or closing, just return.
+     if (!connState->isOpen())
+         return;
+ 
+     debugs(33, 5, "Answer: " << answer << " kind:" << answer.kind);
+     assert(connState->serverBump());
+     Ssl::BumpMode bumpAction;
+-    if (answer == ACCESS_ALLOWED) {
++    if (answer.allowed()) {
+         bumpAction = (Ssl::BumpMode)answer.kind;
+     } else
+         bumpAction = Ssl::bumpSplice;
+ 
+     connState->serverBump()->act.step2 = bumpAction;
+     connState->sslBumpMode = bumpAction;
+     Http::StreamPointer context = connState->pipeline.front();
+     if (ClientHttpRequest *http = (context ? context->http : nullptr))
+         http->al->ssl.bumpMode = bumpAction;
+ 
+     if (bumpAction == Ssl::bumpTerminate) {
+         connState->clientConnection->close();
+     } else if (bumpAction != Ssl::bumpSplice) {
+         connState->startPeekAndSplice();
+     } else if (!connState->splice())
+         connState->clientConnection->close();
+ }
+ 
+ bool
+ ConnStateData::splice()
+ {
+     // normally we can splice here, because we just got client hello message
+ 
+     if (fd_table[clientConnection->fd].ssl.get()) {
+         // Restore default read methods
+         fd_table[clientConnection->fd].read_method = &default_read_method;
+         fd_table[clientConnection->fd].write_method = &default_write_method;
+     }
+ 
+     // XXX: assuming that there was an HTTP/1.1 CONNECT to begin with...
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2017-06-01 23:49:09 +0000
++++ src/client_side_reply.cc	2017-06-11 09:33:23 +0000
+@@ -841,61 +841,61 @@ clientReplyContext::processConditional(S
+     if (r.flags.ims) {
+         // handle If-Modified-Since requests from the client
+         if (e->modifiedSince(r.ims, r.imslen)) {
+             // Modified-Since is true; treat as an unconditional hit
+             return false;
+ 
+         } else {
+             // otherwise reply with 304 Not Modified
+             sendNotModified();
+         }
+         return true;
+     }
+ 
+     return false;
+ }
+ 
+ /// whether squid.conf send_hit prevents us from serving this hit
+ bool
+ clientReplyContext::blockedHit() const
+ {
+     if (!Config.accessList.sendHit)
+         return false; // hits are not blocked by default
+ 
+     if (http->flags.internal)
+         return false; // internal content "hits" cannot be blocked
+ 
+     if (const HttpReply *rep = http->storeEntry()->getReply()) {
+         std::unique_ptr<ACLFilledChecklist> chl(clientAclChecklistCreate(Config.accessList.sendHit, http));
+         chl->reply = const_cast<HttpReply*>(rep); // ACLChecklist API bug
+         HTTPMSGLOCK(chl->reply);
+-        return chl->fastCheck() != ACCESS_ALLOWED; // when in doubt, block
++        return !chl->fastCheck().allowed(); // when in doubt, block
+     }
+ 
+     // This does not happen, I hope, because we are called from CacheHit, which
+     // is called via a storeClientCopy() callback, and store should initialize
+     // the reply before calling that callback.
+     debugs(88, 3, "Missing reply!");
+     return false;
+ }
+ 
+ void
+ clientReplyContext::purgeRequestFindObjectToPurge()
+ {
+     /* Try to find a base entry */
+     http->flags.purging = true;
+     lookingforstore = 1;
+ 
+     // TODO: can we use purgeAllCached() here instead of doing the
+     // getPublicByRequestMethod() dance?
+     StoreEntry::getPublicByRequestMethod(this, http->request, Http::METHOD_GET);
+ }
+ 
+ // Purges all entries with a given url
+ // TODO: move to SideAgent parent, when we have one
+ /*
+  * We probably cannot purge Vary-affected responses because their MD5
+  * keys depend on vary headers.
+  */
+ void
+ purgeEntriesByUrl(HttpRequest * req, const char *url)
+ {
+@@ -2053,61 +2053,61 @@ clientReplyContext::processReplyAccess (
+     headers_sz = reply->hdr_sz;
+ 
+     /** check for absent access controls (permit by default) */
+     if (!Config.accessList.reply) {
+         processReplyAccessResult(ACCESS_ALLOWED);
+         return;
+     }
+ 
+     /** Process http_reply_access lists */
+     ACLFilledChecklist *replyChecklist =
+         clientAclChecklistCreate(Config.accessList.reply, http);
+     replyChecklist->reply = reply;
+     HTTPMSGLOCK(replyChecklist->reply);
+     replyChecklist->nonBlockingCheck(ProcessReplyAccessResult, this);
+ }
+ 
+ void
+ clientReplyContext::ProcessReplyAccessResult(allow_t rv, void *voidMe)
+ {
+     clientReplyContext *me = static_cast<clientReplyContext *>(voidMe);
+     me->processReplyAccessResult(rv);
+ }
+ 
+ void
+ clientReplyContext::processReplyAccessResult(const allow_t &accessAllowed)
+ {
+     debugs(88, 2, "The reply for " << http->request->method
+            << ' ' << http->uri << " is " << accessAllowed << ", because it matched "
+            << (AclMatchedName ? AclMatchedName : "NO ACL's"));
+ 
+-    if (accessAllowed != ACCESS_ALLOWED) {
++    if (!accessAllowed.allowed()) {
+         ErrorState *err;
+         err_type page_id;
+         page_id = aclGetDenyInfoPage(&Config.denyInfoList, AclMatchedName, 1);
+ 
+         http->logType = LOG_TCP_DENIED_REPLY;
+ 
+         if (page_id == ERR_NONE)
+             page_id = ERR_ACCESS_DENIED;
+ 
+         Ip::Address tmp_noaddr;
+         tmp_noaddr.setNoAddr();
+         err = clientBuildError(page_id, Http::scForbidden, NULL,
+                                http->getConn() != NULL ? http->getConn()->clientConnection->remote : tmp_noaddr,
+                                http->request);
+ 
+         removeClientStoreReference(&sc, http);
+ 
+         HTTPMSGUNLOCK(reply);
+ 
+         startError(err);
+ 
+         return;
+     }
+ 
+     /* Ok, the reply is allowed, */
+     http->loggingEntry(http->storeEntry());
+ 
+     ssize_t body_size = reqofs - reply->hdr_sz;
+     if (body_size < 0) {
+         reqofs = reply->hdr_sz;
+
+=== modified file 'src/client_side_request.cc'
+--- src/client_side_request.cc	2017-05-07 21:53:15 +0000
++++ src/client_side_request.cc	2017-06-11 09:49:58 +0000
+@@ -429,120 +429,119 @@ ClientRequestContext::httpStateIsValid()
+ /**
+  * clientFollowXForwardedForCheck() checks the content of X-Forwarded-For:
+  * against the followXFF ACL, or cleans up and passes control to
+  * clientAccessCheck().
+  *
+  * The trust model here is a little ambiguous. So to clarify the logic:
+  * - we may always use the direct client address as the client IP.
+  * - these trust tests merey tell whether we trust given IP enough to believe the
+  *   IP string which it appended to the X-Forwarded-For: header.
+  * - if at any point we don't trust what an IP adds we stop looking.
+  * - at that point the current contents of indirect_client_addr are the value set
+  *   by the last previously trusted IP.
+  * ++ indirect_client_addr contains the remote direct client from the trusted peers viewpoint.
+  */
+ static void
+ clientFollowXForwardedForCheck(allow_t answer, void *data)
+ {
+     ClientRequestContext *calloutContext = (ClientRequestContext *) data;
+ 
+     if (!calloutContext->httpStateIsValid())
+         return;
+ 
+     ClientHttpRequest *http = calloutContext->http;
+     HttpRequest *request = http->request;
+ 
+     /*
+      * answer should be be ACCESS_ALLOWED or ACCESS_DENIED if we are
+      * called as a result of ACL checks, or -1 if we are called when
+      * there's nothing left to do.
+      */
+-    if (answer == ACCESS_ALLOWED &&
+-            request->x_forwarded_for_iterator.size () != 0) {
++    if (answer.allowed() && request->x_forwarded_for_iterator.size() != 0) {
+ 
+         /*
+          * Remove the last comma-delimited element from the
+          * x_forwarded_for_iterator and use it to repeat the cycle.
+          */
+         const char *p;
+         const char *asciiaddr;
+         int l;
+         Ip::Address addr;
+         p = request->x_forwarded_for_iterator.termedBuf();
+         l = request->x_forwarded_for_iterator.size();
+ 
+         /*
+         * XXX x_forwarded_for_iterator should really be a list of
+         * IP addresses, but it's a String instead.  We have to
+         * walk backwards through the String, biting off the last
+         * comma-delimited part each time.  As long as the data is in
+         * a String, we should probably implement and use a variant of
+         * strListGetItem() that walks backwards instead of forwards
+         * through a comma-separated list.  But we don't even do that;
+         * we just do the work in-line here.
+         */
+         /* skip trailing space and commas */
+         while (l > 0 && (p[l-1] == ',' || xisspace(p[l-1])))
+             --l;
+         request->x_forwarded_for_iterator.cut(l);
+         /* look for start of last item in list */
+         while (l > 0 && ! (p[l-1] == ',' || xisspace(p[l-1])))
+             --l;
+         asciiaddr = p+l;
+         if ((addr = asciiaddr)) {
+             request->indirect_client_addr = addr;
+             request->x_forwarded_for_iterator.cut(l);
+             calloutContext->acl_checklist = clientAclChecklistCreate(Config.accessList.followXFF, http);
+             if (!Config.onoff.acl_uses_indirect_client) {
+                 /* override the default src_addr tested if we have to go deeper than one level into XFF */
+                 Filled(calloutContext->acl_checklist)->src_addr = request->indirect_client_addr;
+             }
+             calloutContext->acl_checklist->nonBlockingCheck(clientFollowXForwardedForCheck, data);
+             return;
+         }
+     } /*if (answer == ACCESS_ALLOWED &&
+         request->x_forwarded_for_iterator.size () != 0)*/
+ 
+     /* clean up, and pass control to clientAccessCheck */
+     if (Config.onoff.log_uses_indirect_client) {
+         /*
+         * Ensure that the access log shows the indirect client
+         * instead of the direct client.
+         */
+         ConnStateData *conn = http->getConn();
+         conn->log_addr = request->indirect_client_addr;
+         http->al->cache.caddr = conn->log_addr;
+     }
+     request->x_forwarded_for_iterator.clean();
+     request->flags.done_follow_x_forwarded_for = true;
+ 
+-    if (answer != ACCESS_ALLOWED && answer != ACCESS_DENIED) {
++    if (!answer.someRuleMatched({ACCESS_ALLOWED, ACCESS_DENIED})) {
+         debugs(28, DBG_CRITICAL, "ERROR: Processing X-Forwarded-For. Stopping at IP address: " << request->indirect_client_addr );
+     }
+ 
+     /* process actual access ACL as normal. */
+     calloutContext->clientAccessCheck();
+ }
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+ 
+ static void
+ hostHeaderIpVerifyWrapper(const ipcache_addrs* ia, const Dns::LookupDetails &dns, void *data)
+ {
+     ClientRequestContext *c = static_cast<ClientRequestContext*>(data);
+     c->hostHeaderIpVerify(ia, dns);
+ }
+ 
+ void
+ ClientRequestContext::hostHeaderIpVerify(const ipcache_addrs* ia, const Dns::LookupDetails &dns)
+ {
+     Comm::ConnectionPointer clientConn = http->getConn()->clientConnection;
+ 
+     // note the DNS details for the transaction stats.
+     http->request->recordLookup(dns);
+ 
+     if (ia != NULL && ia->count > 0) {
+         // Is the NAT destination IP in DNS?
+         for (int i = 0; i < ia->count; ++i) {
+             if (clientConn->local.matchIPAddr(ia->in_addrs[i]) == 0) {
+                 debugs(85, 3, HERE << "validate IP " << clientConn->local << " possible from Host:");
+                 http->request->flags.hostVerified = true;
+                 http->doCallouts();
+@@ -744,61 +743,61 @@ ClientRequestContext::clientAccessCheck2
+ 
+ void
+ clientAccessCheckDoneWrapper(allow_t answer, void *data)
+ {
+     ClientRequestContext *calloutContext = (ClientRequestContext *) data;
+ 
+     if (!calloutContext->httpStateIsValid())
+         return;
+ 
+     calloutContext->clientAccessCheckDone(answer);
+ }
+ 
+ void
+ ClientRequestContext::clientAccessCheckDone(const allow_t &answer)
+ {
+     acl_checklist = NULL;
+     err_type page_id;
+     Http::StatusCode status;
+     debugs(85, 2, "The request " << http->request->method << ' ' <<
+            http->uri << " is " << answer <<
+            "; last ACL checked: " << (AclMatchedName ? AclMatchedName : "[none]"));
+ 
+ #if USE_AUTH
+     char const *proxy_auth_msg = "<null>";
+     if (http->getConn() != NULL && http->getConn()->getAuth() != NULL)
+         proxy_auth_msg = http->getConn()->getAuth()->denyMessage("<null>");
+     else if (http->request->auth_user_request != NULL)
+         proxy_auth_msg = http->request->auth_user_request->denyMessage("<null>");
+ #endif
+ 
+-    if (answer != ACCESS_ALLOWED) {
++    if (!answer.allowed()) {
+         // auth has a grace period where credentials can be expired but okay not to challenge.
+ 
+         /* Send an auth challenge or error */
+         // XXX: do we still need aclIsProxyAuth() ?
+         bool auth_challenge = (answer == ACCESS_AUTH_REQUIRED || aclIsProxyAuth(AclMatchedName));
+         debugs(85, 5, "Access Denied: " << http->uri);
+         debugs(85, 5, "AclMatchedName = " << (AclMatchedName ? AclMatchedName : "<null>"));
+ #if USE_AUTH
+         if (auth_challenge)
+             debugs(33, 5, "Proxy Auth Message = " << (proxy_auth_msg ? proxy_auth_msg : "<null>"));
+ #endif
+ 
+         /*
+          * NOTE: get page_id here, based on AclMatchedName because if
+          * USE_DELAY_POOLS is enabled, then AclMatchedName gets clobbered in
+          * the clientCreateStoreEntry() call just below.  Pedro Ribeiro
+          * <pribeiro@isel.pt>
+          */
+         page_id = aclGetDenyInfoPage(&Config.denyInfoList, AclMatchedName, answer != ACCESS_AUTH_REQUIRED);
+ 
+         http->logType = LOG_TCP_DENIED;
+ 
+         if (auth_challenge) {
+ #if USE_AUTH
+             if (http->request->flags.sslBumped) {
+                 /*SSL Bumped request, authentication is not possible*/
+                 status = Http::scForbidden;
+             } else if (!http->flags.accel) {
+                 /* Proxy authorisation needed */
+                 status = Http::scProxyAuthenticationRequired;
+@@ -855,92 +854,92 @@ ClientHttpRequest::noteAdaptationAclChec
+             ih->rfc931 = getConn()->clientConnection->rfc931;
+ #if USE_OPENSSL
+             if (getConn()->clientConnection->isOpen()) {
+                 ih->ssluser = sslGetUserEmail(fd_table[getConn()->clientConnection->fd].ssl.get());
+             }
+ #endif
+         }
+         ih->log_uri = log_uri;
+         ih->req_sz = req_sz;
+     }
+ #endif
+ 
+     if (!g) {
+         debugs(85,3, HERE << "no adaptation needed");
+         doCallouts();
+         return;
+     }
+ 
+     startAdaptation(g);
+ }
+ 
+ #endif
+ 
+ static void
+ clientRedirectAccessCheckDone(allow_t answer, void *data)
+ {
+     ClientRequestContext *context = (ClientRequestContext *)data;
+     ClientHttpRequest *http = context->http;
+     context->acl_checklist = NULL;
+ 
+-    if (answer == ACCESS_ALLOWED)
++    if (answer.allowed())
+         redirectStart(http, clientRedirectDoneWrapper, context);
+     else {
+         Helper::Reply const nilReply(Helper::Error);
+         context->clientRedirectDone(nilReply);
+     }
+ }
+ 
+ void
+ ClientRequestContext::clientRedirectStart()
+ {
+     debugs(33, 5, HERE << "'" << http->uri << "'");
+     http->al->syncNotes(http->request);
+     if (Config.accessList.redirector) {
+         acl_checklist = clientAclChecklistCreate(Config.accessList.redirector, http);
+         acl_checklist->nonBlockingCheck(clientRedirectAccessCheckDone, this);
+     } else
+         redirectStart(http, clientRedirectDoneWrapper, this);
+ }
+ 
+ /**
+  * This methods handles Access checks result of StoreId access list.
+  * Will handle as "ERR" (no change) in a case Access is not allowed.
+  */
+ static void
+ clientStoreIdAccessCheckDone(allow_t answer, void *data)
+ {
+     ClientRequestContext *context = static_cast<ClientRequestContext *>(data);
+     ClientHttpRequest *http = context->http;
+     context->acl_checklist = NULL;
+ 
+-    if (answer == ACCESS_ALLOWED)
++    if (answer.allowed())
+         storeIdStart(http, clientStoreIdDoneWrapper, context);
+     else {
+         debugs(85, 3, "access denied expected ERR reply handling: " << answer);
+         Helper::Reply const nilReply(Helper::Error);
+         context->clientStoreIdDone(nilReply);
+     }
+ }
+ 
+ /**
+  * Start locating an alternative storeage ID string (if any) from admin
+  * configured helper program. This is an asynchronous operation terminating in
+  * ClientRequestContext::clientStoreIdDone() when completed.
+  */
+ void
+ ClientRequestContext::clientStoreIdStart()
+ {
+     debugs(33, 5,"'" << http->uri << "'");
+ 
+     if (Config.accessList.store_id) {
+         acl_checklist = clientAclChecklistCreate(Config.accessList.store_id, http);
+         acl_checklist->nonBlockingCheck(clientStoreIdAccessCheckDone, this);
+     } else
+         storeIdStart(http, clientStoreIdDoneWrapper, this);
+ }
+ 
+ static int
+ clientHierarchical(ClientHttpRequest * http)
+ {
+     HttpRequest *request = http->request;
+     HttpRequestMethod method = request->method;
+@@ -1372,61 +1371,61 @@ ClientRequestContext::clientStoreIdDone(
+ /** Test cache allow/deny configuration
+  *  Sets flags.cachable=1 if caching is not denied.
+  */
+ void
+ ClientRequestContext::checkNoCache()
+ {
+     if (Config.accessList.noCache) {
+         acl_checklist = clientAclChecklistCreate(Config.accessList.noCache, http);
+         acl_checklist->nonBlockingCheck(checkNoCacheDoneWrapper, this);
+     } else {
+         /* unless otherwise specified, we try to cache. */
+         checkNoCacheDone(ACCESS_ALLOWED);
+     }
+ }
+ 
+ static void
+ checkNoCacheDoneWrapper(allow_t answer, void *data)
+ {
+     ClientRequestContext *calloutContext = (ClientRequestContext *) data;
+ 
+     if (!calloutContext->httpStateIsValid())
+         return;
+ 
+     calloutContext->checkNoCacheDone(answer);
+ }
+ 
+ void
+ ClientRequestContext::checkNoCacheDone(const allow_t &answer)
+ {
+     acl_checklist = NULL;
+-    if (answer == ACCESS_DENIED) {
++    if (answer.denied()) {
+         http->request->flags.noCache = true; // dont read reply from cache
+         http->request->flags.cachable = false; // dont store reply into cache
+     }
+     http->doCallouts();
+ }
+ 
+ #if USE_OPENSSL
+ bool
+ ClientRequestContext::sslBumpAccessCheck()
+ {
+     if (!http->getConn()) {
+         http->al->ssl.bumpMode = Ssl::bumpEnd; // SslBump does not apply; log -
+         return false;
+     }
+ 
+     const Ssl::BumpMode bumpMode = http->getConn()->sslBumpMode;
+     if (http->request->flags.forceTunnel) {
+         debugs(85, 5, "not needed; already decided to tunnel " << http->getConn());
+         if (bumpMode != Ssl::bumpEnd)
+             http->al->ssl.bumpMode = bumpMode; // inherited from bumped connection
+         return false;
+     }
+ 
+     // If SSL connection tunneling or bumping decision has been made, obey it.
+     if (bumpMode != Ssl::bumpEnd) {
+         debugs(85, 5, HERE << "SslBump already decided (" << bumpMode <<
+                "), " << "ignoring ssl_bump for " << http->getConn());
+ 
+         // We need the following "if" for transparently bumped TLS connection,
+         // because in this case we are running ssl_bump access list before
+@@ -1471,61 +1470,61 @@ ClientRequestContext::sslBumpAccessCheck
+         return false;
+     }
+ 
+     debugs(85, 5, HERE << "SslBump possible, checking ACL");
+ 
+     ACLFilledChecklist *aclChecklist = clientAclChecklistCreate(Config.accessList.ssl_bump, http);
+     aclChecklist->nonBlockingCheck(sslBumpAccessCheckDoneWrapper, this);
+     return true;
+ }
+ 
+ /**
+  * A wrapper function to use the ClientRequestContext::sslBumpAccessCheckDone method
+  * as ACLFilledChecklist callback
+  */
+ static void
+ sslBumpAccessCheckDoneWrapper(allow_t answer, void *data)
+ {
+     ClientRequestContext *calloutContext = static_cast<ClientRequestContext *>(data);
+ 
+     if (!calloutContext->httpStateIsValid())
+         return;
+     calloutContext->sslBumpAccessCheckDone(answer);
+ }
+ 
+ void
+ ClientRequestContext::sslBumpAccessCheckDone(const allow_t &answer)
+ {
+     if (!httpStateIsValid())
+         return;
+ 
+-    const Ssl::BumpMode bumpMode = answer == ACCESS_ALLOWED ?
++    const Ssl::BumpMode bumpMode = answer.allowed() ?
+                                    static_cast<Ssl::BumpMode>(answer.kind) : Ssl::bumpSplice;
+     http->sslBumpNeed(bumpMode); // for processRequest() to bump if needed
+     http->al->ssl.bumpMode = bumpMode; // for logging
+ 
+     if (bumpMode == Ssl::bumpTerminate) {
+         const Comm::ConnectionPointer clientConn = http->getConn() ? http->getConn()->clientConnection : nullptr;
+         if (Comm::IsConnOpen(clientConn)) {
+             debugs(85, 3, "closing after Ssl::bumpTerminate ");
+             clientConn->close();
+         }
+         return;
+     }
+ 
+     http->doCallouts();
+ }
+ #endif
+ 
+ /*
+  * Identify requests that do not go through the store and client side stream
+  * and forward them to the appropriate location. All other requests, request
+  * them.
+  */
+ void
+ ClientHttpRequest::processRequest()
+ {
+     debugs(85, 4, request->method << ' ' << uri);
+ 
+     const bool untouchedConnect = request->method == Http::METHOD_CONNECT && !redirect.status;
+ 
+ #if USE_OPENSSL
+
+=== modified file 'src/clients/Client.cc'
+--- src/clients/Client.cc	2017-04-03 07:22:32 +0000
++++ src/clients/Client.cc	2017-06-11 09:33:23 +0000
+@@ -495,61 +495,61 @@ Client::maybePurgeOthers()
+     const char *reqUrl = tmp.c_str();
+     debugs(88, 5, "maybe purging due to " << request->method << ' ' << tmp);
+     purgeEntriesByUrl(request.getRaw(), reqUrl);
+     purgeEntriesByHeader(request.getRaw(), reqUrl, theFinalReply, Http::HdrType::LOCATION);
+     purgeEntriesByHeader(request.getRaw(), reqUrl, theFinalReply, Http::HdrType::CONTENT_LOCATION);
+ }
+ 
+ /// called when we have final (possibly adapted) reply headers; kids extend
+ void
+ Client::haveParsedReplyHeaders()
+ {
+     Must(theFinalReply);
+     maybePurgeOthers();
+ 
+     // adaptation may overwrite old offset computed using the virgin response
+     const bool partial = theFinalReply->content_range &&
+                          theFinalReply->sline.status() == Http::scPartialContent;
+     currentOffset = partial ? theFinalReply->content_range->spec.offset : 0;
+ }
+ 
+ /// whether to prevent caching of an otherwise cachable response
+ bool
+ Client::blockCaching()
+ {
+     if (const Acl::Tree *acl = Config.accessList.storeMiss) {
+         // This relatively expensive check is not in StoreEntry::checkCachable:
+         // That method lacks HttpRequest and may be called too many times.
+         ACLFilledChecklist ch(acl, originalRequest().getRaw());
+         ch.reply = const_cast<HttpReply*>(entry->getReply()); // ACLFilledChecklist API bug
+         HTTPMSGLOCK(ch.reply);
+-        if (ch.fastCheck() != ACCESS_ALLOWED) { // when in doubt, block
++        if (!ch.fastCheck().allowed()) { // when in doubt, block
+             debugs(20, 3, "store_miss prohibits caching");
+             return true;
+         }
+     }
+     return false;
+ }
+ 
+ HttpRequestPointer
+ Client::originalRequest()
+ {
+     return request;
+ }
+ 
+ #if USE_ADAPTATION
+ /// Initiate an asynchronous adaptation transaction which will call us back.
+ void
+ Client::startAdaptation(const Adaptation::ServiceGroupPointer &group, HttpRequest *cause)
+ {
+     debugs(11, 5, "Client::startAdaptation() called");
+     // check whether we should be sending a body as well
+     // start body pipe to feed ICAP transaction if needed
+     assert(!virginBodyDestination);
+     HttpReply *vrep = virginReply();
+     assert(!vrep->body_pipe);
+     int64_t size = 0;
+     if (vrep->expectingBody(cause->method, size) && size) {
+         virginBodyDestination = new BodyPipe(this);
+         vrep->body_pipe = virginBodyDestination;
+         debugs(93, 6, HERE << "will send virgin reply body to " <<
+                virginBodyDestination << "; size: " << size);
+
+=== modified file 'src/clients/FtpClient.cc'
+--- src/clients/FtpClient.cc	2017-01-01 00:12:22 +0000
++++ src/clients/FtpClient.cc	2017-06-11 09:33:23 +0000
+@@ -678,61 +678,61 @@ Ftp::Client::sendPassive()
+             debugs(9, 5, "FTP Channel is IPv6 (" << ctrl.conn->remote << ") attempting EPSV 2 after EPSV ALL has failed.");
+             mb.appendf("EPSV 2%s", Ftp::crlf);
+             state = SENT_EPSV_2;
+             break;
+         }
+     // else fall through to skip EPSV 2
+ 
+     case SENT_EPSV_2: /* EPSV IPv6 failed. Try EPSV IPv4 */
+         if (ctrl.conn->local.isIPv4()) {
+             debugs(9, 5, "FTP Channel is IPv4 (" << ctrl.conn->remote << ") attempting EPSV 1 after EPSV ALL has failed.");
+             mb.appendf("EPSV 1%s", Ftp::crlf);
+             state = SENT_EPSV_1;
+             break;
+         } else if (Config.Ftp.epsv_all) {
+             debugs(9, DBG_IMPORTANT, "FTP does not allow PASV method after 'EPSV ALL' has been sent.");
+             failed(ERR_FTP_FAILURE, 0);
+             return false;
+         }
+     // else fall through to skip EPSV 1
+ 
+     case SENT_EPSV_1: /* EPSV options exhausted. Try PASV now. */
+         debugs(9, 5, "FTP Channel (" << ctrl.conn->remote << ") rejects EPSV connection attempts. Trying PASV instead.");
+         mb.appendf("PASV%s", Ftp::crlf);
+         state = SENT_PASV;
+         break;
+ 
+     default: {
+         bool doEpsv = true;
+         if (Config.accessList.ftp_epsv) {
+             ACLFilledChecklist checklist(Config.accessList.ftp_epsv, fwd->request, NULL);
+-            doEpsv = (checklist.fastCheck() == ACCESS_ALLOWED);
++            doEpsv = checklist.fastCheck().allowed();
+         }
+         if (!doEpsv) {
+             debugs(9, 5, "EPSV support manually disabled. Sending PASV for FTP Channel (" << ctrl.conn->remote <<")");
+             mb.appendf("PASV%s", Ftp::crlf);
+             state = SENT_PASV;
+         } else if (Config.Ftp.epsv_all) {
+             debugs(9, 5, "EPSV ALL manually enabled. Attempting with FTP Channel (" << ctrl.conn->remote <<")");
+             mb.appendf("EPSV ALL%s", Ftp::crlf);
+             state = SENT_EPSV_ALL;
+         } else {
+             if (ctrl.conn->local.isIPv6()) {
+                 debugs(9, 5, "FTP Channel (" << ctrl.conn->remote << "). Sending default EPSV 2");
+                 mb.appendf("EPSV 2%s", Ftp::crlf);
+                 state = SENT_EPSV_2;
+             }
+             if (ctrl.conn->local.isIPv4()) {
+                 debugs(9, 5, "Channel (" << ctrl.conn->remote <<"). Sending default EPSV 1");
+                 mb.appendf("EPSV 1%s", Ftp::crlf);
+                 state = SENT_EPSV_1;
+             }
+         }
+         break;
+     }
+     }
+ 
+     if (ctrl.message)
+         wordlistDestroy(&ctrl.message);
+     ctrl.message = NULL; //No message to return to client.
+     ctrl.offset = 0; //reset readed response, to make room read the next response
+ 
+
+=== modified file 'src/external_acl.cc'
+--- src/external_acl.cc	2017-01-11 19:06:57 +0000
++++ src/external_acl.cc	2017-06-11 09:33:23 +0000
+@@ -429,61 +429,61 @@ external_acl::add(const ExternalACLEntry
+ {
+     trimCache();
+     assert(anEntry != NULL);
+     assert (anEntry->def == NULL);
+     anEntry->def = this;
+     ExternalACLEntry *e = const_cast<ExternalACLEntry *>(anEntry.getRaw()); // XXX: make hash a std::map of Pointer.
+     hash_join(cache, e);
+     dlinkAdd(e, &e->lru, &lru_list);
+     e->lock(); //cbdataReference(e); // lock it on behalf of the hash
+     ++cache_entries;
+ }
+ 
+ void
+ external_acl::trimCache()
+ {
+     if (cache_size && cache_entries >= cache_size) {
+         ExternalACLEntryPointer e(static_cast<ExternalACLEntry *>(lru_list.tail->data));
+         external_acl_cache_delete(this, e);
+     }
+ }
+ 
+ bool
+ external_acl::maybeCacheable(const allow_t &result) const
+ {
+     if (cache_size <= 0)
+         return false; // cache is disabled
+ 
+     if (result == ACCESS_DUNNO)
+         return false; // non-cacheable response
+ 
+-    if ((result == ACCESS_ALLOWED ? ttl : negative_ttl) <= 0)
++    if ((result.allowed() ? ttl : negative_ttl) <= 0)
+         return false; // not caching this type of response
+ 
+     return true;
+ }
+ 
+ /******************************************************************
+  * external acl type
+  */
+ 
+ class external_acl_data
+ {
+     CBDATA_CLASS(external_acl_data);
+ 
+ public:
+     explicit external_acl_data(external_acl *aDef) : def(cbdataReference(aDef)), name(NULL), arguments(NULL) {}
+     ~external_acl_data();
+ 
+     external_acl *def;
+     const char *name;
+     wordlist *arguments;
+ };
+ 
+ CBDATA_CLASS_INIT(external_acl_data);
+ 
+ external_acl_data::~external_acl_data()
+ {
+     xfree(name);
+     wordlistDestroy(&arguments);
+     cbdataReferenceDone(def);
+ }
+@@ -588,61 +588,61 @@ aclMatchExternal(external_acl_data *acl,
+     if (entry != NULL) {
+         if (entry->def == acl->def) {
+             /* Ours, use it.. if the key matches */
+             const char *key = makeExternalAclKey(ch, acl);
+             if (!key)
+                 return ACCESS_DUNNO; // insufficent data to continue
+             if (strcmp(key, (char*)entry->key) != 0) {
+                 debugs(82, 9, "entry key='" << (char *)entry->key << "', our key='" << key << "' dont match. Discarded.");
+                 // too bad. need a new lookup.
+                 entry = ch->extacl_entry = NULL;
+             }
+         } else {
+             /* Not ours.. get rid of it */
+             debugs(82, 9, "entry " << entry << " not valid or not ours. Discarded.");
+             if (entry != NULL) {
+                 debugs(82, 9, "entry def=" << entry->def << ", our def=" << acl->def);
+                 const char *key = makeExternalAclKey(ch, acl); // may be nil
+                 debugs(82, 9, "entry key='" << (char *)entry->key << "', our key='" << key << "'");
+             }
+             entry = ch->extacl_entry = NULL;
+         }
+     }
+ 
+     if (!entry) {
+         debugs(82, 9, HERE << "No helper entry available");
+ #if USE_AUTH
+         if (acl->def->require_auth) {
+             /* Make sure the user is authenticated */
+             debugs(82, 3, HERE << acl->def->name << " check user authenticated.");
+             const allow_t ti = AuthenticateAcl(ch);
+-            if (ti != ACCESS_ALLOWED) {
++            if (!ti.allowed()) {
+                 debugs(82, 2, HERE << acl->def->name << " user not authenticated (" << ti << ")");
+                 return ti;
+             }
+             debugs(82, 3, HERE << acl->def->name << " user is authenticated.");
+         }
+ #endif
+         const char *key = makeExternalAclKey(ch, acl);
+ 
+         if (!key) {
+             /* Not sufficient data to process */
+             return ACCESS_DUNNO;
+         }
+ 
+         entry = static_cast<ExternalACLEntry *>(hash_lookup(acl->def->cache, key));
+ 
+         const ExternalACLEntryPointer staleEntry = entry;
+         if (entry != NULL && external_acl_entry_expired(acl->def, entry))
+             entry = NULL;
+ 
+         if (entry != NULL && external_acl_grace_expired(acl->def, entry)) {
+             // refresh in the background
+             ExternalACLLookup::Start(ch, acl, true);
+             debugs(82, 4, HERE << "no need to wait for the refresh of '" <<
+                    key << "' in '" << acl->def->name << "' (ch=" << ch << ").");
+         }
+ 
+         if (!entry) {
+             debugs(82, 2, HERE << acl->def->name << "(\"" << key << "\") = lookup needed");
+ 
+             // TODO: All other helpers allow temporary overload. Should not we?
+@@ -775,74 +775,74 @@ makeExternalAclKey(ACLFilledChecklist *
+                 }
+             }
+ 
+             ch->al->lastAclData = sb;
+         }
+ 
+ #if USE_IDENT
+         if (t->type == Format::LFT_USER_IDENT) {
+             if (!*ch->rfc931) {
+                 // if we fail to go async, we still return NULL and the caller
+                 // will detect the failure in ACLExternal::match().
+                 (void)ch->goAsync(IdentLookup::Instance());
+                 return NULL;
+             }
+         }
+ #endif
+     }
+ 
+     // assemble the full helper lookup string
+     acl_data->def->format.assemble(mb, ch->al, 0);
+ 
+     return mb.buf;
+ }
+ 
+ static int
+ external_acl_entry_expired(external_acl * def, const ExternalACLEntryPointer &entry)
+ {
+     if (def->cache_size <= 0 || entry->result == ACCESS_DUNNO)
+         return 1;
+ 
+-    if (entry->date + (entry->result == ACCESS_ALLOWED ? def->ttl : def->negative_ttl) < squid_curtime)
++    if (entry->date + (entry->result.allowed() ? def->ttl : def->negative_ttl) < squid_curtime)
+         return 1;
+     else
+         return 0;
+ }
+ 
+ static int
+ external_acl_grace_expired(external_acl * def, const ExternalACLEntryPointer &entry)
+ {
+     if (def->cache_size <= 0 || entry->result == ACCESS_DUNNO)
+         return 1;
+ 
+     int ttl;
+-    ttl = entry->result == ACCESS_ALLOWED ? def->ttl : def->negative_ttl;
++    ttl = entry->result.allowed() ? def->ttl : def->negative_ttl;
+     ttl = (ttl * (100 - def->grace)) / 100;
+ 
+     if (entry->date + ttl <= squid_curtime)
+         return 1;
+     else
+         return 0;
+ }
+ 
+ static ExternalACLEntryPointer
+ external_acl_cache_add(external_acl * def, const char *key, ExternalACLEntryData const & data)
+ {
+     ExternalACLEntryPointer entry;
+ 
+     if (!def->maybeCacheable(data.result)) {
+         debugs(82,6, HERE);
+ 
+         if (data.result == ACCESS_DUNNO) {
+             if (const ExternalACLEntryPointer oldentry = static_cast<ExternalACLEntry *>(hash_lookup(def->cache, key)))
+                 external_acl_cache_delete(def, oldentry);
+         }
+         entry = new ExternalACLEntry;
+         entry->key = xstrdup(key);
+         entry->update(data);
+         entry->def = def;
+         return entry;
+     }
+ 
+     entry = static_cast<ExternalACLEntry *>(hash_lookup(def->cache, key));
+     debugs(82, 2, "external_acl_cache_add: Adding '" << key << "' = " << data.result);
+ 
+
+=== modified file 'src/htcp.cc'
+--- src/htcp.cc	2017-01-01 00:12:22 +0000
++++ src/htcp.cc	2017-06-11 09:33:23 +0000
+@@ -747,61 +747,61 @@ htcpUnpackDetail(char *buf, int sz)
+     /* Set CACHE-HDRS */
+     buf += 2;
+ 
+     d->cache_hdrs = buf;
+     buf += l;
+     d->cacheHdrsSz = l;
+     sz -= l;
+ 
+     debugs(31, 3, "htcpUnpackDetail: " << sz << " bytes left");
+ 
+     /*
+      * Add terminating null to CACHE-HDRS. This is possible because we allocated
+      * an extra byte when we received the packet. This will overwrite any following
+      * AUTH block.
+      */
+     *buf = '\0';
+ 
+     return d;
+ }
+ 
+ static bool
+ htcpAccessAllowed(acl_access * acl, const htcpSpecifier::Pointer &s, Ip::Address &from)
+ {
+     /* default deny if no access list present */
+     if (!acl)
+         return false;
+ 
+     ACLFilledChecklist checklist(acl, s->request.getRaw(), nullptr);
+     checklist.src_addr = from;
+     checklist.my_addr.setNoAddr();
+-    return (checklist.fastCheck() == ACCESS_ALLOWED);
++    return checklist.fastCheck().allowed();
+ }
+ 
+ static void
+ htcpTstReply(htcpDataHeader * dhdr, StoreEntry * e, htcpSpecifier * spec, Ip::Address &from)
+ {
+     static char pkt[8192];
+     HttpHeader hdr(hoHtcpReply);
+     ssize_t pktlen;
+ 
+     htcpStuff stuff(dhdr->msg_id, HTCP_TST, RR_RESPONSE, 0);
+     stuff.response = e ? 0 : 1;
+     debugs(31, 3, "htcpTstReply: response = " << stuff.response);
+ 
+     if (spec) {
+         stuff.S.method = spec->method;
+         stuff.S.uri = spec->uri;
+         stuff.S.version = spec->version;
+         stuff.S.req_hdrs = spec->req_hdrs;
+         stuff.S.reqHdrsSz = spec->reqHdrsSz;
+         if (e)
+             hdr.putInt(Http::HdrType::AGE, (e->timestamp <= squid_curtime ? (squid_curtime - e->timestamp) : 0) );
+         else
+             hdr.putInt(Http::HdrType::AGE, 0);
+         MemBuf mb;
+         mb.init();
+         hdr.packInto(&mb);
+         stuff.D.resp_hdrs = xstrdup(mb.buf);
+         stuff.D.respHdrsSz = mb.contentSize();
+         debugs(31, 3, "htcpTstReply: resp_hdrs = {" << stuff.D.resp_hdrs << "}");
+         mb.reset();
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2017-06-09 00:12:17 +0000
++++ src/http.cc	2017-06-11 09:33:23 +0000
+@@ -780,61 +780,61 @@ HttpStateData::processReplyHeader()
+ 
+     processSurrogateControl (vrep);
+ 
+     request->hier.peer_reply_status = newrep->sline.status();
+ 
+     ctx_exit(ctx);
+ }
+ 
+ /// ignore or start forwarding the 1xx response (a.k.a., control message)
+ void
+ HttpStateData::handle1xx(HttpReply *reply)
+ {
+     HttpReply::Pointer msg(reply); // will destroy reply if unused
+ 
+     // one 1xx at a time: we must not be called while waiting for previous 1xx
+     Must(!flags.handling1xx);
+     flags.handling1xx = true;
+ 
+     if (!request->canHandle1xx() || request->forcedBodyContinuation) {
+         debugs(11, 2, "ignoring 1xx because it is " << (request->forcedBodyContinuation ? "already sent" : "not supported by client"));
+         proceedAfter1xx();
+         return;
+     }
+ 
+ #if USE_HTTP_VIOLATIONS
+     // check whether the 1xx response forwarding is allowed by squid.conf
+     if (Config.accessList.reply) {
+         ACLFilledChecklist ch(Config.accessList.reply, originalRequest().getRaw());
+         ch.reply = reply;
+         HTTPMSGLOCK(ch.reply);
+-        if (ch.fastCheck() != ACCESS_ALLOWED) { // TODO: support slow lookups?
++        if (!ch.fastCheck().allowed()) { // TODO: support slow lookups?
+             debugs(11, 3, HERE << "ignoring denied 1xx");
+             proceedAfter1xx();
+             return;
+         }
+     }
+ #endif // USE_HTTP_VIOLATIONS
+ 
+     debugs(11, 2, HERE << "forwarding 1xx to client");
+ 
+     // the Sink will use this to call us back after writing 1xx to the client
+     typedef NullaryMemFunT<HttpStateData> CbDialer;
+     const AsyncCall::Pointer cb = JobCallback(11, 3, CbDialer, this,
+                                   HttpStateData::proceedAfter1xx);
+     CallJobHere1(11, 4, request->clientConnectionManager, ConnStateData,
+                  ConnStateData::sendControlMsg, HttpControlMsg(msg, cb));
+     // If the call is not fired, then the Sink is gone, and HttpStateData
+     // will terminate due to an aborted store entry or another similar error.
+     // If we get stuck, it is not handle1xx fault if we could get stuck
+     // for similar reasons without a 1xx response.
+ }
+ 
+ /// restores state and resumes processing after 1xx is ignored or forwarded
+ void
+ HttpStateData::proceedAfter1xx()
+ {
+     Must(flags.handling1xx);
+     debugs(11, 2, "continuing with " << payloadSeen << " bytes in buffer after 1xx");
+     CallJobHere(11, 3, this, HttpStateData, HttpStateData::processReply);
+ }
+ 
+@@ -2291,61 +2291,61 @@ httpStart(FwdState *fwd)
+ void
+ HttpStateData::start()
+ {
+     if (!sendRequest()) {
+         debugs(11, 3, "httpStart: aborted");
+         mustStop("HttpStateData::start failed");
+         return;
+     }
+ 
+     ++ statCounter.server.all.requests;
+     ++ statCounter.server.http.requests;
+ 
+     /*
+      * We used to set the read timeout here, but not any more.
+      * Now its set in httpSendComplete() after the full request,
+      * including request body, has been written to the server.
+      */
+ }
+ 
+ /// if broken posts are enabled for the request, try to fix and return true
+ bool
+ HttpStateData::finishingBrokenPost()
+ {
+ #if USE_HTTP_VIOLATIONS
+     if (!Config.accessList.brokenPosts) {
+         debugs(11, 5, HERE << "No brokenPosts list");
+         return false;
+     }
+ 
+     ACLFilledChecklist ch(Config.accessList.brokenPosts, originalRequest().getRaw());
+-    if (ch.fastCheck() != ACCESS_ALLOWED) {
++    if (!ch.fastCheck().allowed()) {
+         debugs(11, 5, HERE << "didn't match brokenPosts");
+         return false;
+     }
+ 
+     if (!Comm::IsConnOpen(serverConnection)) {
+         debugs(11, 3, HERE << "ignoring broken POST for closed " << serverConnection);
+         assert(closeHandler != NULL);
+         return true; // prevent caller from proceeding as if nothing happened
+     }
+ 
+     debugs(11, 3, "finishingBrokenPost: fixing broken POST");
+     typedef CommCbMemFunT<HttpStateData, CommIoCbParams> Dialer;
+     requestSender = JobCallback(11,5,
+                                 Dialer, this, HttpStateData::wroteLast);
+     Comm::Write(serverConnection, "\r\n", 2, requestSender, NULL);
+     return true;
+ #else
+     return false;
+ #endif /* USE_HTTP_VIOLATIONS */
+ }
+ 
+ /// if needed, write last-chunk to end the request body and return true
+ bool
+ HttpStateData::finishingChunkedRequest()
+ {
+     if (flags.sentLastChunk) {
+         debugs(11, 5, HERE << "already sent last-chunk");
+         return false;
+     }
+ 
+
+=== modified file 'src/http/Stream.cc'
+--- src/http/Stream.cc	2017-02-19 17:13:27 +0000
++++ src/http/Stream.cc	2017-06-11 09:33:23 +0000
+@@ -269,61 +269,61 @@ Http::Stream::sendStartOfMessage(HttpRep
+     MemBuf *mb = rep->pack();
+ 
+     // dump now, so we dont output any body.
+     debugs(11, 2, "HTTP Client " << clientConnection);
+     debugs(11, 2, "HTTP Client REPLY:\n---------\n" << mb->buf << "\n----------");
+ 
+     /* Save length of headers for persistent conn checks */
+     http->out.headers_sz = mb->contentSize();
+ #if HEADERS_LOG
+     headersLog(0, 0, http->request->method, rep);
+ #endif
+ 
+     if (bodyData.data && bodyData.length) {
+         if (multipartRangeRequest())
+             packRange(bodyData, mb);
+         else if (http->request->flags.chunkedReply) {
+             packChunk(bodyData, *mb);
+         } else {
+             size_t length = lengthToSend(bodyData.range());
+             noteSentBodyBytes(length);
+             mb->append(bodyData.data, length);
+         }
+     }
+ #if USE_DELAY_POOLS
+     for (const auto &pool: MessageDelayPools::Instance()->pools) {
+         if (pool->access) {
+             std::unique_ptr<ACLFilledChecklist> chl(clientAclChecklistCreate(pool->access, http));
+             chl->reply = rep;
+             HTTPMSGLOCK(chl->reply);
+             const allow_t answer = chl->fastCheck();
+-            if (answer == ACCESS_ALLOWED) {
++            if (answer.allowed()) {
+                 writeQuotaHandler = pool->createBucket();
+                 fd_table[clientConnection->fd].writeQuotaHandler = writeQuotaHandler;
+                 break;
+             } else {
+                 debugs(83, 4, "Response delay pool " << pool->poolName <<
+                        " skipped because ACL " << answer);
+             }
+         }
+     }
+ #endif
+ 
+     getConn()->write(mb);
+     delete mb;
+ }
+ 
+ void
+ Http::Stream::sendBody(StoreIOBuffer bodyData)
+ {
+     if (!multipartRangeRequest() && !http->request->flags.chunkedReply) {
+         size_t length = lengthToSend(bodyData.range());
+         noteSentBodyBytes(length);
+         getConn()->write(bodyData.data, length);
+         return;
+     }
+ 
+     MemBuf mb;
+     mb.init();
+     if (multipartRangeRequest())
+         packRange(bodyData, &mb);
+     else
+
+=== modified file 'src/icp_v2.cc'
+--- src/icp_v2.cc	2017-01-01 00:12:22 +0000
++++ src/icp_v2.cc	2017-06-11 09:33:23 +0000
+@@ -390,61 +390,61 @@ icpCreateAndSend(icp_opcode opcode, int
+     icp_common_t *reply = _icp_common_t::createMessage(opcode, flags, url, reqnum, pad);
+     icpUdpSend(fd, from, reply, icpLogFromICPCode(opcode), 0);
+ }
+ 
+ void
+ icpDenyAccess(Ip::Address &from, char *url, int reqnum, int fd)
+ {
+     debugs(12, 2, "icpDenyAccess: Access Denied for " << from << " by " << AclMatchedName << ".");
+ 
+     if (clientdbCutoffDenied(from)) {
+         /*
+          * count this DENIED query in the clientdb, even though
+          * we're not sending an ICP reply...
+          */
+         clientdbUpdate(from, LOG_UDP_DENIED, AnyP::PROTO_ICP, 0);
+     } else {
+         icpCreateAndSend(ICP_DENIED, 0, url, reqnum, 0, fd, from);
+     }
+ }
+ 
+ bool
+ icpAccessAllowed(Ip::Address &from, HttpRequest * icp_request)
+ {
+     /* absent any explicit rules, we deny all */
+     if (!Config.accessList.icp)
+         return false;
+ 
+     ACLFilledChecklist checklist(Config.accessList.icp, icp_request, NULL);
+     checklist.src_addr = from;
+     checklist.my_addr.setNoAddr();
+-    return (checklist.fastCheck() == ACCESS_ALLOWED);
++    return checklist.fastCheck().allowed();
+ }
+ 
+ char const *
+ icpGetUrlToSend(char *url)
+ {
+     if (strpbrk(url, w_space))
+         return rfc1738_escape(url);
+     else
+         return url;
+ }
+ 
+ HttpRequest *
+ icpGetRequest(char *url, int reqnum, int fd, Ip::Address &from)
+ {
+     if (strpbrk(url, w_space)) {
+         url = rfc1738_escape(url);
+         icpCreateAndSend(ICP_ERR, 0, rfc1738_escape(url), reqnum, 0, fd, from);
+         return NULL;
+     }
+ 
+     HttpRequest *result;
+ 
+     if ((result = HttpRequest::CreateFromUrl(url)) == NULL)
+         icpCreateAndSend(ICP_ERR, 0, url, reqnum, 0, fd, from);
+ 
+     return result;
+ 
+ }
+ 
+ static void
+
+=== modified file 'src/log/access_log.cc'
+--- src/log/access_log.cc	2017-01-01 00:12:22 +0000
++++ src/log/access_log.cc	2017-06-11 09:33:23 +0000
+@@ -57,61 +57,61 @@ typedef struct {
+     int n;
+ } fvdb_entry;
+ static hash_table *via_table = NULL;
+ static hash_table *forw_table = NULL;
+ static void fvdbInit();
+ static void fvdbDumpTable(StoreEntry * e, hash_table * hash);
+ static void fvdbCount(hash_table * hash, const char *key);
+ static OBJH fvdbDumpVia;
+ static OBJH fvdbDumpForw;
+ static FREE fvdbFreeEntry;
+ static void fvdbClear(void);
+ static void fvdbRegisterWithCacheManager();
+ #endif
+ 
+ int LogfileStatus = LOG_DISABLE;
+ 
+ void
+ accessLogLogTo(CustomLog* log, AccessLogEntry::Pointer &al, ACLChecklist * checklist)
+ {
+ 
+     if (al->url.isEmpty())
+         al->url = Format::Dash;
+ 
+     if (!al->http.content_type || *al->http.content_type == '\0')
+         al->http.content_type = dash_str;
+ 
+     if (al->hier.host[0] == '\0')
+         xstrncpy(al->hier.host, dash_str, SQUIDHOSTNAMELEN);
+ 
+     for (; log; log = log->next) {
+-        if (log->aclList && checklist && checklist->fastCheck(log->aclList) != ACCESS_ALLOWED)
++        if (log->aclList && checklist && !checklist->fastCheck(log->aclList).allowed())
+             continue;
+ 
+         // The special-case "none" type has no logfile object set
+         if (log->type == Log::Format::CLF_NONE)
+             return;
+ 
+         if (log->logfile) {
+             logfileLineStart(log->logfile);
+ 
+             switch (log->type) {
+ 
+             case Log::Format::CLF_SQUID:
+                 Log::Format::SquidNative(al, log->logfile);
+                 break;
+ 
+             case Log::Format::CLF_COMBINED:
+                 Log::Format::HttpdCombined(al, log->logfile);
+                 break;
+ 
+             case Log::Format::CLF_COMMON:
+                 Log::Format::HttpdCommon(al, log->logfile);
+                 break;
+ 
+             case Log::Format::CLF_REFERER:
+                 Log::Format::SquidReferer(al, log->logfile);
+                 break;
+ 
+             case Log::Format::CLF_USERAGENT:
+                 Log::Format::SquidUserAgent(al, log->logfile);
+                 break;
+
+=== modified file 'src/neighbors.cc'
+--- src/neighbors.cc	2017-06-09 04:38:40 +0000
++++ src/neighbors.cc	2017-06-11 09:33:23 +0000
+@@ -141,61 +141,61 @@ peerAllowedToUse(const CachePeer * p, Ht
+ 
+     if (neighborType(p, request->url) == PEER_SIBLING) {
+ #if PEER_MULTICAST_SIBLINGS
+         if (p->type == PEER_MULTICAST && p->options.mcast_siblings &&
+                 (request->flags.noCache || request->flags.refresh || request->flags.loopDetected || request->flags.needValidation))
+             debugs(15, 2, "peerAllowedToUse(" << p->name << ", " << request->url.authority() << ") : multicast-siblings optimization match");
+ #endif
+         if (request->flags.noCache)
+             return false;
+ 
+         if (request->flags.refresh)
+             return false;
+ 
+         if (request->flags.loopDetected)
+             return false;
+ 
+         if (request->flags.needValidation)
+             return false;
+     }
+ 
+     // CONNECT requests are proxy requests. Not to be forwarded to origin servers.
+     // Unless the destination port matches, in which case we MAY perform a 'DIRECT' to this CachePeer.
+     if (p->options.originserver && request->method == Http::METHOD_CONNECT && request->url.port() != p->http_port)
+         return false;
+ 
+     if (p->access == NULL)
+         return true;
+ 
+     ACLFilledChecklist checklist(p->access, request, NULL);
+ 
+-    return (checklist.fastCheck() == ACCESS_ALLOWED);
++    return checklist.fastCheck().allowed();
+ }
+ 
+ /* Return TRUE if it is okay to send an ICP request to this CachePeer.   */
+ static int
+ peerWouldBePinged(const CachePeer * p, HttpRequest * request)
+ {
+     if (p->icp.port == 0)
+         return 0;
+ 
+     if (p->options.no_query)
+         return 0;
+ 
+     if (p->options.mcast_responder)
+         return 0;
+ 
+     if (p->n_addresses == 0)
+         return 0;
+ 
+     if (p->options.background_ping && (squid_curtime - p->stats.last_query < Config.backgroundPingRate))
+         return 0;
+ 
+     /* the case below seems strange, but can happen if the
+      * URL host is on the other side of a firewall */
+     if (p->type == PEER_SIBLING)
+         if (!request->flags.hierarchical)
+             return 0;
+ 
+     if (!peerAllowedToUse(p, request))
+         return 0;
+ 
+
+=== modified file 'src/security/PeerConnector.cc'
+--- src/security/PeerConnector.cc	2017-02-15 03:10:55 +0000
++++ src/security/PeerConnector.cc	2017-06-11 09:33:23 +0000
+@@ -311,61 +311,61 @@ Security::PeerConnector::sslCrtvdHandleR
+     serverConn->close();
+     return;
+ }
+ #endif
+ 
+ #if USE_OPENSSL
+ /// Checks errors in the cert. validator response against sslproxy_cert_error.
+ /// The first honored error, if any, is returned via errDetails parameter.
+ /// The method returns all seen errors except SSL_ERROR_NONE as Security::CertErrors.
+ Security::CertErrors *
+ Security::PeerConnector::sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &resp, Ssl::ErrorDetail *& errDetails)
+ {
+     ACLFilledChecklist *check = NULL;
+     if (acl_access *acl = ::Config.ssl_client.cert_error) {
+         check = new ACLFilledChecklist(acl, request.getRaw(), dash_str);
+         check->al = al;
+     }
+ 
+     Security::CertErrors *errs = nullptr;
+     Security::SessionPointer session(fd_table[serverConnection()->fd].ssl);
+     typedef Ssl::CertValidationResponse::RecvdErrors::const_iterator SVCRECI;
+     for (SVCRECI i = resp.errors.begin(); i != resp.errors.end(); ++i) {
+         debugs(83, 7, "Error item: " << i->error_no << " " << i->error_reason);
+ 
+         assert(i->error_no != SSL_ERROR_NONE);
+ 
+         if (!errDetails) {
+             bool allowed = false;
+             if (check) {
+                 check->sslErrors = new Security::CertErrors(Security::CertError(i->error_no, i->cert, i->error_depth));
+-                if (check->fastCheck() == ACCESS_ALLOWED)
++                if (check->fastCheck().allowed())
+                     allowed = true;
+             }
+             // else the Config.ssl_client.cert_error access list is not defined
+             // and the first error will cause the error page
+ 
+             if (allowed) {
+                 debugs(83, 3, "bypassing SSL error " << i->error_no << " in " << "buffer");
+             } else {
+                 debugs(83, 5, "confirming SSL error " << i->error_no);
+                 X509 *brokenCert = i->cert.get();
+                 Security::CertPointer peerCert(SSL_get_peer_certificate(session.get()));
+                 const char *aReason = i->error_reason.empty() ? NULL : i->error_reason.c_str();
+                 errDetails = new Ssl::ErrorDetail(i->error_no, peerCert.get(), brokenCert, aReason);
+             }
+             if (check) {
+                 delete check->sslErrors;
+                 check->sslErrors = NULL;
+             }
+         }
+ 
+         if (!errs)
+             errs = new Security::CertErrors(Security::CertError(i->error_no, i->cert, i->error_depth));
+         else
+             errs->push_back_unique(Security::CertError(i->error_no, i->cert, i->error_depth));
+     }
+     if (check)
+         delete check;
+ 
+     return errs;
+ }
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2017-02-19 06:12:04 +0000
++++ src/servers/FtpServer.cc	2017-06-11 09:33:23 +0000
+@@ -1518,61 +1518,61 @@ Ftp::Server::handlePortRequest(String &,
+ 
+     changeState(fssHandlePort, "handlePortRequest");
+     setDataCommand();
+     return true; // forward our fake PASV request
+ }
+ 
+ bool
+ Ftp::Server::handleDataRequest(String &, String &)
+ {
+     if (!checkDataConnPre())
+         return false;
+ 
+     master->userDataDone = 0;
+     originDataDownloadAbortedOnError = false;
+ 
+     changeState(fssHandleDataRequest, "handleDataRequest");
+ 
+     return true;
+ }
+ 
+ bool
+ Ftp::Server::handleUploadRequest(String &, String &)
+ {
+     if (!checkDataConnPre())
+         return false;
+ 
+     if (Config.accessList.forceRequestBodyContinuation) {
+         ClientHttpRequest *http = pipeline.front()->http;
+         HttpRequest *request = http->request;
+         ACLFilledChecklist bodyContinuationCheck(Config.accessList.forceRequestBodyContinuation, request, NULL);
+-        if (bodyContinuationCheck.fastCheck() == ACCESS_ALLOWED) {
++        if (bodyContinuationCheck.fastCheck().allowed()) {
+             request->forcedBodyContinuation = true;
+             if (checkDataConnPost()) {
+                 // Write control Msg
+                 writeEarlyReply(150, "Data connection opened");
+                 maybeReadUploadData();
+             } else {
+                 // wait for acceptDataConnection but tell it to call wroteEarlyReply
+                 // after writing "150 Data connection opened"
+                 typedef CommCbMemFunT<Server, CommIoCbParams> Dialer;
+                 AsyncCall::Pointer call = JobCallback(33, 5, Dialer, this, Ftp::Server::wroteEarlyReply);
+                 onDataAcceptCall = call;
+             }
+         }
+     }
+ 
+     changeState(fssHandleUploadRequest, "handleDataRequest");
+ 
+     return true;
+ }
+ 
+ bool
+ Ftp::Server::handleEprtRequest(String &, String &params)
+ {
+     debugs(9, 3, "Process an EPRT " << params);
+ 
+     if (gotEpsvAll) {
+         setReply(500, "Rejecting EPRT after EPSV ALL");
+         return false;
+     }
+ 
+
+=== modified file 'src/servers/Http1Server.cc'
+--- src/servers/Http1Server.cc	2017-01-30 12:46:15 +0000
++++ src/servers/Http1Server.cc	2017-06-11 09:33:23 +0000
+@@ -228,61 +228,61 @@ Http::One::Server::proceedAfterBodyConti
+ 
+ void
+ Http::One::Server::processParsedRequest(Http::StreamPointer &context)
+ {
+     if (!buildHttpRequest(context))
+         return;
+ 
+     ClientHttpRequest *http = context->http;
+     HttpRequest::Pointer request = http->request;
+ 
+     if (request->header.has(Http::HdrType::EXPECT)) {
+         const String expect = request->header.getList(Http::HdrType::EXPECT);
+         const bool supportedExpect = (expect.caseCmp("100-continue") == 0);
+         if (!supportedExpect) {
+             clientStreamNode *node = context->getClientReplyContext();
+             quitAfterError(request.getRaw());
+             // setLogUri should called before repContext->setReplyToError
+             setLogUri(http, urlCanonicalClean(request.getRaw()));
+             clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+             assert (repContext);
+             repContext->setReplyToError(ERR_INVALID_REQ, Http::scExpectationFailed, request->method, http->uri,
+                                         clientConnection->remote, request.getRaw(), NULL, NULL);
+             assert(context->http->out.offset == 0);
+             context->pullData();
+             clientProcessRequestFinished(this, request);
+             return;
+         }
+ 
+         if (Config.accessList.forceRequestBodyContinuation) {
+             ACLFilledChecklist bodyContinuationCheck(Config.accessList.forceRequestBodyContinuation, request.getRaw(), NULL);
+-            if (bodyContinuationCheck.fastCheck() == ACCESS_ALLOWED) {
++            if (bodyContinuationCheck.fastCheck().allowed()) {
+                 debugs(33, 5, "Body Continuation forced");
+                 request->forcedBodyContinuation = true;
+                 //sendControlMsg
+                 HttpReply::Pointer rep = new HttpReply;
+                 rep->sline.set(Http::ProtocolVersion(), Http::scContinue);
+ 
+                 typedef UnaryMemFunT<Http1::Server, Http::StreamPointer> CbDialer;
+                 const AsyncCall::Pointer cb = asyncCall(11, 3,  "Http1::Server::proceedAfterBodyContinuation", CbDialer(this, &Http1::Server::proceedAfterBodyContinuation, Http::StreamPointer(context)));
+                 sendControlMsg(HttpControlMsg(rep, cb));
+                 return;
+             }
+         }
+     }
+     clientProcessRequest(this, parser_, context.getRaw());
+ }
+ 
+ void
+ Http::One::Server::noteBodyConsumerAborted(BodyPipe::Pointer ptr)
+ {
+     ConnStateData::noteBodyConsumerAborted(ptr);
+     stopReceiving("virgin request body consumer aborted"); // closes ASAP
+ }
+ 
+ void
+ Http::One::Server::handleReply(HttpReply *rep, StoreIOBuffer receivedData)
+ {
+     // the caller guarantees that we are dealing with the current context only
+     Http::StreamPointer context = pipeline.front();
+     Must(context != nullptr);
+     const ClientHttpRequest *http = context->http;
+
+=== modified file 'src/snmp_core.cc'
+--- src/snmp_core.cc	2017-01-01 00:12:22 +0000
++++ src/snmp_core.cc	2017-06-11 09:33:23 +0000
+@@ -356,82 +356,80 @@ snmpHandleUdp(int sock, void *)
+     len = comm_udp_recvfrom(sock, buf, sizeof(buf)-1, 0, from);
+ 
+     if (len > 0) {
+         debugs(49, 3, "snmpHandleUdp: FD " << sock << ": received " << len << " bytes from " << from << ".");
+ 
+         snmp_rq = (SnmpRequest *)xcalloc(1, sizeof(SnmpRequest));
+         snmp_rq->buf = (u_char *) buf;
+         snmp_rq->len = len;
+         snmp_rq->sock = sock;
+         snmp_rq->outbuf = (unsigned char *)xmalloc(snmp_rq->outlen = SNMP_REQUEST_SIZE);
+         snmp_rq->from = from;
+         snmpDecodePacket(snmp_rq);
+         xfree(snmp_rq->outbuf);
+         xfree(snmp_rq);
+     } else {
+         int xerrno = errno;
+         debugs(49, DBG_IMPORTANT, "snmpHandleUdp: FD " << sock << " recvfrom: " << xstrerr(xerrno));
+     }
+ }
+ 
+ /*
+  * Turn SNMP packet into a PDU, check available ACL's
+  */
+ static void
+ snmpDecodePacket(SnmpRequest * rq)
+ {
+     struct snmp_pdu *PDU;
+     u_char *Community;
+     u_char *buf = rq->buf;
+     int len = rq->len;
+-    allow_t allow = ACCESS_DENIED;
+ 
+     if (!Config.accessList.snmp) {
+         debugs(49, DBG_IMPORTANT, "WARNING: snmp_access not configured. agent query DENIED from : " << rq->from);
+         return;
+     }
+ 
+     debugs(49, 5, HERE << "Called.");
+     PDU = snmp_pdu_create(0);
+     /* Allways answer on SNMPv1 */
+     rq->session.Version = SNMP_VERSION_1;
+     Community = snmp_parse(&rq->session, PDU, buf, len);
+ 
+     /* Check if we have explicit permission to access SNMP data.
+      * default (set above) is to deny all */
+     if (Community) {
+         ACLFilledChecklist checklist(Config.accessList.snmp, NULL, NULL);
+         checklist.src_addr = rq->from;
+         checklist.snmp_community = (char *) Community;
+-        allow = checklist.fastCheck();
+ 
+-        if (allow == ACCESS_ALLOWED && (snmp_coexist_V2toV1(PDU))) {
++        if (checklist.fastCheck().allowed() && (snmp_coexist_V2toV1(PDU))) {
+             rq->community = Community;
+             rq->PDU = PDU;
+             debugs(49, 5, "snmpAgentParse: reqid=[" << PDU->reqid << "]");
+             snmpConstructReponse(rq);
+         } else {
+             debugs(49, DBG_IMPORTANT, "WARNING: SNMP agent query DENIED from : " << rq->from);
+         }
+         xfree(Community);
+ 
+     } else {
+         debugs(49, DBG_IMPORTANT, "WARNING: Failed SNMP agent query from : " << rq->from);
+         snmp_free_pdu(PDU);
+     }
+ }
+ 
+ /*
+  * Packet OK, ACL Check OK, Create reponse.
+  */
+ static void
+ snmpConstructReponse(SnmpRequest * rq)
+ {
+ 
+     struct snmp_pdu *RespPDU;
+ 
+     debugs(49, 5, "snmpConstructReponse: Called.");
+ 
+     if (UsingSmp() && IamWorkerProcess()) {
+         AsyncJob::Start(new Snmp::Forwarder(static_cast<Snmp::Pdu&>(*rq->PDU),
+                                             static_cast<Snmp::Session&>(rq->session), rq->sock, rq->from));
+         snmp_free_pdu(rq->PDU);
+
+=== modified file 'src/ssl/PeekingPeerConnector.cc'
+--- src/ssl/PeekingPeerConnector.cc	2017-05-07 21:53:15 +0000
++++ src/ssl/PeekingPeerConnector.cc	2017-06-11 09:33:23 +0000
+@@ -9,61 +9,61 @@
+ /* DEBUG: section 83    SSL-Bump Server/Peer negotiation */
+ 
+ #include "squid.h"
+ #include "acl/FilledChecklist.h"
+ #include "client_side.h"
+ #include "errorpage.h"
+ #include "fde.h"
+ #include "http/Stream.h"
+ #include "HttpRequest.h"
+ #include "security/NegotiationHistory.h"
+ #include "SquidConfig.h"
+ #include "ssl/bio.h"
+ #include "ssl/PeekingPeerConnector.h"
+ #include "ssl/ServerBump.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeekingPeerConnector);
+ 
+ void switchToTunnel(HttpRequest *request, Comm::ConnectionPointer & clientConn, Comm::ConnectionPointer &srvConn);
+ 
+ void
+ Ssl::PeekingPeerConnector::cbCheckForPeekAndSpliceDone(allow_t answer, void *data)
+ {
+     Ssl::PeekingPeerConnector *peerConnect = (Ssl::PeekingPeerConnector *) data;
+     // Use job calls to add done() checks and other job logic/protections.
+     CallJobHere1(83, 7, CbcPointer<PeekingPeerConnector>(peerConnect), Ssl::PeekingPeerConnector, checkForPeekAndSpliceDone, answer);
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::checkForPeekAndSpliceDone(allow_t answer)
+ {
+-    const Ssl::BumpMode finalAction = (answer.code == ACCESS_ALLOWED) ?
++    const Ssl::BumpMode finalAction = answer.allowed() ?
+                                       static_cast<Ssl::BumpMode>(answer.kind):
+                                       checkForPeekAndSpliceGuess();
+     checkForPeekAndSpliceMatched(finalAction);
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::checkForPeekAndSplice()
+ {
+     // Mark Step3 of bumping
+     if (request->clientConnectionManager.valid()) {
+         if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
+             serverBump->step = Ssl::bumpStep3;
+         }
+     }
+ 
+     handleServerCertificate();
+ 
+     ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(
+         ::Config.accessList.ssl_bump,
+         request.getRaw(), NULL);
+     acl_checklist->al = al;
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpNone));
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpPeek));
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpStare));
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpClientFirst));
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpServerFirst));
+     Security::SessionPointer session(fd_table[serverConn->fd].ssl);
+     BIO *b = SSL_get_rbio(session.get());
+     Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(BIO_get_data(b));
+     if (!srvBio->canSplice())
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2017-06-07 15:57:21 +0000
++++ src/ssl/support.cc	2017-06-11 09:33:23 +0000
+@@ -302,61 +302,61 @@ ssl_verify_cb(int ok, X509_STORE_CTX * c
+         Security::CertPointer broken_cert;
+         broken_cert.resetAndLock(X509_STORE_CTX_get_current_cert(ctx));
+         if (!broken_cert)
+             broken_cert = peer_cert;
+ 
+         Security::CertErrors *errs = static_cast<Security::CertErrors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors));
+         const int depth = X509_STORE_CTX_get_error_depth(ctx);
+         if (!errs) {
+             errs = new Security::CertErrors(Security::CertError(error_no, broken_cert, depth));
+             if (!SSL_set_ex_data(ssl, ssl_ex_index_ssl_errors,  (void *)errs)) {
+                 debugs(83, 2, "Failed to set ssl error_no in ssl_verify_cb: Certificate " << buffer);
+                 delete errs;
+                 errs = NULL;
+             }
+         } else // remember another error number
+             errs->push_back_unique(Security::CertError(error_no, broken_cert, depth));
+ 
+         if (const char *err_descr = Ssl::GetErrorDescr(error_no))
+             debugs(83, 5, err_descr << ": " << buffer);
+         else
+             debugs(83, DBG_IMPORTANT, "SSL unknown certificate error " << error_no << " in " << buffer);
+ 
+         // Check if the certificate error can be bypassed.
+         // Infinity validation loop errors can not bypassed.
+         if (error_no != SQUID_X509_V_ERR_INFINITE_VALIDATION) {
+             if (check) {
+                 ACLFilledChecklist *filledCheck = Filled(check);
+                 assert(!filledCheck->sslErrors);
+                 filledCheck->sslErrors = new Security::CertErrors(Security::CertError(error_no, broken_cert));
+                 filledCheck->serverCert = peer_cert;
+-                if (check->fastCheck() == ACCESS_ALLOWED) {
++                if (check->fastCheck().allowed()) {
+                     debugs(83, 3, "bypassing SSL error " << error_no << " in " << buffer);
+                     ok = 1;
+                 } else {
+                     debugs(83, 5, "confirming SSL error " << error_no);
+                 }
+                 delete filledCheck->sslErrors;
+                 filledCheck->sslErrors = NULL;
+                 filledCheck->serverCert.reset();
+             }
+             // If the certificate validator is used then we need to allow all errors and
+             // pass them to certficate validator for more processing
+             else if (Ssl::TheConfig.ssl_crt_validator) {
+                 ok = 1;
+             }
+         }
+     }
+ 
+     if (Ssl::TheConfig.ssl_crt_validator) {
+         // Check if we have stored certificates chain. Store if not.
+         if (!SSL_get_ex_data(ssl, ssl_ex_index_ssl_cert_chain)) {
+             STACK_OF(X509) *certStack = X509_STORE_CTX_get1_chain(ctx);
+             if (certStack && !SSL_set_ex_data(ssl, ssl_ex_index_ssl_cert_chain, certStack))
+                 sk_X509_pop_free(certStack, X509_free);
+         }
+     }
+ 
+     if (!ok && !SSL_get_ex_data(ssl, ssl_ex_index_ssl_error_detail) ) {
+ 
+         // Find the broken certificate. It may be intermediate.
+         Security::CertPointer broken_cert(peer_cert); // reasonable default if search fails
+
+=== modified file 'src/tunnel.cc'
+--- src/tunnel.cc	2017-06-09 04:38:40 +0000
++++ src/tunnel.cc	2017-06-11 09:52:21 +0000
+@@ -1070,61 +1070,61 @@ tunnelConnectDone(const Comm::Connection
+ 
+     AsyncCall::Pointer timeoutCall = commCbCall(5, 4, "tunnelTimeout",
+                                      CommTimeoutCbPtrFun(tunnelTimeout, tunnelState));
+     commSetConnTimeout(conn, Config.Timeout.read, timeoutCall);
+ }
+ 
+ void
+ tunnelStart(ClientHttpRequest * http)
+ {
+     debugs(26, 3, HERE);
+     /* Create state structure. */
+     TunnelStateData *tunnelState = NULL;
+     ErrorState *err = NULL;
+     HttpRequest *request = http->request;
+     char *url = http->uri;
+ 
+     /*
+      * client_addr.isNoAddr()  indicates this is an "internal" request
+      * from peer_digest.c, asn.c, netdb.c, etc and should always
+      * be allowed.  yuck, I know.
+      */
+ 
+     if (Config.accessList.miss && !request->client_addr.isNoAddr()) {
+         /*
+          * Check if this host is allowed to fetch MISSES from us (miss_access)
+          * default is to allow.
+          */
+         ACLFilledChecklist ch(Config.accessList.miss, request, NULL);
+         ch.src_addr = request->client_addr;
+         ch.my_addr = request->my_addr;
+-        if (ch.fastCheck() == ACCESS_DENIED) {
++        if (ch.fastCheck().denied()) {
+             debugs(26, 4, HERE << "MISS access forbidden.");
+             err = new ErrorState(ERR_FORWARDING_DENIED, Http::scForbidden, request);
+             http->al->http.code = Http::scForbidden;
+             errorSend(http->getConn()->clientConnection, err);
+             return;
+         }
+     }
+ 
+     debugs(26, 3, request->method << ' ' << url << ' ' << request->http_ver);
+     ++statCounter.server.all.requests;
+     ++statCounter.server.other.requests;
+ 
+     tunnelState = new TunnelStateData(http);
+ #if USE_DELAY_POOLS
+     //server.setDelayId called from tunnelConnectDone after server side connection established
+ #endif
+     tunnelState->startSelectingDestinations(request, http->al, nullptr);
+ }
+ 
+ void
+ TunnelStateData::connectToPeer()
+ {
+     if (CachePeer *p = server.conn->getPeer()) {
+         if (p->secure.encryptTransport) {
+             AsyncCall::Pointer callback = asyncCall(5,4,
+                                                     "TunnelStateData::ConnectedToPeer",
+                                                     MyAnswerDialer(&TunnelStateData::connectedToPeer, this));
+             auto *connector = new Security::BlindPeerConnector(request, server.conn, callback, al);
+             AsyncJob::Start(connector); // will call our callback
+             return;
+

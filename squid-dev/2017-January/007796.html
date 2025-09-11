@@ -1,0 +1,2773 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] initial GnuTLS support for encrypted server connections
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20initial%20GnuTLS%20support%20for%20encrypted%20server%0A%20connections&In-Reply-To=%3Ccb9a9779-57a1-cefc-fc85-2db89c36826c%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="007795.html">
+   <LINK REL="Next"  HREF="007797.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20initial%20GnuTLS%20support%20for%20encrypted%20server%0A%20connections&In-Reply-To=%3Ccb9a9779-57a1-cefc-fc85-2db89c36826c%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Thu Jan 19 07:25:56 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007795.html">[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections
+</A></li>
+        <LI>Next message: <A HREF="007797.html">[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7796">[ date ]</a>
+              <a href="thread.html#7796">[ thread ]</a>
+              <a href="subject.html#7796">[ subject ]</a>
+              <a href="author.html#7796">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Ar, forgot the patch again. Please find it attached.
+
+
+Amos
+-------------- next part --------------
+=== modified file 'src/Makefile.am'
+--- src/Makefile.am	2017-01-08 05:12:44 +0000
++++ src/Makefile.am	2017-01-12 13:05:40 +0000
+@@ -3022,44 +3022,44 @@
+ 	$(TESTSOURCES) \
+ 	SquidMath.cc \
+ 	SquidMath.h \
+ 	swap_log_op.cc
+ tests_testUfs_LDADD = \
+ 	http/libhttp.la \
+ 	parser/libparser.la \
+ 	CommCalls.o \
+ 	ident/libident.la \
+ 	acl/libacls.la \
+ 	acl/libstate.la \
+ 	acl/libapi.la \
+ 	libsquid.la \
+ 	ip/libip.la \
+ 	fs/libfs.la \
+ 	mgr/libmgr.la \
+ 	$(REPL_OBJS) \
+ 	acl/libacls.la \
+ 	DiskIO/libdiskio.la \
+ 	acl/libapi.la \
++	anyp/libanyp.la \
+ 	$(SSL_LIBS) \
+ 	ipc/libipc.la \
+ 	comm/libcomm.la \
+-	anyp/libanyp.la \
+ 	dns/libdns.la \
+ 	base/libbase.la \
+ 	ip/libip.la \
+ 	mem/libmem.la \
+ 	store/libstore.la \
+ 	$(ADAPTATION_LIBS) \
+ 	sbuf/libsbuf.la \
+ 	$(top_builddir)/lib/libmisccontainers.la \
+ 	$(top_builddir)/lib/libmiscencoding.la \
+ 	$(top_builddir)/lib/libmiscutil.la \
+ 	$(NETTLELIB) \
+ 	$(REGEXLIB) \
+ 	$(SSLLIB) \
+ 	$(LIBCPPUNIT_LIBS) \
+ 	$(COMPAT_LIB) \
+ 	$(XTRA_LIBS)
+ tests_testUfs_LDFLAGS = $(LIBADD_DL)
+ tests_testUfs_DEPENDENCIES = \
+ 	$(SWAP_TEST_DS)
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2017-01-01 00:12:22 +0000
++++ src/client_side.cc	2017-01-14 15:35:16 +0000
+@@ -2540,47 +2540,46 @@
+     if (params.flag != Comm::OK) {
+         // Its possible the call was still queued when the client disconnected
+         debugs(33, 2, s-&gt;listenConn &lt;&lt; &quot;: accept failure: &quot; &lt;&lt; xstrerr(params.xerrno));
+         return;
+     }
+ 
+     debugs(33, 4, params.conn &lt;&lt; &quot;: accepted&quot;);
+     fd_note(params.conn-&gt;fd, &quot;client http connect&quot;);
+ 
+     if (s-&gt;tcp_keepalive.enabled)
+         commSetTcpKeepalive(params.conn-&gt;fd, s-&gt;tcp_keepalive.idle, s-&gt;tcp_keepalive.interval, s-&gt;tcp_keepalive.timeout);
+ 
+     ++incoming_sockets_accepted;
+ 
+     // Socket is ready, setup the connection manager to start using it
+     auto *srv = Http::NewServer(xact);
+     AsyncJob::Start(srv); // usually async-calls readSomeData()
+ }
+ 
+ #if USE_OPENSSL
+-
+-/** Create SSL connection structure and update fd_table */
++/// Create TLS connection structure and update fd_table
+ static bool
+ httpsCreate(const Comm::ConnectionPointer &amp;conn, const Security::ContextPointer &amp;ctx)
+ {
+-    if (Ssl::CreateServer(ctx, conn, &quot;client https start&quot;)) {
+-        debugs(33, 5, &quot;will negotate SSL on &quot; &lt;&lt; conn);
++    if (Security::CreateServerSession(ctx, conn, &quot;client https start&quot;)) {
++        debugs(33, 5, &quot;will negotiate TLS on &quot; &lt;&lt; conn);
+         return true;
+     }
+ 
+     conn-&gt;close();
+     return false;
+ }
+ 
+ /**
+  *
+  * \retval 1 on success
+  * \retval 0 when needs more data
+  * \retval -1 on error
+  */
+ static int
+ Squid_SSL_accept(ConnStateData *conn, PF *callback)
+ {
+     int fd = conn-&gt;clientConnection-&gt;fd;
+     auto ssl = fd_table[fd].ssl.get();
+     int ret;
+ 
+
+=== modified file 'src/comm.cc'
+--- src/comm.cc	2017-01-01 00:12:22 +0000
++++ src/comm.cc	2017-01-16 12:39:06 +0000
+@@ -747,44 +747,41 @@
+     if (n &lt; 0) {
+         int xerrno = errno;
+         debugs(5, 3, &quot;FD &quot; &lt;&lt; fd &lt;&lt; &quot; read: &quot; &lt;&lt; xstrerr(xerrno));
+     }
+     comm_close(fd);
+ }
+ 
+ static void
+ commLingerTimeout(const FdeCbParams &amp;params)
+ {
+     debugs(5, 3, &quot;commLingerTimeout: FD &quot; &lt;&lt; params.fd);
+     comm_close(params.fd);
+ }
+ 
+ /*
+  * Inspired by apache
+  */
+ void
+ comm_lingering_close(int fd)
+ {
+-#if USE_OPENSSL
+-    if (fd_table[fd].ssl)
+-        ssl_shutdown_method(fd_table[fd].ssl);
+-#endif
++    Security::SessionSendGoodbye(fd_table[fd].ssl);
+ 
+     if (shutdown(fd, 1) &lt; 0) {
+         comm_close(fd);
+         return;
+     }
+ 
+     fd_note(fd, &quot;lingering close&quot;);
+     AsyncCall::Pointer call = commCbCall(5,4, &quot;commLingerTimeout&quot;, FdeCbPtrFun(commLingerTimeout, NULL));
+ 
+     debugs(5, 3, HERE &lt;&lt; &quot;FD &quot; &lt;&lt; fd &lt;&lt; &quot; timeout &quot; &lt;&lt; timeout);
+     assert(fd_table[fd].flags.open);
+     if (callback != NULL) {
+         typedef FdeCbParams Params;
+         Params &amp;params = GetCommParams&lt;Params&gt;(callback);
+         params.fd = fd;
+         fd_table[fd].timeoutHandler = callback;
+         fd_table[fd].timeout = squid_curtime + static_cast&lt;time_t&gt;(10);
+     }
+ 
+     Comm::SetSelect(fd, COMM_SELECT_READ, commLingerClose, NULL, 0);
+@@ -808,48 +805,45 @@
+         debugs(50, DBG_CRITICAL, &quot;ERROR: Closing &quot; &lt;&lt; conn &lt;&lt; &quot; with TCP RST: &quot; &lt;&lt; xstrerr(xerrno));
+     }
+     conn-&gt;close();
+ }
+ 
+ // Legacy close function.
+ void
+ old_comm_reset_close(int fd)
+ {
+     struct linger L;
+     L.l_onoff = 1;
+     L.l_linger = 0;
+ 
+     if (setsockopt(fd, SOL_SOCKET, SO_LINGER, (char *) &amp;L, sizeof(L)) &lt; 0) {
+         int xerrno = errno;
+         debugs(50, DBG_CRITICAL, &quot;ERROR: Closing FD &quot; &lt;&lt; fd &lt;&lt; &quot; with TCP RST: &quot; &lt;&lt; xstrerr(xerrno));
+     }
+     comm_close(fd);
+ }
+ 
+-#if USE_OPENSSL
+ void
+-commStartSslClose(const FdeCbParams &amp;params)
++commStartTlsClose(const FdeCbParams &amp;params)
+ {
+-    assert(fd_table[params.fd].ssl);
+-    ssl_shutdown_method(fd_table[params.fd].ssl.get());
++    Security::SessionSendGoodbye(fd_table[params.fd].ssl);
+ }
+-#endif
+ 
+ void
+ comm_close_complete(const FdeCbParams &amp;params)
+ {
+     fde *F = &amp;fd_table[params.fd];
+     F-&gt;ssl.reset();
+     F-&gt;dynamicTlsContext.reset();
+     fd_close(params.fd);        /* update fdstat */
+     close(params.fd);
+ 
+     ++ statCounter.syscalls.sock.closes;
+ 
+     /* When one connection closes, give accept() a chance, if need be */
+     Comm::AcceptLimiter::Instance().kick();
+ }
+ 
+ /*
+  * Close the socket fd.
+  *
+  * + call write handlers with ERR_CLOSING
+@@ -873,49 +867,47 @@
+     if (F-&gt;closing())
+         return;
+ 
+     /* XXX: is this obsolete behind F-&gt;closing() ? */
+     if ( (shutting_down || reconfiguring) &amp;&amp; (!F-&gt;flags.open || F-&gt;type == FD_FILE))
+         return;
+ 
+     /* The following fails because ipc.c is doing calls to pipe() to create sockets! */
+     if (!isOpen(fd)) {
+         debugs(50, DBG_IMPORTANT, HERE &lt;&lt; &quot;BUG 3556: FD &quot; &lt;&lt; fd &lt;&lt; &quot; is not an open socket.&quot;);
+         // XXX: do we need to run close(fd) or fd_close(fd) here?
+         return;
+     }
+ 
+     assert(F-&gt;type != FD_FILE);
+ 
+     PROF_start(comm_close);
+ 
+     F-&gt;flags.close_request = true;
+ 
+-#if USE_OPENSSL
+     if (F-&gt;ssl) {
+-        AsyncCall::Pointer startCall=commCbCall(5,4, &quot;commStartSslClose&quot;,
+-                                                FdeCbPtrFun(commStartSslClose, NULL));
++        AsyncCall::Pointer startCall=commCbCall(5,4, &quot;commStartTlsClose&quot;,
++                                                FdeCbPtrFun(commStartTlsClose, nullptr));
+         FdeCbParams &amp;startParams = GetCommParams&lt;FdeCbParams&gt;(startCall);
+         startParams.fd = fd;
+         ScheduleCallHere(startCall);
+     }
+-#endif
+ 
+     // a half-closed fd may lack a reader, so we stop monitoring explicitly
+     if (commHasHalfClosedMonitor(fd))
+         commStopHalfClosedMonitor(fd);
+     commUnsetFdTimeout(fd);
+ 
+     // notify read/write handlers after canceling select reservations, if any
+     if (COMMIO_FD_WRITECB(fd)-&gt;active()) {
+         Comm::SetSelect(fd, COMM_SELECT_WRITE, NULL, NULL, 0);
+         COMMIO_FD_WRITECB(fd)-&gt;finish(Comm::ERR_CLOSING, errno);
+     }
+     if (COMMIO_FD_READCB(fd)-&gt;active()) {
+         Comm::SetSelect(fd, COMM_SELECT_READ, NULL, NULL, 0);
+         COMMIO_FD_READCB(fd)-&gt;finish(Comm::ERR_CLOSING, errno);
+     }
+ 
+ #if USE_DELAY_POOLS
+     if (ClientInfo *clientInfo = F-&gt;clientInfo) {
+         if (clientInfo-&gt;selectWaiting) {
+             clientInfo-&gt;selectWaiting = false;
+
+=== modified file 'src/security/BlindPeerConnector.cc'
+--- src/security/BlindPeerConnector.cc	2017-01-01 00:12:22 +0000
++++ src/security/BlindPeerConnector.cc	2017-01-14 07:20:47 +0000
+@@ -15,63 +15,68 @@
+ #include &quot;neighbors.h&quot;
+ #include &quot;security/BlindPeerConnector.h&quot;
+ #include &quot;security/NegotiationHistory.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Security, BlindPeerConnector);
+ 
+ Security::ContextPointer
+ Security::BlindPeerConnector::getTlsContext()
+ {
+     if (const CachePeer *peer = serverConnection()-&gt;getPeer()) {
+         assert(peer-&gt;secure.encryptTransport);
+         return peer-&gt;sslContext;
+     }
+     return ::Config.ssl_client.sslContext;
+ }
+ 
+ bool
+ Security::BlindPeerConnector::initialize(Security::SessionPointer &amp;serverSession)
+ {
+-    if (!Security::PeerConnector::initialize(serverSession))
++    if (!Security::PeerConnector::initialize(serverSession)) {
++        debugs(83, 5, &quot;Security::PeerConnector::initialize failed&quot;);
+         return false;
++    }
+ 
+     if (const CachePeer *peer = serverConnection()-&gt;getPeer()) {
+         assert(peer);
+ 
+         // NP: domain may be a raw-IP but it is now always set
+         assert(!peer-&gt;secure.sslDomain.isEmpty());
+ 
+ #if USE_OPENSSL
+         // const loss is okay here, ssl_ex_index_server is only read and not assigned a destructor
+         SBuf *host = new SBuf(peer-&gt;secure.sslDomain);
+         SSL_set_ex_data(serverSession.get(), ssl_ex_index_server, host);
+ 
+         Security::SetSessionResumeData(serverSession, peer-&gt;sslSession);
+     } else {
+         SBuf *hostName = new SBuf(request-&gt;url.host());
+         SSL_set_ex_data(serverSession.get(), ssl_ex_index_server, (void*)hostName);
+ #endif
+     }
++
++    debugs(83, 5, &quot;success&quot;);
+     return true;
+ }
+ 
+ void
+ Security::BlindPeerConnector::noteNegotiationDone(ErrorState *error)
+ {
+     if (error) {
++        debugs(83, 5, &quot;error=&quot; &lt;&lt; (void*)error);
+         // XXX: forward.cc calls peerConnectSucceeded() after an OK TCP connect but
+         // we call peerConnectFailed() if SSL failed afterwards. Is that OK?
+         // It is not clear whether we should call peerConnectSucceeded/Failed()
+         // based on TCP results, SSL results, or both. And the code is probably not
+         // consistent in this aspect across tunnelling and forwarding modules.
+         if (CachePeer *p = serverConnection()-&gt;getPeer())
+             peerConnectFailed(p);
+         return;
+     }
+ 
+     if (auto *peer = serverConnection()-&gt;getPeer()) {
+         const int fd = serverConnection()-&gt;fd;
+         Security::MaybeGetSessionResumeData(fd_table[fd].ssl, peer-&gt;sslSession);
+     }
+ }
+ 
+
+=== modified file 'src/security/PeerConnector.cc'
+--- src/security/PeerConnector.cc	2017-01-01 00:12:22 +0000
++++ src/security/PeerConnector.cc	2017-01-16 12:35:30 +0000
+@@ -41,116 +41,120 @@
+     debugs(83, 5, &quot;Security::PeerConnector constructed, this=&quot; &lt;&lt; (void*)this);
+     // if this throws, the caller's cb dialer is not our CbDialer
+     Must(dynamic_cast&lt;CbDialer*&gt;(callback-&gt;getDialer()));
+ }
+ 
+ Security::PeerConnector::~PeerConnector()
+ {
+     debugs(83, 5, &quot;Security::PeerConnector destructed, this=&quot; &lt;&lt; (void*)this);
+ }
+ 
+ bool Security::PeerConnector::doneAll() const
+ {
+     return (!callback || callback-&gt;canceled()) &amp;&amp; AsyncJob::doneAll();
+ }
+ 
+ /// Preps connection and SSL state. Calls negotiate().
+ void
+ Security::PeerConnector::start()
+ {
+     AsyncJob::start();
++    debugs(83, 5, &quot;this=&quot; &lt;&lt; (void*)this);
+ 
+     Security::SessionPointer tmp;
+     if (prepareSocket() &amp;&amp; initialize(tmp))
+         negotiate();
+     else
+         mustStop(&quot;Security::PeerConnector TLS socket initialize failed&quot;);
+ }
+ 
+ void
+ Security::PeerConnector::commCloseHandler(const CommCloseCbParams &amp;params)
+ {
+     debugs(83, 5, &quot;FD &quot; &lt;&lt; params.fd &lt;&lt; &quot;, Security::PeerConnector=&quot; &lt;&lt; params.data);
+     connectionClosed(&quot;Security::PeerConnector::commCloseHandler&quot;);
+ }
+ 
+ void
+ Security::PeerConnector::connectionClosed(const char *reason)
+ {
++    debugs(83, 5, reason &lt;&lt; &quot; socket closed/closing. this=&quot; &lt;&lt; (void*)this);
+     mustStop(reason);
+     callback = NULL;
+ }
+ 
+ bool
+ Security::PeerConnector::prepareSocket()
+ {
+-    const int fd = serverConnection()-&gt;fd;
+-    if (!Comm::IsConnOpen(serverConn) || fd_table[serverConn-&gt;fd].closing()) {
++    debugs(83, 5, serverConnection() &lt;&lt; &quot;, this=&quot; &lt;&lt; (void*)this);
++    if (!Comm::IsConnOpen(serverConnection()) || fd_table[serverConnection()-&gt;fd].closing()) {
+         connectionClosed(&quot;Security::PeerConnector::prepareSocket&quot;);
+         return false;
+     }
+ 
++    debugs(83, 5, serverConnection());
++
+     // watch for external connection closures
+     typedef CommCbMemFunT&lt;Security::PeerConnector, CommCloseCbParams&gt; Dialer;
+     closeHandler = JobCallback(9, 5, Dialer, this, Security::PeerConnector::commCloseHandler);
+-    comm_add_close_handler(fd, closeHandler);
++    comm_add_close_handler(serverConnection()-&gt;fd, closeHandler);
+     return true;
+ }
+ 
+ bool
+ Security::PeerConnector::initialize(Security::SessionPointer &amp;serverSession)
+ {
+-#if USE_OPENSSL
+     Security::ContextPointer ctx(getTlsContext());
+-    assert(ctx);
++    debugs(83, 5, serverConnection() &lt;&lt; &quot;, ctx=&quot; &lt;&lt; (void*)ctx.get());
+ 
+-    if (!Ssl::CreateClient(ctx, serverConnection(), &quot;server https start&quot;)) {
++    if (!ctx || !Security::CreateClientSession(ctx, serverConnection(), &quot;server https start&quot;)) {
+         const auto xerrno = errno;
+-        const auto ssl_error = ERR_get_error();
++        if (!ctx) {
++            debugs(83, DBG_IMPORTANT, &quot;Error initializing TLS connection: No security context.&quot;);
++        } // else CreateClientSession() did the appropriate debugs() already
+         ErrorState *anErr = new ErrorState(ERR_SOCKET_FAILURE, Http::scInternalServerError, request.getRaw());
+         anErr-&gt;xerrno = xerrno;
+-        debugs(83, DBG_IMPORTANT, &quot;Error allocating TLS handle: &quot; &lt;&lt; Security::ErrorString(ssl_error));
+         noteNegotiationDone(anErr);
+         bail(anErr);
+         return false;
+     }
+ 
+     // A TLS/SSL session has now been created for the connection and stored in fd_table
+     serverSession = fd_table[serverConnection()-&gt;fd].ssl;
++    debugs(83, 5, serverConnection() &lt;&lt; &quot;, session=&quot; &lt;&lt; (void*)serverSession.get());
+ 
++#if USE_OPENSSL
+     // If CertValidation Helper used do not lookup checklist for errors,
+     // but keep a list of errors to send it to CertValidator
+     if (!Ssl::TheConfig.ssl_crt_validator) {
+         // Create the ACL check list now, while we have access to more info.
+         // The list is used in ssl_verify_cb() and is freed in ssl_free().
+         if (acl_access *acl = ::Config.ssl_client.cert_error) {
+             ACLFilledChecklist *check = new ACLFilledChecklist(acl, request.getRaw(), dash_str);
+             check-&gt;al = al;
+             // check-&gt;fd(fd); XXX: need client FD here
+             SSL_set_ex_data(serverSession.get(), ssl_ex_index_cert_error_check, check);
+         }
+     }
++#endif
+ 
+     return true;
+-#else
+-    return false;
+-#endif
+ }
+ 
+ void
+ Security::PeerConnector::setReadTimeout()
+ {
+     int timeToRead;
+     if (negotiationTimeout) {
+         const int timeUsed = squid_curtime - startTime;
+         const int timeLeft = max(0, static_cast&lt;int&gt;(negotiationTimeout - timeUsed));
+         timeToRead = min(static_cast&lt;int&gt;(::Config.Timeout.read), timeLeft);
+     } else
+         timeToRead = ::Config.Timeout.read;
+     AsyncCall::Pointer nil;
+     commSetConnTimeout(serverConnection(), timeToRead, nil);
+ }
+ 
+ void
+ Security::PeerConnector::recordNegotiationDetails()
+ {
+     const int fd = serverConnection()-&gt;fd;
+@@ -162,71 +166,90 @@
+ #if USE_OPENSSL
+     // retrieve TLS parsed extra info
+     BIO *b = SSL_get_rbio(session.get());
+     Ssl::ServerBio *bio = static_cast&lt;Ssl::ServerBio *&gt;(BIO_get_data(b));
+     if (const Security::TlsDetails::Pointer &amp;details = bio-&gt;receivedHelloDetails())
+         serverConnection()-&gt;tlsNegotiations()-&gt;retrieveParsedInfo(details);
+ #endif
+ }
+ 
+ void
+ Security::PeerConnector::negotiate()
+ {
+     if (!Comm::IsConnOpen(serverConnection()))
+         return;
+ 
+     const int fd = serverConnection()-&gt;fd;
+     if (fd_table[fd].closing())
+         return;
+ 
+ #if USE_OPENSSL
+-    const int result = SSL_connect(fd_table[fd].ssl.get());
++    auto session = fd_table[fd].ssl.get();
++    debugs(83, 5, &quot;SSL_connect session=&quot; &lt;&lt; (void*)session);
++    const int result = SSL_connect(session);
++    if (result &lt;= 0) {
++#elif USE_GNUTLS
++    auto session = fd_table[fd].ssl.get();
++    const int result = gnutls_handshake(session);
++    debugs(83, 5, &quot;gnutls_handshake session=&quot; &lt;&lt; (void*)session &lt;&lt; &quot;, result=&quot; &lt;&lt; result);
++
++    if (result == GNUTLS_E_SUCCESS) {
++        char *desc = gnutls_session_get_desc(session);
++        debugs(83, 2, serverConnection() &lt;&lt; &quot; TLS Session info: &quot; &lt;&lt; desc);
++        gnutls_free(desc);
++    }
++
++    if (result != GNUTLS_E_SUCCESS) {
++        // debug the TLS session state so far
++        auto descIn = gnutls_handshake_get_last_in(session);
++        debugs(83, 2, &quot;handshake IN: &quot; &lt;&lt; gnutls_handshake_description_get_name(descIn));
++        auto descOut = gnutls_handshake_get_last_out(session);
++        debugs(83, 2, &quot;handshake OUT: &quot; &lt;&lt; gnutls_handshake_description_get_name(descOut));
+ #else
+-    const int result = -1;
++    if (const int result = -1) {
+ #endif
+-    if (result &lt;= 0) {
+         handleNegotiateError(result);
+         return; // we might be gone by now
+     }
+ 
+     recordNegotiationDetails();
+ 
+     if (!sslFinalized())
+         return;
+ 
+     callBack();
+ }
+ 
+ bool
+ Security::PeerConnector::sslFinalized()
+ {
+ #if USE_OPENSSL
+     if (Ssl::TheConfig.ssl_crt_validator &amp;&amp; useCertValidator_) {
+         const int fd = serverConnection()-&gt;fd;
+         Security::SessionPointer session(fd_table[fd].ssl);
+ 
+         Ssl::CertValidationRequest validationRequest;
+-        // WARNING: Currently we do not use any locking for any of the
+-        // members of the Ssl::CertValidationRequest class. In this code the
++        // WARNING: Currently we do not use any locking for 'errors' member
++        // of the Ssl::CertValidationRequest class. In this code the
+         // Ssl::CertValidationRequest object used only to pass data to
+         // Ssl::CertValidationHelper::submit method.
+-        validationRequest.ssl = session.get();
++        validationRequest.ssl = session;
+         if (SBuf *dName = (SBuf *)SSL_get_ex_data(session.get(), ssl_ex_index_server))
+             validationRequest.domainName = dName-&gt;c_str();
+         if (Security::CertErrors *errs = static_cast&lt;Security::CertErrors *&gt;(SSL_get_ex_data(session.get(), ssl_ex_index_ssl_errors)))
+             // validationRequest disappears on return so no need to cbdataReference
+             validationRequest.errors = errs;
+         try {
+             debugs(83, 5, &quot;Sending SSL certificate for validation to ssl_crtvd.&quot;);
+             AsyncCall::Pointer call = asyncCall(83,5, &quot;Security::PeerConnector::sslCrtvdHandleReply&quot;, Ssl::CertValidationHelper::CbDialer(this, &amp;Security::PeerConnector::sslCrtvdHandleReply, nullptr));
+             Ssl::CertValidationHelper::GetInstance()-&gt;sslSubmit(validationRequest, call);
+             return false;
+         } catch (const std::exception &amp;e) {
+             debugs(83, DBG_IMPORTANT, &quot;ERROR: Failed to compose ssl_crtvd &quot; &lt;&lt;
+                    &quot;request for &quot; &lt;&lt; validationRequest.domainName &lt;&lt;
+                    &quot; certificate: &quot; &lt;&lt; e.what() &lt;&lt; &quot;; will now block to &quot; &lt;&lt;
+                    &quot;validate that certificate.&quot;);
+             // fall through to do blocking in-process generation.
+             ErrorState *anErr = new ErrorState(ERR_GATEWAY_FAILURE, Http::scInternalServerError, request.getRaw());
+ 
+             noteNegotiationDone(anErr);
+             bail(anErr);
+@@ -343,178 +366,215 @@
+     }
+     if (check)
+         delete check;
+ 
+     return errs;
+ }
+ #endif
+ 
+ /// A wrapper for Comm::SetSelect() notifications.
+ void
+ Security::PeerConnector::NegotiateSsl(int, void *data)
+ {
+     PeerConnector *pc = static_cast&lt;Security::PeerConnector *&gt;(data);
+     // Use job calls to add done() checks and other job logic/protections.
+     CallJobHere(83, 7, pc, Security::PeerConnector, negotiate);
+ }
+ 
+ void
+ Security::PeerConnector::handleNegotiateError(const int ret)
+ {
+-#if USE_OPENSSL
+     const int fd = serverConnection()-&gt;fd;
+-    unsigned long ssl_lib_error = SSL_ERROR_NONE;
+-    Security::SessionPointer session(fd_table[fd].ssl);
++    const Security::SessionPointer session(fd_table[fd].ssl);
++    unsigned long ssl_lib_error = ret;
++
++#if USE_OPENSSL
+     const int ssl_error = SSL_get_error(session.get(), ret);
+ 
+     switch (ssl_error) {
+     case SSL_ERROR_WANT_READ:
+         noteWantRead();
+         return;
+ 
+     case SSL_ERROR_WANT_WRITE:
+         noteWantWrite();
+         return;
+ 
+     case SSL_ERROR_SSL:
+     case SSL_ERROR_SYSCALL:
+         ssl_lib_error = ERR_get_error();
+         // proceed to the general error handling code
+         break;
+     default:
+         // no special error handling for all other errors
++        ssl_lib_error = SSL_ERROR_NONE;
++        break;
++    }
++
++#elif USE_GNUTLS
++    const int ssl_error = ret;
++
++    switch (ret) {
++    case GNUTLS_E_WARNING_ALERT_RECEIVED: {
++            auto alert = gnutls_alert_get(session.get());
++            debugs(83, DBG_IMPORTANT, &quot;TLS ALERT: &quot; &lt;&lt; gnutls_alert_get_name(alert));
++        }
++        // drop through to next case
++
++    case GNUTLS_E_AGAIN:
++    case GNUTLS_E_INTERRUPTED:
++        if (gnutls_record_get_direction(session.get()) == 0)
++            noteWantRead();
++        else
++            noteWantWrite();
++        return;
++
++    default:
++        // no special error handling for all other errors
+         break;
+     }
+ 
++#else
++    // this avoids unused variable compiler warnings.
++    Must(!session);
++    const int ssl_error = ret;
++#endif
++
+     // Log connection details, if any
+     recordNegotiationDetails();
+     noteNegotiationError(ret, ssl_error, ssl_lib_error);
+-#endif
+ }
+ 
+ void
+ Security::PeerConnector::noteWantRead()
+ {
+     const int fd = serverConnection()-&gt;fd;
++    debugs(83, 5, serverConnection());
+ #if USE_OPENSSL
+     Security::SessionPointer session(fd_table[fd].ssl);
+     BIO *b = SSL_get_rbio(session.get());
+     Ssl::ServerBio *srvBio = static_cast&lt;Ssl::ServerBio *&gt;(BIO_get_data(b));
+     if (srvBio-&gt;holdRead()) {
+         if (srvBio-&gt;gotHello()) {
+             if (checkForMissingCertificates())
+                 return; // Wait to download certificates before proceed.
+ 
+             srvBio-&gt;holdRead(false);
+             // schedule a negotiateSSl to allow openSSL parse received data
+             Security::PeerConnector::NegotiateSsl(fd, this);
+             return;
+         } else if (srvBio-&gt;gotHelloFailed()) {
+             srvBio-&gt;holdRead(false);
+             debugs(83, DBG_IMPORTANT, &quot;Error parsing SSL Server Hello Message on FD &quot; &lt;&lt; fd);
+             // schedule a negotiateSSl to allow openSSL parse received data
+             Security::PeerConnector::NegotiateSsl(fd, this);
+             return;
+         }
+     }
+ #endif
+     setReadTimeout();
+     Comm::SetSelect(fd, COMM_SELECT_READ, &amp;NegotiateSsl, this, 0);
+ }
+ 
+ void
+ Security::PeerConnector::noteWantWrite()
+ {
+     const int fd = serverConnection()-&gt;fd;
++    debugs(83, 5, serverConnection());
+     Comm::SetSelect(fd, COMM_SELECT_WRITE, &amp;NegotiateSsl, this, 0);
+     return;
+ }
+ 
+ void
+ Security::PeerConnector::noteNegotiationError(const int ret, const int ssl_error, const int ssl_lib_error)
+ {
+-#if USE_OPENSSL // not used unless OpenSSL enabled.
+ #if defined(EPROTO)
+     int sysErrNo = EPROTO;
+ #else
+     int sysErrNo = EACCES;
+ #endif
+ 
++#if USE_OPENSSL
+     // store/report errno when ssl_error is SSL_ERROR_SYSCALL, ssl_lib_error is 0, and ret is -1
+     if (ssl_error == SSL_ERROR_SYSCALL &amp;&amp; ret == -1 &amp;&amp; ssl_lib_error == 0)
+         sysErrNo = errno;
++#endif
++    int xerr = errno;
+ 
+     const int fd = serverConnection()-&gt;fd;
+-    debugs(83, DBG_IMPORTANT, &quot;Error negotiating SSL on FD &quot; &lt;&lt; fd &lt;&lt;
++    debugs(83, DBG_IMPORTANT, &quot;ERROR: negotiating TLS on FD &quot; &lt;&lt; fd &lt;&lt;
+            &quot;: &quot; &lt;&lt; Security::ErrorString(ssl_lib_error) &lt;&lt; &quot; (&quot; &lt;&lt;
+-           ssl_error &lt;&lt; &quot;/&quot; &lt;&lt; ret &lt;&lt; &quot;/&quot; &lt;&lt; errno &lt;&lt; &quot;)&quot;);
++           ssl_error &lt;&lt; &quot;/&quot; &lt;&lt; ret &lt;&lt; &quot;/&quot; &lt;&lt; xerr &lt;&lt; &quot;)&quot;);
+ 
+     ErrorState *anErr = NULL;
+     if (request != NULL)
+         anErr = ErrorState::NewForwarding(ERR_SECURE_CONNECT_FAIL, request.getRaw());
+     else
+         anErr = new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scServiceUnavailable, NULL);
+     anErr-&gt;xerrno = sysErrNo;
+ 
++#if USE_OPENSSL
+     Security::SessionPointer session(fd_table[fd].ssl);
+     Ssl::ErrorDetail *errFromFailure = static_cast&lt;Ssl::ErrorDetail *&gt;(SSL_get_ex_data(session.get(), ssl_ex_index_ssl_error_detail));
+     if (errFromFailure != NULL) {
+         // The errFromFailure is attached to the ssl object
+         // and will be released when ssl object destroyed.
+         // Copy errFromFailure to a new Ssl::ErrorDetail object
+         anErr-&gt;detail = new Ssl::ErrorDetail(*errFromFailure);
+     } else {
+         // server_cert can be NULL here
+         X509 *server_cert = SSL_get_peer_certificate(session.get());
+         anErr-&gt;detail = new Ssl::ErrorDetail(SQUID_ERR_SSL_HANDSHAKE, server_cert, NULL);
+         X509_free(server_cert);
+     }
+ 
+     if (ssl_lib_error != SSL_ERROR_NONE)
+         anErr-&gt;detail-&gt;setLibError(ssl_lib_error);
++#endif
+ 
+     noteNegotiationDone(anErr);
+     bail(anErr);
+-#endif
+ }
+ 
+ void
+ Security::PeerConnector::bail(ErrorState *error)
+ {
+     Must(error); // or the recepient will not know there was a problem
+     Must(callback != NULL);
+     CbDialer *dialer = dynamic_cast&lt;CbDialer*&gt;(callback-&gt;getDialer());
+     Must(dialer);
+     dialer-&gt;answer().error = error;
+ 
+     callBack();
+     // Our job is done. The callabck recepient will probably close the failed
+     // peer connection and try another peer or go direct (if possible). We
+     // can close the connection ourselves (our error notification would reach
+     // the recepient before the fd-closure notification), but we would rather
+     // minimize the number of fd-closure notifications and let the recepient
+     // manage the TCP state of the connection.
+ }
+ 
+ void
+ Security::PeerConnector::callBack()
+ {
++    debugs(83, 5, &quot;TLS setup ended for &quot; &lt;&lt; serverConnection());
++
+     AsyncCall::Pointer cb = callback;
+     // Do this now so that if we throw below, swanSong() assert that we _tried_
+     // to call back holds.
+     callback = NULL; // this should make done() true
+ 
+     // remove close handler
+     comm_remove_close_handler(serverConnection()-&gt;fd, closeHandler);
+ 
+     CbDialer *dialer = dynamic_cast&lt;CbDialer*&gt;(cb-&gt;getDialer());
+     Must(dialer);
+     dialer-&gt;answer().conn = serverConnection();
+     ScheduleCallHere(cb);
+ }
+ 
+ void
+ Security::PeerConnector::swanSong()
+ {
+     // XXX: unregister fd-closure monitoring and CommSetSelect interest, if any
+     AsyncJob::swanSong();
+     if (callback != NULL) { // paranoid: we have left the caller waiting
+
+=== modified file 'src/security/PeerOptions.cc'
+--- src/security/PeerOptions.cc	2017-01-01 00:12:22 +0000
++++ src/security/PeerOptions.cc	2017-01-17 13:51:44 +0000
+@@ -4,91 +4,117 @@
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;base/Packable.h&quot;
+ #include &quot;Debug.h&quot;
+ #include &quot;fatal.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;parser/Tokenizer.h&quot;
+ #include &quot;Parsing.h&quot;
+ #include &quot;security/PeerOptions.h&quot;
+ 
+ #if USE_OPENSSL
+ #include &quot;ssl/support.h&quot;
+ #endif
+ 
+ Security::PeerOptions Security::ProxyOutgoingConfig;
+ 
++Security::PeerOptions::PeerOptions()
++{
++     // init options consistent with an empty sslOptions
++     parseOptions();
++}
++
+ Security::PeerOptions::PeerOptions(const Security::PeerOptions &amp;p) :
+     sslOptions(p.sslOptions),
+     caDir(p.caDir),
+     crlFile(p.crlFile),
+     sslCipher(p.sslCipher),
+     sslFlags(p.sslFlags),
+     sslDomain(p.sslDomain),
+     parsedOptions(p.parsedOptions),
+     parsedFlags(p.parsedFlags),
+     certs(p.certs),
+     caFiles(p.caFiles),
+     parsedCrl(p.parsedCrl),
+     sslVersion(p.sslVersion),
+     encryptTransport(p.encryptTransport)
+ {
+     memcpy(&amp;flags, &amp;p.flags, sizeof(flags));
+ }
+ 
++Security::PeerOptions &amp;
++Security::PeerOptions::operator =(const Security::PeerOptions &amp;p)
++{
++    sslOptions = p.sslOptions;
++    caDir = p.caDir;
++    crlFile = p.crlFile;
++    sslCipher = p.sslCipher;
++    sslFlags = p.sslFlags;
++    sslDomain = p.sslDomain;
++    parsedOptions = p.parsedOptions;
++    parsedFlags = p.parsedFlags;
++    certs = p.certs;
++    caFiles = p.caFiles;
++    parsedCrl = p.parsedCrl;
++    sslVersion = p.sslVersion;
++    encryptTransport = p.encryptTransport;
++    memcpy(&amp;flags, &amp;p.flags, sizeof(flags));
++    return *this;
++}
++
+ void
+ Security::PeerOptions::parse(const char *token)
+ {
+     if (!*token) {
+         // config says just &quot;ssl&quot; or &quot;tls&quot; (or &quot;tls-&quot;)
+         encryptTransport = true;
+         return;
+     }
+ 
+     if (strncmp(token, &quot;disable&quot;, 7) == 0) {
+         clear();
+         return;
+     }
+ 
+     if (strncmp(token, &quot;cert=&quot;, 5) == 0) {
+         KeyData t;
+         t.privateKeyFile = t.certFile = SBuf(token + 5);
+         certs.emplace_back(t);
+     } else if (strncmp(token, &quot;key=&quot;, 4) == 0) {
+         if (certs.empty() || certs.back().certFile.isEmpty()) {
+             fatal(&quot;cert= option must be set before key= is used.&quot;);
+             return;
+         }
+         KeyData &amp;t = certs.back();
+         t.privateKeyFile = SBuf(token + 4);
+     } else if (strncmp(token, &quot;version=&quot;, 8) == 0) {
+         debugs(0, DBG_PARSE_NOTE(1), &quot;UPGRADE WARNING: SSL version= is deprecated. Use options= to limit protocols instead.&quot;);
+         sslVersion = xatoi(token + 8);
+     } else if (strncmp(token, &quot;min-version=&quot;, 12) == 0) {
+         tlsMinVersion = SBuf(token + 12);
+     } else if (strncmp(token, &quot;options=&quot;, 8) == 0) {
+         sslOptions = SBuf(token + 8);
+-        parsedOptions = parseOptions();
++        parseOptions();
+     } else if (strncmp(token, &quot;cipher=&quot;, 7) == 0) {
+         sslCipher = SBuf(token + 7);
+     } else if (strncmp(token, &quot;cafile=&quot;, 7) == 0) {
+         caFiles.emplace_back(SBuf(token + 7));
+     } else if (strncmp(token, &quot;capath=&quot;, 7) == 0) {
+         caDir = SBuf(token + 7);
+ #if !USE_OPENSSL
+         debugs(3, DBG_PARSE_NOTE(1), &quot;WARNING: capath= option requires --with-openssl.&quot;);
+ #endif
+     } else if (strncmp(token, &quot;crlfile=&quot;, 8) == 0) {
+         crlFile = SBuf(token + 8);
+         loadCrlFile();
+     } else if (strncmp(token, &quot;flags=&quot;, 6) == 0) {
+         if (parsedFlags != 0) {
+             debugs(3, DBG_PARSE_NOTE(1), &quot;WARNING: Overwriting flags=&quot; &lt;&lt; sslFlags &lt;&lt; &quot; with &quot; &lt;&lt; SBuf(token + 6));
+         }
+         sslFlags = SBuf(token + 6);
+         parsedFlags = parseFlags();
+     } else if (strncmp(token, &quot;default-ca=off&quot;, 14) == 0 || strncmp(token, &quot;no-default-ca&quot;, 13) == 0) {
+         if (flags.tlsDefaultCa.configured() &amp;&amp; flags.tlsDefaultCa)
+@@ -150,83 +176,121 @@
+         // default OFF for listening ports
+         if (flags.tlsDefaultCa)
+             p-&gt;appendf(&quot; %sdefault-ca&quot;, pfx);
+         else
+             p-&gt;appendf(&quot; %sdefault-ca=off&quot;, pfx);
+     }
+ 
+     if (!flags.tlsNpn)
+         p-&gt;appendf(&quot; %sno-npn&quot;, pfx);
+ }
+ 
+ void
+ Security::PeerOptions::updateTlsVersionLimits()
+ {
+     if (!tlsMinVersion.isEmpty()) {
+         ::Parser::Tokenizer tok(tlsMinVersion);
+         int64_t v = 0;
+         if (tok.skip('1') &amp;&amp; tok.skip('.') &amp;&amp; tok.int64(v, 10, false, 1) &amp;&amp; v &lt;= 3) {
+             // only account for TLS here - SSL versions are handled by options= parameter
+             // avoid affecting options= parameter in cachemgr config report
++#if USE_OPENSSL
+ #if SSL_OP_NO_TLSv1
+             if (v &gt; 0)
+                 parsedOptions |= SSL_OP_NO_TLSv1;
+ #endif
+ #if SSL_OP_NO_TLSv1_1
+             if (v &gt; 1)
+                 parsedOptions |= SSL_OP_NO_TLSv1_1;
+ #endif
+ #if SSL_OP_NO_TLSv1_2
+             if (v &gt; 2)
+                 parsedOptions |= SSL_OP_NO_TLSv1_2;
+ #endif
+ 
++#elif USE_GNUTLS
++            // XXX: update parsedOptions directly to avoid polluting 'options=' dumps
++            SBuf add;
++            if (v &gt; 0)
++                add.append(&quot;:-VERS-TLS1.0&quot;);
++            if (v &gt; 1)
++                add.append(&quot;:-VERS-TLS1.1&quot;);
++            if (v &gt; 2)
++                add.append(&quot;:-VERS-TLS1.2&quot;);
++
++            if (sslOptions.isEmpty())
++                add.chop(1); // remove the initial ':'
++            sslOptions.append(add);
++#endif
++
+         } else {
+             debugs(0, DBG_PARSE_NOTE(1), &quot;WARNING: Unknown TLS minimum version: &quot; &lt;&lt; tlsMinVersion);
+         }
+ 
+-    } else if (sslVersion &gt; 2) {
++        return;
++    }
++
++     if (sslVersion &gt; 2) {
+         // backward compatibility hack for sslversion= configuration
+         // only use if tls-min-version=N.N is not present
+         // values 0-2 for auto and SSLv2 are not supported any longer.
+         // Do it this way so we DO cause changes to options= in cachemgr config report
+-        const char *add = NULL;
++        const char *add = nullptr;
+         switch (sslVersion) {
+         case 3:
+-            add = &quot;NO_TLSv1,NO_TLSv1_1,NO_TLSv1_2&quot;;
++#if USE_OPENSSL
++            parsedOptions |= (SSL_OP_NO_TLSv1|SSL_OP_NO_TLSv1_1|SSL_OP_NO_TLSv1_2);
++#elif USE_GNUTLS
++            add = &quot;:-VERS-TLS1.0:-VERS-TLS1.1:-VERS-TLS1.2&quot;;
++#endif
+             break;
+         case 4:
+-            add = &quot;NO_SSLv3,NO_TLSv1_1,NO_TLSv1_2&quot;;
++#if USE_OPENSSL
++            parsedOptions |= (SSL_OP_NO_SSLv3|SSL_OP_NO_TLSv1_1|SSL_OP_NO_TLSv1_2);
++#elif USE_GNUTLS
++            add = &quot;:+VERS-TLS1.0:-VERS-TLS1.1:-VERS-TLS1.2&quot;;
++#endif
+             break;
+         case 5:
+-            add = &quot;NO_SSLv3,NO_TLSv1,NO_TLSv1_2&quot;;
++#if USE_OPENSSL
++            parsedOptions |= (SSL_OP_NO_SSLv3|SSL_OP_NO_TLSv1|SSL_OP_NO_TLSv1_2);
++#elif USE_GNUTLS
++            add = &quot;:-VERS-TLS1.0:+VERS-TLS1.1:-VERS-TLS1.2&quot;;
++#endif
+             break;
+         case 6:
+-            add = &quot;NO_SSLv3,NO_TLSv1,NO_TLSv1_1&quot;;
++#if USE_OPENSSL
++            parsedOptions |= (SSL_OP_NO_SSLv3|SSL_OP_NO_TLSv1|SSL_OP_NO_TLSv1_1);
++#elif USE_GNUTLS
++            add = &quot;:-VERS-TLS1.0:-VERS-TLS1.1&quot;;
++#endif
+             break;
+         default: // nothing
+             break;
+         }
+         if (add) {
+-            if (!sslOptions.isEmpty())
+-                sslOptions.append(&quot;,&quot;,1);
+-            sslOptions.append(add, strlen(add));
++#if USE_GNUTLS // dont bother otherwise
++            if (sslOptions.isEmpty())
++                sslOptions.append(add+1, strlen(add+1));
++            else
++                sslOptions.append(add, strlen(add));
++#endif
+         }
+         sslVersion = 0; // prevent sslOptions being repeatedly appended
+     }
+ }
+ 
+ Security::ContextPointer
+ Security::PeerOptions::createBlankContext() const
+ {
+     Security::ContextPointer ctx;
+ #if USE_OPENSSL
+     Ssl::Initialize();
+ 
+ #if (OPENSSL_VERSION_NUMBER &gt;= 0x10100000L)
+     SSL_CTX *t = SSL_CTX_new(TLS_client_method());
+ #else
+     SSL_CTX *t = SSL_CTX_new(SSLv23_client_method());
+ #endif
+     if (!t) {
+         const auto x = ERR_get_error();
+         fatalf(&quot;Failed to allocate TLS client context: %s\n&quot;, Security::ErrorString(x));
+@@ -240,51 +304,55 @@
+         fatalf(&quot;Failed to allocate TLS client context: %s\n&quot;, Security::ErrorString(x));
+     }
+     ctx.resetWithoutLocking(t);
+ 
+ #else
+     debugs(83, 1, &quot;WARNING: Failed to allocate TLS client context: No TLS library&quot;);
+ 
+ #endif
+ 
+     return ctx;
+ }
+ 
+ Security::ContextPointer
+ Security::PeerOptions::createClientContext(bool setOptions)
+ {
+     updateTlsVersionLimits();
+ 
+     Security::ContextPointer t(createBlankContext());
+     if (t) {
+ #if USE_OPENSSL
++        // NP: GnuTLS uses 'priorities' which are set per-session instead.
++        SSL_CTX_set_options(t.get(), (setOptions ? parsedOptions : 0));
++
+         // XXX: temporary performance regression. c_str() data copies and prevents this being a const method
+-        Ssl::InitClientContext(t, *this, (setOptions ? parsedOptions : 0), parsedFlags);
++        Ssl::InitClientContext(t, *this, parsedFlags);
+ #endif
+         updateContextNpn(t);
+         updateContextCa(t);
+         updateContextCrl(t);
+     }
+ 
+     return t;
+ }
+ 
++#if USE_OPENSSL
+ /// set of options we can parse and what they map to
+ static struct ssl_option {
+     const char *name;
+     long value;
+ 
+ } ssl_options[] = {
+ 
+ #if SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG
+     {
+         &quot;NETSCAPE_REUSE_CIPHER_CHANGE_BUG&quot;, SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG
+     },
+ #endif
+ #if SSL_OP_SSLREF2_REUSE_CERT_TYPE_BUG
+     {
+         &quot;SSLREF2_REUSE_CERT_TYPE_BUG&quot;, SSL_OP_SSLREF2_REUSE_CERT_TYPE_BUG
+     },
+ #endif
+ #if SSL_OP_MICROSOFT_BIG_SSLV3_BUFFER
+     {
+         &quot;MICROSOFT_BIG_SSLV3_BUFFER&quot;, SSL_OP_MICROSOFT_BIG_SSLV3_BUFFER
+@@ -380,52 +448,54 @@
+         &quot;No_Compression&quot;, SSL_OP_NO_COMPRESSION
+     },
+ #endif
+ #if SSL_OP_NO_TICKET
+     {
+         &quot;NO_TICKET&quot;, SSL_OP_NO_TICKET
+     },
+ #endif
+ #if SSL_OP_SINGLE_ECDH_USE
+     {
+         &quot;SINGLE_ECDH_USE&quot;, SSL_OP_SINGLE_ECDH_USE
+     },
+ #endif
+     {
+         &quot;&quot;, 0
+     },
+     {
+         NULL, 0
+     }
+ };
++#endif /* USE_OPENSSL */
+ 
+ /**
+  * Pre-parse TLS options= parameter to be applied when the TLS objects created.
+  * Options must not used in the case of peek or stare bump mode.
+  */
+-long
++void
+ Security::PeerOptions::parseOptions()
+ {
+-    long op = 0;
++#if USE_OPENSSL
+     ::Parser::Tokenizer tok(sslOptions);
++    long op = 0;
+ 
+-    do {
++    while (!tok.atEnd()) {
+         enum {
+             MODE_ADD, MODE_REMOVE
+         } mode;
+ 
+         if (tok.skip('-') || tok.skip('!'))
+             mode = MODE_REMOVE;
+         else {
+             (void)tok.skip('+'); // default action is add. ignore if missing operator
+             mode = MODE_ADD;
+         }
+ 
+         static const CharacterSet optChars = CharacterSet(&quot;TLS-option&quot;, &quot;_&quot;) + CharacterSet::ALPHA + CharacterSet::DIGIT;
+         int64_t hex = 0;
+         SBuf option;
+         long value = 0;
+ 
+         // Bug 4429: identify the full option name before determining text or numeric
+         if (tok.prefix(option, optChars)) {
+ 
+             // find the named option in our supported set
+@@ -444,47 +514,64 @@
+         }
+ 
+         if (value) {
+             switch (mode) {
+             case MODE_ADD:
+                 op |= value;
+                 break;
+             case MODE_REMOVE:
+                 op &amp;= ~value;
+                 break;
+             }
+         } else {
+             debugs(83, DBG_PARSE_NOTE(1), &quot;ERROR: Unknown TLS option &quot; &lt;&lt; option);
+         }
+ 
+         static const CharacterSet delims(&quot;TLS-option-delim&quot;,&quot;:,&quot;);
+         if (!tok.skipAll(delims) &amp;&amp; !tok.atEnd()) {
+             fatalf(&quot;Unknown TLS option '&quot; SQUIDSBUFPH &quot;'&quot;, SQUIDSBUFPRINT(tok.remaining()));
+         }
+ 
+-    } while (!tok.atEnd());
++    }
+ 
+ #if SSL_OP_NO_SSLv2
+     // compliance with RFC 6176: Prohibiting Secure Sockets Layer (SSL) Version 2.0
+     op = op | SSL_OP_NO_SSLv2;
+ #endif
+-    return op;
++    parsedOptions = op;
++
++#elif USE_GNUTLS
++    if (sslOptions.isEmpty()) {
++        parsedOptions.reset();
++        return;
++    }
++
++    const char *err = nullptr;
++    const char *priorities = sslOptions.c_str();
++    gnutls_priority_t op;
++    if (gnutls_priority_init(&amp;op, priorities, &amp;err) != GNUTLS_E_SUCCESS) {
++        fatalf(&quot;Unknown TLS option '%s'&quot;, err);
++    }
++    parsedOptions = Security::ParsedOptions(op, [](gnutls_priority_t p) {
++            gnutls_priority_deinit(p);
++    });
++#endif
+ }
+ 
+ /**
+  * Parses the TLS flags squid.conf parameter
+  */
+ long
+ Security::PeerOptions::parseFlags()
+ {
+     if (sslFlags.isEmpty())
+         return 0;
+ 
+     static struct {
+         SBuf label;
+         long mask;
+     } flagTokens[] = {
+         { SBuf(&quot;NO_DEFAULT_CA&quot;), SSL_FLAG_NO_DEFAULT_CA },
+         { SBuf(&quot;DELAYED_AUTH&quot;), SSL_FLAG_DELAYED_AUTH },
+         { SBuf(&quot;DONT_VERIFY_PEER&quot;), SSL_FLAG_DONT_VERIFY_PEER },
+         { SBuf(&quot;DONT_VERIFY_DOMAIN&quot;), SSL_FLAG_DONT_VERIFY_DOMAIN },
+         { SBuf(&quot;NO_SESSION_REUSE&quot;), SSL_FLAG_NO_SESSION_REUSE },
+@@ -625,26 +712,50 @@
+     if (parsedCrl.size()) {
+         for (auto &amp;i : parsedCrl) {
+             if (!X509_STORE_add_crl(st, i.get()))
+                 debugs(83, 2, &quot;WARNING: Failed to add CRL&quot;);
+             else
+                 verifyCrl = true;
+         }
+     }
+ 
+ #if X509_V_FLAG_CRL_CHECK
+     if ((parsedFlags &amp; SSL_FLAG_VERIFY_CRL_ALL))
+         X509_STORE_set_flags(st, X509_V_FLAG_CRL_CHECK|X509_V_FLAG_CRL_CHECK_ALL);
+     else if (verifyCrl || (parsedFlags &amp; SSL_FLAG_VERIFY_CRL))
+         X509_STORE_set_flags(st, X509_V_FLAG_CRL_CHECK);
+ #endif
+ 
+ #endif /* USE_OPENSSL */
+ }
+ 
+ void
++Security::PeerOptions::updateSessionOptions(Security::SessionPointer &amp;s)
++{
++    // 'options=' value being set to session is a GnuTLS specific thing.
++#if !USE_OPENSSL &amp;&amp; USE_GNUTLS
++    int x;
++    SBuf errMsg;
++    if (!parsedOptions) {
++        debugs(83, 5, &quot;set GnuTLS default priority/options for session=&quot; &lt;&lt; s);
++        x = gnutls_set_default_priority(s.get());
++        static const SBuf defaults(&quot;default&quot;);
++        errMsg = defaults;
++    } else {
++        debugs(83, 5, &quot;set GnuTLS options '&quot; &lt;&lt; sslOptions &lt;&lt; &quot;' for session=&quot; &lt;&lt; s);
++        x = gnutls_priority_set(s.get(), parsedOptions.get());
++        errMsg = sslOptions;
++    }
++
++    if (x != GNUTLS_E_SUCCESS) {
++        debugs(83, DBG_IMPORTANT, &quot;ERROR: Failed to set TLS options (&quot; &lt;&lt; errMsg &lt;&lt; &quot;). error: &quot; &lt;&lt; Security::ErrorString(x));
++    }
++#endif
++}
++
++void
+ parse_securePeerOptions(Security::PeerOptions *opt)
+ {
+     while(const char *token = ConfigParser::NextToken())
+         opt-&gt;parse(token);
+ }
+ 
+
+=== modified file 'src/security/PeerOptions.h'
+--- src/security/PeerOptions.h	2017-01-01 00:12:22 +0000
++++ src/security/PeerOptions.h	2017-01-17 13:54:04 +0000
+@@ -5,105 +5,111 @@
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SRC_SECURITY_PEEROPTIONS_H
+ #define SQUID_SRC_SECURITY_PEEROPTIONS_H
+ 
+ #include &quot;base/YesNoNone.h&quot;
+ #include &quot;ConfigParser.h&quot;
+ #include &quot;security/KeyData.h&quot;
+ 
+ class Packable;
+ 
+ namespace Security
+ {
+ 
+ /// TLS squid.conf settings for a remote server peer
+ class PeerOptions
+ {
+ public:
+-    PeerOptions() : parsedOptions(0), parsedFlags(0), sslVersion(0), encryptTransport(false) {}
++    PeerOptions();
+     PeerOptions(const PeerOptions &amp;);
+-    virtual ~PeerOptions() = default;
++    PeerOptions &amp;operator =(const PeerOptions &amp;);
++    virtual ~PeerOptions() {}
+ 
+     /// parse a TLS squid.conf option
+     virtual void parse(const char *);
+ 
+     /// reset the configuration details to default
+     virtual void clear() {*this = PeerOptions();}
+ 
+     /// generate an unset security context object
+     virtual Security::ContextPointer createBlankContext() const;
+ 
+     /// generate a security client-context from these configured options
+     Security::ContextPointer createClientContext(bool setOptions);
+ 
+     /// sync the context options with tls-min-version=N configuration
+     void updateTlsVersionLimits();
+ 
+     /// setup the NPN extension details for the given context
+     void updateContextNpn(Security::ContextPointer &amp;);
+ 
+     /// setup the CA details for the given context
+     void updateContextCa(Security::ContextPointer &amp;);
+ 
+     /// setup the CRL details for the given context
+     void updateContextCrl(Security::ContextPointer &amp;);
+ 
++    /// setup any library-specific options that can be set for the given session
++    void updateSessionOptions(Security::SessionPointer &amp;);
++
+     /// output squid.conf syntax with 'pfx' prefix on parameters for the stored settings
+     virtual void dumpCfg(Packable *, const char *pfx) const;
+ 
+ private:
+-    long parseOptions();
++    void parseOptions(); ///&lt; parsed value of sslOptions
+     long parseFlags();
+     void loadCrlFile();
+ 
+ public:
+     SBuf sslOptions;     ///&lt; library-specific options string
+     SBuf caDir;          ///&lt; path of directory containing a set of trusted Certificate Authorities
+     SBuf crlFile;        ///&lt; path of file containing Certificate Revoke List
+ 
+     SBuf sslCipher;
+     SBuf sslFlags;       ///&lt; flags defining what TLS operations Squid performs
+     SBuf sslDomain;
+ 
+     SBuf tlsMinVersion;  ///&lt; version label for minimum TLS version to permit
+ 
+-    long parsedOptions; ///&lt; parsed value of sslOptions
+-    long parsedFlags;   ///&lt; parsed value of sslFlags
++    Security::ParsedOptions parsedOptions; ///&lt; parsed value of sslOptions
++    long parsedFlags = 0;   ///&lt; parsed value of sslFlags
+ 
+     std::list&lt;Security::KeyData&gt; certs; ///&lt; details from the cert= and file= config parameters
+     std::list&lt;SBuf&gt; caFiles;  ///&lt; paths of files containing trusted Certificate Authority
+     Security::CertRevokeList parsedCrl; ///&lt; CRL to use when verifying the remote end certificate
+ 
+ protected:
+-    int sslVersion;
++    int sslVersion = 0;
+ 
+     /// flags governing Squid internal TLS operations
+     struct flags_ {
+         flags_() : tlsDefaultCa(true), tlsNpn(true) {}
++        flags_(const flags_ &amp;) = default;
++        flags_ &amp;operator =(const flags_ &amp;) = default;
+ 
+         /// whether to use the system default Trusted CA when verifying the remote end certificate
+         YesNoNone tlsDefaultCa;
+ 
+         /// whether to use the TLS NPN extension on these connections
+         bool tlsNpn;
+     } flags;
+ 
+ public:
+     /// whether transport encryption (TLS/SSL) is to be used on connections to the peer
+-    bool encryptTransport;
++    bool encryptTransport = false;
+ };
+ 
+ /// configuration options for DIRECT server access
+ extern PeerOptions ProxyOutgoingConfig;
+ 
+ } // namespace Security
+ 
+ // parse the tls_outgoing_options directive
+ void parse_securePeerOptions(Security::PeerOptions *);
+ #define free_securePeerOptions(x) Security::ProxyOutgoingConfig.clear()
+ #define dump_securePeerOptions(e,n,x) do { (e)-&gt;appendf(n); (x).dumpCfg((e),&quot;&quot;); (e)-&gt;append(&quot;\n&quot;,1); } while(false)
+ 
+ #endif /* SQUID_SRC_SECURITY_PEEROPTIONS_H */
+ 
+
+=== modified file 'src/security/Session.cc'
+--- src/security/Session.cc	2017-01-01 00:12:22 +0000
++++ src/security/Session.cc	2017-01-16 15:16:35 +0000
+@@ -1,41 +1,214 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 83    TLS session management */
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;anyp/PortCfg.h&quot;
+ #include &quot;base/RunnersRegistry.h&quot;
++#include &quot;CachePeer.h&quot;
+ #include &quot;Debug.h&quot;
++#include &quot;fd.h&quot;
++#include &quot;fde.h&quot;
+ #include &quot;ipc/MemMap.h&quot;
+ #include &quot;security/Session.h&quot;
+ #include &quot;SquidConfig.h&quot;
++#include &quot;ssl/bio.h&quot;
+ 
+ #define SSL_SESSION_ID_SIZE 32
+ #define SSL_SESSION_MAX_SIZE 10*1024
+ 
++#if USE_OPENSSL || USE_GNUTLS
++static int
++tls_read_method(int fd, char *buf, int len)
++{
++    auto session = fd_table[fd].ssl.get();
++    debugs(83, 3, &quot;started for session=&quot; &lt;&lt; (void*)session);
++
++#if DONT_DO_THIS &amp;&amp; USE_OPENSSL
++    if (!SSL_is_init_finished(session)) {
++        errno = ENOTCONN;
++        return -1;
++    }
++#endif
++
++#if USE_OPENSSL
++    int i = SSL_read(session, buf, len);
++#elif USE_GNUTLS
++    int i = gnutls_record_recv(session, buf, len);
++#endif
++
++    if (i &gt; 0) {
++        debugs(83, 8, &quot;TLS FD &quot; &lt;&lt; fd &lt;&lt; &quot; session=&quot; &lt;&lt; (void*)session &lt;&lt; &quot; &quot; &lt;&lt; i &lt;&lt; &quot; bytes&quot;);
++        (void)VALGRIND_MAKE_MEM_DEFINED(buf, i);
++    }
++
++#if USE_OPENSSL
++    if (i &gt; 0 &amp;&amp; SSL_pending(session) &gt; 0) {
++#elif USE_GNUTLS
++    if (i &gt; 0 &amp;&amp; gnutls_record_check_pending(session) &gt; 0) {
++#endif
++        debugs(83, 2, &quot;TLS FD &quot; &lt;&lt; fd &lt;&lt; &quot; is pending&quot;);
++        fd_table[fd].flags.read_pending = true;
++    } else
++        fd_table[fd].flags.read_pending = false;
++
++    return i;
++}
++
++static int
++tls_write_method(int fd, const char *buf, int len)
++{
++    auto session = fd_table[fd].ssl.get();
++    debugs(83, 3, &quot;started for session=&quot; &lt;&lt; (void*)session);
++
++#if USE_OPENSSL
++    if (!SSL_is_init_finished(session)) {
++        errno = ENOTCONN;
++        return -1;
++    }
++#endif
++
++#if USE_OPENSSL
++    int i = SSL_write(session, buf, len);
++#elif USE_GNUTLS
++    int i = gnutls_record_send(session, buf, len);
++#endif
++
++    if (i &gt; 0) {
++        debugs(83, 8, &quot;TLS FD &quot; &lt;&lt; fd &lt;&lt; &quot; session=&quot; &lt;&lt; (void*)session &lt;&lt; &quot; &quot; &lt;&lt; i &lt;&lt; &quot; bytes&quot;);
++    }
++    return i;
++}
++#endif
++
++static bool
++CreateSession(const Security::ContextPointer &amp;ctx, const Comm::ConnectionPointer &amp;conn, Security::Io::Type type, const char *squidCtx)
++{
++    if (!Comm::IsConnOpen(conn)) {
++        debugs(83, DBG_IMPORTANT, &quot;Gone connection&quot;);
++        return false;
++    }
++
++#if USE_OPENSSL || USE_GNUTLS
++
++    const char *errAction = &quot;with no TLS/SSL library&quot;;
++    int errCode = 0;
++#if USE_OPENSSL
++    Security::SessionPointer session(SSL_new(ctx.get()), [](SSL *p) {
++            debugs(83, 5, &quot;SSL_free session=&quot; &lt;&lt; (void*)p);
++            SSL_free(p);
++        });
++    debugs(83, 5, &quot;SSL_new session=&quot; &lt;&lt; (void*)session.get());
++    if (!session) {
++        errCode = ERR_get_error();
++        errAction = &quot;failed to allocate handle&quot;;
++    }
++#elif USE_GNUTLS
++    gnutls_session_t tmp;
++    errCode = gnutls_init(&amp;tmp, static_cast&lt;unsigned int&gt;(type) | GNUTLS_NONBLOCK);
++    Security::SessionPointer session(tmp, [](gnutls_session_t p) {
++            debugs(83, 5, &quot;gnutls_deinit session=&quot; &lt;&lt; (void*)p);
++            gnutls_deinit(p);
++    });
++    debugs(83, 5, &quot;gnutls_init &quot; &lt;&lt; (type == Security::Io::BIO_TO_SERVER ? &quot;client&quot; : &quot;server&quot; )&lt;&lt; &quot; session=&quot; &lt;&lt; (void*)session.get());
++    if (errCode != GNUTLS_E_SUCCESS) {
++        session.reset();
++        errAction = &quot;failed to initialize session&quot;;
++    }
++#endif
++
++    if (session) {
++        const int fd = conn-&gt;fd;
++
++#if USE_OPENSSL
++        // without BIO, we would call SSL_set_fd(ssl.get(), fd) instead
++        if (BIO *bio = Ssl::Bio::Create(fd, type)) {
++            Ssl::Bio::Link(session.get(), bio); // cannot fail
++#elif USE_GNUTLS
++        errCode = gnutls_credentials_set(session.get(), GNUTLS_CRD_CERTIFICATE, ctx.get());
++        if (errCode == GNUTLS_E_SUCCESS) {
++
++            if (auto *peer = conn-&gt;getPeer())
++                peer-&gt;secure.updateSessionOptions(session);
++            else
++                Security::ProxyOutgoingConfig.updateSessionOptions(session);
++
++            // NP: GnuTLS does not yet support the BIO operations
++            //     this does the equivalent of SSL_set_fd() for now.
++            gnutls_transport_set_int(session.get(), fd);
++            gnutls_handshake_set_timeout(session.get(), GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
++#endif
++
++            debugs(83, 5, &quot;link FD &quot; &lt;&lt; fd &lt;&lt; &quot; to TLS session=&quot; &lt;&lt; (void*)session.get());
++            fd_table[fd].ssl = session;
++            fd_table[fd].read_method = &amp;tls_read_method;
++            fd_table[fd].write_method = &amp;tls_write_method;
++            fd_note(fd, squidCtx);
++            return true;
++        }
++
++#if USE_OPENSSL
++        errCode = ERR_get_error();
++        errAction = &quot;failed to initialize I/O&quot;;
++#elif USE_GNUTLS
++        errAction = &quot;failed to assign credentials&quot;;
++#endif
++    }
++
++    debugs(83, DBG_IMPORTANT, &quot;ERROR: &quot; &lt;&lt; squidCtx &lt;&lt; ' ' &lt;&lt; errAction &lt;&lt;
++           &quot;: &quot; &lt;&lt; (errCode != 0 ? Security::ErrorString(errCode) : &quot;&quot;));
++#endif
++    return false;
++}
++
++bool
++Security::CreateClientSession(const Security::ContextPointer &amp;ctx, const Comm::ConnectionPointer &amp;c, const char *squidCtx)
++{
++    return CreateSession(ctx, c, Security::Io::BIO_TO_SERVER, squidCtx);
++}
++
++bool
++Security::CreateServerSession(const Security::ContextPointer &amp;ctx, const Comm::ConnectionPointer &amp;c, const char *squidCtx)
++{
++    return CreateSession(ctx, c, Security::Io::BIO_TO_CLIENT, squidCtx);
++}
++
++void
++Security::SessionSendGoodbye(const Security::SessionPointer &amp;s)
++{
++    debugs(83, 5, &quot;session=&quot; &lt;&lt; (void*)s.get());
++    if (s) {
++#if USE_OPENSSL
++        SSL_shutdown(s.get());
++#elif USE_GNUTLS
++        gnutls_bye(s.get(), GNUTLS_SHUT_RDWR);
++#endif
++    }
++}
++
+ bool
+ Security::SessionIsResumed(const Security::SessionPointer &amp;s)
+ {
+     bool result = false;
+ #if USE_OPENSSL
+     result = SSL_session_reused(s.get()) == 1;
+ #elif USE_GNUTLS
+     result = gnutls_session_is_resumed(s.get()) != 0;
+ #endif
+     debugs(83, 7, &quot;session=&quot; &lt;&lt; (void*)s.get() &lt;&lt; &quot;, query? answer: &quot; &lt;&lt; (result ? 'T' : 'F') );
+     return result;
+ }
+ 
+ void
+ Security::MaybeGetSessionResumeData(const Security::SessionPointer &amp;s, Security::SessionStatePointer &amp;data)
+ {
+     if (!SessionIsResumed(s)) {
+ #if USE_OPENSSL
+         // nil is valid for SSL_get1_session(), it cannot fail.
+         data.reset(SSL_get1_session(s.get()));
+
+=== modified file 'src/security/Session.h'
+--- src/security/Session.h	2017-01-01 00:12:22 +0000
++++ src/security/Session.h	2017-01-16 12:37:44 +0000
+@@ -1,78 +1,81 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SRC_SECURITY_SESSION_H
+ #define SQUID_SRC_SECURITY_SESSION_H
+ 
++#include &quot;base/HardFun.h&quot;
++#include &quot;comm/forward.h&quot;
+ #include &quot;security/LockingPointer.h&quot;
+ 
+ #include &lt;memory&gt;
+ 
+ #if USE_OPENSSL
+ #if HAVE_OPENSSL_SSL_H
+ #include &lt;openssl/ssl.h&gt;
+ #endif
+ #endif
+ 
+ #if USE_GNUTLS
+ #if HAVE_GNUTLS_GNUTLS_H
+ #include &lt;gnutls/gnutls.h&gt;
+ #endif
+ #endif
+ 
+ namespace Security {
+ 
++/// Creates TLS Client connection structure (aka 'session' state) and initializes TLS/SSL I/O (Comm and BIO).
++/// On errors, emits DBG_IMPORTANT with details and returns false.
++bool CreateClientSession(const Security::ContextPointer &amp;, const Comm::ConnectionPointer &amp;, const char *squidCtx);
++
++/// Creates TLS Server connection structure (aka 'session' state) and initializes TLS/SSL I/O (Comm and BIO).
++/// On errors, emits DBG_IMPORTANT with details and returns false.
++bool CreateServerSession(const Security::ContextPointer &amp;, const Comm::ConnectionPointer &amp;, const char *squidCtx);
++
+ #if USE_OPENSSL
+-CtoCpp1(SSL_free, SSL *);
+-#if defined(CRYPTO_LOCK_SSL) // OpenSSL 1.0
+-inline int SSL_up_ref(SSL *t) {if (t) CRYPTO_add(&amp;t-&gt;references, 1, CRYPTO_LOCK_SSL); return 0;}
+-#endif
+-typedef Security::LockingPointer&lt;SSL, Security::SSL_free_cpp, HardFun&lt;int, SSL *, SSL_up_ref&gt; &gt; SessionPointer;
++typedef std::shared_ptr&lt;SSL&gt; SessionPointer;
+ 
+ typedef std::unique_ptr&lt;SSL_SESSION, HardFun&lt;void, SSL_SESSION*, &amp;SSL_SESSION_free&gt;&gt; SessionStatePointer;
+ 
+ #elif USE_GNUTLS
+-// Locks can be implemented attaching locks counter to gnutls_session_t
+-// objects using the gnutls_session_set_ptr()/gnutls_session_get_ptr ()
+-// library functions
+-CtoCpp1(gnutls_deinit, gnutls_session_t);
+-typedef Security::LockingPointer&lt;struct gnutls_session_int, gnutls_deinit_cpp&gt; SessionPointer;
++typedef std::shared_ptr&lt;struct gnutls_session_int&gt; SessionPointer;
+ 
+ // wrapper function to get around gnutls_free being a typedef
+ inline void squid_gnutls_free(void *d) {gnutls_free(d);}
+ typedef std::unique_ptr&lt;gnutls_datum_t, HardFun&lt;void, void*, &amp;Security::squid_gnutls_free&gt;&gt; SessionStatePointer;
+ 
+ #else
+-// use void* so we can check against NULL
+-CtoCpp1(xfree, void *);
+-typedef Security::LockingPointer&lt;void, xfree_cpp&gt; SessionPointer;
++typedef std::shared_ptr&lt;void&gt; SessionPointer;
+ 
+ typedef std::unique_ptr&lt;int&gt; SessionStatePointer;
+ 
+ #endif
+ 
++/// send the shutdown/bye notice for an active TLS session.
++void SessionSendGoodbye(const Security::SessionPointer &amp;);
++
+ /// whether the session is a resumed one
+ bool SessionIsResumed(const Security::SessionPointer &amp;);
+ 
+ /**
+  * When the session is not a resumed session, retrieve the details needed to
+  * resume a later connection and store them in 'data'. This may result in 'data'
+  * becoming a nil Pointer if no details exist or an error occurs.
+  *
+  * When the session is already a resumed session, do nothing and leave 'data'
+  * unhanged.
+  * XXX: is this latter behaviour always correct?
+  */
+ void MaybeGetSessionResumeData(const Security::SessionPointer &amp;, Security::SessionStatePointer &amp;data);
+ 
+ /// Set the data for resuming a previous session.
+ /// Needs to be done before using the SessionPointer for a handshake.
+ void SetSessionResumeData(const Security::SessionPointer &amp;, const Security::SessionStatePointer &amp;);
+ 
+ } // namespace Security
+ 
+
+=== modified file 'src/security/forward.h'
+--- src/security/forward.h	2017-01-01 00:12:22 +0000
++++ src/security/forward.h	2017-01-17 04:47:37 +0000
+@@ -91,29 +91,52 @@
+ 
+ class EncryptorAnswer;
+ 
+ /// Squid defined error code (&lt;0), an error code returned by X.509 API, or SSL_ERROR_NONE
+ typedef int ErrorCode;
+ 
+ inline const char *ErrorString(const ErrorCode code) {
+ #if USE_OPENSSL
+     return ERR_error_string(code, nullptr);
+ #elif USE_GNUTLS
+     return gnutls_strerror(code);
+ #else
+     return &quot;[no TLS library]&quot;;
+ #endif
+ }
+ 
+ /// set of Squid defined TLS error codes
+ /// \note using std::unordered_set ensures values are unique, with fast lookup
+ typedef std::unordered_set&lt;Security::ErrorCode&gt; Errors;
+ 
++namespace Io
++{
++    enum Type {
++#if USE_GNUTLS
++        // NP: this is odd looking but correct.
++        // 'to-client' means we are a server, and vice versa.
++        BIO_TO_CLIENT = GNUTLS_SERVER,
++        BIO_TO_SERVER = GNUTLS_CLIENT
++#else
++        BIO_TO_CLIENT = 6000,
++        BIO_TO_SERVER
++#endif
++    };
++
++} // namespace Io
++
+ class KeyData;
++
++#if !USE_OPENSSL &amp;&amp; USE_GNUTLS
++typedef std::shared_ptr&lt;struct gnutls_priority_st&gt; ParsedOptions;
++#else
++typedef long ParsedOptions;
++#endif
++
+ class PeerConnector;
+ class PeerOptions;
+ class ServerOptions;
+ 
+ } // namespace Security
+ 
+ #endif /* SQUID_SRC_SECURITY_FORWARD_H */
+ 
+
+=== modified file 'src/ssl/bio.cc'
+--- src/ssl/bio.cc	2017-01-01 00:12:22 +0000
++++ src/ssl/bio.cc	2017-01-12 13:05:40 +0000
+@@ -45,41 +45,41 @@
+ #if (OPENSSL_VERSION_NUMBER &lt; 0x10100000L)
+ /// Initialization structure for the BIO table with
+ /// Squid-specific methods and BIO method wrappers.
+ static BIO_METHOD SquidMethods = {
+     BIO_TYPE_SOCKET,
+     &quot;squid&quot;,
+     squid_bio_write,
+     squid_bio_read,
+     squid_bio_puts,
+     NULL, // squid_bio_gets not supported
+     squid_bio_ctrl,
+     squid_bio_create,
+     squid_bio_destroy,
+     NULL // squid_callback_ctrl not supported
+ };
+ #else
+ static BIO_METHOD *SquidMethods = NULL;
+ #endif
+ 
+ BIO *
+-Ssl::Bio::Create(const int fd, Ssl::Bio::Type type)
++Ssl::Bio::Create(const int fd, Security::Io::Type type)
+ {
+ #if (OPENSSL_VERSION_NUMBER &lt; 0x10100000L)
+     BIO_METHOD *useMethod = &SquidMethods;
+ #else
+     if (!SquidMethods) {
+         SquidMethods = BIO_meth_new(BIO_TYPE_SOCKET, &quot;squid&quot;);
+         BIO_meth_set_write(SquidMethods, squid_bio_write);
+         BIO_meth_set_read(SquidMethods, squid_bio_read);
+         BIO_meth_set_puts(SquidMethods, squid_bio_puts);
+         BIO_meth_set_gets(SquidMethods, NULL);
+         BIO_meth_set_ctrl(SquidMethods, squid_bio_ctrl);
+         BIO_meth_set_create(SquidMethods, squid_bio_create);
+         BIO_meth_set_destroy(SquidMethods, squid_bio_destroy);
+     }
+     const BIO_METHOD *useMethod = SquidMethods;
+ #endif
+ 
+     if (BIO *bio = BIO_new(useMethod)) {
+         BIO_int_ctrl(bio, BIO_C_SET_FD, type, fd);
+         return bio;
+@@ -558,41 +558,41 @@
+ 
+ /// implements puts() via write()
+ static int
+ squid_bio_puts(BIO *table, const char *str)
+ {
+     assert(str);
+     return squid_bio_write(table, str, strlen(str));
+ }
+ 
+ /// other BIO manipulations (those without dedicated callbacks in BIO table)
+ static long
+ squid_bio_ctrl(BIO *table, int cmd, long arg1, void *arg2)
+ {
+     debugs(83, 5, table &lt;&lt; ' ' &lt;&lt; cmd &lt;&lt; '(' &lt;&lt; arg1 &lt;&lt; &quot;, &quot; &lt;&lt; arg2 &lt;&lt; ')');
+ 
+     switch (cmd) {
+     case BIO_C_SET_FD: {
+         assert(arg2);
+         const int fd = *static_cast&lt;int*&gt;(arg2);
+         Ssl::Bio *bio;
+-        if (arg1 == Ssl::Bio::BIO_TO_SERVER)
++        if (arg1 == Security::Io::BIO_TO_SERVER)
+             bio = new Ssl::ServerBio(fd);
+         else
+             bio = new Ssl::ClientBio(fd);
+         assert(!BIO_get_data(table));
+         BIO_set_data(table, bio);
+         BIO_set_init(table, 1);
+         return 0;
+     }
+ 
+     case BIO_C_GET_FD:
+         if (BIO_get_init(table)) {
+             Ssl::Bio *bio = static_cast&lt;Ssl::Bio*&gt;(BIO_get_data(table));
+             assert(bio);
+             if (arg2)
+                 *static_cast&lt;int*&gt;(arg2) = bio-&gt;fd();
+             return bio-&gt;fd();
+         }
+         return -1;
+ 
+     case BIO_CTRL_DUP:
+
+=== modified file 'src/ssl/bio.h'
+--- src/ssl/bio.h	2017-01-01 00:12:22 +0000
++++ src/ssl/bio.h	2017-01-12 13:05:40 +0000
+@@ -1,76 +1,73 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SSL_BIO_H
+ #define SQUID_SSL_BIO_H
+ 
++#if USE_OPENSSL
++
+ #include &quot;fd.h&quot;
+ #include &quot;security/Handshake.h&quot;
+ 
+ #include &lt;iosfwd&gt;
+ #include &lt;list&gt;
+ #if HAVE_OPENSSL_BIO_H
+ #include &lt;openssl/bio.h&gt;
+ #endif
+ #include &lt;string&gt;
+ #include &lt;type_traits&gt;
+ 
+ namespace Ssl
+ {
+ 
+ /// BIO source and sink node, handling socket I/O and monitoring SSL state
+ class Bio
+ {
+ public:
+-    enum Type {
+-        BIO_TO_CLIENT = 6000,
+-        BIO_TO_SERVER
+-    };
+-
+     explicit Bio(const int anFd);
+     virtual ~Bio();
+ 
+     /// Writes the given data to socket
+     virtual int write(const char *buf, int size, BIO *table);
+ 
+     /// Reads data from socket
+     virtual int read(char *buf, int size, BIO *table);
+ 
+     /// Flushes any buffered data to socket.
+     /// The Ssl::Bio does not buffer any data, so this method has nothing to do
+     virtual void flush(BIO *table) {}
+ 
+     int fd() const { return fd_; } ///&lt; The SSL socket descriptor
+ 
+     /// Called by linked SSL connection whenever state changes, an alert
+     /// appears, or an error occurs. See SSL_set_info_callback().
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+ 
+     /// Creates a low-level BIO table, creates a high-level Ssl::Bio object
+     /// for a given socket, and then links the two together via BIO_C_SET_FD.
+-    static BIO *Create(const int fd, Type type);
++    static BIO *Create(const int fd, Security::Io::Type type);
+     /// Tells ssl connection to use BIO and monitor state via stateChanged()
+     static void Link(SSL *ssl, BIO *bio);
+ 
+     const SBuf &amp;rBufData() {return rbuf;} ///&lt; The buffered input data
+ protected:
+     const int fd_; ///&lt; the SSL socket we are reading and writing
+     SBuf rbuf;  ///&lt; Used to buffer input data.
+ };
+ 
+ /// BIO node to handle socket IO for squid client side
+ /// If bumping is enabled  this Bio detects and analyses client hello message
+ /// to retrieve the SSL features supported by the client
+ class ClientBio: public Bio
+ {
+ public:
+     explicit ClientBio(const int anFd): Bio(anFd), holdRead_(false), holdWrite_(false), helloSize(0) {}
+ 
+     /// The ClientBio version of the Ssl::Bio::stateChanged method
+     /// When the client hello message retrieved, fill the
+     /// &quot;features&quot; member with the client provided informations.
+@@ -185,22 +182,23 @@
+     Ssl::BumpMode bumpMode_;
+ 
+     /// The size of data stored in rbuf which passed to the openSSL
+     size_t rbufConsumePos;
+     Security::HandshakeParser parser_; ///&lt; The TLS/SSL messages parser.
+ };
+ 
+ } // namespace Ssl
+ 
+ void
+ applyTlsDetailsToSSL(SSL *ssl, Security::TlsDetails::Pointer const &amp;details, Ssl::BumpMode bumpMode);
+ 
+ #if (OPENSSL_VERSION_NUMBER &lt; 0x10100000L)
+ // OpenSSL v1.0 bio compatibility functions
+ inline void *BIO_get_data(BIO *table) { return table-&gt;ptr; }
+ inline void BIO_set_data(BIO *table, void *data) { table-&gt;ptr = data; }
+ inline int BIO_get_init(BIO *table) { return table-&gt;init; }
+ inline void BIO_set_init(BIO *table, int init) { table-&gt;init = init; }
+ #endif
+ 
++#endif /* USE_OPENSSL */
+ #endif /* SQUID_SSL_BIO_H */
+ 
+
+=== modified file 'src/ssl/cert_validate_message.cc'
+--- src/ssl/cert_validate_message.cc	2017-01-01 00:12:22 +0000
++++ src/ssl/cert_validate_message.cc	2017-01-12 13:05:40 +0000
+@@ -4,50 +4,50 @@
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;acl/FilledChecklist.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;helper.h&quot;
+ #include &quot;security/CertError.h&quot;
+ #include &quot;ssl/cert_validate_message.h&quot;
+ #include &quot;ssl/ErrorDetail.h&quot;
+ #include &quot;ssl/support.h&quot;
+ #include &quot;util.h&quot;
+ 
+ void
+ Ssl::CertValidationMsg::composeRequest(CertValidationRequest const &amp;vcert)
+ {
+     body.clear();
+     body += Ssl::CertValidationMsg::param_host + &quot;=&quot; + vcert.domainName;
+-    STACK_OF(X509) *peerCerts = static_cast&lt;STACK_OF(X509) *&gt;(SSL_get_ex_data(vcert.ssl, ssl_ex_index_ssl_cert_chain));
++    STACK_OF(X509) *peerCerts = static_cast&lt;STACK_OF(X509) *&gt;(SSL_get_ex_data(vcert.ssl.get(), ssl_ex_index_ssl_cert_chain));
+ 
+-    if (const char *sslVersion = SSL_get_version(vcert.ssl))
++    if (const char *sslVersion = SSL_get_version(vcert.ssl.get()))
+         body += &quot;\n&quot; +  Ssl::CertValidationMsg::param_proto_version + &quot;=&quot; + sslVersion;
+ 
+-    if (const char *cipherName = SSL_CIPHER_get_name(SSL_get_current_cipher(vcert.ssl)))
++    if (const char *cipherName = SSL_CIPHER_get_name(SSL_get_current_cipher(vcert.ssl.get())))
+         body += &quot;\n&quot; +  Ssl::CertValidationMsg::param_cipher + &quot;=&quot; + cipherName;
+ 
+     if (!peerCerts)
+-        peerCerts = SSL_get_peer_cert_chain(vcert.ssl);
++        peerCerts = SSL_get_peer_cert_chain(vcert.ssl.get());
+ 
+     if (peerCerts) {
+         Ssl::BIO_Pointer bio(BIO_new(BIO_s_mem()));
+         for (int i = 0; i &lt; sk_X509_num(peerCerts); ++i) {
+             X509 *cert = sk_X509_value(peerCerts, i);
+             PEM_write_bio_X509(bio.get(), cert);
+             body = body + &quot;\n&quot; + param_cert + xitoa(i) + &quot;=&quot;;
+             char *ptr;
+             long len = BIO_get_mem_data(bio.get(), &amp;ptr);
+             body.append(ptr, (ptr[len-1] == '\n' ? len - 1 : len));
+             if (!BIO_reset(bio.get())) {
+                 // print an error?
+             }
+         }
+     }
+ 
+     if (vcert.errors) {
+         int i = 0;
+         for (const Security::CertErrors *err = vcert.errors; err; err = err-&gt;next, ++i) {
+             body +=&quot;\n&quot;;
+
+=== modified file 'src/ssl/cert_validate_message.h'
+--- src/ssl/cert_validate_message.h	2017-01-01 00:12:22 +0000
++++ src/ssl/cert_validate_message.h	2017-01-12 13:05:40 +0000
+@@ -9,44 +9,43 @@
+ #ifndef SQUID_SSL_CERT_VALIDATE_MESSAGE_H
+ #define SQUID_SSL_CERT_VALIDATE_MESSAGE_H
+ 
+ #include &quot;base/RefCount.h&quot;
+ #include &quot;helper/ResultCode.h&quot;
+ #include &quot;ssl/crtd_message.h&quot;
+ #include &quot;ssl/support.h&quot;
+ 
+ #include &lt;vector&gt;
+ 
+ namespace Ssl
+ {
+ 
+ /**
+  * This class is used to hold the required informations to build
+  * a request message for the certificate validator helper
+  */
+ class CertValidationRequest
+ {
+ public:
+-    SSL *ssl;
+-    Security::CertErrors *errors; ///&lt; The list of errors detected
++    Security::SessionPointer ssl;
++    Security::CertErrors *errors = nullptr; ///&lt; The list of errors detected
+     std::string domainName; ///&lt; The server name
+-    CertValidationRequest() : ssl(NULL), errors(NULL) {}
+ };
+ 
+ /**
+  * This class is used to store informations found in certificate validation
+  * response messages read from certificate validator helper
+  */
+ class CertValidationResponse: public RefCountable
+ {
+ public:
+     typedef RefCount&lt;CertValidationResponse&gt; Pointer;
+ 
+     /**
+      * This class used to hold error informations returned from
+      * cert validator helper.
+      */
+     class  RecvdError
+     {
+     public:
+         RecvdError(): id(0), error_no(SSL_ERROR_NONE), cert(NULL), error_depth(-1) {}
+         RecvdError(const RecvdError &amp;);
+
+=== modified file 'src/ssl/helper.cc'
+--- src/ssl/helper.cc	2017-01-01 00:12:22 +0000
++++ src/ssl/helper.cc	2017-01-12 13:05:40 +0000
+@@ -219,41 +219,41 @@
+         if (!Ssl::CertValidationHelper::HelperCache-&gt;add(crtdvdData-&gt;query.c_str(), item))
+             delete item;
+     }
+ 
+     delete crtdvdData;
+ }
+ 
+ void Ssl::CertValidationHelper::sslSubmit(Ssl::CertValidationRequest const &amp;request, AsyncCall::Pointer &amp;callback)
+ {
+     assert(ssl_crt_validator);
+ 
+     Ssl::CertValidationMsg message(Ssl::CrtdMessage::REQUEST);
+     message.setCode(Ssl::CertValidationMsg::code_cert_validate);
+     message.composeRequest(request);
+     debugs(83, 5, &quot;SSL crtvd request: &quot; &lt;&lt; message.compose().c_str());
+ 
+     submitData *crtdvdData = new submitData;
+     crtdvdData-&gt;query = message.compose();
+     crtdvdData-&gt;query += '\n';
+     crtdvdData-&gt;callback = callback;
+-    crtdvdData-&gt;ssl.resetAndLock(request.ssl);
++    crtdvdData-&gt;ssl = request.ssl;
+     Ssl::CertValidationResponse::Pointer const*validationResponse;
+ 
+     if (CertValidationHelper::HelperCache &amp;&amp;
+             (validationResponse = CertValidationHelper::HelperCache-&gt;get(crtdvdData-&gt;query.c_str()))) {
+ 
+         CertValidationHelper::CbDialer *dialer = dynamic_cast&lt;CertValidationHelper::CbDialer*&gt;(callback-&gt;getDialer());
+         Must(dialer);
+         dialer-&gt;arg1 = *validationResponse;
+         ScheduleCallHere(callback);
+         delete crtdvdData;
+         return;
+     }
+ 
+     if (!ssl_crt_validator-&gt;trySubmit(crtdvdData-&gt;query.c_str(), sslCrtvdHandleReplyWrapper, crtdvdData)) {
+         Ssl::CertValidationResponse::Pointer resp = new Ssl::CertValidationResponse;;
+         resp-&gt;resultCode = ::Helper::BrokenHelper;
+         Ssl::CertValidationHelper::CbDialer *dialer = dynamic_cast&lt;Ssl::CertValidationHelper::CbDialer*&gt;(callback-&gt;getDialer());
+         Must(dialer);
+         dialer-&gt;arg1 = resp;
+         ScheduleCallHere(callback);
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2017-01-01 00:12:22 +0000
++++ src/ssl/support.cc	2017-01-17 04:13:26 +0000
+@@ -6,40 +6,41 @@
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 83    SSL accelerator support */
+ 
+ #include &quot;squid.h&quot;
+ 
+ /* MS Visual Studio Projects are monolithic, so we need the following
+  * #if to exclude the SSL code from compile process when not needed.
+  */
+ #if USE_OPENSSL
+ 
+ #include &quot;acl/FilledChecklist.h&quot;
+ #include &quot;anyp/PortCfg.h&quot;
+ #include &quot;fatal.h&quot;
+ #include &quot;fd.h&quot;
+ #include &quot;fde.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;ipc/MemMap.h&quot;
+ #include &quot;security/CertError.h&quot;
++#include &quot;security/Session.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ #include &quot;SquidTime.h&quot;
+ #include &quot;ssl/bio.h&quot;
+ #include &quot;ssl/Config.h&quot;
+ #include &quot;ssl/ErrorDetail.h&quot;
+ #include &quot;ssl/gadgets.h&quot;
+ #include &quot;ssl/support.h&quot;
+ #include &quot;URL.h&quot;
+ 
+ #include &lt;cerrno&gt;
+ 
+ // TODO: Move ssl_ex_index_* global variables from global.cc here.
+ int ssl_ex_index_ssl_untrusted_chain = -1;
+ 
+ Ipc::MemMap *Ssl::SessionCache = NULL;
+ const char *Ssl::SessionCacheName = &quot;ssl_session_cache&quot;;
+ 
+ static Ssl::CertsIndexedList SquidUntrustedCerts;
+ 
+ const EVP_MD *Ssl::DefaultSignHash = NULL;
+@@ -632,47 +633,45 @@
+ 
+         debugs(83, 5, &quot;Comparing private and public SSL keys.&quot;);
+ 
+         if (!SSL_CTX_check_private_key(ctx.get())) {
+             ssl_error = ERR_get_error();
+             debugs(83, DBG_CRITICAL, &quot;ERROR: SSL private key '&quot; &lt;&lt; certfile &lt;&lt; &quot;' does not match public key '&quot; &lt;&lt;
+                    keyfile &lt;&lt; &quot;': &quot; &lt;&lt; Security::ErrorString(ssl_error));
+             return false;
+         }
+     */
+ 
+     if (!configureSslContext(ctx, port)) {
+         debugs(83, DBG_CRITICAL, &quot;ERROR: Configuring static SSL context&quot;);
+         return false;
+     }
+ 
+     return true;
+ }
+ 
+ bool
+-Ssl::InitClientContext(Security::ContextPointer &amp;ctx, Security::PeerOptions &amp;peer, long options, long fl)
++Ssl::InitClientContext(Security::ContextPointer &amp;ctx, Security::PeerOptions &amp;peer, long fl)
+ {
+     if (!ctx)
+         return false;
+ 
+-    SSL_CTX_set_options(ctx.get(), options);
+-
+     maybeDisableRenegotiate(ctx);
+ 
+     if (!peer.sslCipher.isEmpty()) {
+         debugs(83, 5, &quot;Using chiper suite &quot; &lt;&lt; peer.sslCipher &lt;&lt; &quot;.&quot;);
+ 
+         const char *cipher = peer.sslCipher.c_str();
+         if (!SSL_CTX_set_cipher_list(ctx.get(), cipher)) {
+             const int ssl_error = ERR_get_error();
+             fatalf(&quot;Failed to set SSL cipher suite '%s': %s\n&quot;,
+                    cipher, Security::ErrorString(ssl_error));
+         }
+     }
+ 
+     if (!peer.certs.empty()) {
+         // TODO: support loading multiple cert/key pairs
+         auto &amp;keys = peer.certs.front();
+         if (!keys.certFile.isEmpty()) {
+             debugs(83, DBG_IMPORTANT, &quot;Using certificate in &quot; &lt;&lt; keys.certFile);
+ 
+             const char *certfile = keys.certFile.c_str();
+@@ -699,89 +698,40 @@
+                 fatalf(&quot;SSL private key '%s' does not match public key '%s': %s\n&quot;,
+                        certfile, keyfile, Security::ErrorString(ssl_error));
+             }
+         }
+     }
+ 
+     maybeSetupRsaCallback(ctx);
+ 
+     if (fl &amp; SSL_FLAG_DONT_VERIFY_PEER) {
+         debugs(83, 2, &quot;NOTICE: Peer certificates are not verified for validity!&quot;);
+         SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, NULL);
+     } else {
+         debugs(83, 9, &quot;Setting certificate verification callback.&quot;);
+         SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ssl_verify_cb);
+     }
+ 
+     return true;
+ }
+ 
+ /// \ingroup ServerProtocolSSLInternal
+-int
+-ssl_read_method(int fd, char *buf, int len)
+-{
+-    auto ssl = fd_table[fd].ssl.get();
+-
+-#if DONT_DO_THIS
+-
+-    if (!SSL_is_init_finished(ssl)) {
+-        errno = ENOTCONN;
+-        return -1;
+-    }
+-
+-#endif
+-
+-    int i = SSL_read(ssl, buf, len);
+-    if (i &gt; 0) {
+-        (void)VALGRIND_MAKE_MEM_DEFINED(buf, i);
+-    }
+-
+-    if (i &gt; 0 &amp;&amp; SSL_pending(ssl) &gt; 0) {
+-        debugs(83, 2, &quot;SSL FD &quot; &lt;&lt; fd &lt;&lt; &quot; is pending&quot;);
+-        fd_table[fd].flags.read_pending = true;
+-    } else
+-        fd_table[fd].flags.read_pending = false;
+-
+-    return i;
+-}
+-
+-/// \ingroup ServerProtocolSSLInternal
+-int
+-ssl_write_method(int fd, const char *buf, int len)
+-{
+-    auto ssl = fd_table[fd].ssl.get();
+-    if (!SSL_is_init_finished(ssl)) {
+-        errno = ENOTCONN;
+-        return -1;
+-    }
+-
+-    int i = SSL_write(ssl, buf, len);
+-    return i;
+-}
+-
+-void
+-ssl_shutdown_method(SSL *ssl)
+-{
+-    SSL_shutdown(ssl);
+-}
+-
+-/// \ingroup ServerProtocolSSLInternal
+ static const char *
+ ssl_get_attribute(X509_NAME * name, const char *attribute_name)
+ {
+     static char buffer[1024];
+     buffer[0] = '\0';
+ 
+     if (strcmp(attribute_name, &quot;DN&quot;) == 0) {
+         X509_NAME_oneline(name, buffer, sizeof(buffer));
+     } else {
+         int nid = OBJ_txt2nid(const_cast&lt;char *&gt;(attribute_name));
+         if (nid == 0) {
+             debugs(83, DBG_IMPORTANT, &quot;WARNING: Unknown SSL attribute name '&quot; &lt;&lt; attribute_name &lt;&lt; &quot;'&quot;);
+             return nullptr;
+         }
+         X509_NAME_get_text_by_NID(name, nid, buffer, sizeof(buffer));
+     }
+ 
+     return *buffer ? buffer : nullptr;
+ }
+ 
+@@ -1053,41 +1003,45 @@
+ 
+     if (!SSL_use_PrivateKey(ssl, pkey.get()))
+         return false;
+ 
+     return true;
+ }
+ 
+ bool
+ Ssl::verifySslCertificate(Security::ContextPointer &amp;ctx, CertificateProperties const &amp;properties)
+ {
+     // SSL_get_certificate is buggy in openssl versions 1.0.1d and 1.0.1e
+     // Try to retrieve certificate directly from Security::ContextPointer object
+ #if SQUID_USE_SSLGETCERTIFICATE_HACK
+     X509 ***pCert = (X509 ***)ctx-&gt;cert;
+     X509 * cert = pCert &amp;&amp; *pCert ? **pCert : NULL;
+ #elif SQUID_SSLGETCERTIFICATE_BUGGY
+     X509 * cert = NULL;
+     assert(0);
+ #else
+     // Temporary ssl for getting X509 certificate from SSL_CTX.
+-    Security::SessionPointer ssl(SSL_new(ctx.get()));
++    Security::SessionPointer ssl(SSL_new(ctx.get()), [](SSL *p) {
++            debugs(83, 5, &quot;SSL_free session=&quot; &lt;&lt; (void*)p);
++            SSL_free(p);
++        });
++    debugs(83, 5, &quot;SSL_new session=&quot; &lt;&lt; (void*)ssl.get());
+     X509 * cert = SSL_get_certificate(ssl.get());
+ #endif
+     if (!cert)
+         return false;
+     ASN1_TIME * time_notBefore = X509_get_notBefore(cert);
+     ASN1_TIME * time_notAfter = X509_get_notAfter(cert);
+     bool ret = (X509_cmp_current_time(time_notBefore) &lt; 0 &amp;&amp; X509_cmp_current_time(time_notAfter) &gt; 0);
+     if (!ret)
+         return false;
+ 
+     return certificateMatchesProperties(cert, properties);
+ }
+ 
+ bool
+ Ssl::setClientSNI(SSL *ssl, const char *fqdn)
+ {
+     //The SSL_CTRL_SET_TLSEXT_HOSTNAME is a openssl macro which indicates
+     // if the TLS servername extension (SNI) is enabled in openssl library.
+ #if defined(SSL_CTRL_SET_TLSEXT_HOSTNAME)
+     if (!SSL_set_tlsext_host_name(ssl, fqdn)) {
+@@ -1436,87 +1390,40 @@
+     Ssl::CertificateProperties certProperties;
+     if (const char *cn = CommonHostName(cert.get())) {
+         certProperties.commonName = &quot;Not trusted by \&quot;&quot;;
+         certProperties.commonName += cn;
+         certProperties.commonName += &quot;\&quot;&quot;;
+     } else if (const char *org = getOrganization(cert.get())) {
+         certProperties.commonName =  &quot;Not trusted by \&quot;&quot;;
+         certProperties.commonName += org;
+         certProperties.commonName += &quot;\&quot;&quot;;
+     } else
+         certProperties.commonName =  &quot;Not trusted&quot;;
+     certProperties.setCommonName = true;
+     // O, OU, and other CA subject fields will be mimicked
+     // Expiration date and other common properties will be mimicked
+     certProperties.signAlgorithm = Ssl::algSignSelf;
+     certProperties.signWithPkey.resetAndLock(pkey.get());
+     certProperties.mimicCert.resetAndLock(cert.get());
+     return Ssl::generateSslCertificate(untrustedCert, untrustedPkey, certProperties);
+ }
+ 
+-static bool
+-SslCreate(const Security::ContextPointer &amp;ctx, const Comm::ConnectionPointer &amp;conn, Ssl::Bio::Type type, const char *squidCtx)
+-{
+-    if (!Comm::IsConnOpen(conn)) {
+-        debugs(83, DBG_IMPORTANT, &quot;Gone connection&quot;);
+-        return false;
+-    }
+-
+-    const char *errAction = NULL;
+-    int errCode = 0;
+-    if (auto ssl = SSL_new(ctx.get())) {
+-        const int fd = conn-&gt;fd;
+-        // without BIO, we would call SSL_set_fd(ssl, fd) instead
+-        if (BIO *bio = Ssl::Bio::Create(fd, type)) {
+-            Ssl::Bio::Link(ssl, bio); // cannot fail
+-
+-            fd_table[fd].ssl.resetWithoutLocking(ssl);
+-            fd_table[fd].read_method = &amp;ssl_read_method;
+-            fd_table[fd].write_method = &amp;ssl_write_method;
+-            fd_note(fd, squidCtx);
+-            return true;
+-        }
+-        errCode = ERR_get_error();
+-        errAction = &quot;failed to initialize I/O&quot;;
+-        SSL_free(ssl);
+-    } else {
+-        errCode = ERR_get_error();
+-        errAction = &quot;failed to allocate handle&quot;;
+-    }
+-
+-    debugs(83, DBG_IMPORTANT, &quot;ERROR: &quot; &lt;&lt; squidCtx &lt;&lt; ' ' &lt;&lt; errAction &lt;&lt;
+-           &quot;: &quot; &lt;&lt; Security::ErrorString(errCode));
+-    return false;
+-}
+-
+-bool
+-Ssl::CreateClient(const Security::ContextPointer &amp;ctx, const Comm::ConnectionPointer &amp;c, const char *squidCtx)
+-{
+-    return SslCreate(ctx, c, Ssl::Bio::BIO_TO_SERVER, squidCtx);
+-}
+-
+-bool
+-Ssl::CreateServer(const Security::ContextPointer &amp;ctx, const Comm::ConnectionPointer &amp;c, const char *squidCtx)
+-{
+-    return SslCreate(ctx, c, Ssl::Bio::BIO_TO_CLIENT, squidCtx);
+-}
+-
+ static int
+ store_session_cb(SSL *ssl, SSL_SESSION *session)
+ {
+     if (!Ssl::SessionCache)
+         return 0;
+ 
+     debugs(83, 5, &quot;Request to store SSL Session &quot;);
+ 
+     SSL_SESSION_set_timeout(session, Config.SSL.session_ttl);
+ 
+ #if (OPENSSL_VERSION_NUMBER &lt; 0x10100000L)
+     unsigned char *id = session-&gt;session_id;
+     unsigned int idlen = session-&gt;session_id_length;
+ #else
+     unsigned int idlen;
+     const unsigned char *id = SSL_SESSION_get_id(session, &amp;idlen);
+ #endif
+     unsigned char key[MEMMAP_SLOT_KEY_SIZE];
+     // Session ids are of size 32bytes. They should always fit to a
+     // MemMap::Slot::key
+
+=== modified file 'src/ssl/support.h'
+--- src/ssl/support.h	2017-01-01 00:12:22 +0000
++++ src/ssl/support.h	2017-01-16 15:21:04 +0000
+@@ -56,76 +56,59 @@
+ namespace AnyP
+ {
+ class PortCfg;
+ };
+ 
+ namespace Ipc
+ {
+ class MemMap;
+ }
+ 
+ namespace Ssl
+ {
+ /// initialize the SSL library global state.
+ /// call before generating any SSL context
+ void Initialize();
+ 
+ class ErrorDetail;
+ class CertValidationResponse;
+ typedef RefCount&lt;CertValidationResponse&gt; CertValidationResponsePointer;
+ 
+-/// Creates SSL Client connection structure and initializes SSL I/O (Comm and BIO).
+-/// On errors, emits DBG_IMPORTANT with details and returns false.
+-bool CreateClient(const Security::ContextPointer &amp;, const Comm::ConnectionPointer &amp;, const char *squidCtx);
+-
+-/// Creates SSL Server connection structure and initializes SSL I/O (Comm and BIO).
+-/// On errors, emits DBG_IMPORTANT with details and returns false.
+-bool CreateServer(const Security::ContextPointer &amp;, const Comm::ConnectionPointer &amp;, const char *squidCtx);
+-
+ void SetSessionCallbacks(Security::ContextPointer &amp;);
+ extern Ipc::MemMap *SessionCache;
+ extern const char *SessionCacheName;
+ 
+ /// initialize a TLS server context with OpenSSL specific settings
+ bool InitServerContext(Security::ContextPointer &amp;, AnyP::PortCfg &amp;);
+ 
+ /// initialize a TLS client context with OpenSSL specific settings
+-bool InitClientContext(Security::ContextPointer &amp;, Security::PeerOptions &amp;, long options, long flags);
++bool InitClientContext(Security::ContextPointer &amp;, Security::PeerOptions &amp;, long flags);
+ 
+ #if defined(CRYPTO_LOCK_X509)
+ // portability wrapper for OpenSSL 1.0 vs 1.1
+ // use Security::CertPointer instead where possible
+ inline int X509_up_ref(X509 *t) {if (t) CRYPTO_add(&amp;t-&gt;references, 1, CRYPTO_LOCK_X509); return 0;}
+ #endif
+ 
+ } //namespace Ssl
+ 
+ /// \ingroup ServerProtocolSSLAPI
+-int ssl_read_method(int, char *, int);
+-
+-/// \ingroup ServerProtocolSSLAPI
+-int ssl_write_method(int, const char *, int);
+-
+-/// \ingroup ServerProtocolSSLAPI
+-void ssl_shutdown_method(SSL *ssl);
+-
+-/// \ingroup ServerProtocolSSLAPI
+ const char *sslGetUserEmail(SSL *ssl);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ const char *sslGetUserAttribute(SSL *ssl, const char *attribute_name);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ const char *sslGetCAAttribute(SSL *ssl, const char *attribute_name);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ const char *sslGetUserCertificatePEM(SSL *ssl);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ const char *sslGetUserCertificateChainPEM(SSL *ssl);
+ 
+ namespace Ssl
+ {
+ /// \ingroup ServerProtocolSSLAPI
+ typedef char const *GETX509ATTRIBUTE(X509 *, const char *);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+
+=== modified file 'src/tests/stub_libsecurity.cc'
+--- src/tests/stub_libsecurity.cc	2017-01-01 00:12:22 +0000
++++ src/tests/stub_libsecurity.cc	2017-01-18 16:14:36 +0000
+@@ -51,46 +51,57 @@
+ const char *PeerConnector::status() const STUB_RETVAL(&quot;&quot;)
+ void PeerConnector::commCloseHandler(const CommCloseCbParams &amp;) STUB
+ void PeerConnector::connectionClosed(const char *) STUB
+ bool PeerConnector::prepareSocket() STUB_RETVAL(false)
+ void PeerConnector::setReadTimeout() STUB
+ bool PeerConnector::initialize(Security::SessionPointer &amp;) STUB_RETVAL(false)
+ void PeerConnector::negotiate() STUB
+ bool PeerConnector::sslFinalized() STUB_RETVAL(false)
+ void PeerConnector::handleNegotiateError(const int) STUB
+ void PeerConnector::noteWantRead() STUB
+ void PeerConnector::noteWantWrite() STUB
+ void PeerConnector::noteNegotiationError(const int, const int, const int) STUB
+ //    virtual Security::ContextPointer getTlsContext() = 0;
+ void PeerConnector::bail(ErrorState *) STUB
+ void PeerConnector::callBack() STUB
+ void PeerConnector::recordNegotiationDetails() STUB
+ }
+ 
+ #include &quot;security/PeerOptions.h&quot;
+ Security::PeerOptions Security::ProxyOutgoingConfig;
++Security::PeerOptions::PeerOptions() {
++#if !USE_GNUTLS
++    parsedOptions = 0;
++#endif
++     STUB_NOP
++}
++Security::PeerOptions::PeerOptions(const Security::PeerOptions &amp;) {STUB}
++Security::PeerOptions &amp;Security::PeerOptions::operator =(const Security::PeerOptions &amp;) STUB_RETVAL(*this)
+ void Security::PeerOptions::parse(char const*) STUB
+ Security::ContextPointer Security::PeerOptions::createClientContext(bool) STUB_RETVAL(Security::ContextPointer())
+ void Security::PeerOptions::updateTlsVersionLimits() STUB
+ Security::ContextPointer Security::PeerOptions::createBlankContext() const STUB_RETVAL(Security::ContextPointer())
+ void Security::PeerOptions::updateContextCa(Security::ContextPointer &amp;) STUB
+ void Security::PeerOptions::updateContextCrl(Security::ContextPointer &amp;) STUB
++void Security::PeerOptions::updateSessionOptions(Security::SessionPointer &amp;) STUB
+ void Security::PeerOptions::dumpCfg(Packable*, char const*) const STUB
+-long Security::PeerOptions::parseOptions() STUB_RETVAL(0)
+-long Security::PeerOptions::parseFlags() STUB_RETVAL(0)
++void Security::PeerOptions::parseOptions() STUB
+ void parse_securePeerOptions(Security::PeerOptions *) STUB
+ 
+ #include &quot;security/ServerOptions.h&quot;
+ //Security::ServerOptions::ServerOptions(const Security::ServerOptions &amp;) STUB
+ void Security::ServerOptions::parse(const char *) STUB
+ void Security::ServerOptions::dumpCfg(Packable *, const char *) const STUB
+ Security::ContextPointer Security::ServerOptions::createBlankContext() const STUB_RETVAL(Security::ContextPointer())
+ bool Security::ServerOptions::createStaticServerContext(AnyP::PortCfg &amp;) STUB_RETVAL(false)
+ void Security::ServerOptions::updateContextEecdh(Security::ContextPointer &amp;) STUB
+ 
+ #include &quot;security/Session.h&quot;
+ namespace Security {
++bool CreateClientSession(const Security::ContextPointer &amp;, const Comm::ConnectionPointer &amp;, const char *) STUB_RETVAL(false)
++bool CreateServerSession(const Security::ContextPointer &amp;, const Comm::ConnectionPointer &amp;, const char *) STUB_RETVAL(false)
++void SessionSendGoodbye(const Security::SessionPointer &amp;) STUB
+ bool SessionIsResumed(const Security::SessionPointer &amp;) STUB_RETVAL(false)
+ void MaybeGetSessionResumeData(const Security::SessionPointer &amp;, Security::SessionStatePointer &amp;) STUB
+ void SetSessionResumeData(const Security::SessionPointer &amp;, const Security::SessionStatePointer &amp;) STUB
+ } // namespace Security
+ 
+
+=== modified file 'src/tests/stub_libsslsquid.cc'
+--- src/tests/stub_libsslsquid.cc	2017-01-01 00:12:22 +0000
++++ src/tests/stub_libsslsquid.cc	2017-01-12 13:05:40 +0000
+@@ -34,45 +34,42 @@
+ //Ssl::CertificateStorageAction::CertificateStorageAction(const Mgr::Command::Pointer &amp;cmd) STUB
+ Ssl::CertificateStorageAction::Pointer Ssl::CertificateStorageAction::Create(const Mgr::Command::Pointer &amp;cmd) STUB_RETSTATREF(Ssl::CertificateStorageAction::Pointer)
+ void Ssl::CertificateStorageAction::dump(StoreEntry *sentry) STUB
+ void Ssl::GlobalContextStorage::addLocalStorage(Ip::Address const &amp; address, size_t size_of_store) STUB
+ Ssl::LocalContextStorage *Ssl::GlobalContextStorage::getLocalStorage(Ip::Address const &amp; address)
+ { fatal(STUB_API &quot; required&quot;); static Ssl::LocalContextStorage v(0,0); return &v; }
+ void Ssl::GlobalContextStorage::reconfigureStart() STUB
+ //Ssl::GlobalContextStorage Ssl::TheGlobalContextStorage;
+ 
+ #include &quot;ssl/ErrorDetail.h&quot;
+ Security::ErrorCode parseErrorString(const char *name) STUB_RETVAL(0)
+ //const char *Ssl::getErrorName(Security::ErrorCode value) STUB_RETVAL(NULL)
+ Ssl::ErrorDetail::ErrorDetail(Security::ErrorCode, X509 *, X509 *, const char *) STUB
+ Ssl::ErrorDetail::ErrorDetail(ErrorDetail const &amp;) STUB
+ const String &amp; Ssl::ErrorDetail::toString() const STUB_RETSTATREF(String)
+ 
+ #include &quot;ssl/support.h&quot;
+ namespace Ssl
+ {
+ bool InitServerContext(Security::ContextPointer &amp;, AnyP::PortCfg &amp;) STUB_RETVAL(false)
+-bool InitClientContext(Security::ContextPointer &amp;, Security::PeerOptions &amp;, long, const char *) STUB_RETVAL(false)
++bool InitClientContext(Security::ContextPointer &amp;, Security::PeerOptions &amp;, const char *) STUB_RETVAL(false)
+ } // namespace Ssl
+-int ssl_read_method(int, char *, int) STUB_RETVAL(0)
+-int ssl_write_method(int, const char *, int) STUB_RETVAL(0)
+-void ssl_shutdown_method(SSL *ssl) STUB
+ const char *sslGetUserEmail(SSL *ssl) STUB_RETVAL(NULL)
+ const char *sslGetUserAttribute(SSL *ssl, const char *attribute_name) STUB_RETVAL(NULL)
+ const char *sslGetCAAttribute(SSL *ssl, const char *attribute_name) STUB_RETVAL(NULL)
+ const char *sslGetUserCertificatePEM(SSL *ssl) STUB_RETVAL(NULL)
+ const char *sslGetUserCertificateChainPEM(SSL *ssl) STUB_RETVAL(NULL)
+ namespace Ssl
+ {
+ //GETX509ATTRIBUTE GetX509UserAttribute;
+ //GETX509ATTRIBUTE GetX509CAAttribute;
+ //GETX509ATTRIBUTE GetX509Fingerprint;
+ std::vector&lt;const char *&gt; BumpModeStr = {&quot;&quot;};
+ bool generateUntrustedCert(Security::CertPointer &amp; untrustedCert, EVP_PKEY_Pointer &amp; untrustedPkey, Security::CertPointer const &amp; cert, EVP_PKEY_Pointer const &amp; pkey) STUB_RETVAL(false)
+ Security::ContextPointer generateSslContext(CertificateProperties const &amp;, AnyP::PortCfg &amp;) STUB_RETVAL(Security::ContextPointer())
+ bool verifySslCertificate(Security::ContextPointer &amp;, CertificateProperties const &amp;) STUB_RETVAL(false)
+ Security::ContextPointer generateSslContextUsingPkeyAndCertFromMemory(const char *, AnyP::PortCfg &amp;) STUB_RETVAL(Security::ContextPointer())
+ void addChainToSslContext(Security::ContextPointer &amp;, STACK_OF(X509) *) STUB
+ void readCertChainAndPrivateKeyFromFiles(Security::CertPointer &amp; cert, EVP_PKEY_Pointer &amp; pkey, X509_STACK_Pointer &amp; chain, char const * certFilename, char const * keyFilename) STUB
+ int matchX509CommonNames(X509 *peer_cert, void *check_data, int (*check_func)(void *check_data,  ASN1_STRING *cn_data)) STUB_RETVAL(0)
+ bool checkX509ServerValidity(X509 *cert, const char *server) STUB_RETVAL(false)
+ int asn1timeToString(ASN1_TIME *tm, char *buf, int len) STUB_RETVAL(0)
+
+=== modified file 'src/url.cc'
+--- src/url.cc	2017-01-01 00:12:22 +0000
++++ src/url.cc	2017-01-14 07:26:47 +0000
+@@ -813,41 +813,41 @@
+         break;
+ 
+     case AnyP::PROTO_FTP:
+ 
+         if (r-&gt;method == Http::METHOD_PUT)
+             rc = 1;
+ 
+     case AnyP::PROTO_GOPHER:
+ 
+     case AnyP::PROTO_WAIS:
+ 
+     case AnyP::PROTO_WHOIS:
+         if (r-&gt;method == Http::METHOD_GET)
+             rc = 1;
+         else if (r-&gt;method == Http::METHOD_HEAD)
+             rc = 1;
+ 
+         break;
+ 
+     case AnyP::PROTO_HTTPS:
+-#if USE_OPENSSL
++#if USE_OPENSSL || USE_GNUTLS
+         rc = 1;
+ #else
+         /*
+         * Squid can't originate an SSL connection, so it should
+         * never receive an &quot;https:&quot; URL.  It should always be
+         * CONNECT instead.
+         */
+         rc = 0;
+ #endif
+         break;
+ 
+     default:
+         break;
+     }
+ 
+     return rc;
+ }
+ 
+ /*
+  * Quick-n-dirty host extraction from a URL.  Steps:
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007795.html">[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections
+</A></li>
+	<LI>Next message: <A HREF="007797.html">[squid-dev] [PATCH] initial GnuTLS support for encrypted server connections
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7796">[ date ]</a>
+              <a href="thread.html#7796">[ thread ]</a>
+              <a href="subject.html#7796">[ subject ]</a>
+              <a href="author.html#7796">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

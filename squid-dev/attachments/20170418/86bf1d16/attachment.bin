@@ -1,0 +1,262 @@
+Do not forward HTTP requests to dead idle peers.
+
+Squid does not forward HTTP transactions to dead peers except when a
+dead peer was idle for some time (ten peer connect timeouts or longer).
+When the idle peer is still dead, this exception leads to transaction
+delays (at best) or client disconnects/errors (at worst), depending on
+Squid and client configurations/state. I am removing this exception.
+
+The "use dead idle peer" heuristic was introduced as a small part of a
+much bigger bug #14 fix (trunk r6631). AFAICT, the stated goal of the
+feature was speeding up failure recovery: The heuristic may result in
+HTTP transactions sent to a previously dead (but now alive) idle peer
+earlier, before the peer is proven to be alive (using peer revival
+mechanisms such as TCP probes). However, the negative side effects of
+this heuristic outweigh its accidental benefits. If somebody needs Squid
+to detect revived idle peers earlier, they need to add a different
+probing mechanism that does not jeopardize HTTP transactions.
+
+Nobody has spoken in defense of this feature on Squid mailing lists:
+http://lists.squid-cache.org/pipermail/squid-users/2017-March/014785.html
+http://lists.squid-cache.org/pipermail/squid-dev/2017-March/008308.html
+
+The removed functionality was not used to detect revived peers. All peer
+revival mechanisms (such as TCP probes) remain intact.
+
+=== modified file 'src/neighbors.cc'
+--- src/neighbors.cc	2017-04-12 23:34:50 +0000
++++ src/neighbors.cc	2017-04-18 10:07:37 +0000
+@@ -32,61 +32,61 @@
+ #include "multicast.h"
+ #include "neighbors.h"
+ #include "NeighborTypeDomainList.h"
+ #include "pconn.h"
+ #include "PeerDigest.h"
+ #include "PeerPoolMgr.h"
+ #include "PeerSelectState.h"
+ #include "RequestFlags.h"
+ #include "SquidConfig.h"
+ #include "SquidMath.h"
+ #include "SquidTime.h"
+ #include "stat.h"
+ #include "Store.h"
+ #include "store_key_md5.h"
+ #include "tools.h"
+ #include "URL.h"
+ 
+ /* count mcast group peers every 15 minutes */
+ #define MCAST_COUNT_RATE 900
+ 
+ bool peerAllowedToUse(const CachePeer *, HttpRequest *);
+ static int peerWouldBePinged(const CachePeer *, HttpRequest *);
+ static void neighborRemove(CachePeer *);
+ static void neighborAlive(CachePeer *, const MemObject *, const icp_common_t *);
+ #if USE_HTCP
+ static void neighborAliveHtcp(CachePeer *, const MemObject *, const HtcpReplyData *);
+ #endif
+ static void neighborCountIgnored(CachePeer *);
+ static void peerRefreshDNS(void *);
+ static IPH peerDNSConfigure;
+-static bool peerProbeConnect(CachePeer *);
++static void peerProbeConnect(CachePeer *);
+ static CNCB peerProbeConnectDone;
+ static void peerCountMcastPeersDone(void *data);
+ static void peerCountMcastPeersStart(void *data);
+ static void peerCountMcastPeersSchedule(CachePeer * p, time_t when);
+ static IRCB peerCountHandleIcpReply;
+ 
+ static void neighborIgnoreNonPeer(const Ip::Address &, icp_opcode);
+ static OBJH neighborDumpPeers;
+ static OBJH neighborDumpNonPeers;
+ static void dump_peers(StoreEntry * sentry, CachePeer * peers);
+ 
+ static unsigned short echo_port;
+ 
+ static int NLateReplies = 0;
+ static CachePeer *first_ping = NULL;
+ 
+ const char *
+ neighborTypeStr(const CachePeer * p)
+ {
+     if (p->type == PEER_NONE)
+         return "Non-Peer";
+ 
+     if (p->type == PEER_SIBLING)
+         return "Sibling";
+ 
+     if (p->type == PEER_MULTICAST)
+         return "Multicast Group";
+ 
+     return "Parent";
+ }
+@@ -1096,64 +1096,62 @@
+     for (p = Config.peers; p; p = p->next) {
+         if (!strcasecmp(name, p->name))
+             break;
+     }
+ 
+     return p;
+ }
+ 
+ CachePeer *
+ peerFindByNameAndPort(const char *name, unsigned short port)
+ {
+     CachePeer *p = NULL;
+ 
+     for (p = Config.peers; p; p = p->next) {
+         if (strcasecmp(name, p->name))
+             continue;
+ 
+         if (port != p->http_port)
+             continue;
+ 
+         break;
+     }
+ 
+     return p;
+ }
+ 
+ int
+ neighborUp(const CachePeer * p)
+ {
+     if (!p->tcp_up) {
+-        if (!peerProbeConnect((CachePeer *) p)) {
+-            debugs(15, 8, "neighborUp: DOWN (probed): " << p->host << " (" << p->in_addr << ")");
+-            return 0;
+-        }
++        peerProbeConnect(const_cast<CachePeer*>(p));
++        return 0;
+     }
+ 
+     /*
+      * The CachePeer can not be UP if we don't have any IP addresses
+      * for it.
+      */
+     if (0 == p->n_addresses) {
+         debugs(15, 8, "neighborUp: DOWN (no-ip): " << p->host << " (" << p->in_addr << ")");
+         return 0;
+     }
+ 
+     if (p->options.no_query) {
+         debugs(15, 8, "neighborUp: UP (no-query): " << p->host << " (" << p->in_addr << ")");
+         return 1;
+     }
+ 
+     if (p->stats.probe_start != 0 &&
+             squid_curtime - p->stats.probe_start > Config.Timeout.deadPeer) {
+         debugs(15, 8, "neighborUp: DOWN (dead): " << p->host << " (" << p->in_addr << ")");
+         return 0;
+     }
+ 
+     debugs(15, 8, "neighborUp: UP: " << p->host << " (" << p->in_addr << ")");
+     return 1;
+ }
+ 
+ void
+ peerNoteDigestGone(CachePeer * p)
+ {
+ #if USE_CACHE_DIGESTS
+@@ -1265,91 +1263,91 @@
+ 
+     if (!p->tcp_up) {
+         debugs(15, DBG_IMPORTANT, "Detected DEAD " << neighborTypeStr(p) << ": " << p->name);
+         p->stats.logged_state = PEER_DEAD;
+     }
+ }
+ 
+ void
+ peerConnectFailed(CachePeer *p)
+ {
+     debugs(15, DBG_IMPORTANT, "TCP connection to " << p->host << "/" << p->http_port << " failed");
+     peerConnectFailedSilent(p);
+ }
+ 
+ void
+ peerConnectSucceded(CachePeer * p)
+ {
+     if (!p->tcp_up) {
+         debugs(15, 2, "TCP connection to " << p->host << "/" << p->http_port << " succeded");
+         p->tcp_up = p->connect_fail_limit; // NP: so peerAlive(p) works properly.
+         peerAlive(p);
+         if (!p->n_addresses)
+             ipcache_nbgethostbyname(p->host, peerDNSConfigure, p);
+     } else
+         p->tcp_up = p->connect_fail_limit;
+ }
+ 
+ /*
+ * peerProbeConnect will be called on dead peers by neighborUp
+ */
+-static bool
++static void
+ peerProbeConnect(CachePeer * p)
+ {
++    if (p->testing_now > 0) {
++        debugs(15, 8, "already probing " << p);
++        return;
++    }
++
++    if (squid_curtime - p->stats.last_connect_probe == 0) {
++        debugs(15, 8, "just probed " << p);
++        return;
++    }
++
+     const time_t ctimeout = peerConnectTimeout(p);
+-    bool ret = (squid_curtime - p->stats.last_connect_failure) > (ctimeout * 10);
+-
+-    if (p->testing_now > 0)
+-        return ret;/* probe already running */
+-
+-    if (squid_curtime - p->stats.last_connect_probe == 0)
+-        return ret;/* don't probe to often */
+-
+     /* for each IP address of this CachePeer. find one that we can connect to and probe it. */
+     for (int i = 0; i < p->n_addresses; ++i) {
+         Comm::ConnectionPointer conn = new Comm::Connection;
+         conn->remote = p->addresses[i];
+         conn->remote.port(p->http_port);
+         conn->setPeer(p);
+         getOutgoingAddress(NULL, conn);
+ 
+         ++ p->testing_now;
+ 
+         AsyncCall::Pointer call = commCbCall(15,3, "peerProbeConnectDone", CommConnectCbPtrFun(peerProbeConnectDone, p));
+         Comm::ConnOpener *cs = new Comm::ConnOpener(conn, call, ctimeout);
+         cs->setHost(p->host);
+         AsyncJob::Start(cs);
+     }
+ 
+     p->stats.last_connect_probe = squid_curtime;
+-
+-    return ret;
+ }
+ 
+ static void
+ peerProbeConnectDone(const Comm::ConnectionPointer &conn, Comm::Flag status, int, void *data)
+ {
+     CachePeer *p = (CachePeer*)data;
+ 
+     if (status == Comm::OK) {
+         peerConnectSucceded(p);
+     } else {
+         peerConnectFailedSilent(p);
+     }
+ 
+     -- p->testing_now;
+     conn->close();
+     // TODO: log this traffic.
+ }
+ 
+ static void
+ peerCountMcastPeersSchedule(CachePeer * p, time_t when)
+ {
+     if (p->mcast.flags.count_event_pending)
+         return;
+ 
+     eventAdd("peerCountMcastPeersStart",
+              peerCountMcastPeersStart,
+              p,
+              (double) when, 1);
+ 
+     p->mcast.flags.count_event_pending = true;
+

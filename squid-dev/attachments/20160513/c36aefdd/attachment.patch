@@ -1,0 +1,496 @@
+Fixed Server::maybeMakeSpaceAvailable() logic.
+
+This change fixes logic bugs that mostly affect performance: In micro-
+tests, this change gives 10% performance improvement for intercepted
+"fast peek at SNI and splice" SslBump configurations. Similar
+improvement is expected for future plain HTTP/2 parsers.
+
+maybeMakeSpaceAvailable() is called with an essentially random inBuf.
+The method must prepare inBuf for the next network read. The old code
+was not doing that [well enough], leading to performance problems.
+
+In some environments, inBuf often ends up having tiny space exceeding 2
+bytes (e.g., 6 bytes). This happens, for example, when Squid creates and
+parses a fake CONNECT request. The old code often left such tiny inBufs
+"as is" because we tried to ensure that we have at least 2 bytes to read
+instead of trying to provide a reasonable number of buffer space for the
+next network read. Tiny buffers naturally result in tiny network reads,
+which are very inefficient, especially for non-incremental parsers.
+
+I have removed the explicit "2 byte" space checks: Both the new and the
+old code do not _guarantee_ that at least 2 bytes of buffer space are
+always available, and the caller does not check that condition either.
+If some other code relies on it, more fixes will be needed (but this
+change is not breaking that guarantee -- either it was broken earlier or
+was never fully enforced). In practice, only buffers approaching
+Config.maxRequestBufferSize limit may violate this guarantee AFAICT, and
+those buffers ought to be rare, so the bug, if any, remains unnoticed.
+
+Another subtle maybeMakeSpaceAvailable() problem was that the code
+contained its own buffer capacity increase algorithm (n^2 growth).
+However, increasing buffer capacity exponentially does not make much
+sense because network read sizes are not going to increase
+exponentially. Also, memAllocStringmemAllocate() overwrites n^2 growth
+with its own logic. Besides, it is buffer _space_, not the total
+capacity that should be increased. More work is needed to better match
+Squid buffer size for from-user network reads with the TCP stack buffers
+and traffic patterns.
+
+Both the old and the new code reallocate inBuf MemBlobs. However, the
+new code leaves "reallocate or memmove" decision to the new
+SBuf::reserve(), opening the possibility for future memmove
+optimizations that SBuf/MemBlob do not currently support.
+
+It is probably wrong that inBuf points to an essentially random MemBlob
+outside Server control but this change does not attempt to fix that.
+
+=== modified file 'src/sbuf/SBuf.cc'
+--- src/sbuf/SBuf.cc	2016-03-01 10:25:13 +0000
++++ src/sbuf/SBuf.cc	2016-04-17 00:30:45 +0000
+@@ -106,40 +106,63 @@ SBuf::assign(const SBuf &S)
+     len_ = S.len_;
+     return *this;
+ }
+ 
+ SBuf&
+ SBuf::assign(const char *S, size_type n)
+ {
+     const Locker blobKeeper(this, S);
+     debugs(24, 6, id << " from c-string, n=" << n << ")");
+     clear();
+     return append(S, n); //bounds checked in append()
+ }
+ 
+ void
+ SBuf::reserveCapacity(size_type minCapacity)
+ {
+     Must(minCapacity <= maxSize);
+     cow(minCapacity);
+ }
+ 
++SBuf::size_type
++SBuf::reserve(const SBufReservationRequirements &req)
++{
++    debugs(24, 8, id << " was: " << off_ << '+' << len_ << '+' << spaceSize() <<
++           '=' << store_->capacity);
++
++    const bool mustRealloc = !req.allowShared && store_->LockCount() > 1;
++
++    if (!mustRealloc && spaceSize() >= req.minSpace)
++        return spaceSize(); // the caller is content with what we have
++
++    /* only reallocation can make the caller happy */
++
++    if (!mustRealloc && len_ >= req.maxCapacity)
++        return spaceSize(); // but we cannot reallocate
++
++    const size_type newSpace = std::min(req.idealSpace, maxSize - len_);
++    reserveCapacity(std::min(len_ + newSpace, req.maxCapacity));
++    debugs(24, 7, id << " now: " << off_ << '+' << len_ << '+' << spaceSize() <<
++           '=' << store_->capacity);
++    return spaceSize(); // reallocated and probably reserved enough space
++}
++
+ char *
+ SBuf::rawSpace(size_type minSpace)
+ {
+     Must(length() <= maxSize - minSpace);
+     debugs(24, 7, "reserving " << minSpace << " for " << id);
+     ++stats.rawAccess;
+     // we're not concerned about RefCounts here,
+     // the store knows the last-used portion. If
+     // it's available, we're effectively claiming ownership
+     // of it. If it's not, we need to go away (realloc)
+     if (store_->canAppend(off_+len_, minSpace)) {
+         debugs(24, 7, id << " not growing");
+         return bufEnd();
+     }
+     // TODO: we may try to memmove before realloc'ing in order to avoid
+     //   one allocation operation, if we're the sole owners of a MemBlob.
+     //   Maybe some heuristic on off_ and length()?
+     cow(minSpace+length());
+     return bufEnd();
+ }
+
+=== modified file 'src/sbuf/SBuf.h'
+--- src/sbuf/SBuf.h	2016-03-01 10:25:13 +0000
++++ src/sbuf/SBuf.h	2016-04-17 00:33:27 +0000
+@@ -1,62 +1,62 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 24    SBuf */
+ 
+ #ifndef SQUID_SBUF_H
+ #define SQUID_SBUF_H
+ 
+ #include "base/InstanceId.h"
+ #include "Debug.h"
+ #include "globals.h"
+ #include "sbuf/Exceptions.h"
++#include "sbuf/forward.h"
+ #include "sbuf/MemBlob.h"
+ #include "sbuf/Stats.h"
+ 
+ #include <climits>
+ #include <cstdarg>
+ #include <iosfwd>
+ #include <iterator>
+ #if HAVE_UNISTD_H
+ #include <unistd.h>
+ #endif
+ 
+ /* SBuf placeholder for printf */
+ #ifndef SQUIDSBUFPH
+ #define SQUIDSBUFPH "%.*s"
+ #define SQUIDSBUFPRINT(s) (s).plength(),(s).rawContent()
+ #endif /* SQUIDSBUFPH */
+ 
+ // TODO: move within SBuf and rename
+ typedef enum {
+     caseSensitive,
+     caseInsensitive
+ } SBufCaseSensitive;
+ 
+ class CharacterSet;
+-class SBuf;
+ 
+ /** Forward input const_iterator for SBufs
+  *
+  * Please note that any operation on the underlying SBuf may invalidate
+  * all iterators over it, resulting in undefined behavior by them.
+  */
+ class SBufIterator : public std::iterator<std::input_iterator_tag, char>
+ {
+ public:
+     friend class SBuf;
+     typedef MemBlob::size_type size_type;
+     bool operator==(const SBufIterator &s) const;
+     bool operator!=(const SBufIterator &s) const;
+ 
+     const char &operator*() const { return *iter; }
+     SBufIterator& operator++() { ++iter; return *this; }
+ 
+ protected:
+     SBufIterator(const SBuf &, size_type);
+ 
+@@ -448,40 +448,46 @@ public:
+      * least minSpace bytes of unused backing store following the currently
+      * used portion and single ownership of the backing store.
+      * \throw SBufTooBigException if the user tries to allocate too big a SBuf
+      */
+     void reserveSpace(size_type minSpace) {
+         Must(minSpace <= maxSize);
+         Must(length() <= maxSize - minSpace);
+         reserveCapacity(length()+minSpace);
+     }
+ 
+     /** Request to guarantee the SBuf's store capacity
+      *
+      * After this method is called, the SBuf is guaranteed to have at least
+      * minCapacity bytes of total buffer size, including the currently-used
+      * portion; it is also guaranteed that after this call this SBuf
+      * has unique ownership of the underlying memory store.
+      * \throw SBufTooBigException if the user tries to allocate too big a SBuf
+      */
+     void reserveCapacity(size_type minCapacity);
+ 
++    /** Accommodate caller's requirements regarding SBuf's storage if possible.
++     *
++     * \return spaceSize(), which may be zero
++     */
++    size_type reserve(const SBufReservationRequirements &requirements);
++
+     /** slicing method
+      *
+      * Removes SBuf prefix and suffix, leaving a sequence of 'n'
+      * bytes starting from position 'pos', first byte is at pos 0.
+      * It is an in-place-modifying version of substr.
+      * \param pos start sub-stringing from this byte. If it is
+      *      npos or it is greater than the SBuf length, the SBuf is cleared and
+      *      an empty SBuf is returned.
+      * \param n maximum number of bytes of the resulting SBuf.
+      *     npos means "to end of SBuf".
+      *     if it is 0, the SBuf is cleared and an empty SBuf is returned.
+      *     if it overflows the end of the SBuf, it is capped to the end of SBuf
+      * \see substr, trim
+      */
+     SBuf& chop(size_type pos, size_type n = npos);
+ 
+     /** Remove characters in the toremove set at the beginning, end or both
+      *
+      * \param toremove characters to be removed. Stops chomping at the first
+      *        found char not in the set
+@@ -669,40 +675,56 @@ private:
+      * The result is guarranteed to be to be at least the desired size.
+      */
+     size_type estimateCapacity(size_type desired) const {return (2*desired);}
+ 
+     void reAlloc(size_type newsize);
+ 
+     void cow(size_type minsize = npos);
+ 
+     void checkAccessBounds(size_type pos) const;
+ 
+     /** Low-level append operation
+      *
+      * Takes as input a contiguous area of memory and appends its contents
+      * to the SBuf, taking care of memory management. Does no bounds checking
+      * on the supplied memory buffer, it is the duty of the caller to ensure
+      * that the supplied area is valid.
+      */
+     SBuf& lowAppend(const char * memArea, size_type areaSize);
+ };
+ 
++/// Named SBuf::reserve() parameters. Defaults ask for and restrict nothing.
++class SBufReservationRequirements
++{
++public:
++    typedef SBuf::size_type size_type;
++
++    /*
++     * Parameters are listed in the reverse order of importance: Satisfaction of
++     * the lower-listed requirements may violate the higher-listed requirements.
++     */
++    size_type idealSpace = 0; ///< if allocating anyway, provide this much space
++    size_type minSpace = 0; ///< allocate if spaceSize() is smaller
++    size_type maxCapacity = SBuf::maxSize; ///< do not allocate more than this
++    bool allowShared = true; ///< whether sharing our storage with others is OK
++};
++
+ /// ostream output operator
+ inline std::ostream &
+ operator <<(std::ostream& os, const SBuf& S)
+ {
+     return S.print(os);
+ }
+ 
+ /// Returns a lower-cased copy of its parameter.
+ inline SBuf
+ ToUpper(SBuf buf)
+ {
+     buf.toUpper();
+     return buf;
+ }
+ 
+ /// Returns an upper-cased copy of its parameter.
+ inline SBuf
+ ToLower(SBuf buf)
+ {
+     buf.toLower();
+
+=== modified file 'src/sbuf/forward.h'
+--- src/sbuf/forward.h	2016-03-01 15:51:56 +0000
++++ src/sbuf/forward.h	2016-04-16 01:15:06 +0000
+@@ -1,37 +1,38 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SRC_SBUF_FORWARD_H
+ #define SQUID_SRC_SBUF_FORWARD_H
+ 
+ #include <functional>
+ #include <list>
+ 
+ class MemBlob;
+ 
+ class SBuf;
+ class SBufIterator;
+ class SBufReverseIterator;
++class SBufReservationRequirements;
+ 
+ class OutOfBoundsException;
+ class InvalidParamException;
+ class SBufTooBigException;
+ 
+ class SBufStats;
+ typedef std::list<SBuf> SBufList;
+ 
+ class SBufEqual;
+ class SBufStartsWith;
+ class SBufAddLength;
+ namespace std {
+ template <> struct hash<SBuf>;
+ }
+ class CaseInsensitiveSBufHash;
+ 
+ #endif /* SQUID_SRC_SBUF_FORWARD_H */
+ 
+
+=== modified file 'src/servers/Server.cc'
+--- src/servers/Server.cc	2016-01-24 17:41:43 +0000
++++ src/servers/Server.cc	2016-04-18 17:07:16 +0000
+@@ -44,60 +44,58 @@ Server::start()
+ }
+ 
+ void
+ Server::swanSong()
+ {
+     if (Comm::IsConnOpen(clientConnection))
+         clientConnection->close();
+ 
+     BodyProducer::swanSong();
+ }
+ 
+ void
+ Server::stopReading()
+ {
+     if (reading()) {
+         Comm::ReadCancel(clientConnection->fd, reader);
+         reader = NULL;
+     }
+ }
+ 
+-bool
++/// Prepare inBuf for I/O. This method balances several conflicting desires:
++/// 1. Do not read too few bytes at a time.
++/// 2. Do not waste too much buffer space.
++/// 3. Do not [re]allocate or memmove the buffer too much.
++/// 4. Obey Config.maxRequestBufferSize limit.
++void
+ Server::maybeMakeSpaceAvailable()
+ {
+-    if (inBuf.spaceSize() < 2) {
+-        const SBuf::size_type haveCapacity = inBuf.length() + inBuf.spaceSize();
+-        if (haveCapacity >= Config.maxRequestBufferSize) {
+-            debugs(33, 4, "request buffer full: client_request_buffer_max_size=" << Config.maxRequestBufferSize);
+-            return false;
+-        }
+-        if (haveCapacity == 0) {
+-            // haveCapacity is based on the SBuf visible window of the MemBlob buffer, which may fill up.
+-            // at which point bump the buffer back to default. This allocates a new MemBlob with any un-parsed bytes.
+-            inBuf.reserveCapacity(CLIENT_REQ_BUF_SZ);
+-        } else {
+-            const SBuf::size_type wantCapacity = min(static_cast<SBuf::size_type>(Config.maxRequestBufferSize), haveCapacity*2);
+-            inBuf.reserveCapacity(wantCapacity);
+-        }
+-        debugs(33, 2, "growing request buffer: available=" << inBuf.spaceSize() << " used=" << inBuf.length());
+-    }
+-    return (inBuf.spaceSize() >= 2);
++    // The hard-coded parameters are arbitrary but seem reasonable.
++    // A careful study of Squid I/O and parsing patterns is needed to tune them.
++    SBufReservationRequirements requirements;
++    requirements.minSpace = 1024; // smaller I/Os are not worth their overhead
++    requirements.idealSpace = CLIENT_REQ_BUF_SZ; // we expect few larger I/Os
++    requirements.maxCapacity = Config.maxRequestBufferSize;
++    requirements.allowShared = true; // allow because inBuf is used immediately
++    inBuf.reserve(requirements);
++    if (!inBuf.spaceSize())
++        debugs(33, 4, "request buffer full: client_request_buffer_max_size=" << Config.maxRequestBufferSize);
+ }
+ 
+ void
+ Server::readSomeData()
+ {
+     if (reading())
+         return;
+ 
+     debugs(33, 4, clientConnection << ": reading request...");
+ 
+     // we can only read if there is more than 1 byte of space free
+     if (Config.maxRequestBufferSize - inBuf.length() < 2)
+         return;
+ 
+     typedef CommCbMemFunT<Server, CommIoCbParams> Dialer;
+     reader = JobCallback(33, 5, Dialer, this, Server::doClientRead);
+     Comm::Read(clientConnection, reader);
+ }
+ 
+ void
+
+=== modified file 'src/servers/Server.h'
+--- src/servers/Server.h	2016-02-23 08:51:22 +0000
++++ src/servers/Server.h	2016-04-16 19:35:42 +0000
+@@ -73,41 +73,41 @@ public:
+ 
+     /// schedule some data for a Comm::Write()
+     void write(char *buf, int len) {
+         typedef CommCbMemFunT<Server, CommIoCbParams> Dialer;
+         writer = JobCallback(33, 5, Dialer, this, Server::clientWriteDone);
+         Comm::Write(clientConnection, buf, len, writer, nullptr);
+     }
+ 
+     /// processing to sync state after a Comm::Write()
+     virtual void afterClientWrite(size_t) {}
+ 
+     /// whether Comm::Write() is scheduled
+     bool writing() const {return writer != NULL;}
+ 
+ // XXX: should be 'protected:' for child access only,
+ //      but all sorts of code likes to play directly
+ //      with the I/O buffers and socket.
+ public:
+ 
+     /// grows the available read buffer space (if possible)
+-    bool maybeMakeSpaceAvailable();
++    void maybeMakeSpaceAvailable();
+ 
+     // Client TCP connection details from comm layer.
+     Comm::ConnectionPointer clientConnection;
+ 
+     /**
+      * The transfer protocol currently being spoken on this connection.
+      * HTTP/1.x CONNECT, HTTP/1.1 Upgrade and HTTP/2 SETTINGS offer the
+      * ability to change protocols on the fly.
+      */
+     AnyP::ProtocolVersion transferProtocol;
+ 
+     /// Squid listening port details where this connection arrived.
+     AnyP::PortCfgPointer port;
+ 
+     /// read I/O buffer for the client connection
+     SBuf inBuf;
+ 
+     bool receivedFirstByte_; ///< true if at least one byte received on this connection
+ 
+     /// set of requests waiting to be serviced
+
+=== modified file 'src/tests/stub_SBuf.cc'
+--- src/tests/stub_SBuf.cc	2016-02-24 18:12:43 +0000
++++ src/tests/stub_SBuf.cc	2016-04-17 01:27:56 +0000
+@@ -36,33 +36,34 @@ SBuf& SBuf::append(const SBuf & S) STUB_
+ SBuf& SBuf::append(const char * S, size_type Ssize) STUB_RETVAL(*this)
+ SBuf& Printf(const char *fmt, ...);
+ SBuf& SBuf::appendf(const char *fmt, ...) STUB_RETVAL(*this)
+ SBuf& SBuf::vappendf(const char *fmt, va_list vargs) STUB_RETVAL(*this)
+ std::ostream& SBuf::print(std::ostream &os) const STUB_RETVAL(os)
+ std::ostream& SBuf::dump(std::ostream &os) const STUB_RETVAL(os)
+ void SBuf::setAt(size_type pos, char toset) STUB
+ int SBuf::compare(const SBuf &S, const SBufCaseSensitive isCaseSensitive, const size_type n) const STUB_RETVAL(-1)
+ int SBuf::compare(const char *s, const SBufCaseSensitive isCaseSensitive, const size_type n) const STUB_RETVAL(-1)
+ bool SBuf::startsWith(const SBuf &S, const SBufCaseSensitive isCaseSensitive) const STUB_RETVAL(false)
+ bool SBuf::operator ==(const SBuf & S) const STUB_RETVAL(false)
+ bool SBuf::operator !=(const SBuf & S) const STUB_RETVAL(false)
+ SBuf SBuf::consume(size_type n) STUB_RETVAL(*this)
+ const SBufStats& SBuf::GetStats() STUB_RETVAL(SBuf::stats)
+ SBuf::size_type SBuf::copy(char *dest, size_type n) const STUB_RETVAL(0)
+ const char* SBuf::rawContent() const STUB_RETVAL(NULL)
+ char *SBuf::rawSpace(size_type minSize) STUB_RETVAL(NULL)
+ void SBuf::forceSize(size_type newSize) STUB
+ const char* SBuf::c_str() STUB_RETVAL("")
+ void SBuf::reserveCapacity(size_type minCapacity) STUB
++SBuf::size_type SBuf::reserveCapacity(const SBufReservationRequirements &) STUB_RETVAL(0)
+ SBuf& SBuf::chop(size_type pos, size_type n) STUB_RETVAL(*this)
+ SBuf& SBuf::trim(const SBuf &toRemove, bool atBeginning, bool atEnd) STUB_RETVAL(*this)
+ SBuf SBuf::substr(size_type pos, size_type n) const STUB_RETVAL(*this)
+ SBuf::size_type SBuf::find(char c, size_type startPos) const STUB_RETVAL(SBuf::npos)
+ SBuf::size_type SBuf::find(const SBuf & str, size_type startPos) const STUB_RETVAL(SBuf::npos)
+ SBuf::size_type SBuf::rfind(char c, size_type endPos) const STUB_RETVAL(SBuf::npos)
+ SBuf::size_type SBuf::rfind(const SBuf &str, size_type endPos) const STUB_RETVAL(SBuf::npos)
+ SBuf::size_type SBuf::findFirstOf(const CharacterSet &set, size_type startPos) const STUB_RETVAL(SBuf::npos)
+ SBuf::size_type SBuf::findFirstNotOf(const CharacterSet &set, size_type startPos) const STUB_RETVAL(SBuf::npos)
+ int SBuf::scanf(const char *format, ...) STUB_RETVAL(-1)
+ void SBuf::toLower() STUB
+ void SBuf::toUpper() STUB
+ 
+

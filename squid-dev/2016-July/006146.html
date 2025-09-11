@@ -1,0 +1,239 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [RFC] annotate_transaction ACL
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BRFC%5D%20annotate_transaction%20ACL&In-Reply-To=%3C57814D08.90702%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006155.html">
+   <LINK REL="Next"  HREF="006147.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [RFC] annotate_transaction ACL</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BRFC%5D%20annotate_transaction%20ACL&In-Reply-To=%3C57814D08.90702%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [RFC] annotate_transaction ACL">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Sat Jul  9 19:14:16 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006155.html">[squid-dev] [PATCH Bug 4534 and N-bit fixes for CacheDigest
+</A></li>
+        <LI>Next message: <A HREF="006147.html">[squid-dev] [RFC] annotate_transaction ACL
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6146">[ date ]</a>
+              <a href="thread.html#6146">[ thread ]</a>
+              <a href="subject.html#6146">[ subject ]</a>
+              <a href="author.html#6146">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+    I propose adding two new ACLs: annotate_transaction and
+annotate_client[_connection]. Their draft documentation and usage
+examples are provided at the end of the email.
+
+The motivation for adding these ACLs is a persistent stream of requests
+from admins that want to know whether Squid has made some decision (or
+reached some important decision point). For example, an admin may need
+to know whether a particular http_access rule has matched or whether the
+request was received on a bumped connection.
+
+All these complex decisions live inside various ACL-driven squid.conf
+directives, especially directives that take many allow/deny/etc rules.
+In theory, it is possible to re-compute those ACLs to determine whether
+a certain condition was met. However, the following complications often
+make that &quot;just recompute the same ACLs&quot; solution impractical:
+
+0. Directives like ssl_bump are evaluated several times. Each time, the
+ACL decision tree changes (and so does Squid state). It is usually
+impractical to reconstruct the exact replica of the ACL decision tree as
+it existed at the time a particular decision was reached. This problem
+often be worked around by adding (at the decision point) a special
+external ACL that always matches and adds annotations, but each extra
+external ACL adds significant overheads and may increase complexity,
+especially in setups that do not use external ACLs.
+
+1. The ACLs involved may have side effects. This is typical for external
+ACLs. For external ACLs, the problem can sometimes be worked around if
+the external ACL itself returns an annotation (which can later be tested
+instead of re-evaluating that external ACL), but since the same external
+ACL can be used in different unknown-to-the-ACL contexts, the
+same-for-all annotation may not be enough. Another [poor] solution
+mentioned in #0 applies to this problem as well, with similar limitations.
+
+2. The ACLs involved may be unstable -- re-evaluating them is not
+guaranteed to produce the same result. This problem is typical for
+complex ACLs such as server_name and external, but also affects such
+simple ACLs such as dst. A [poor] solution mentioned in #0 applies to
+this problem as well, with similar limitations.
+
+3. The ACLs involved may be slow/asynchronous but the directive where
+the decision needs to be reproduced only supports fast ACLs. Again, a
+[poor] solution mentioned in #0 applies to this problem as well, with
+similar limitations.
+
+4. The directives involved only support fast ACLs while adding
+annotation (as described in #0) requires &quot;slow&quot; [external] ACL support.
+
+The proposed new ACLs solve these problems nicely, with low overhead,
+and without adding any overheads to deployments that do not need them.
+
+
+I have also considered and rejected the following two alternative
+solutions to the problem because they had [fairly obvious?] serious
+drawbacks:
+
+A. Extend rule syntax to be able to mark reached decision points without
+creating an ACL:
+
+    ssl_bump bump acl1 acl2 annotate(foo=bar) acl3
+
+B. Add general ACL options to be able to force any existing ACL to add
+an annotation:
+
+    acl myOldAcl dst --annotate foo=bar 127.0.0.1/32
+
+Please let me know if you consider any of the above alternatives more
+attractive (than adding new ACLs) or need me to detail their drawbacks.
+
+
+Please note that the documentation below does not currently detail what
+&quot;adding&quot; a foo=bar annotation means when there is already an annotation
+named &quot;foo&quot;. During implementation, we will decide whether the new ACLs
+should always append to the existing matching annotation and/or
+overwrite it. The documentation will be adjusted accordingly, of course.
+
+
+* acl aclname annotate_transaction key value [fast]
+
+Always matches. Used for its side effect: This ACL immediately adds
+a key=value annotation to the current master transaction. The added
+annotation can then be tested using note ACL and logged (or sent to
+helpers) using %note format code. This ACL is especially useful for
+recording complex multi-step ACL-driven decisions. For example:
+
+    # Do not log transaction accepted after aclX matched
+
+    # First, mark transactions accepted after aclX matched
+    acl markSpecial annotate_transaction special true
+    http_access allow acl001
+    ...
+    http_access deny acl100
+    http_access allow aclX markSpecial
+
+    # Second, do not log marked transactions:
+    acl markedSpecial note special true
+    access_log ... deny markedSpecial
+
+    # Note that the following would not have worked because aclX
+    # alone does not determine whether the transaction was allowed:
+    # access_log ... deny markedSpecial # Wrong
+
+
+Warning: This ACL annotates the transaction even when negated and
+even if subsequent ACLs fail to match. For example, the following
+three rules will have exactly the same effect as far as annotations
+set by the &quot;mark&quot; ACL are concerned:
+
+    some_directive acl1 acl2 ... mark # rule matches if mark is reached
+    some_directive acl1 acl2 ... !mark     # rule never matches
+    some_directive acl1 acl2 ... mark !all # rule never matches
+
+
+* acl aclname annotate_client key value [fast]
+
+Always matches. Used for its side effect: This ACL immediately adds
+a key=value annotation to the current client-to-Squid connection.
+Connection annotations are propagated to the current and all future
+master transactions on the annotated connection. All caveats for the
+annotate_transaction ACL apply to this ACL.
+
+Example:
+
+    # Do not rewrite bumped transactions
+
+    # First, mark bumped connections:
+    acl markBumped annotate_client bumped true
+    ssl_bump peek acl1
+    ssl_bump stare acl2
+    ssl_bump bump acl3 markBumped
+    ssl_bump splice all
+
+    # Second, do not send marked transactions to the redirector:
+    acl markedBumped note bumped true
+    url_rewrite_access deny markedBumped
+
+    # Note that the following would not have worked because acl3 alone
+    # does not determine whether the connection is going to be bumped:
+    # url_rewrite_access deny acl3 # Wrong
+
+
+
+Please let me know if you object to adding these new ACLs or have any
+improvement suggestions.
+
+
+Thank you,
+
+Alex.
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006155.html">[squid-dev] [PATCH Bug 4534 and N-bit fixes for CacheDigest
+</A></li>
+	<LI>Next message: <A HREF="006147.html">[squid-dev] [RFC] annotate_transaction ACL
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6146">[ date ]</a>
+              <a href="thread.html#6146">[ thread ]</a>
+              <a href="subject.html#6146">[ subject ]</a>
+              <a href="author.html#6146">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,127 @@
+>From 95c5124510a2cd6f1473d2ec9a31776f2e442d8e Mon Sep 17 00:00:00 2001
+From: Alex Dowad <alexinbeijing@gmail.com>
+Date: Tue, 28 Apr 2015 19:37:02 +0200
+Subject: [PATCH] Fix incorrect use of errno in various places
+
+Fix problems with 'errno' in TcpAcceptor::Listen, Comm::HandleRead, and
+Comm::HandleWrite. 'errno' is only valid after a standard library function
+returns an error. Also, we must avoid calling out to other functions before
+recording the value of 'errno', since they might overwrite it.
+---
+ src/comm/Read.cc        | 14 ++++++++------
+ src/comm/TcpAcceptor.cc |  2 +-
+ src/comm/Write.cc       | 13 ++++++++-----
+ 3 files changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/src/comm/Read.cc b/src/comm/Read.cc
+index e6c5657..19754f8 100644
+--- a/src/comm/Read.cc
++++ b/src/comm/Read.cc
+@@ -125,6 +125,8 @@ Comm::ReadNow(CommIoCbParams &params, SBuf &buf)
+ void
+ Comm::HandleRead(int fd, void *data)
+ {
++    int xerrno = 0;
++
+     Comm::IoCallback *ccb = (Comm::IoCallback *) data;
+ 
+     assert(data == COMMIO_FD_READCB(fd));
+@@ -140,22 +142,22 @@ Comm::HandleRead(int fd, void *data)
+     /* For legacy callers : Attempt a read */
+     // Keep in sync with Comm::ReadNow()!
+     ++ statCounter.syscalls.sock.reads;
+-    errno = 0;
+     int retval = FD_READ_METHOD(fd, ccb->buf, ccb->size);
+-    debugs(5, 3, "FD " << fd << ", size " << ccb->size << ", retval " << retval << ", errno " << errno);
++    if (retval < 0)
++        xerrno = errno;
++    debugs(5, 3, "FD " << fd << ", size " << ccb->size << ", retval " << retval << ", errno " << xerrno);
+ 
+     /* See if we read anything */
+     /* Note - read 0 == socket EOF, which is a valid read */
+     if (retval >= 0) {
+         fd_bytes(fd, retval, FD_READ);
+         ccb->offset = retval;
+-        ccb->finish(Comm::OK, errno);
++        ccb->finish(Comm::OK, 0);
+         return;
+-
+-    } else if (retval < 0 && !ignoreErrno(errno)) {
++    } else if (retval < 0 && !ignoreErrno(xerrno)) {
+         debugs(5, 3, "comm_read_try: scheduling Comm::COMM_ERROR");
+         ccb->offset = 0;
+-        ccb->finish(Comm::COMM_ERROR, errno);
++        ccb->finish(Comm::COMM_ERROR, xerrno);
+         return;
+     };
+ 
+diff --git a/src/comm/TcpAcceptor.cc b/src/comm/TcpAcceptor.cc
+index 17c13bb..c6c0aa2 100644
+--- a/src/comm/TcpAcceptor.cc
++++ b/src/comm/TcpAcceptor.cc
+@@ -152,8 +152,8 @@ Comm::TcpAcceptor::setListen()
+ {
+     errcode = 0; // reset local errno copy.
+     if (listen(conn->fd, Squid_MaxFD >> 2) < 0) {
+-        debugs(50, DBG_CRITICAL, "ERROR: listen(" << status() << ", " << (Squid_MaxFD >> 2) << "): " << xstrerror());
+         errcode = errno;
++        debugs(50, DBG_CRITICAL, "ERROR: listen(" << status() << ", " << (Squid_MaxFD >> 2) << "): " << xstrerror());
+         return;
+     }
+ 
+diff --git a/src/comm/Write.cc b/src/comm/Write.cc
+index 4a853e2..efe4bde 100644
+--- a/src/comm/Write.cc
++++ b/src/comm/Write.cc
+@@ -57,6 +57,7 @@ Comm::HandleWrite(int fd, void *data)
+ {
+     Comm::IoCallback *state = static_cast<Comm::IoCallback *>(data);
+     int len = 0;
++    int xerrno = 0;
+     int nleft;
+ 
+     assert(state->conn != NULL && state->conn->fd == fd);
+@@ -103,6 +104,8 @@ Comm::HandleWrite(int fd, void *data)
+ 
+     /* actually WRITE data */
+     len = FD_WRITE_METHOD(fd, state->buf + state->offset, nleft);
++    if (len < 0)
++        xerrno = errno;
+     debugs(5, 5, HERE << "write() returns " << len);
+ 
+ #if USE_DELAY_POOLS
+@@ -133,18 +136,18 @@ Comm::HandleWrite(int fd, void *data)
+         if (nleft != 0)
+             debugs(5, DBG_IMPORTANT, "FD " << fd << " write failure: connection closed with " << nleft << " bytes remaining.");
+ 
+-        state->finish(nleft ? Comm::COMM_ERROR : Comm::OK, errno);
++        state->finish(nleft ? Comm::COMM_ERROR : Comm::OK, 0);
+     } else if (len < 0) {
+         /* An error */
+         if (fd_table[fd].flags.socket_eof) {
+             debugs(50, 2, HERE << "FD " << fd << " write failure: " << xstrerror() << ".");
+-            state->finish(nleft ? Comm::COMM_ERROR : Comm::OK, errno);
+-        } else if (ignoreErrno(errno)) {
++            state->finish(nleft ? Comm::COMM_ERROR : Comm::OK, xerrno);
++        } else if (ignoreErrno(xerrno)) {
+             debugs(50, 9, HERE << "FD " << fd << " write failure: " << xstrerror() << ".");
+             state->selectOrQueueWrite();
+         } else {
+             debugs(50, 2, HERE << "FD " << fd << " write failure: " << xstrerror() << ".");
+-            state->finish(nleft ? Comm::COMM_ERROR : Comm::OK, errno);
++            state->finish(nleft ? Comm::COMM_ERROR : Comm::OK, xerrno);
+         }
+     } else {
+         /* A successful write, continue */
+@@ -154,7 +157,7 @@ Comm::HandleWrite(int fd, void *data)
+             /* Not done, reinstall the write handler and write some more */
+             state->selectOrQueueWrite();
+         } else {
+-            state->finish(nleft ? Comm::OK : Comm::COMM_ERROR, errno);
++            state->finish(nleft ? Comm::OK : Comm::COMM_ERROR, 0);
+         }
+     }
+ 
+-- 
+2.0.0.GIT
+

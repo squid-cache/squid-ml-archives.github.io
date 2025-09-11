@@ -1,0 +1,1449 @@
+Do not allow low-level debugging to hide important/critical messages.
+
+Removed debugs() side effects that inadvertently resulted in some
+important/critical messages logged at the wrong debugging level and,
+hence, becoming invisible to the admin. The removed side effects set the
+"current" debugging level when a debugs() parameter called a function
+that also called debugs(). The last nested debugs() called affected the
+level of all debugs() still in progress!
+
+Related changes:
+
+* Reentrant debugging messages no longer clobber parent messages. Each
+  debugging message is logged separately, in the natural order of
+  debugs() calls that would have happened if debugs() were a function
+  (that gets already evaluated arguments) and not a macro (that
+  evaluates its arguments in the middle of the call). This order is
+  "natural" because good macros work like functions from the caller
+  point of view.
+
+* Assertions hit while evaluating debugs() parameters are now logged
+  instead of being lost with the being-built debugs() log line.
+
+* 10-20% faster debugs() performance because we no longer allocate a new
+  std::ostringstream buffer for the vast majority of debugs() calls.
+  Only reentrant calls get a new buffer.
+
+* Removed old_debug(), addressing an old "needs to die" to-do.
+
+* Removed do_debug() that changed debugging level while testing whether
+  debugging is needed. Use side-effect-free Debug::Enabled() instead.
+
+Also removed the OutStream wrapper class. The wrapper was added in trunk 
+revision 13767 that promised to (but did not?) MemPool the debug output
+buffers. We no longer "new" the buffer stream so a custom new() method
+would be unused. Besides, the r13767 explanation implied that providing
+a Child::new() method would somehow overwrite Parent::allocator_type,
+which did not compute for me. Finally, Squid "new"s other allocator-
+enabled STL objects without overriding their new methods so either the
+same problem is still there or it did not exist (or was different?).
+
+Also removed Debug::xassert() because the debugs() assertions now work
+OK without that hack.
+
+=== modified file 'src/Debug.h'
+--- src/Debug.h	2016-01-01 00:12:18 +0000
++++ src/Debug.h	2016-05-19 08:48:18 +0000
+@@ -25,153 +25,164 @@
+ #if PURIFY
+ #define assert(EX) ((void)0)
+ #elif defined(NODEBUG)
+ #define assert(EX) ((void)0)
+ #elif STDC_HEADERS
+ #define assert(EX)  ((EX)?((void)0):xassert( # EX , __FILE__, __LINE__))
+ #else
+ #define assert(EX)  ((EX)?((void)0):xassert("EX", __FILE__, __LINE__))
+ #endif
+ 
+ /* context-based debugging, the actual type is subject to change */
+ typedef int Ctx;
+ Ctx ctx_enter(const char *descr);
+ void ctx_exit(Ctx ctx);
+ 
+ /* defined debug section limits */
+ #define MAX_DEBUG_SECTIONS 100
+ 
+ /* defined names for Debug Levels */
+ #define DBG_CRITICAL    0   /**< critical messages always shown when they occur */
+ #define DBG_IMPORTANT   1   /**< important messages always shown when their section is being checked */
+ /* levels 2-8 are still being discussed amongst the developers */
+ #define DBG_DATA    9   /**< output is a large data dump only necessary for advanced debugging */
+ 
+ #define DBG_PARSE_NOTE(x) (opt_parse_cfg_only?0:(x)) /**< output is always to be displayed on '-k parse' but at level-x normally. */
+ 
+ class Debug
+ {
+ 
+ public:
++    /// meta-information for debugs() or a similar debugging call
++    class Context
++    {
++    public:
++        Context(const int aSectionLevel, const int aLevel);
++
++        int level; ///< minimum debugging level required by the debugs() call
++        int sectionLevel; ///< maximum debugging level allowed during the call
++
++    private:
++        friend class Debug;
++        void rewind(const int aSection, const int aLevel);
++        void formatStream();
++        Context *upper; ///< previous or parent record in nested debugging calls
++        std::ostringstream buf; ///< debugs() output sink
++    };
++
++    /// whether debugging the given section and the given level produces output
++    static bool Enabled(const int section, const int level)
++    {
++        return level <= Debug::Levels[section];
++    }
++
+     static char *debugOptions;
+     static char *cache_log;
+     static int rotateNumber;
+     static int Levels[MAX_DEBUG_SECTIONS];
+-    static int level; ///< minimum debugging level required by debugs() call
+-    static int sectionLevel; ///< maximum debugging level allowed now
+     static int override_X;
+     static int log_stderr;
+     static bool log_syslog;
+ 
+-    static std::ostream &getDebugOut();
+-    static void finishDebug();
+     static void parseOptions(char const *);
+ 
++    /// minimum level required by the current debugs() call
++    static int Level() { return Current ? Current->level : 1; }
++    /// maximum level currently allowed
++    static int SectionLevel() { return Current ? Current->sectionLevel : 1; }
++
++    /// opens debugging context and returns output buffer
++    static std::ostringstream &Start(const int section, const int level);
++    /// logs output buffer created in Start() and closes debugging context
++    static void Finish();
++
+ private:
+-    // Hack: replaces global ::xassert() to debug debugging assertions
+-    static void xassert(const char *msg, const char *file, int line);
+-
+-    /// Wrapper class to prevent SquidNew.h overrides getting confused
+-    /// with the libc++6 std::ostringstream definitions
+-    class OutStream : public std::ostringstream
+-    {
+-        MEMPROXY_CLASS(OutStream);
+-    public:
+-        void *operator new[] (size_t size) throw(std::bad_alloc) = delete; //{return xmalloc(size);}
+-        void operator delete[] (void *address) throw() = delete; // {xfree(address);}
+-    };
+-
+-    static OutStream *CurrentDebug;
+-    static int TheDepth; // level of nested debugging calls
++    static Context *Current; ///< deepest active context; nil outside debugs()
+ };
+ 
+ extern FILE *debug_log;
+ 
+ size_t BuildPrefixInit();
+ const char * SkipBuildPrefix(const char* path);
+ 
+ /* Debug stream
+  *
+  * Unit tests can enable full debugging to stderr for one
+  * debug section; to enable this, #define ENABLE_DEBUG_SECTION to the
+  * section number before any header
+  */
+ #define debugs(SECTION, LEVEL, CONTENT) \
+    do { \
+-        if ((Debug::level = (LEVEL)) <= Debug::Levels[SECTION]) { \
+-            Debug::sectionLevel = Debug::Levels[SECTION]; \
+-            std::ostream &_dbo=Debug::getDebugOut(); \
+-            if (Debug::level > DBG_IMPORTANT) { \
+-                _dbo << (SECTION) << ',' << (LEVEL) << "| " \
++        const int _dbg_level = (LEVEL); \
++        if (Debug::Enabled((SECTION), _dbg_level)) { \
++            std::ostream &_dbo = Debug::Start((SECTION), _dbg_level); \
++            if (_dbg_level > DBG_IMPORTANT) { \
++                _dbo << (SECTION) << ',' << _dbg_level << "| " \
+                      << SkipBuildPrefix(__FILE__)<<"("<<__LINE__<<") "<<__FUNCTION__<<": "; \
+             } \
+             _dbo << CONTENT; \
+-            Debug::finishDebug(); \
++            Debug::Finish(); \
+         } \
+    } while (/*CONSTCOND*/ 0)
+ 
+ /** stream manipulator which does nothing.
+  * \deprecated Do not add to new code, and remove when editing old code
+  *
+  * Its purpose is to inactivate calls made following previous debugs()
+  * guidelines such as
+  * debugs(1,2, HERE << "some message");
+  *
+  * His former objective is now absorbed in the debugs call itself
+  */
+ inline std::ostream&
+ HERE(std::ostream& s)
+ {
+     return s;
+ }
+ 
+ /*
+  * MYNAME is for use at debug levels 0 and 1 where HERE is too messy.
+  *
+  * debugs(1,1, MYNAME << "WARNING: some message");
+  */
+ #ifdef __PRETTY_FUNCTION__
+ #define MYNAME __PRETTY_FUNCTION__ << " "
+ #else
+ #define MYNAME __FUNCTION__ << " "
+ #endif
+ 
+ /* some uint8_t do not like streaming control-chars (values 0-31, 127+) */
+ inline std::ostream& operator <<(std::ostream &os, const uint8_t d)
+ {
+     return (os << (int)d);
+ }
+ 
+-/* Legacy debug style. Still used in some places. needs to die... */
+-#define do_debug(SECTION, LEVEL)   ((Debug::level = (LEVEL)) <= Debug::Levels[SECTION])
+-#define old_debug(SECTION, LEVEL)  if do_debug((SECTION), (LEVEL)) _db_print
+-
+ /* Legacy debug function definitions */
+ void _db_init(const char *logfile, const char *options);
+ void _db_print(const char *,...) PRINTF_FORMAT_ARG1;
+ void _db_set_syslog(const char *facility);
+ void _db_rotate_log(void);
+ 
+ /// Prints raw and/or non-terminated data safely, efficiently, and beautifully.
+ /// Allows raw data debugging in debugs() statements with low debugging levels
+ /// by printing only if higher section debugging levels are configured:
+ ///   debugs(11, DBG_IMPORTANT, "always printed" << Raw(may be printed...));
+ class Raw
+ {
+ public:
+     Raw(const char *label, const char *data, const size_t size):
+         level(-1), label_(label), data_(data), size_(size) {}
+ 
+     /// limit data printing to at least the given debugging level
+     Raw &minLevel(const int aLevel) { level = aLevel; return *this; }
+ 
+     /// If debugging is prohibited by the current debugs() or section level,
+     /// prints nothing. Otherwise, dumps data using one of these formats:
+     ///   " label[size]=data" if label was set and data size is positive
+     ///   " label[0]" if label was set and data size is zero
+     ///   " data" if label was not set and data size is positive
+     ///   "" (i.e., prints nothing) if label was not set and data size is zero
+     std::ostream &print(std::ostream &os) const;
+ 
+     /// Minimum section debugging level necessary for printing. By default,
+     /// small strings are always printed while large strings are only printed
+     /// if DBG_DATA debugging level is enabled.
+
+=== modified file 'src/adaptation/ecap/Host.cc'
+--- src/adaptation/ecap/Host.cc	2016-02-21 18:07:04 +0000
++++ src/adaptation/ecap/Host.cc	2016-05-19 08:29:25 +0000
+@@ -120,66 +120,64 @@
+      * This has to be done using vGiven string and not Service object itself
+      * because dereferencing a Service pointer coming from an unsupported
+      * version is unsafe.
+      */
+     if (SupportedVersion(vGiven, "eCAP service built")) {
+         Must(!weak.expired());
+         RegisterAdapterService(weak.lock());
+     }
+ }
+ 
+ static int
+ SquidLogLevel(libecap::LogVerbosity lv)
+ {
+     if (lv.critical())
+         return DBG_CRITICAL; // is it a good idea to ignore other flags?
+ 
+     if (lv.large())
+         return DBG_DATA; // is it a good idea to ignore other flags?
+ 
+     if (lv.application())
+         return lv.normal() ? DBG_IMPORTANT : 2;
+ 
+     return 2 + 2*lv.debugging() + 3*lv.operation() + 2*lv.xaction();
+ }
+ 
+ std::ostream *
+ Adaptation::Ecap::Host::openDebug(libecap::LogVerbosity lv)
+ {
+     const int squidLevel = SquidLogLevel(lv);
+     const int squidSection = 93; // XXX: this should be a global constant
+-    // XXX: Debug.h should provide this to us
+-    if ((Debug::level = squidLevel) <= Debug::Levels[squidSection])
+-        return &Debug::getDebugOut();
+-    else
+-        return NULL;
++    return Debug::Enabled(squidSection, squidLevel) ?
++        &Debug::Start(squidSection, squidLevel) :
++        NULL;
+ }
+ 
+ void
+ Adaptation::Ecap::Host::closeDebug(std::ostream *debug)
+ {
+     if (debug)
+-        Debug::finishDebug();
++        Debug::Finish();
+ }
+ 
+ Adaptation::Ecap::Host::MessagePtr
+ Adaptation::Ecap::Host::newRequest() const
+ {
+     return MessagePtr(new Adaptation::Ecap::MessageRep(new HttpRequest));
+ }
+ 
+ Adaptation::Ecap::Host::MessagePtr
+ Adaptation::Ecap::Host::newResponse() const
+ {
+     return MessagePtr(new Adaptation::Ecap::MessageRep(new HttpReply));
+ }
+ 
+ void
+ Adaptation::Ecap::Host::Register()
+ {
+     if (!TheHost && SupportedVersion(libecap::VersionString(),
+                                      "Squid executable dynamically linked")) {
+         TheHost.reset(new Adaptation::Ecap::Host);
+         libecap::RegisterHost(TheHost);
+     }
+ }
+ 
+
+=== modified file 'src/base/Lock.h'
+--- src/base/Lock.h	2016-01-01 00:12:18 +0000
++++ src/base/Lock.h	2016-05-19 08:29:25 +0000
+@@ -6,64 +6,64 @@
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SRC_BASE_LOCK_H
+ #define SQUID_SRC_BASE_LOCK_H
+ 
+ /**
+  * This class provides a tracking counter and presents
+  * lock(), unlock() and LockCount() accessors.
+  *
+  * All locks must be cleared with unlock() before this object
+  * is destroyed.
+  *
+  * Accessors provided by this interface are not private,
+  * to allow class hierarchies.
+  *
+  * Build with -DLOCKCOUNT_DEBUG flag to enable lock debugging.
+  * It is disabled by default due to the cost of debug output.
+  */
+ class Lock
+ {
+ public:
+     Lock():count_(0) {}
+ 
+     virtual ~Lock() { assert(count_ == 0); }
+ 
+     /// Register one lock / reference against this object.
+     /// All locks must be cleared before it may be destroyed.
+     void lock() const {
+ #if defined(LOCKCOUNT_DEBUG)
+-        old_debug(0,1)("Incrementing this %p from count %u\n",this,count_);
++        debugs(0,1, "Incrementing this " << static_cast<void*>(this) << " from count " << count_);
+ #endif
+         assert(count_ < UINT32_MAX);
+         ++count_;
+     }
+ 
+     /// Clear one lock / reference against this object.
+     /// All locks must be cleared before it may be destroyed.
+     uint32_t unlock() const {
+ #if defined(LOCKCOUNT_DEBUG)
+-        old_debug(0,1)("Decrementing this %p from count %u\n",this,count_);
++        debugs(0,1, "Decrementing this " << static_cast<void*>(this) << " from count " << count_);
+ #endif
+         assert(count_ > 0);
+         return --count_;
+     }
+ 
+     /// Inspect the current count of references.
+     uint32_t LockCount() const { return count_; }
+ 
+ private:
+     mutable uint32_t count_; ///< number of references currently being tracked
+ };
+ 
+ // For clarity we provide some aliases for the tracking mechanisms
+ // using Lock so that we can easily see what type of smart pointers
+ // are to be used for the child object.
+ // NP: CbcPointer<> and RefCount<> pointers should be used consistently
+ //     for any given child class type
+ 
+ /// The locking interface for use on Reference-Counted classes
+ #define RefCountable virtual Lock
+ 
+ #endif /* SQUID_SRC_BASE_LOCK_H */
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-04-07 16:36:10 +0000
++++ src/client_side.cc	2016-05-19 08:29:25 +0000
+@@ -2626,61 +2626,61 @@
+             debugs(83, DBG_IMPORTANT, "Error negotiating SSL connection on FD " <<
+                    fd << ": " << ERR_error_string(ERR_get_error(), NULL) <<
+                    " (" << ssl_error << "/" << ret << ")");
+             return -1;
+         }
+ 
+         /* NOTREACHED */
+     }
+     return 1;
+ }
+ 
+ /** negotiate an SSL connection */
+ static void
+ clientNegotiateSSL(int fd, void *data)
+ {
+     ConnStateData *conn = (ConnStateData *)data;
+     X509 *client_cert;
+     auto ssl = fd_table[fd].ssl.get();
+ 
+     int ret;
+     if ((ret = Squid_SSL_accept(conn, clientNegotiateSSL)) <= 0) {
+         if (ret < 0) // An error
+             conn->clientConnection->close();
+         return;
+     }
+ 
+     if (SSL_session_reused(ssl)) {
+         debugs(83, 2, "clientNegotiateSSL: Session " << SSL_get_session(ssl) <<
+                " reused on FD " << fd << " (" << fd_table[fd].ipaddr << ":" << (int)fd_table[fd].remote_port << ")");
+     } else {
+-        if (do_debug(83, 4)) {
++        if (Debug::Enabled(83, 4)) {
+             /* Write out the SSL session details.. actually the call below, but
+              * OpenSSL headers do strange typecasts confusing GCC.. */
+             /* PEM_write_SSL_SESSION(debug_log, SSL_get_session(ssl)); */
+ #if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x00908000L
+             PEM_ASN1_write((i2d_of_void *)i2d_SSL_SESSION, PEM_STRING_SSL_SESSION, debug_log, (char *)SSL_get_session(ssl), NULL,NULL,0,NULL,NULL);
+ 
+ #elif (ALLOW_ALWAYS_SSL_SESSION_DETAIL == 1)
+ 
+             /* When using gcc 3.3.x and OpenSSL 0.9.7x sometimes a compile error can occur here.
+             * This is caused by an unpredicatble gcc behaviour on a cast of the first argument
+             * of PEM_ASN1_write(). For this reason this code section is disabled. To enable it,
+             * define ALLOW_ALWAYS_SSL_SESSION_DETAIL=1.
+             * Because there are two possible usable cast, if you get an error here, try the other
+             * commented line. */
+ 
+             PEM_ASN1_write((int(*)())i2d_SSL_SESSION, PEM_STRING_SSL_SESSION, debug_log, (char *)SSL_get_session(ssl), NULL,NULL,0,NULL,NULL);
+             /* PEM_ASN1_write((int(*)(...))i2d_SSL_SESSION, PEM_STRING_SSL_SESSION, debug_log, (char *)SSL_get_session(ssl), NULL,NULL,0,NULL,NULL); */
+ 
+ #else
+ 
+             debugs(83, 4, "With " OPENSSL_VERSION_TEXT ", session details are available only defining ALLOW_ALWAYS_SSL_SESSION_DETAIL=1 in the source." );
+ 
+ #endif
+             /* Note: This does not automatically fflush the log file.. */
+         }
+ 
+         debugs(83, 2, "clientNegotiateSSL: New session " <<
+                SSL_get_session(ssl) << " on FD " << fd << " (" <<
+                fd_table[fd].ipaddr << ":" << (int)fd_table[fd].remote_port <<
+                ")");
+
+=== modified file 'src/debug.cc'
+--- src/debug.cc	2016-03-18 12:05:14 +0000
++++ src/debug.cc	2016-05-19 08:29:25 +0000
+@@ -1,56 +1,54 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 00    Debug Routines */
+ 
+ #include "squid.h"
+ #include "Debug.h"
+ #include "ipc/Kids.h"
+ #include "SquidTime.h"
+ #include "util.h"
+ 
+ /* for shutting_down flag in xassert() */
+ #include "globals.h"
+ 
+ char *Debug::debugOptions = NULL;
+ int Debug::override_X = 0;
+ int Debug::log_stderr = -1;
+ bool Debug::log_syslog = false;
+ int Debug::Levels[MAX_DEBUG_SECTIONS];
+-int Debug::level;
+-int Debug::sectionLevel;
+ char *Debug::cache_log = NULL;
+ int Debug::rotateNumber = -1;
+ FILE *debug_log = NULL;
+ static char *debug_log_file = NULL;
+ static int Ctx_Lock = 0;
+ static const char *debugLogTime(void);
+ static const char *debugLogKid(void);
+ static void ctx_print(void);
+ #if HAVE_SYSLOG
+ #ifdef LOG_LOCAL4
+ static int syslog_facility = 0;
+ #endif
+ static void _db_print_syslog(const char *format, va_list args);
+ #endif
+ static void _db_print_stderr(const char *format, va_list args);
+ static void _db_print_file(const char *format, va_list args);
+ 
+ #if _SQUID_WINDOWS_
+ extern LPCRITICAL_SECTION dbg_mutex;
+ typedef BOOL (WINAPI * PFInitializeCriticalSectionAndSpinCount) (LPCRITICAL_SECTION, DWORD);
+ #endif
+ 
+ void
+ _db_print(const char *format,...)
+ {
+     char f[BUFSIZ];
+     f[0]='\0';
+     va_list args1;
+     va_list args2;
+     va_list args3;
+@@ -107,89 +105,89 @@
+ #if HAVE_SYSLOG
+     _db_print_syslog(format, args3);
+ #endif
+ 
+ #if _SQUID_WINDOWS_
+     LeaveCriticalSection(dbg_mutex);
+ #endif
+ 
+     va_end(args1);
+     va_end(args2);
+     va_end(args3);
+ }
+ 
+ static void
+ _db_print_file(const char *format, va_list args)
+ {
+     if (debug_log == NULL)
+         return;
+ 
+     /* give a chance to context-based debugging to print current context */
+     if (!Ctx_Lock)
+         ctx_print();
+ 
+     vfprintf(debug_log, format, args);
+     fflush(debug_log);
+ }
+ 
+ static void
+ _db_print_stderr(const char *format, va_list args)
+ {
+-    if (Debug::log_stderr < Debug::level)
++    if (Debug::log_stderr < Debug::Level())
+         return;
+ 
+     if (debug_log == stderr)
+         return;
+ 
+     vfprintf(stderr, format, args);
+ }
+ 
+ #if HAVE_SYSLOG
+ static void
+ _db_print_syslog(const char *format, va_list args)
+ {
+     /* level 0,1 go to syslog */
+ 
+-    if (Debug::level > 1)
++    if (Debug::Level() > 1)
+         return;
+ 
+     if (!Debug::log_syslog)
+         return;
+ 
+     char tmpbuf[BUFSIZ];
+     tmpbuf[0] = '\0';
+ 
+     vsnprintf(tmpbuf, BUFSIZ, format, args);
+ 
+     tmpbuf[BUFSIZ - 1] = '\0';
+ 
+-    syslog(Debug::level == 0 ? LOG_WARNING : LOG_NOTICE, "%s", tmpbuf);
++    syslog(Debug::Level() == 0 ? LOG_WARNING : LOG_NOTICE, "%s", tmpbuf);
+ }
+ #endif /* HAVE_SYSLOG */
+ 
+ static void
+ debugArg(const char *arg)
+ {
+     int s = 0;
+     int l = 0;
+     int i;
+ 
+     if (!strncasecmp(arg, "rotate=", 7)) {
+         arg += 7;
+         Debug::rotateNumber = atoi(arg);
+         return;
+     } else if (!strncasecmp(arg, "ALL", 3)) {
+         s = -1;
+         arg += 4;
+     } else {
+         s = atoi(arg);
+         while (*arg && *arg++ != ',');
+     }
+ 
+     l = atoi(arg);
+     assert(s >= -1);
+ 
+     if (s >= MAX_DEBUG_SECTIONS)
+         s = MAX_DEBUG_SECTIONS-1;
+ 
+     if (l < 0)
+         l = 0;
+@@ -497,61 +495,61 @@
+         errno = 0;
+         if (remove(to) == -1) {
+             const auto saved_errno = errno;
+             debugs(0, DBG_IMPORTANT, "removal of log file " << to << " failed: " << xstrerr(saved_errno));
+         }
+ #endif
+         errno = 0;
+         if (rename(debug_log_file, to) == -1) {
+             const auto saved_errno = errno;
+             debugs(0, DBG_IMPORTANT, "renaming file " << debug_log_file << " to "
+                    << to << "failed: " << xstrerr(saved_errno));
+         }
+     }
+ 
+     /* Close and reopen the log.  It may have been renamed "manually"
+      * before HUP'ing us. */
+     if (debug_log != stderr)
+         debugOpenLog(Debug::cache_log);
+ }
+ 
+ static const char *
+ debugLogTime(void)
+ {
+ 
+     time_t t = getCurrentTime();
+ 
+     struct tm *tm;
+     static char buf[128];
+     static time_t last_t = 0;
+ 
+-    if (Debug::level > 1) {
++    if (Debug::Level() > 1) {
+         char buf2[128];
+         tm = localtime(&t);
+         strftime(buf2, 127, "%Y/%m/%d %H:%M:%S", tm);
+         buf2[127] = '\0';
+         snprintf(buf, 127, "%s.%03d", buf2, (int) current_time.tv_usec / 1000);
+         last_t = t;
+     } else if (t != last_t) {
+         tm = localtime(&t);
+         strftime(buf, 127, "%Y/%m/%d %H:%M:%S", tm);
+         last_t = t;
+     }
+ 
+     buf[127] = '\0';
+     return buf;
+ }
+ 
+ static const char *
+ debugLogKid(void)
+ {
+     if (KidIdentifier != 0) {
+         static char buf[16];
+         if (!*buf) // optimization: fill only once after KidIdentifier is set
+             snprintf(buf, sizeof(buf), " kid%d", KidIdentifier);
+         return buf;
+     }
+ 
+     return "";
+ }
+ 
+ void
+@@ -699,127 +697,147 @@
+             _db_print("ctx: exit levels from %2d down to %2d\n",
+                       Ctx_Reported_Level, Ctx_Valid_Level + 1);
+         else
+             _db_print("ctx: exit level %2d\n", Ctx_Reported_Level);
+ 
+         Ctx_Reported_Level = Ctx_Valid_Level;
+     }
+ 
+     /* report new contexts that were pushed since last report */
+     while (Ctx_Reported_Level < Ctx_Current_Level) {
+         ++Ctx_Reported_Level;
+         ++Ctx_Valid_Level;
+         _db_print("ctx: enter level %2d: '%s'\n", Ctx_Reported_Level,
+                   ctx_get_descr(Ctx_Reported_Level));
+     }
+ 
+     /* unlock */
+     --Ctx_Lock;
+ }
+ 
+ /* checks for nulls and overflows */
+ static const char *
+ ctx_get_descr(Ctx ctx)
+ {
+     if (ctx < 0 || ctx > CTX_MAX_LEVEL)
+         return "<lost>";
+ 
+     return Ctx_Descrs[ctx] ? Ctx_Descrs[ctx] : "<null>";
+ }
+ 
+-int Debug::TheDepth = 0;
+-
+-Debug::OutStream *Debug::CurrentDebug(NULL);
+-
+-std::ostream &
+-Debug::getDebugOut()
+-{
+-    assert(TheDepth >= 0);
+-    ++TheDepth;
+-    if (TheDepth > 1) {
+-        assert(CurrentDebug);
+-        *CurrentDebug << std::endl << "reentrant debuging " << TheDepth << "-{";
+-    } else {
+-        assert(!CurrentDebug);
+-        CurrentDebug = new Debug::OutStream;
+-        // set default formatting flags
+-        CurrentDebug->setf(std::ios::fixed);
+-        CurrentDebug->precision(2);
+-    }
+-    return *CurrentDebug;
+-}
+-
+-void
+-Debug::finishDebug()
+-{
+-    assert(TheDepth >= 0);
+-    assert(CurrentDebug);
+-    if (TheDepth > 1) {
+-        *CurrentDebug << "}-" << TheDepth << std::endl;
+-    } else {
+-        assert(TheDepth == 1);
+-        _db_print("%s\n", CurrentDebug->str().c_str());
+-        delete CurrentDebug;
+-        CurrentDebug = NULL;
+-    }
+-    --TheDepth;
+-}
+-
+-// Hack: replaces global ::xassert() to debug debugging assertions
+-// Relies on assert macro calling xassert() without a specific scope.
+-void
+-Debug::xassert(const char *msg, const char *file, int line)
+-{
+-
+-    if (CurrentDebug) {
+-        *CurrentDebug << "assertion failed: " << file << ":" << line <<
+-                      ": \"" << msg << "\"";
+-    }
+-    abort();
++Debug::Context *Debug::Current = NULL;
++
++Debug::Context::Context(const int aSection, const int aLevel):
++    level(aLevel),
++    sectionLevel(Levels[aSection]),
++    upper(Current)
++{
++    formatStream();
++}
++
++/// Optimization: avoids new Context creation for every debugs().
++void
++Debug::Context::rewind(const int aSection, const int aLevel)
++{
++    level = aLevel;
++    sectionLevel = Levels[aSection];
++    assert(upper == Current);
++
++    buf.str(std::string());
++    buf.clear();
++    // debugs() users are supposed to preserve format, but
++    // some do not, so we have to waste cycles resetting it for all.
++    formatStream();
++}
++
++/// configures default formatting for the debugging stream
++void
++Debug::Context::formatStream()
++{
++    const static std::ostringstream cleanStream;
++    buf.flags(cleanStream.flags() | std::ios::fixed);
++    buf.width(cleanStream.width());
++    buf.precision(2);
++    buf.fill(' ');
++    // If this is not enough, use copyfmt(cleanStream) which is ~10% slower.
++}
++
++std::ostringstream &
++Debug::Start(const int section, const int level)
++{
++    Context *future = NULL;
++
++    // prepare future context
++    if (Current) {
++        // all reentrant debugs() calls get here; create a dedicated context
++        future = new Context(section, level);
++    } else {
++        // Optimization: Nearly all debugs() calls get here; avoid allocations
++        static Context *topContext = new Context(1, 1);
++        topContext->rewind(section, level);
++        future = topContext;
++    }
++
++    Current = future;
++
++    return future->buf;
++}
++
++void
++Debug::Finish()
++{
++    // TODO: Optimize to remove at least one extra copy.
++    _db_print("%s\n", Current->buf.str().c_str());
++
++    Context *past = Current;
++    Current = past->upper;
++    if (Current)
++        delete past;
++    // else it was a static topContext from Debug::Start()
+ }
+ 
+ size_t
+ BuildPrefixInit()
+ {
+     // XXX: This must be kept in sync with the actual debug.cc location
+     const char *ThisFileNameTail = "src/debug.cc";
+ 
+     const char *file=__FILE__;
+ 
+     // Disable heuristic if it does not work.
+     if (!strstr(file, ThisFileNameTail))
+         return 0;
+ 
+     return strlen(file)-strlen(ThisFileNameTail);
+ }
+ 
+ const char*
+ SkipBuildPrefix(const char* path)
+ {
+     static const size_t BuildPrefixLength = BuildPrefixInit();
+ 
+     return path+BuildPrefixLength;
+ }
+ 
+ std::ostream &
+ Raw::print(std::ostream &os) const
+ {
+     if (label_)
+         os << ' ' << label_ << '[' << size_ << ']';
+ 
+     if (!size_)
+         return os;
+ 
+     // finalize debugging level if no level was set explicitly via minLevel()
+     const int finalLevel = (level >= 0) ? level :
+-                           (size_ > 40 ? DBG_DATA : Debug::sectionLevel);
+-    if (finalLevel <= Debug::sectionLevel) {
++                           (size_ > 40 ? DBG_DATA : Debug::SectionLevel());
++    if (finalLevel <= Debug::SectionLevel()) {
+         os << (label_ ? '=' : ' ');
+         if (data_)
+             os.write(data_, size_);
+         else
+             os << "[null]";
+     }
+ 
+     return os;
+ }
+ 
+
+=== modified file 'src/esi/Expression.cc'
+--- src/esi/Expression.cc	2016-01-01 00:12:18 +0000
++++ src/esi/Expression.cc	2016-05-19 08:29:25 +0000
+@@ -89,62 +89,60 @@
+ }
+ 
+ void
+ stackpop(stackmember * s, int *depth)
+ {
+     if (!(*depth)--)
+         return;
+ 
+     cleanmember(&s[*depth]);
+ }
+ 
+ static evaluate evalnegate;
+ static evaluate evalliteral;
+ static evaluate evalor;
+ static evaluate evaland;
+ static evaluate evallesseq;
+ static evaluate evallessthan;
+ static evaluate evalmoreeq;
+ static evaluate evalmorethan;
+ static evaluate evalequals;
+ static evaluate evalnotequals;
+ static evaluate evalstartexpr;
+ static evaluate evalendexpr;
+ static evaluate evalexpr;
+ static void dumpstack(stackmember * stack, int depth);
+ static int addmember(stackmember * stack, int *stackdepth,
+                      stackmember * candidate);
+ static int membercompare(stackmember a, stackmember b);
+ static char const *trim(char const *s);
+ static stackmember getsymbol(const char *s, char const **endptr);
+-static void printliteral(stackmember s);
+-static void printmember(stackmember s);
+ 
+ /* -2 = failed to compate
+  * -1 = a less than b
+  * 0 = a equal b
+  * 2 - a more than b
+  */
+ int
+ membercompare(stackmember a, stackmember b)
+ {
+     /* we can compare: sub expressions to sub expressions ,
+      * literals to literals
+      */
+ 
+     if (!((a.valuetype == ESI_EXPR_LITERAL && b.valuetype == ESI_EXPR_LITERAL &&
+             a.valuestored != ESI_LITERAL_INVALID && b.valuestored != ESI_LITERAL_INVALID) ||
+             (a.valuetype == ESI_EXPR_EXPR && b.valuetype == ESI_EXPR_EXPR)))
+         return -2;
+ 
+     if (a.valuetype == ESI_EXPR_EXPR) {
+         if (a.value.integral == b.value.integral)
+             return 0;
+         else
+             return 1;
+     } else if (a.valuestored == ESI_LITERAL_STRING) {
+         if (b.valuestored == ESI_LITERAL_STRING) {
+             int i =strcmp(a.value.string, b.value.string);
+ 
+             if (i < 0)
+                 return -1;
+ 
+@@ -819,159 +817,160 @@
+             debugs(86, 6, "found more than");
+             *endptr = s + 1;
+             rv.valuetype = ESI_EXPR_MORE;
+             rv.precedence = 5;
+             rv.eval = evalmorethan;
+         }
+     } else if (!strncmp(s, "false", 5)) {
+         debugs(86, 5, "getsymbol: found variable result 'false'");
+         *endptr = s + 5;
+         rv.valuetype = ESI_EXPR_EXPR;
+         rv.valuestored = ESI_LITERAL_BOOL;
+         rv.value.integral = 0;
+         rv.precedence = 1;
+         rv.eval = evalexpr;
+     } else if (!strncmp(s, "true", 4)) {
+         debugs(86, 5, "getsymbol: found variable result 'true'");
+         *endptr = s + 4;
+         rv.valuetype = ESI_EXPR_EXPR;
+         rv.valuestored = ESI_LITERAL_BOOL;
+         rv.value.integral = 1;
+         rv.precedence = 1;
+         rv.eval = evalexpr;
+     } else {
+         debugs(86, DBG_IMPORTANT, "invalid expr '" << s << "'");
+         *endptr = origs;
+     }
+ 
+     return rv;
+ }
+ 
+-void
+-printliteral(stackmember s)
++static void
++printLiteral(std::ostream &os, const stackmember &s)
+ {
+     switch (s.valuestored) {
+ 
+     case ESI_LITERAL_INVALID:
+-        old_debug(86, 1)( " Invalid " );
++        os << " Invalid ";
+         break;
+ 
+     case ESI_LITERAL_FLOAT:
+-        old_debug(86,1)("%f", s.value.floating);
++        os << s.value.floating;
+         break;
+ 
+     case ESI_LITERAL_STRING:
+-        old_debug(86,1)("'%s'", s.value.string);
++        os << '\'' << s.value.string << '\'';
+         break;
+ 
+     case ESI_LITERAL_INT:
+-        old_debug(86,1)("%d", s.value.integral);
++        os << s.value.integral;
+         break;
+ 
+     case ESI_LITERAL_BOOL:
+-        old_debug(86,1)("%s",s.value.integral ? "true" : "false");
++        os << (s.value.integral ? "true" : "false");
+     }
+ }
+ 
+-void
+-printmember(stackmember s)
++static std::ostream &
++operator <<(std::ostream &os, const stackmember &s)
+ {
+     switch (s.valuetype) {
+ 
+     case ESI_EXPR_INVALID:
+-        old_debug(86,1)(" Invalid ");
++        os << " Invalid ";
+         break;
+ 
+     case ESI_EXPR_LITERAL:
+-        printliteral(s);
++        printLiteral(os, s);
+         break;
+ 
+     case ESI_EXPR_EXPR:
+-        old_debug(86,1)("%s", s.value.integral ? "true" : "false");
++        os << (s.value.integral ? "true" : "false");
+         break;
+ 
+     case ESI_EXPR_OR:
+-        old_debug(86,1)("|");
++        os << "|";
+         break;
+ 
+     case ESI_EXPR_AND:
+-        old_debug(86,1)("&");
++        os << "&";
+         break;
+ 
+     case ESI_EXPR_NOT:
+-        old_debug(86,1)("!");
++        os << "!";
+         break;
+ 
+     case ESI_EXPR_START:
+-        old_debug(86,1)("(");
++        os << "(";
+         break;
+ 
+     case ESI_EXPR_END:
+-        old_debug(86,1)(")");
++        os << ")";
+         break;
+ 
+     case ESI_EXPR_EQ:
+-        old_debug(86,1)("==");
++        os << "==";
+         break;
+ 
+     case ESI_EXPR_NOTEQ:
+-        old_debug(86,1)("!=");
++        os << "!=";
+         break;
+ 
+     case ESI_EXPR_LESS:
+-        old_debug(86,1)("<");
++        os << "<";
+         break;
+ 
+     case ESI_EXPR_LESSEQ:
+-        old_debug(86,1)("<=");
++        os << "<=";
+         break;
+ 
+     case ESI_EXPR_MORE:
+-        old_debug(86,1)(">");
++        os << ">";
+         break;
+ 
+     case ESI_EXPR_MOREEQ:
+-        old_debug(86,1)(">=");
++        os << ">=";
+         break;
+     }
++
++    return os;
+ }
+ 
+ void
+ dumpstack(stackmember * stack, int depth)
+ {
+-    int i;
+-
+-    for (i = 0; i < depth; ++i)
+-        printmember(stack[i]);
+-
+-    if (depth)
+-        old_debug(86,1)("\n");
++    if (depth) {
++        std::ostringstream buf;
++        for (int i = 0; i < depth; ++i)
++            buf << stack[i];
++        debugs(86,1, buf.str());
++    }
+ }
+ 
+ int
+ addmember(stackmember * stack, int *stackdepth, stackmember * candidate)
+ {
+     if (candidate->valuetype != ESI_EXPR_LITERAL && *stackdepth > 1) {
+         /* !(!(a==b))) is why thats safe */
+         /* strictly less than until we unwind */
+ 
+         if (candidate->precedence < stack[*stackdepth - 1].precedence ||
+                 candidate->precedence < stack[*stackdepth - 2].precedence) {
+             /* must be an operator */
+ 
+             if (stack[*stackdepth - 2].valuetype == ESI_EXPR_LITERAL ||
+                     stack[*stackdepth - 2].valuetype == ESI_EXPR_INVALID ||
+                     stack[*stackdepth - 2].eval(stack, stackdepth,
+                                                 *stackdepth - 2, candidate)) {
+                 /* cleanup candidate and stack */
+                 dumpstack(stack, *stackdepth);
+                 cleanmember(candidate);
+                 debugs(86, DBG_IMPORTANT, "invalid expression");
+                 return 0;
+             }
+         } else {
+             stack[(*stackdepth)++] = *candidate;
+         }
+     } else if (candidate->valuetype != ESI_EXPR_INVALID)
+         stack[(*stackdepth)++] = *candidate;
+ 
+     return 1;
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2016-03-17 03:28:14 +0000
++++ src/servers/FtpServer.cc	2016-05-19 08:29:25 +0000
+@@ -1278,61 +1278,61 @@
+     switch (socketState) {
+     case STREAM_UNPLANNED_COMPLETE:
+     case STREAM_FAILED:
+         io.conn->close();
+         return;
+ 
+     case STREAM_NONE:
+     case STREAM_COMPLETE:
+         flags.readMore = true;
+         changeState(fssConnected, "Ftp::Server::wroteReply");
+         if (bodyParser)
+             finishDechunkingRequest(false);
+         context->finished();
+         kick();
+         return;
+     }
+ }
+ 
+ bool
+ Ftp::Server::handleRequest(HttpRequest *request)
+ {
+     debugs(33, 9, request);
+     Must(request);
+ 
+     HttpHeader &header = request->header;
+     Must(header.has(Http::HdrType::FTP_COMMAND));
+     String &cmd = header.findEntry(Http::HdrType::FTP_COMMAND)->value;
+     Must(header.has(Http::HdrType::FTP_ARGUMENTS));
+     String &params = header.findEntry(Http::HdrType::FTP_ARGUMENTS)->value;
+ 
+-    if (do_debug(9, 2)) {
++    if (Debug::Enabled(9, 2)) {
+         MemBuf mb;
+         mb.init();
+         request->pack(&mb);
+ 
+         debugs(9, 2, "FTP Client " << clientConnection);
+         debugs(9, 2, "FTP Client REQUEST:\n---------\n" << mb.buf <<
+                "\n----------");
+     }
+ 
+     // TODO: When HttpHeader uses SBuf, change keys to SBuf
+     typedef std::map<const std::string, RequestHandler> RequestHandlers;
+     static RequestHandlers handlers;
+     if (!handlers.size()) {
+         handlers["LIST"] = &Ftp::Server::handleDataRequest;
+         handlers["NLST"] = &Ftp::Server::handleDataRequest;
+         handlers["MLSD"] = &Ftp::Server::handleDataRequest;
+         handlers["FEAT"] = &Ftp::Server::handleFeatRequest;
+         handlers["PASV"] = &Ftp::Server::handlePasvRequest;
+         handlers["PORT"] = &Ftp::Server::handlePortRequest;
+         handlers["RETR"] = &Ftp::Server::handleDataRequest;
+         handlers["EPRT"] = &Ftp::Server::handleEprtRequest;
+         handlers["EPSV"] = &Ftp::Server::handleEpsvRequest;
+         handlers["CWD"] = &Ftp::Server::handleCwdRequest;
+         handlers["PASS"] = &Ftp::Server::handlePassRequest;
+         handlers["CDUP"] = &Ftp::Server::handleCdupRequest;
+     }
+ 
+     RequestHandler handler = NULL;
+     if (request->method == Http::METHOD_PUT)
+         handler = &Ftp::Server::handleUploadRequest;
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2016-04-05 09:43:47 +0000
++++ src/ssl/support.cc	2016-05-19 08:29:25 +0000
+@@ -108,61 +108,61 @@
+ 
+         if (!rsa_512) {
+             rsa_512 = RSA_generate_key(512, RSA_F4, NULL, NULL);
+             newkey = 1;
+         }
+ 
+         rsa = rsa_512;
+         break;
+ 
+     case 1024:
+ 
+         if (!rsa_1024) {
+             rsa_1024 = RSA_generate_key(1024, RSA_F4, NULL, NULL);
+             newkey = 1;
+         }
+ 
+         rsa = rsa_1024;
+         break;
+ 
+     default:
+         debugs(83, DBG_IMPORTANT, "ssl_temp_rsa_cb: Unexpected key length " << keylen);
+         return NULL;
+     }
+ 
+     if (rsa == NULL) {
+         debugs(83, DBG_IMPORTANT, "ssl_temp_rsa_cb: Failed to generate key " << keylen);
+         return NULL;
+     }
+ 
+     if (newkey) {
+-        if (do_debug(83, 5))
++        if (Debug::Enabled(83, 5))
+             PEM_write_RSAPrivateKey(debug_log, rsa, NULL, NULL, 0, NULL, NULL);
+ 
+         debugs(83, DBG_IMPORTANT, "Generated ephemeral RSA key of length " << keylen);
+     }
+ 
+     return rsa;
+ }
+ 
+ int Ssl::asn1timeToString(ASN1_TIME *tm, char *buf, int len)
+ {
+     BIO *bio;
+     int write = 0;
+     bio = BIO_new(BIO_s_mem());
+     if (bio) {
+         if (ASN1_TIME_print(bio, tm))
+             write = BIO_read(bio, buf, len-1);
+         BIO_free(bio);
+     }
+     buf[write]='\0';
+     return write;
+ }
+ 
+ int Ssl::matchX509CommonNames(X509 *peer_cert, void *check_data, int (*check_func)(void *check_data,  ASN1_STRING *cn_data))
+ {
+     assert(peer_cert);
+ 
+     X509_NAME *name = X509_get_subject_name(peer_cert);
+ 
+     for (int i = X509_NAME_get_index_by_NID(name, NID_commonName, -1); i >= 0; i = X509_NAME_get_index_by_NID(name, NID_commonName, i)) {
+ 
+
+=== modified file 'src/tests/stub_debug.cc'
+--- src/tests/stub_debug.cc	2016-01-01 00:12:18 +0000
++++ src/tests/stub_debug.cc	2016-05-19 08:44:55 +0000
+@@ -1,147 +1,146 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /*
+  * A stub implementation of the Debug.h API.
+  * For use by test binaries which do not need the full context debugging
+  *
+  * Note: it doesn't use the STUB API as the functions defined here must
+  * not abort the unit test.
+  */
+ #include "squid.h"
+ #include "Debug.h"
+ 
+ FILE *debug_log = NULL;
+-int Debug::TheDepth = 0;
+ 
+ char *Debug::debugOptions;
+ char *Debug::cache_log= NULL;
+ int Debug::rotateNumber = 0;
+ int Debug::Levels[MAX_DEBUG_SECTIONS];
+-int Debug::level;
+-int Debug::sectionLevel;
+ int Debug::override_X = 0;
+ int Debug::log_stderr = 1;
+ bool Debug::log_syslog = false;
+ 
+ Ctx
+ ctx_enter(const char *)
+ {
+     return -1;
+ }
+ 
+ void
+ ctx_exit(Ctx)
+ {}
+ 
+ void
+ _db_init(const char *, const char *)
+ {}
+ 
+ void
+ _db_set_syslog(const char *)
+ {}
+ 
+ void
+ _db_rotate_log(void)
+ {}
+ 
+ static void
+ _db_print_stderr(const char *format, va_list args);
+ 
+ void
+ _db_print(const char *format,...)
+ {
+     static char f[BUFSIZ];
+     va_list args1;
+     va_list args2;
+     va_list args3;
+ 
+     va_start(args1, format);
+     va_start(args2, format);
+     va_start(args3, format);
+ 
+     snprintf(f, BUFSIZ, "%s| %s",
+              "stub time", //debugLogTime(squid_curtime),
+              format);
+ 
+     _db_print_stderr(f, args2);
+ 
+     va_end(args1);
+     va_end(args2);
+     va_end(args3);
+ }
+ 
+ static void
+ _db_print_stderr(const char *format, va_list args)
+ {
+-    if (1 < Debug::level)
++    if (1 < Debug::Level())
+         return;
+ 
+     vfprintf(stderr, format, args);
+ }
+ 
+-Debug::OutStream *Debug::CurrentDebug(NULL);
+-
+-std::ostream &
+-Debug::getDebugOut()
+-{
+-    if (!CurrentDebug) {
+-        CurrentDebug = new Debug::OutStream;
+-        CurrentDebug->setf(std::ios::fixed);
+-        CurrentDebug->precision(2);
+-    }
+-    return *CurrentDebug;
+-}
+-
+ void
+ Debug::parseOptions(char const *)
+ {}
+ 
+-void
+-Debug::finishDebug()
+-{
+-    std::cerr << "debugs: " << CurrentDebug->str() << std::endl;
+-    delete CurrentDebug;
+-    CurrentDebug = NULL;
+-}
+-
+-void
+-Debug::xassert(const char *msg, const char *file, int line)
+-{
+-    getDebugOut() << "assertion failed: " << file << ":" << line <<
+-                  ": \"" << msg << "\"";
+-    abort();
+-}
+-
+ const char*
+ SkipBuildPrefix(const char* path)
+ {
+     return path;
+ }
+ 
++Debug::Context *Debug::Current = NULL;
++
++Debug::Context::Context(const int aSection, const int aLevel):
++    level(aLevel),
++    sectionLevel(Levels[aSection]),
++    upper(Current)
++{
++    buf.setf(std::ios::fixed);
++    buf.precision(2);
++}
++
++std::ostringstream &
++Debug::Start(const int section, const int level)
++{
++    Current = new Context(section, level);
++    return Current->buf;
++}
++
++void
++Debug::Finish()
++{
++    if (Current) {
++        _db_print("%s\n", Current->buf.str().c_str());
++        delete Current;
++        Current = NULL;
++    }
++}
++
+ std::ostream &
+ Raw::print(std::ostream &os) const
+ {
+     if (label_)
+         os << ' ' << label_ << '[' << size_ << ']';
+ 
+     if (!size_)
+         return os;
+ 
+     // finalize debugging level if no level was set explicitly via minLevel()
+     const int finalLevel = (level >= 0) ? level :
+-                           (size_ > 40 ? DBG_DATA : Debug::sectionLevel);
+-    if (finalLevel <= Debug::sectionLevel) {
++                           (size_ > 40 ? DBG_DATA : Debug::SectionLevel());
++    if (finalLevel <= Debug::SectionLevel()) {
+         os << (label_ ? '=' : ' ');
+-        os.write(data_, size_);
++        if (data_)
++            os.write(data_, size_);
++        else
++            os << "[null]";
+     }
+ 
+     return os;
+ }
+ 
+

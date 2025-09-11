@@ -1,0 +1,146 @@
+Fixed stuck transactions with large bodies.
+
+r14093 (Replace Packer object API with Packable API) removed
+StoreEntry::flush() calls while removing packerClean(). Without
+flushing, store entry does not pipeline body content to Servers,
+and transactions get stuck with full read buffers.
+
+=== modified file 'src/HttpRequest.cc'
+--- src/HttpRequest.cc	2015-07-19 13:23:01 +0000
++++ src/HttpRequest.cc	2015-07-31 23:34:13 +0000
+@@ -342,40 +342,41 @@ HttpRequest::parseHeader(Http1::RequestP
+     // zero does not need parsing
+     if (!hp.headerBlockSize())
+         return true;
+ 
+     // XXX: c_str() reallocates. performance regression.
+     const bool result = header.parse(hp.mimeHeader().c_str(), hp.headerBlockSize());
+ 
+     if (result)
+         hdrCacheInit();
+ 
+     return result;
+ }
+ 
+ /* swaps out request using httpRequestPack */
+ void
+ HttpRequest::swapOut(StoreEntry * e)
+ {
+     assert(e);
+     e->buffer();
+     pack(e);
++    e->flush();
+ }
+ 
+ /* packs request-line and headers, appends <crlf> terminator */
+ void
+ HttpRequest::pack(Packable * p)
+ {
+     assert(p);
+     /* pack request-line */
+     p->appendf(SQUIDSBUFPH " " SQUIDSBUFPH " HTTP/%d.%d\r\n",
+                SQUIDSBUFPRINT(method.image()), SQUIDSBUFPRINT(url.path()),
+                http_ver.major, http_ver.minor);
+     /* headers */
+     header.packInto(p);
+     /* trailer */
+     p->append("\r\n", 2);
+ }
+ 
+ /*
+  * A wrapper for debugObj()
+  */
+
+=== modified file 'src/base/Packable.h'
+--- src/base/Packable.h	2015-05-26 09:18:13 +0000
++++ src/base/Packable.h	2015-07-31 23:22:07 +0000
+@@ -32,40 +32,42 @@
+  * code.
+  *
+  * Packer
+  * ------
+  *
+  * Objects inheriting from Packable provide a uniform interface for code to
+  * assemble data before passing to Store and Comm modules.
+  *
+  * Packable objects have their own append and printf routines that "know"
+  * where to send incoming data. In case of Store interface, sending data to
+  * storeAppend. Packable buffer objects retain the data such that it can be
+  * flushed later to Comm::Write.
+  *
+  * Thus, one can write just one function that will take a Packable object
+  * and either "pack" things for Comm::Write or "append" things to Store,
+  * depending on actual Packable object supplied.
+  */
+ class Packable
+ {
+ public:
++    virtual ~Packable() {}
++
+     /// Appends a c-string to existing packed data.
+     virtual void append(const char *buf, int size) = 0;
+ 
+     /// Append operation with printf-style arguments.
+     void appendf(const char *fmt,...) PRINTF_FORMAT_ARG2
+     {
+         va_list args;
+         va_start(args, fmt);
+         vappendf(fmt, args);
+         va_end(args);
+     }
+ 
+     /** Append operation, with vsprintf(3)-style arguments.
+      *
+      * \note arguments may be evaluated more than once, be careful
+      *       of side-effects
+      */
+     virtual void vappendf(const char *fmt, va_list ap) = 0;
+ };
+ 
+
+=== modified file 'src/store.cc'
+--- src/store.cc	2015-05-25 14:02:29 +0000
++++ src/store.cc	2015-07-31 23:36:36 +0000
+@@ -1917,40 +1917,41 @@ StoreEntry::replaceHttpReply(HttpReply *
+ 
+ void
+ StoreEntry::startWriting()
+ {
+     /* TODO: when we store headers serparately remove the header portion */
+     /* TODO: mark the length of the headers ? */
+     /* We ONLY want the headers */
+ 
+     assert (isEmpty());
+     assert(mem_obj);
+ 
+     const HttpReply *rep = getReply();
+     assert(rep);
+ 
+     buffer();
+     rep->packHeadersInto(this);
+     mem_obj->markEndOfReplyHeaders();
+     EBIT_CLR(flags, ENTRY_FWD_HDR_WAIT);
+ 
+     rep->body.packInto(this);
++    flush();
+ }
+ 
+ char const *
+ StoreEntry::getSerialisedMetaData()
+ {
+     StoreMeta *tlv_list = storeSwapMetaBuild(this);
+     int swap_hdr_sz;
+     char *result = storeSwapMetaPack(tlv_list, &swap_hdr_sz);
+     storeSwapTLVFree(tlv_list);
+     assert (swap_hdr_sz >= 0);
+     mem_obj->swap_hdr_sz = (size_t) swap_hdr_sz;
+     return result;
+ }
+ 
+ /**
+  * Abandon the transient entry our worker has created if neither the shared
+  * memory cache nor the disk cache wants to store it. Collapsed requests, if
+  * any, should notice and use Plan B instead of getting stuck waiting for us
+  * to start swapping the entry out.
+  */
+

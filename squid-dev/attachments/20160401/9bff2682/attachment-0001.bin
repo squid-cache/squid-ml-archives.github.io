@@ -1,0 +1,169 @@
+Make the size of the buffer on Http::Stream configurable.
+
+This work is submitted on behalf of Bloomberg L.P.
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2016-03-12 20:27:35 +0000
++++ src/SquidConfig.h	2016-04-01 00:34:32 +0000
+@@ -80,6 +80,7 @@
+         int64_t max;
+     } quickAbort;
+     int64_t readAheadGap;
++    int64_t httpStreamBufferSize;
+     RemovalPolicySettings *replPolicy;
+     RemovalPolicySettings *memPolicy;
+ #if USE_HTTP_VIOLATIONS
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2016-03-12 20:27:35 +0000
++++ src/cf.data.pre	2016-04-01 00:34:32 +0000
+@@ -5594,12 +5594,22 @@
+ COMMENT: buffer-size
+ TYPE: b_int64_t
+ LOC: Config.readAheadGap
+-DEFAULT: 16 KB
++DEFAULT: 64 KB
+ DOC_START
+ 	The amount of data the cache will buffer ahead of what has been
+ 	sent to the client when retrieving an object from another server.
+ DOC_END
+ 
++NAME: http_stream_buffer_size
++COMMENT: buffer-size
++TYPE: b_int64_t
++LOC: Config.httpStreamBufferSize
++DEFAULT: 64 KB
++DOC_START
++	The buffer size that the cache will use when streaming response objects to
++	clients.
++DOC_END
++
+ NAME: negative_ttl
+ IFDEF: USE_HTTP_VIOLATIONS
+ COMMENT: time-units
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-03-10 06:55:17 +0000
++++ src/client_side.cc	2016-04-01 00:34:32 +0000
+@@ -1012,9 +1012,7 @@
+     http->uri = xstrdup(uri);
+     setLogUri (http, uri);
+     auto *context = new Http::Stream(clientConnection, http);
+-    StoreIOBuffer tempBuffer;
+-    tempBuffer.data = context->reqbuf;
+-    tempBuffer.length = HTTP_REQBUF_SZ;
++    StoreIOBuffer tempBuffer = context->getStoreIOBuffer();
+     clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, new clientReplyContext(http), clientSocketRecipient,
+                      clientSocketDetach, context, tempBuffer);
+@@ -1359,9 +1357,7 @@
+     http->req_sz = hp->messageHeaderSize();
+     Http::Stream *result = new Http::Stream(csd->clientConnection, http);
+ 
+-    StoreIOBuffer tempBuffer;
+-    tempBuffer.data = result->reqbuf;
+-    tempBuffer.length = HTTP_REQBUF_SZ;
++    StoreIOBuffer tempBuffer = result->getStoreIOBuffer();
+ 
+     ClientStreamData newServer = new clientReplyContext(http);
+     ClientStreamData newClient = result;
+
+=== modified file 'src/http/Stream.cc'
+--- src/http/Stream.cc	2016-01-24 17:41:43 +0000
++++ src/http/Stream.cc	2016-04-01 00:34:32 +0000
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "squid.h"
++#include "SquidConfig.h"
+ #include "client_side_request.h"
+ #include "http/Stream.h"
+ #include "HttpHdrContRange.h"
+@@ -23,11 +24,12 @@
+     connRegistered_(false)
+ {
+     assert(http != nullptr);
+-    memset(reqbuf, '\0', sizeof (reqbuf));
+     flags.deferred = 0;
+     flags.parsed_ok = 0;
+     deferredparams.node = nullptr;
+     deferredparams.rep = nullptr;
++
++    requestBuffer.init(Config.httpStreamBufferSize, Config.httpStreamBufferSize);
+ }
+ 
+ Http::Stream::~Stream()
+@@ -109,12 +111,10 @@
+     debugs(33, 5, reply << " written " << http->out.size << " into " << clientConnection);
+ 
+     /* More data will be coming from the stream. */
+-    StoreIOBuffer readBuffer;
++    StoreIOBuffer readBuffer = getStoreIOBuffer();
+     /* XXX: Next requested byte in the range sequence */
+     /* XXX: length = getmaximumrangelenfgth */
+     readBuffer.offset = getNextRangeOffset();
+-    readBuffer.length = HTTP_REQBUF_SZ;
+-    readBuffer.data = reqbuf;
+     /* we may note we have reached the end of the wanted ranges */
+     clientStreamRead(getTail(), http, readBuffer);
+ }
+@@ -568,6 +568,16 @@
+     deferredparams.queuedBuffer = receivedData;
+ }
+ 
++StoreIOBuffer
++Http::Stream::getStoreIOBuffer()
++{
++    StoreIOBuffer tempBuffer;
++    tempBuffer.data = this->requestBuffer.content();
++    tempBuffer.length = this->requestBuffer.spaceSize();
++    assert(tempBuffer.length);
++    return tempBuffer;
++}
++
+ void
+ Http::Stream::prepareReply(HttpReply *rep)
+ {
+
+=== modified file 'src/http/Stream.h'
+--- src/http/Stream.h	2016-01-31 12:05:30 +0000
++++ src/http/Stream.h	2016-04-01 00:37:37 +0000
+@@ -120,12 +120,13 @@
+ 
+     void deferRecipientForLater(clientStreamNode *, HttpReply *, StoreIOBuffer receivedData);
+ 
++    StoreIOBuffer getStoreIOBuffer();
++
+ public: // HTTP/1.x state data
+ 
+     Comm::ConnectionPointer clientConnection; ///< details about the client connection socket
+     ClientHttpRequest *http;    /* we pretend to own that Job */
+     HttpReply *reply;
+-    char reqbuf[HTTP_REQBUF_SZ];
+     struct {
+         unsigned deferred:1; ///< This is a pipelined request waiting for the current object to complete
+         unsigned parsed_ok:1; ///< Was this parsed correctly?
+@@ -158,6 +159,8 @@
+ 
+     bool mayUseConnection_; /* This request may use the connection. Don't read anymore requests for now */
+     bool connRegistered_;
++
++    MemBuf requestBuffer;
+ };
+ 
+ } // namespace Http
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2016-01-31 12:05:30 +0000
++++ src/servers/FtpServer.cc	2016-04-01 00:34:32 +0000
+@@ -751,9 +751,7 @@
+     Http::Stream *const result =
+         new Http::Stream(clientConnection, http);
+ 
+-    StoreIOBuffer tempBuffer;
+-    tempBuffer.data = result->reqbuf;
+-    tempBuffer.length = HTTP_REQBUF_SZ;
++    StoreIOBuffer tempBuffer = result->getStoreIOBuffer();
+ 
+     ClientStreamData newServer = new clientReplyContext(http);
+     ClientStreamData newClient = result;
+

@@ -1,0 +1,1203 @@
+Note ACL substrings matching
+
+There are several use cases where an annotation may contain a list of values
+for a single key. Today it is only possible to match the full annotation value.
+
+This patch investigates the -m flag which can be used to enable delimiter
+separated substrings matching on annotations:
+   acl aclname note [-m[=delimiters]] name value ...
+The '-m' flag by default matches comma separated substrings. The optional 
+"delimiters" parameter is a list of non-alphanumeric characters, which can
+be used as alternate delimiters.
+
+E.g. if an external ACL sets an annotation like:
+   "applications=http,facebook,facebook-chat"
+the following ACLs can be used to block access to certain applications:
+
+acl fb_chat      note -m applications facebook-chat
+acl db_upload    note -m  applications dropbox-upload
+http_access      deny fb_chat
+http_access      deny db_upload
+
+This is a Measurement Factory project
+
+=== modified file 'src/acl/Acl.cc'
+--- src/AclRegs.cc	2015-08-04 19:57:07 +0000
++++ src/AclRegs.cc	2015-12-04 13:50:04 +0000
+@@ -194,40 +194,40 @@
+ ACLEui64 ACLEui64::RegistryEntry_("eui64");
+ #endif
+ 
+ #if USE_IDENT
+ ACL::Prototype ACLIdent::UserRegistryProtoype(&ACLIdent::UserRegistryEntry_, "ident");
+ ACLIdent ACLIdent::UserRegistryEntry_(new ACLUserData, "ident");
+ ACL::Prototype ACLIdent::RegexRegistryProtoype(&ACLIdent::RegexRegistryEntry_, "ident_regex" );
+ ACLIdent ACLIdent::RegexRegistryEntry_(new ACLRegexData, "ident_regex");
+ #endif
+ 
+ #if USE_AUTH
+ ACL::Prototype ACLProxyAuth::UserRegistryProtoype(&ACLProxyAuth::UserRegistryEntry_, "proxy_auth");
+ ACLProxyAuth ACLProxyAuth::UserRegistryEntry_(new ACLUserData, "proxy_auth");
+ ACL::Prototype ACLProxyAuth::RegexRegistryProtoype(&ACLProxyAuth::RegexRegistryEntry_, "proxy_auth_regex" );
+ ACLProxyAuth ACLProxyAuth::RegexRegistryEntry_(new ACLRegexData, "proxy_auth_regex");
+ 
+ ACL::Prototype ACLMaxUserIP::RegistryProtoype(&ACLMaxUserIP::RegistryEntry_, "max_user_ip");
+ ACLMaxUserIP ACLMaxUserIP::RegistryEntry_("max_user_ip");
+ #endif
+ 
+ ACL::Prototype ACLTag::RegistryProtoype(&ACLTag::RegistryEntry_, "tag");
+ ACLStrategised<const char *> ACLTag::RegistryEntry_(new ACLStringData, ACLTagStrategy::Instance(), "tag");
+ 
+ ACL::Prototype Acl::AnyOf::RegistryProtoype(&Acl::AnyOf::RegistryEntry_, "any-of");
+ Acl::AnyOf Acl::AnyOf::RegistryEntry_;
+ 
+ ACL::Prototype Acl::AllOf::RegistryProtoype(&Acl::AllOf::RegistryEntry_, "all-of");
+ Acl::AllOf Acl::AllOf::RegistryEntry_;
+ 
+ ACL::Prototype ACLNote::RegistryProtoype(&ACLNote::RegistryEntry_, "note");
+-ACLStrategised<HttpRequest *> ACLNote::RegistryEntry_(new ACLNoteData, ACLNoteStrategy::Instance(), "note");
++ACLStrategised<NotePairs::Entry *> ACLNote::RegistryEntry_(new ACLNoteData, ACLNoteStrategy::Instance(), "note");
+ 
+ #if USE_ADAPTATION
+ ACL::Prototype ACLAdaptationService::RegistryProtoype(&ACLAdaptationService::RegistryEntry_, "adaptation_service");
+ ACLStrategised<const char *> ACLAdaptationService::RegistryEntry_(new ACLAdaptationServiceData, ACLAdaptationServiceStrategy::Instance(), "adaptation_service");
+ #endif
+ 
+ ACL::Prototype ACLSquidError::RegistryProtoype(&ACLSquidError::RegistryEntry_, "squid_error");
+ ACLStrategised<err_type> ACLSquidError::RegistryEntry_(new ACLSquidErrorData, ACLSquidErrorStrategy::Instance(), "squid_error");
+ 
+
+=== modified file 'src/acl/Acl.cc'
+--- src/acl/Acl.cc	2015-10-09 02:13:00 +0000
++++ src/acl/Acl.cc	2015-12-03 11:46:04 +0000
+@@ -1,94 +1,196 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 28    Access Control */
+ 
+ #include "squid.h"
+ #include "acl/Acl.h"
+ #include "acl/Checklist.h"
+ #include "acl/Gadgets.h"
+ #include "anyp/PortCfg.h"
++#include "base/CharacterSet.h"
+ #include "cache_cf.h"
+ #include "ConfigParser.h"
+ #include "Debug.h"
+ #include "dlink.h"
+ #include "fatal.h"
+ #include "globals.h"
+ #include "profiler/Profiler.h"
+ #include "SquidConfig.h"
+ 
+ #include <vector>
+ 
++#define abortFlags(CONTENT) \
++   do { \
++    debugs(28, 0, CONTENT); \
++    self_destruct(); \
++   } while (0)
++
+ const ACLFlag ACLFlags::NoFlags[1] = {ACL_F_END};
+ 
+ const char *AclMatchedName = NULL;
+ 
+-bool ACLFlags::supported(const ACLFlag f) const
++ACLFlags::FlagsTokenizer::FlagsTokenizer(): tokPos(NULL) { }
++
++ACLFlag
++ACLFlags::FlagsTokenizer::nextFlag()
++{
++    if (needNextToken()) {
++        if (!nextToken())
++            return 0;
++    }
++    else {
++        tokPos++;
++    }
++    return *tokPos;
++}
++
++bool
++ACLFlags::FlagsTokenizer::hasParameter() const
++{
++    return tokPos && tokPos[0] && tokPos[1] == '=' && tokPos[2];
++}
++
++SBuf
++ACLFlags::FlagsTokenizer::getParameter() const
++{
++    return hasParameter() ? SBuf(&tokPos[2]) : SBuf();
++}
++
++bool
++ACLFlags::FlagsTokenizer::needNextToken() const
++{
++    return !tokPos || !tokPos[0] || !tokPos[1] || tokPos[1] == '=';
++}
++
++bool
++ACLFlags::FlagsTokenizer::nextToken()
++{
++    char *t = ConfigParser::PeekAtToken();
++    if (t == NULL || t[0] != '-' || !t[1])
++        return false;
++    (void)ConfigParser::NextQuotedToken();
++    if (strcmp(t, "--") == 0)
++        return false;
++    tokPos = t + 1;
++    return true;
++}
++
++
++ACLFlags::Status
++ACLFlags::supported(const ACLFlag f) const
+ {
+     if (f == ACL_F_REGEX_CASE)
+-        return true;
+-    return (supported_.find(f) != std::string::npos);
++        return noParameter;
++    if (f == ACL_F_SUBSTRING)
++        return parameterOptional;
++    if (supported_.find(f) != std::string::npos)
++        return noParameter;
++    return notSupported;
++}
++
++bool
++ACLFlags::parameterSupported(const ACLFlag f, const SBuf &val) const
++{
++    if (f == ACL_F_SUBSTRING)
++        return val.findFirstOf(CharacterSet::ALPHA + CharacterSet::DIGIT) == SBuf::npos;
++    return true;
++}
++
++void
++ACLFlags::makeSet(const ACLFlag f, const SBuf &param)
++{
++    flags_ |= flagToInt(f);
++    if (!param.isEmpty())
++        flagParameters_[f].append(param);
++}
++
++void
++ACLFlags::makeUnSet(const ACLFlag f)
++{
++   flags_ &= ~flagToInt(f);
++   flagParameters_[f].clear();
+ }
+ 
+ void
+ ACLFlags::parseFlags()
+ {
+-    char *nextToken;
+-    while ((nextToken = ConfigParser::PeekAtToken()) != NULL && nextToken[0] == '-') {
+-        (void)ConfigParser::NextToken(); //Get token from cfg line
+-        //if token is the "--" break flag
+-        if (strcmp(nextToken, "--") == 0)
+-            break;
+-
+-        for (const char *flg = nextToken+1; *flg!='\0'; flg++ ) {
+-            if (supported(*flg)) {
+-                makeSet(*flg);
+-            } else {
+-                debugs(28, 0, HERE << "Flag '" << *flg << "' not supported");
+-                self_destruct();
+-            }
++    FlagsTokenizer tokenizer;
++    ACLFlag flag('\0');
++    while ((flag = tokenizer.nextFlag())) {
++        Status status = supported(flag);
++        switch (status)
++        {
++            case notSupported:
++                abortFlags("Flag '" << flag << "' not supported");
++                break;
++            case noParameter:
++                makeSet(flag);
++                break;
++            case parameterRequired:
++                if (!tokenizer.hasParameter()) {
++                    abortFlags("Flag '" << flag << "' must have a parameter");
++                    break;
++                }
++            case parameterOptional:
++                SBuf param;
++                if (tokenizer.hasParameter()) {
++                    param = tokenizer.getParameter();
++                    if (!parameterSupported(flag, param))
++                        abortFlags("Parameter '" << param << "' for flag '" << flag << "' not supported");
++                }
++                makeSet(flag, param);
++                break;
+         }
+     }
+ 
+     /*Regex code needs to parse -i file*/
+     if ( isSet(ACL_F_REGEX_CASE)) {
+         ConfigParser::TokenPutBack("-i");
+         makeUnSet('i');
+     }
+ }
+ 
++SBuf
++ACLFlags::parameter(const ACLFlag f) const
++{
++    assert(static_cast<uint32_t>(f - 'A') < FlagIndexMax);
++    auto p = flagParameters_.find(f);
++    return p == flagParameters_.end() ? SBuf() : p->second;
++}
++
+ const char *
+ ACLFlags::flagsStr() const
+ {
+     static char buf[64];
+     if (flags_ == 0)
+         return "";
+ 
+     char *s = buf;
+     *s++ = '-';
+     for (ACLFlag f = 'A'; f <= 'z'; f++) {
+         // ACL_F_REGEX_CASE (-i) flag handled by ACLRegexData class, ignore
+         if (isSet(f) && f != ACL_F_REGEX_CASE)
+             *s++ = f;
+     }
+     *s = '\0';
+     return buf;
+ }
+ 
+ void *
+ ACL::operator new (size_t)
+ {
+     fatal ("unusable ACL::new");
+     return (void *)1;
+ }
+ 
+ void
+ ACL::operator delete (void *)
+ {
+     fatal ("unusable ACL::delete");
+ }
+
+=== modified file 'src/acl/Acl.h'
+--- src/acl/Acl.h	2015-10-08 12:22:22 +0000
++++ src/acl/Acl.h	2015-12-03 11:46:04 +0000
+@@ -1,91 +1,136 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ACL_H
+ #define SQUID_ACL_H
+ 
+ #include "acl/forward.h"
+ #include "cbdata.h"
+ #include "defines.h"
+ #include "dlink.h"
+ #include "SBufList.h"
+ 
+ #include <ostream>
+ #include <string>
+ #include <vector>
+ 
+ class ConfigParser;
+ 
+ typedef char ACLFlag;
+ // ACLData Flags
+ #define ACL_F_REGEX_CASE 'i'
+ #define ACL_F_NO_LOOKUP 'n'
+ #define ACL_F_STRICT 's'
++#define ACL_F_SUBSTRING 'm'
+ #define ACL_F_END '\0'
+ 
+ /**
+  * \ingroup ACLAPI
+  * Used to hold a list of one-letter flags which can be passed as parameters
+  * to acls  (eg '-i', '-n' etc)
+  */
+ class ACLFlags
+ {
+ public:
+-    explicit ACLFlags(const ACLFlag flags[]) : supported_(flags), flags_(0) {}
++    enum Status
++    {
++        notSupported,
++        noParameter,
++        parameterOptional,
++        parameterRequired
++    };
++
++    explicit ACLFlags(const ACLFlag flags[]) : supported_(flags), flags_(0) { }
+     ACLFlags() : flags_(0) {}
+-    bool supported(const ACLFlag f) const; ///< True if the given flag supported
+-    void makeSet(const ACLFlag f) { flags_ |= flagToInt(f); } ///< Set the given flag
+-    void makeUnSet(const ACLFlag f) { flags_ &= ~flagToInt(f); } ///< Unset the given flag
++    /// True if the given flag supported
++    Status supported(const ACLFlag f) const;
++    /// True if the parameter for the given flag is acceptable
++    bool parameterSupported(const ACLFlag f, const SBuf &val) const;
++    /// Set the given flag
++    void makeSet(const ACLFlag f, const SBuf &param = SBuf(""));
++    void makeUnSet(const ACLFlag f); ///< Unset the given flag
+     /// Return true if the given flag is set
+     bool isSet(const ACLFlag f) const { return flags_ & flagToInt(f);}
++    /// Return the parameter value of the given flag if set
++    SBuf parameter(const ACLFlag f) const;
+     /// Parse optional flags given in the form -[A..Z|a..z]
+     void parseFlags();
+     const char *flagsStr() const; ///< Convert the flags to a string representation
++    /**
++     * Lexical analyzer for ACL flags
++     *
++     * Support tokens in the form:
++     *    -[A..Z|a..z]+[=parameter]
++     * Each token consist by one or more single-letter flags, which may
++     * followed by a parameter string.
++     * The parameter can belongs only to the last flag in token.
++     */
++    class FlagsTokenizer
++    {
++        public:
++            FlagsTokenizer();
++            ACLFlag nextFlag(); ///< The next flag or '\0' if finished
++            /// True if a parameter follows the last parsed flag
++            bool hasParameter() const;
++            /// The parameter of last parsed flag, if exist
++            SBuf getParameter() const;
++
++        private:
++            /// True if the current token parsing is finished
++            bool needNextToken() const;
++            /// Peeks at the next token and return false if the next token 
++            /// is not flag, or a '--' is read.
++            bool nextToken();
++
++            char *tokPos;
++    };
+ 
+ private:
+     /// Convert a flag to a 64bit unsigned integer.
+     /// The characters from 'A' to 'z' represented by the values from 65 to 122.
+     /// They are 57 different characters which can be fit to the bits of an 64bit
+     /// integer.
+     uint64_t flagToInt(const ACLFlag f) const {
+         assert('A' <= f && f <= 'z');
+         return ((uint64_t)1 << (f - 'A'));
+     }
+ 
+     std::string supported_; ///< The supported character flags
+     uint64_t flags_; ///< The flags which is set
++    static const uint32_t FlagIndexMax = 'z' - 'A';
++    std::map<ACLFlag, SBuf> flagParameters_;
+ public:
+     static const ACLFlag NoFlags[1]; ///< An empty flags list
+ };
+ 
+ /// A configurable condition. A node in the ACL expression tree.
+ /// Can evaluate itself in FilledChecklist context.
+ /// Does not change during evaluation.
+ /// \ingroup ACLAPI
+ class ACL
+ {
+ 
+ public:
+     void *operator new(size_t);
+     void operator delete(void *);
+ 
+     static ACL *Factory(char const *);
+     static void ParseAclLine(ConfigParser &parser, ACL ** head);
+     static void Initialize();
+     static ACL *FindByName(const char *name);
+ 
+     ACL();
+     explicit ACL(const ACLFlag flgs[]);
+     virtual ~ACL();
+ 
+     /// sets user-specified ACL name and squid.conf context
+     void context(const char *name, const char *configuration);
+ 
+     /// Orchestrates matching checklist against the ACL using match(),
+     /// after checking preconditions and while providing debugging.
+     /// Returns true if and only if there was a successful match.
+
+=== modified file 'src/acl/Note.cc'
+--- src/acl/Note.cc	2015-01-13 07:25:36 +0000
++++ src/acl/Note.cc	2015-12-08 11:12:49 +0000
+@@ -1,32 +1,82 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "acl/Checklist.h"
+ #include "acl/HttpHeaderData.h"
+ #include "acl/Note.h"
++#include "acl/NoteData.h"
++#include "parser/Tokenizer.h"
+ #include "HttpRequest.h"
+ #include "Notes.h"
+ 
+ int
+-ACLNoteStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
++ACLNoteStrategy::match(ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &flags)
+ {
+-    if (checklist->request != NULL)
+-        return data->match(checklist->request);
+-
++    const HttpRequest *request = checklist->request;
++    if (request) {
++        const CharacterSet &delimiters = noteDelimiters(flags);
++        if (request->notes != NULL && matchNotes(data, request->notes.getRaw(), delimiters))
++            return 1;
++#if USE_ADAPTATION
++        const Adaptation::History::Pointer ah = request->adaptLogHistory();
++        if (ah != NULL && ah->metaHeaders != NULL && matchNotes(data, ah->metaHeaders.getRaw(), delimiters))
++            return 1;
++#endif
++    }
+     return 0;
+ }
+ 
++const CharacterSet &
++ACLNoteStrategy::noteDelimiters(const ACLFlags &flags)
++{
++    // TODO: Optimize by moving CharacterSet formation to ACLFlags?
++    static CharacterSet delimiters("delimiters");
++    if (flags.isSet(ACL_F_SUBSTRING)) {
++        static const SBuf defaultDelimiter(",");
++        SBuf rawDelimiters = flags.parameter(ACL_F_SUBSTRING).isEmpty() ?
++            defaultDelimiter : flags.parameter(ACL_F_SUBSTRING);
++        delimiters.reset(rawDelimiters.c_str());
++    } else {
++        delimiters.reset();
++    }
++    return delimiters;
++}
++
++bool
++ACLNoteStrategy::matchNotes(ACLData<MatchType> *noteData, const NotePairs *note, const CharacterSet &delimiters) const
++{
++    for (auto &entry: note->entries) {
++        if (!delimiters.empty()) {
++            NotePairs::Entry e(entry->name.termedBuf(), "");
++            Parser::Tokenizer t(SBuf(entry->value));
++            SBuf s;
++            while (t.token(s, delimiters)) {
++                e.value = s.c_str();
++                if(noteData->match(&e))
++                    return true;
++            }
++            s = t.remaining();
++            e.value = s.c_str();
++            if (noteData->match(&e))
++                return true;
++        }
++        if (noteData->match(entry))
++            return true;
++    }
++    return false;
++}
++
+ ACLNoteStrategy *
+ ACLNoteStrategy::Instance()
+ {
+     return &Instance_;
+ }
+ 
+ ACLNoteStrategy ACLNoteStrategy::Instance_;
+ 
+
+=== modified file 'src/acl/Note.h'
+--- src/acl/Note.h	2015-01-13 07:25:36 +0000
++++ src/acl/Note.h	2015-12-08 10:55:04 +0000
+@@ -1,48 +1,52 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ACLNOTE_H
+ #define SQUID_ACLNOTE_H
+ 
+ #include "acl/Strategised.h"
+ #include "acl/Strategy.h"
+ 
+ class HttpRequest;
++class ACLNoteData;
++class CharacterSet;
+ 
+ /// \ingroup ACLAPI
+-class ACLNoteStrategy : public ACLStrategy<HttpRequest *>
++class ACLNoteStrategy : public ACLStrategy<NotePairs::Entry *>
+ {
+ 
+ public:
+     virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const { return true; }
+ 
+     static ACLNoteStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g+++ warnings about
+      * private constructors with no friends */
+     ACLNoteStrategy(ACLNoteStrategy const &);
+ 
+ private:
+     static ACLNoteStrategy Instance_;
+     ACLNoteStrategy() { }
+ 
+     ACLNoteStrategy& operator = (ACLNoteStrategy const &);
++    static const CharacterSet &noteDelimiters(const ACLFlags &);
++    bool matchNotes(ACLData<MatchType> *, const NotePairs *, const CharacterSet &) const;
+ };
+ 
+ /// \ingroup ACLAPI
+ class ACLNote
+ {
+ 
+ private:
+     static ACL::Prototype RegistryProtoype;
+-    static ACLStrategised<HttpRequest *> RegistryEntry_;
++    static ACLStrategised<NotePairs::Entry *> RegistryEntry_;
+ };
+ 
+ #endif /* SQUID_ACLNOTE_H */
+ 
+
+=== modified file 'src/acl/NoteData.cc'
+--- src/acl/NoteData.cc	2015-01-29 19:05:24 +0000
++++ src/acl/NoteData.cc	2015-12-04 13:48:22 +0000
+@@ -1,99 +1,71 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "acl/Acl.h"
+ #include "acl/Checklist.h"
+ #include "acl/NoteData.h"
+ #include "acl/StringData.h"
+ #include "ConfigParser.h"
+ #include "Debug.h"
+-#include "HttpRequest.h"
+-#include "Notes.h"
+ #include "wordlist.h"
+ 
+ ACLNoteData::ACLNoteData() : values(new ACLStringData)
+ {}
+ 
+ ACLNoteData::~ACLNoteData()
+ {
+     delete values;
+ }
+ 
+ bool
+-ACLNoteData::matchNotes(NotePairs *note)
+-{
+-    if (note == NULL)
+-        return false;
+-
+-    debugs(28, 3, "Checking " << name);
+-
+-    if (values->empty())
+-        return (note->findFirst(name.termedBuf()) != NULL);
+-
+-    for (std::vector<NotePairs::Entry *>::iterator i = note->entries.begin(); i!= note->entries.end(); ++i) {
+-        if ((*i)->name.cmp(name.termedBuf()) == 0) {
+-            if (values->match((*i)->value.termedBuf()))
+-                return true;
+-        }
+-    }
+-    return false;
+-}
+-
+-bool
+-ACLNoteData::match(HttpRequest *request)
+-{
+-    if (request->notes != NULL && matchNotes(request->notes.getRaw()))
+-        return true;
+-#if USE_ADAPTATION
+-    const Adaptation::History::Pointer ah = request->adaptLogHistory();
+-    if (ah != NULL && ah->metaHeaders != NULL && matchNotes(ah->metaHeaders.getRaw()))
+-        return true;
+-#endif
+-    return false;
++ACLNoteData::match(NotePairs::Entry *entry)
++{
++    return !entry->name.cmp(name.termedBuf()) && values->match(entry->value.termedBuf());
+ }
+ 
+ SBufList
+ ACLNoteData::dump() const
+ {
+     SBufList sl;
+     sl.push_back(SBuf(name));
+ #if __cplusplus >= 201103L
+     sl.splice(sl.end(), values->dump());
+ #else
+     // temp is needed until c++11 move constructor
+     SBufList temp = values->dump();
+     sl.splice(sl.end(), temp);
+ #endif
+     return sl;
+ }
+ 
+ void
+ ACLNoteData::parse()
+ {
+     char* t = ConfigParser::strtokFile();
+     assert (t != NULL);
+     name = t;
+     values->parse();
+ }
+ 
+ bool
+ ACLNoteData::empty() const
+ {
+     return name.size() == 0;
+ }
+ 
+-ACLData<HttpRequest *> *
++ACLData<NotePairs::Entry *> *
+ ACLNoteData::clone() const
+ {
+     ACLNoteData * result = new ACLNoteData;
+-    result->values = values->clone();
++    result->values = dynamic_cast<ACLStringData*>(values->clone());
++    assert(result->values);
+     result->name = name;
+     return result;
+ }
+ 
+
+=== modified file 'src/acl/NoteData.h'
+--- src/acl/NoteData.h	2015-01-13 07:25:36 +0000
++++ src/acl/NoteData.h	2015-12-08 11:27:11 +0000
+@@ -1,39 +1,38 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ACLNOTEDATA_H
+ #define SQUID_ACLNOTEDATA_H
+ 
++#include "Notes.h"
+ #include "acl/Data.h"
+ #include "SquidString.h"
+ 
+-class HttpRequest;
+-class NotePairs;
++class ACLStringData;
+ 
+ /// \ingroup ACLAPI
+-class ACLNoteData : public ACLData<HttpRequest *>
++class ACLNoteData : public ACLData<NotePairs::Entry *>
+ {
+     MEMPROXY_CLASS(ACLNoteData);
+ 
+ public:
+     ACLNoteData();
+     virtual ~ACLNoteData();
+-    virtual bool match(HttpRequest* request);
++    virtual bool match(NotePairs::Entry *);
+     virtual SBufList dump() const;
+     virtual void parse();
+     virtual bool empty() const;
+-    virtual ACLData<HttpRequest *> *clone() const;
++    virtual ACLData<NotePairs::Entry *> *clone() const;
+ 
+ private:
+-    bool matchNotes(NotePairs *note);
+     String name;                   ///< Note name to check. It is always set
+-    ACLData<char const *> *values; ///< if set, at least one value must match
++    ACLStringData *values; ///< if set, at least one value must match
+ };
+ 
+ #endif /* SQUID_ACLNOTEDATA_H */
+ 
+
+=== modified file 'src/acl/StringData.cc'
+--- src/acl/StringData.cc	2015-01-29 19:05:24 +0000
++++ src/acl/StringData.cc	2015-12-03 11:46:04 +0000
+@@ -1,69 +1,74 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 28    Access Control */
+ 
+ #include "squid.h"
+ #include "acl/Checklist.h"
+ #include "acl/StringData.h"
+ #include "ConfigParser.h"
+ #include "Debug.h"
+ 
+ ACLStringData::ACLStringData(ACLStringData const &old) : stringValues(old.stringValues)
+ {
+ }
+ 
+ void
+ ACLStringData::insert(const char *value)
+ {
+     stringValues.insert(SBuf(value));
+ }
+ 
+ bool
+-ACLStringData::match(char const *toFind)
++ACLStringData::match(const SBuf &tf)
+ {
+-    if (stringValues.empty() || !toFind)
++    if (stringValues.empty() || tf.isEmpty())
+         return 0;
+ 
+-    SBuf tf(toFind);
+     debugs(28, 3, "aclMatchStringList: checking '" << tf << "'");
+ 
+     bool found = (stringValues.find(tf) != stringValues.end());
+     debugs(28, 3, "aclMatchStringList: '" << tf << "' " << (found ? "found" : "NOT found"));
+ 
+     return found;
+ }
+ 
++bool
++ACLStringData::match(char const *toFind)
++{
++    return match(SBuf(toFind));
++}
++
+ SBufList
+ ACLStringData::dump() const
+ {
+     SBufList sl;
+     sl.insert(sl.end(), stringValues.begin(), stringValues.end());
+     return sl;
+ }
+ 
+ void
+ ACLStringData::parse()
+ {
+     while (const char *t = ConfigParser::strtokFile())
+         stringValues.insert(SBuf(t));
+ }
+ 
+ bool
+ ACLStringData::empty() const
+ {
+     return stringValues.empty();
+ }
+ 
+ ACLData<char const *> *
+ ACLStringData::clone() const
+ {
+     /* Splay trees don't clone yet. */
+     return new ACLStringData(*this);
+ }
+ 
+
+=== modified file 'src/acl/StringData.h'
+--- src/acl/StringData.h	2015-01-13 10:23:56 +0000
++++ src/acl/StringData.h	2015-12-03 11:46:04 +0000
+@@ -1,41 +1,42 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ACLSTRINGDATA_H
+ #define SQUID_ACLSTRINGDATA_H
+ 
+ #include "acl/Acl.h"
+ #include "acl/Data.h"
+ #include "SBuf.h"
+ 
+ #include <set>
+ 
+ class ACLStringData : public ACLData<char const *>
+ {
+     MEMPROXY_CLASS(ACLStringData);
+ 
+ public:
+     ACLStringData() {}
+     ACLStringData(ACLStringData const &);
+     ACLStringData &operator= (ACLStringData const &);
+     virtual ~ACLStringData() {}
+     bool match(char const *);
++    bool match(const SBuf &);
+     virtual SBufList dump() const;
+     virtual void parse();
+     bool empty() const;
+     virtual ACLData<char const *> *clone() const;
+     /// Insert a string data value
+     void insert(const char *);
+ 
+ private:
+     typedef std::set<SBuf> StringValues_t;
+     StringValues_t stringValues;
+ };
+ 
+ #endif /* SQUID_ACLSTRINGDATA_H */
+ 
+
+=== modified file 'src/base/CharacterSet.cc'
+--- src/base/CharacterSet.cc	2015-01-13 07:25:36 +0000
++++ src/base/CharacterSet.cc	2015-12-03 11:46:04 +0000
+@@ -42,63 +42,72 @@
+     return *this;
+ }
+ 
+ CharacterSet &
+ CharacterSet::addRange(unsigned char low, unsigned char high)
+ {
+     //manual loop splitting is needed to cover case where high is 255
+     // otherwise low will wrap, resulting in infinite loop
+     while (low < high) {
+         chars_[static_cast<uint8_t>(low)] = 1;
+         ++low;
+     }
+     chars_[static_cast<uint8_t>(high)] = 1;
+     return *this;
+ }
+ 
+ CharacterSet
+ CharacterSet::complement(const char *label) const
+ {
+     CharacterSet result((label ? label : "complement_of_some_other_set"), "");
+     // negate each of our elements and add them to the result storage
+     std::transform(chars_.begin(), chars_.end(), result.chars_.begin(),
+                    std::logical_not<Storage::value_type>());
+     return result;
+ }
+ 
+ CharacterSet::CharacterSet(const char *label, const char * const c) :
+     name(label == NULL ? "anonymous" : label),
+     chars_(Storage(256,0))
+ {
+-    const size_t clen = strlen(c);
+-    for (size_t i = 0; i < clen; ++i)
+-        add(c[i]);
++    reset(c);
++}
++
++void
++CharacterSet::reset(const char * const c)
++{
++    std::fill(chars_.begin(), chars_.end(), 0);
++    if (c) {
++        const size_t clen = strlen(c);
++        for (size_t i = 0; i < clen; ++i)
++            add(c[i]);
++    }
+ }
+ 
+ CharacterSet::CharacterSet(const char *label, unsigned char low, unsigned char high) :
+     name(label == NULL ? "anonymous" : label),
+     chars_(Storage(256,0))
+ {
+     addRange(low,high);
+ }
+ 
+ const CharacterSet
+ // RFC 5234
+ CharacterSet::ALPHA("ALPHA", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+              CharacterSet::BIT("BIT","01"),
+              CharacterSet::CR("CR","\r"),
+ #if __cplusplus == 201103L
+ //CharacterSet::CTL("CTL",{{0x01,0x1f},{0x7f,0x7f}}),
+ #endif
+              CharacterSet::DIGIT("DIGIT","0123456789"),
+              CharacterSet::DQUOTE("DQUOTE","\""),
+              CharacterSet::HEXDIG("HEXDIG","0123456789aAbBcCdDeEfF"),
+              CharacterSet::HTAB("HTAB","\t"),
+              CharacterSet::LF("LF","\n"),
+              CharacterSet::SP("SP"," "),
+              CharacterSet::VCHAR("VCHAR", 0x21, 0x7e),
+ // RFC 7230
+              CharacterSet::WSP("WSP"," \t"),
+ #if __cplusplus == 201103L
+ //CharacterSet::CTEXT("ctext",{{0x09,0x09},{0x20,0x20},{0x2a,0x5b},{0x5d,0x7e},{0x80,0xff}}),
+ #endif
+              CharacterSet::TCHAR("TCHAR","!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+
+=== modified file 'src/base/CharacterSet.h'
+--- src/base/CharacterSet.h	2015-01-13 07:25:36 +0000
++++ src/base/CharacterSet.h	2015-12-08 10:33:40 +0000
+@@ -1,79 +1,84 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef _SQUID_SRC_PARSER_CHARACTERSET_H
+ #define _SQUID_SRC_PARSER_CHARACTERSET_H
+ 
+ #include <vector>
+ 
+ /// optimized set of C chars, with quick membership test and merge support
+ class CharacterSet
+ {
+ public:
+     typedef std::vector<uint8_t> Storage;
+ 
+     /// define a character set with the given label ("anonymous" if NULL)
+     ///  with specified initial contents
+-    CharacterSet(const char *label, const char * const initial);
++    CharacterSet(const char *label, const char * const initial = nullptr);
+ 
+     /// define a character set with the given label ("anonymous" if NULL)
+     ///  containing characters defined in the supplied ranges
+     /// \see addRange
+     CharacterSet(const char *label, unsigned char low, unsigned char high);
+ 
+     /// whether a given character exists in the set
+     bool operator[](unsigned char c) const {return chars_[static_cast<uint8_t>(c)] != 0;}
+ 
+     /// add a given character to the character set
+     CharacterSet & add(const unsigned char c);
+ 
+     /// add a list of character ranges, expressed as pairs [low,high], including both ends
+     CharacterSet & addRange(unsigned char low, unsigned char high);
+ 
+     /// add all characters from the given CharacterSet to this one
+     CharacterSet &operator +=(const CharacterSet &src);
+ 
+     /// return a new CharacterSet containing the union of two sets
+     CharacterSet operator +(const CharacterSet &src) const;
+ 
+     /// return a new CharacterSet containing characters not in this set
+     CharacterSet complement(const char *complementLabel = NULL) const;
+ 
+     /// change name; handy in const declarations that use operators
+     CharacterSet &rename(const char *label) { name = label; return *this; }
+ 
++    /// change contents
++    void reset(const char * const chars = 0);
++
++    bool empty() const { return chars_.empty(); }
++
+     /// optional set label for debugging (default: "anonymous")
+     const char * name;
+ 
+     // common character sets, RFC 5234
+     // A-Za-z
+     static const CharacterSet ALPHA;
+     // 0-1
+     static const CharacterSet BIT;
+     // carriage return
+     static const CharacterSet CR;
+     // controls
+ #if __cplusplus == 201103L
+     // ready but disabled as needs C++11 constructor
+     //static const CharacterSet CTL;
+ #endif
+     // 0-9
+     static const CharacterSet DIGIT;
+     // double quote
+     static const CharacterSet DQUOTE;
+     // 0-9aAbBcCdDeEfF
+     static const CharacterSet HEXDIG;
+     // horizontal tab
+     static const CharacterSet HTAB;
+     // line feed
+     static const CharacterSet LF;
+     // white space
+     static const CharacterSet SP;
+     // visible (printable) characters
+     static const CharacterSet VCHAR;
+     // <space><tab>
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2015-10-11 14:08:47 +0000
++++ src/cf.data.pre	2015-12-03 11:46:04 +0000
+@@ -876,74 +876,83 @@
+ 		user="J. \"Bob\" Smith"
+ DOC_END
+ 
+ NAME: acl
+ TYPE: acl
+ LOC: Config.aclList
+ IF USE_OPENSSL
+ DEFAULT: ssl::certHasExpired ssl_error X509_V_ERR_CERT_HAS_EXPIRED
+ DEFAULT: ssl::certNotYetValid ssl_error X509_V_ERR_CERT_NOT_YET_VALID
+ DEFAULT: ssl::certDomainMismatch ssl_error SQUID_X509_V_ERR_DOMAIN_MISMATCH
+ DEFAULT: ssl::certUntrusted ssl_error X509_V_ERR_INVALID_CA X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY X509_V_ERR_CERT_UNTRUSTED
+ DEFAULT: ssl::certSelfSigned ssl_error X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT
+ ENDIF
+ DEFAULT: all src all
+ DEFAULT: manager url_regex -i ^cache_object:// +i ^https?://[^/]+/squid-internal-mgr/
+ DEFAULT: localhost src 127.0.0.1/32 ::1
+ DEFAULT: to_localhost dst 127.0.0.0/8 0.0.0.0/32 ::1
+ DEFAULT_DOC: ACLs all, manager, localhost, and to_localhost are predefined.
+ DOC_START
+ 	Defining an Access List
+ 
+ 	Every access list definition must begin with an aclname and acltype, 
+ 	followed by either type-specific arguments or a quoted filename that
+ 	they are read from.
+ 
+ 	   acl aclname acltype argument ...
+ 	   acl aclname acltype "file" ...
+ 
+ 	When using "file", the file should contain one item per line.
+ 
+-	Some acl types supports options which changes their default behaviour.
+-	The available options are:
++
++	ACL Options
++
++	Some acl types supports options which changes their default behaviour:
+ 
+ 	-i,+i	By default, regular expressions are CASE-SENSITIVE. To make them
+ 		case-insensitive, use the -i option. To return case-sensitive
+ 		use the +i option between patterns, or make a new ACL line
+ 		without -i.	
+ 
+ 	-n	Disable lookups and address type conversions.  If lookup or
+ 		conversion is required because the parameter type (IP or
+ 		domain name) does not match the message address type (domain
+ 		name or IP), then the ACL would immediately declare a mismatch
+ 		without any warnings or lookups.
+ 
++	-m[=delimiters]
++		Perform a list membership test, interpreting values as comma-separated
++		token lists and matching against individual tokens instead of whole values.
++		The optional "delimiters" parameter specifies one or more alternative
++		non-alphanumeric delimiter characters. Two sequential delimiters (e.g., ",,")
++		produce an empty token.
++
+ 	--	Used to stop processing all options, in the case the first acl
+ 		value has '-' character as first character (for example the '-'
+ 		is a valid domain name)
+ 
+ 	Some acl types require suspending the current request in order
+ 	to access some external data source.
+ 	Those which do are marked with the tag [slow], those which
+ 	don't are marked as [fast].
+ 	See http://wiki.squid-cache.org/SquidFaq/SquidAcl
+ 	for further information
+ 
+ 	***** ACL TYPES AVAILABLE *****
+ 
+ 	acl aclname src ip-address/mask ...	# clients IP address [fast]
+ 	acl aclname src addr1-addr2/mask ...	# range of addresses [fast]
+ 	acl aclname dst [-n] ip-address/mask ...	# URL host's IP address [slow]
+ 	acl aclname localip ip-address/mask ... # IP address the client connected to [fast]
+ 
+ 	acl aclname arp      mac-address ... (xx:xx:xx:xx:xx:xx notation)
+ 	  # [fast]
+ 	  # The 'arp' ACL code is not portable to all operating systems.
+ 	  # It works on Linux, Solaris, Windows, FreeBSD, and some other
+ 	  # BSD variants.
+ 	  #
+ 	  # NOTE: Squid can only determine the MAC/EUI address for IPv4
+ 	  # clients that are on the same subnet. If the client is on a
+ 	  # different subnet, then Squid cannot find out its address.
+ 	  #
+ 	  # NOTE 2: IPv6 protocol does not contain ARP. MAC/EUI is either
+ 	  # encoded directly in the IPv6 address or not available.
+@@ -1103,66 +1112,69 @@
+ 	acl aclname external class_name [arguments...]
+ 	  # external ACL lookup via a helper class defined by the
+ 	  # external_acl_type directive [slow]
+ 
+ 	acl aclname user_cert attribute values...
+ 	  # match against attributes in a user SSL certificate
+ 	  # attribute is one of DN/C/O/CN/L/ST or a numerical OID [fast]
+ 
+ 	acl aclname ca_cert attribute values...
+ 	  # match against attributes a users issuing CA SSL certificate
+ 	  # attribute is one of DN/C/O/CN/L/ST or a numerical OID  [fast]
+ 
+ 	acl aclname ext_user username ...
+ 	acl aclname ext_user_regex [-i] pattern ...
+ 	  # string match on username returned by external acl helper [slow]
+ 	  # use REQUIRED to accept any non-null user name.
+ 
+ 	acl aclname tag tagvalue ...
+ 	  # string match on tag returned by external acl helper [fast]
+ 	  # DEPRECATED. Only the first tag will match with this ACL.
+ 	  # Use the 'note' ACL instead for handling multiple tag values.
+ 
+ 	acl aclname hier_code codename ...
+ 	  # string match against squid hierarchy code(s); [fast]
+ 	  #  e.g., DIRECT, PARENT_HIT, NONE, etc.
+ 	  #
+ 	  # NOTE: This has no effect in http_access rules. It only has
+ 	  # effect in rules that affect the reply data stream such as
+ 	  # http_reply_access.
+ 
+-	acl aclname note name [value ...]
++	acl aclname note [-m[=delimiters]] name [value ...]
+ 	  # match transaction annotation [fast]
+ 	  # Without values, matches any annotation with a given name.
+ 	  # With value(s), matches any annotation with a given name that
+ 	  # also has one of the given values.
+-	  # Names and values are compared using a string equality test.
++	  # If the -m flag is used, then the value of the named
++	  # annotation is interpreted as a list of tokens, and the ACL
++	  # matches individual name=token pairs rather than whole
++	  # name=value pairs. See "ACL Options" above for more info.
+ 	  # Annotation sources include note and adaptation_meta directives
+ 	  # as well as helper and eCAP responses.
+ 
+ 	acl aclname adaptation_service service ...
+ 	  # Matches the name of any icap_service, ecap_service,
+ 	  # adaptation_service_set, or adaptation_service_chain that Squid
+ 	  # has used (or attempted to use) for the master transaction.
+ 	  # This ACL must be defined after the corresponding adaptation
+ 	  # service is named in squid.conf. This ACL is usable with
+ 	  # adaptation_meta because it starts matching immediately after
+ 	  # the service has been selected for adaptation.
+ 
+ IF USE_OPENSSL
+ 	acl aclname ssl_error errorname
+ 	  # match against SSL certificate validation error [fast]
+ 	  #
+ 	  # For valid error names see in @DEFAULT_ERROR_DIR@/templates/error-details.txt
+ 	  # template file.
+ 	  #
+ 	  # The following can be used as shortcuts for certificate properties:
+ 	  #  [ssl::]certHasExpired: the "not after" field is in the past
+ 	  #  [ssl::]certNotYetValid: the "not before" field is in the future
+ 	  #  [ssl::]certUntrusted: The certificate issuer is not to be trusted.
+ 	  #  [ssl::]certSelfSigned: The certificate is self signed.
+ 	  #  [ssl::]certDomainMismatch: The certificate CN domain does not
+ 	  #         match the name the name of the host we are connecting to.
+ 	  #
+ 	  # The ssl::certHasExpired, ssl::certNotYetValid, ssl::certDomainMismatch,
+ 	  # ssl::certUntrusted, and ssl::certSelfSigned can also be used as
+ 	  # predefined ACLs, just like the 'all' ACL.
+

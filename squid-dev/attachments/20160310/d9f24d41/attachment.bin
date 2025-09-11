@@ -1,0 +1,144 @@
+assertion failed: Write.cc:41: "!ccb->active()"
+
+Bug description:
+   - The client side and server side are finished
+   - On server side the Ftp::Relay::finalizeDataDownload() is called and
+     schedules the Ftp::Server::originDataCompletionCheckpoint
+   - On client side the "Ftp::Server::userDataCompletionCheckpoint" is
+     called. This is schedules a write to control connection and closes
+     data connection.
+   - The Ftp::Server::originDataCompletionCheckpoint is called which is
+     trying to write to control connection and the assertion triggered.
+
+This patch:
+  - Sets the Ftp::Server::master::waitForOriginData flag to false inside 
+    Ftp::Server::originDataCompletionCheckpoint(), justs before writes the
+    reply message to the client, instead of setting it inside
+    Ftp::Relay::finalizeDataDownload(), to avoid call twice the
+    Ftp::Server::completeDataExchange method id both
+    originDataCompletionCheckpoint and userDataCompletionCheckpoint called
+    concurrently
+  - Does not sets the Ftp::Server::master->waitForOriginData to false inside
+    Ftp::Server::userDataCompletionCheckpoint method if the server side
+    connection is closed, to avoid crash in the case the server side
+    schedules the originDataCompletionCheckpoint before closed the server
+    side connection.
+    In this case squid will close the client-side connection too, because
+    it is pinned with the server-side connection. We do not have to
+    worry for no answer to the ftp-client.
+
+This is a Measurement Factory project
+
+=== modified file 'src/clients/FtpRelay.cc'
+--- src/clients/FtpRelay.cc	2016-01-31 06:14:05 +0000
++++ src/clients/FtpRelay.cc	2016-03-10 18:17:31 +0000
+@@ -699,42 +699,40 @@
+     }
+ 
+     debugs(9, 2, "connected FTP server data channel: " << io.conn);
+ 
+     data.opened(io.conn, dataCloser());
+ 
+     sendCommand();
+ }
+ 
+ void
+ Ftp::Relay::scheduleReadControlReply()
+ {
+     Ftp::Client::scheduleReadControlReply(0);
+ }
+ 
+ void
+ Ftp::Relay::finalizeDataDownload()
+ {
+     debugs(9, 2, "Complete data downloading/Uploading");
+ 
+-    updateMaster().waitForOriginData = false;
+-
+     CbcPointer<ConnStateData> &mgr = fwd->request->clientConnectionManager;
+     if (mgr.valid()) {
+         if (Ftp::Server *srv = dynamic_cast<Ftp::Server*>(mgr.get())) {
+             typedef NullaryMemFunT<Ftp::Server> CbDialer;
+             AsyncCall::Pointer call = JobCallback(11, 3, CbDialer, srv,
+                                                   Ftp::Server::originDataCompletionCheckpoint);
+             ScheduleCallHere(call);
+         }
+     }
+     serverComplete();
+ }
+ 
+ bool
+ Ftp::Relay::abortOnData(const char *reason)
+ {
+     debugs(9, 3, "aborting transaction for " << reason <<
+            "; FD " << (ctrl.conn != NULL ? ctrl.conn->fd : -1) << ", Data FD " << (data.conn != NULL ? data.conn->fd : -1) << ", this " << this);
+     // this method is only called to handle data connection problems
+     // the control connection should keep going
+ 
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2016-01-31 06:14:05 +0000
++++ src/servers/FtpServer.cc	2016-03-10 18:17:31 +0000
+@@ -1690,60 +1690,57 @@
+     reqFlags.cachable = false; // force releaseRequest() in storeCreateEntry()
+     reqFlags.noCache = true;
+     repContext->createStoreEntry(http->request->method, reqFlags);
+     http->storeEntry()->replaceHttpReply(reply);
+ }
+ 
+ void
+ Ftp::Server::callException(const std::exception &e)
+ {
+     debugs(33, 2, "FTP::Server job caught: " << e.what());
+     closeDataConnection();
+     unpinConnection(true);
+     if (Comm::IsConnOpen(clientConnection))
+         clientConnection->close();
+     AsyncJob::callException(e);
+ }
+ 
+ void
+ Ftp::Server::originDataCompletionCheckpoint()
+ {
++    master->waitForOriginData = false;
+     if (!master->userDataDone) {
+         debugs(33, 5, "Transfering from/to client not finished yet");
+         return;
+     }
+ 
+     completeDataExchange();
+ }
+ 
+ void Ftp::Server::userDataCompletionCheckpoint(int finalStatusCode)
+ {
+     Must(!master->userDataDone);
+     master->userDataDone = finalStatusCode;
+ 
+     if (in.bodyParser)
+         finishDechunkingRequest(false);
+ 
+-    // The origin control connection is gone, nothing to wait for
+-    if (!Comm::IsConnOpen(pinning.serverConnection))
+-        master->waitForOriginData = false;
+-
+     if (master->waitForOriginData) {
+         // The completeDataExchange() is not called here unconditionally
+         // because we want to signal the FTP user that we are not fully
+         // done processing its data stream, even though all data bytes
+         // have been sent or received already.
+         debugs(33, 5, "Transfering from/to FTP server is not complete");
+         return;
+     }
+ 
+     completeDataExchange();
+ }
+ 
+ void Ftp::Server::completeDataExchange()
+ {
+     writeCustomReply(master->userDataDone, master->userDataDone == 226 ? "Transfer complete" : "Server error; transfer aborted");
+     closeDataConnection();
+ }
+ 
+ /// Whether Squid FTP Relay supports a named feature (e.g., a command).
+ static bool
+

@@ -1,0 +1,631 @@
+Use DNS TTL for deciding when to reschedule resolution of cache peers, and retry failed cache peers much more often.
+
+This improves the situation for configurations where Squid forwards all
+requests to a cache peer, and a temporary DNS failure left that cache peer
+unresolved. Previously this would would have left users without web access for
+an hour, without manual intervention.
+
+A summary:
+
+    * Use DNS TTL when scheduling the next resolution attempt, resolving each
+      cache peer independently rather than fixed at every hour.
+
+    * In the failure case, attempt another resolution according to negative_dns_ttl
+
+    * Add the TTL to the Dns::LookupDetails object.
+
+    * Fix a small but consistent typo
+
+This work is submitted on behalf of Bloomberg L.P.
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2016-03-12 20:27:35 +0000
++++ src/FwdState.cc	2016-05-11 00:34:29 +0000
+@@ -726,41 +726,41 @@ FwdState::connectedToPeer(Security::Encr
+             peerConnectFailed(p);
+         serverConnection()->close();
+         return;
+     }
+ 
+     if (answer.tunneled) {
+         // TODO: When ConnStateData establishes tunnels, its state changes
+         // [in ways that may affect logging?]. Consider informing
+         // ConnStateData about our tunnel or otherwise unifying tunnel
+         // establishment [side effects].
+         unregister(serverConn); // async call owns it now
+         complete(); // destroys us
+         return;
+     }
+ 
+     // should reach ConnStateData before the dispatched Client job starts
+     CallJobHere1(17, 4, request->clientConnectionManager, ConnStateData,
+                  ConnStateData::notePeerConnection, serverConnection());
+ 
+     if (serverConnection()->getPeer())
+-        peerConnectSucceded(serverConnection()->getPeer());
++        peerConnectSucceeded(serverConnection()->getPeer());
+ 
+     flags.connected_okay = true;
+     dispatch();
+ }
+ 
+ void
+ FwdState::connectTimeout(int fd)
+ {
+     debugs(17, 2, "fwdConnectTimeout: FD " << fd << ": '" << entry->url() << "'" );
+     assert(serverDestinations[0] != NULL);
+     assert(fd == serverDestinations[0]->fd);
+ 
+     if (entry->isEmpty()) {
+         ErrorState *anErr = new ErrorState(ERR_CONNECT_FAIL, Http::scGatewayTimeout, request);
+         anErr->xerrno = ETIMEDOUT;
+         fail(anErr);
+ 
+         /* This marks the peer DOWN ... */
+         if (serverDestinations[0]->getPeer())
+             peerConnectFailed(serverDestinations[0]->getPeer());
+
+=== modified file 'src/dns/LookupDetails.h'
+--- src/dns/LookupDetails.h	2016-01-01 00:12:18 +0000
++++ src/dns/LookupDetails.h	2016-05-17 04:49:08 +0000
+@@ -3,40 +3,41 @@
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 78    DNS lookups */
+ 
+ #ifndef SQUID_DNS_LOOKUPDETAILS_H
+ #define SQUID_DNS_LOOKUPDETAILS_H
+ 
+ #include "SquidString.h"
+ 
+ namespace Dns
+ {
+ 
+ /// encapsulates DNS lookup results
+ class LookupDetails
+ {
+ public:
+-    LookupDetails() : wait(-1) {} ///< no error, no lookup delay (i.e., no lookup)
+-    LookupDetails(const String &anError, int aWait) : error(anError), wait(aWait) {}
++    LookupDetails() : wait(-1), ttl(-1) {} ///< no error, no lookup delay (i.e., no lookup)
++    LookupDetails(const String &anError, int aWait, time_t aTtl) : error(anError), wait(aWait), ttl(aTtl) {}
+ 
+     std::ostream &print(std::ostream &os) const;
+ 
+ public:
+     String error; ///< error message for unsuccessful lookups; empty otherwise
+     int wait; ///< msecs spent waiting for the lookup (if any) or -1 (if none)
++    time_t ttl; ///< the time to live for the lookup (if any) or -1 (if none)
+ };
+ 
+ } // namespace Dns
+ 
+ inline std::ostream &
+ operator <<(std::ostream &os, const Dns::LookupDetails &dns)
+ {
+     return dns.print(os);
+ }
+ 
+ #endif /* SQUID_DNS_LOOKUPDETAILS_H */
+ 
+
+=== modified file 'src/fqdncache.cc'
+--- src/fqdncache.cc	2016-04-22 11:39:23 +0000
++++ src/fqdncache.cc	2016-05-11 02:09:21 +0000
+@@ -289,41 +289,41 @@ fqdncacheAddEntry(fqdncache_entry * f)
+  *
+  * Walks down the pending list, calling handlers
+  */
+ static void
+ fqdncacheCallback(fqdncache_entry * f, int wait)
+ {
+     FQDNH *callback;
+     void *cbdata;
+     f->lastref = squid_curtime;
+ 
+     if (!f->handler)
+         return;
+ 
+     fqdncacheLockEntry(f);
+ 
+     callback = f->handler;
+ 
+     f->handler = NULL;
+ 
+     if (cbdataReferenceValidDone(f->handlerData, &cbdata)) {
+-        const Dns::LookupDetails details(f->error_message, wait);
++        const Dns::LookupDetails details(f->error_message, wait, f->expires - squid_curtime);
+         callback(f->name_count ? f->names[0] : NULL, details, cbdata);
+     }
+ 
+     fqdncacheUnlockEntry(f);
+ }
+ 
+ /// \ingroup FQDNCacheInternal
+ static int
+ fqdncacheParse(fqdncache_entry *f, const rfc1035_rr * answers, int nr, const char *error_message)
+ {
+     int k;
+     int ttl = 0;
+     const char *name = (const char *)f->hash.key;
+     f->expires = squid_curtime + Config.negativeDnsTtl;
+     f->flags.negcached = true;
+ 
+     if (nr < 0) {
+         debugs(35, 3, "fqdncacheParse: Lookup of '" << name << "' failed (" << error_message << ")");
+         f->error_message = xstrdup(error_message);
+         return -1;
+@@ -406,41 +406,41 @@ fqdncacheHandleReply(void *data, const r
+  *
+  \param addr        IP address of domain to resolve.
+  \param handler     A pointer to the function to be called when
+  *          the reply from the FQDN cache
+  *          (or the DNS if the FQDN cache misses)
+  \param handlerData Information that is passed to the handler
+  *          and does not affect the FQDN cache.
+  */
+ void
+ fqdncache_nbgethostbyaddr(const Ip::Address &addr, FQDNH * handler, void *handlerData)
+ {
+     fqdncache_entry *f = NULL;
+     char name[MAX_IPSTRLEN];
+     generic_cbdata *c;
+     addr.toStr(name,MAX_IPSTRLEN);
+     debugs(35, 4, "fqdncache_nbgethostbyaddr: Name '" << name << "'.");
+     ++FqdncacheStats.requests;
+ 
+     if (name[0] == '\0') {
+         debugs(35, 4, "fqdncache_nbgethostbyaddr: Invalid name!");
+-        const Dns::LookupDetails details("Invalid hostname", -1); // error, no lookup
++        const Dns::LookupDetails details("Invalid hostname", -1, -1); // error, no lookup
+         if (handler)
+             handler(NULL, details, handlerData);
+         return;
+     }
+ 
+     f = fqdncache_get(name);
+ 
+     if (NULL == f) {
+         /* miss */
+         (void) 0;
+     } else if (fqdncacheExpiredEntry(f)) {
+         /* hit, but expired -- bummer */
+         fqdncacheRelease(f);
+         f = NULL;
+     } else {
+         /* hit */
+         debugs(35, 4, "fqdncache_nbgethostbyaddr: HIT for '" << name << "'");
+ 
+         if (f->flags.negcached)
+             ++ FqdncacheStats.negative_hits;
+
+=== modified file 'src/ipcache.cc'
+--- src/ipcache.cc	2016-04-22 11:39:23 +0000
++++ src/ipcache.cc	2016-05-17 05:04:10 +0000
+@@ -309,41 +309,41 @@ ipcacheAddEntry(ipcache_entry * i)
+  *
+  * walks down the pending list, calling handlers
+  */
+ static void
+ ipcacheCallback(ipcache_entry *i, int wait)
+ {
+     IPH *callback = i->handler;
+     void *cbdata = NULL;
+     i->lastref = squid_curtime;
+ 
+     if (!i->handler)
+         return;
+ 
+     ipcacheLockEntry(i);
+ 
+     callback = i->handler;
+ 
+     i->handler = NULL;
+ 
+     if (cbdataReferenceValidDone(i->handlerData, &cbdata)) {
+-        const Dns::LookupDetails details(i->error_message, wait);
++        const Dns::LookupDetails details(i->error_message, wait, i->expires - squid_curtime);
+         callback((i->addrs.count ? &i->addrs : NULL), details, cbdata);
+     }
+ 
+     ipcacheUnlockEntry(i);
+ }
+ 
+ /// \ingroup IPCacheAPI
+ static int
+ ipcacheParse(ipcache_entry *i, const rfc1035_rr * answers, int nr, const char *error_message)
+ {
+     int k;
+     int j = 0;
+     int na = 0;
+     int ttl = 0;
+     const char *name = (const char *)i->hash.key;
+     int cname_found = 0;
+ 
+     i->expires = squid_curtime + Config.negativeDnsTtl;
+     i->flags.negcached = true;
+     safe_free(i->addrs.in_addrs);
+@@ -492,41 +492,41 @@ ipcacheHandleReply(void *data, const rfc
+  * XXX: on hits and some errors, the handler is called immediately instead
+  * of scheduling an async call. This reentrant behavior means that the
+  * user job must be extra careful after calling ipcache_nbgethostbyname,
+  * especially if the handler destroys the job. Moreover, the job has
+  * no way of knowing whether the reentrant call happened.
+  * Comm::Connection setup usually protects the job by scheduling an async call,
+  * but some user code calls ipcache_nbgethostbyname directly.
+  */
+ void
+ ipcache_nbgethostbyname(const char *name, IPH * handler, void *handlerData)
+ {
+     ipcache_entry *i = NULL;
+     const ipcache_addrs *addrs = NULL;
+     generic_cbdata *c;
+     debugs(14, 4, "ipcache_nbgethostbyname: Name '" << name << "'.");
+     ++IpcacheStats.requests;
+ 
+     if (name == NULL || name[0] == '\0') {
+         debugs(14, 4, "ipcache_nbgethostbyname: Invalid name!");
+         ++IpcacheStats.invalid;
+-        const Dns::LookupDetails details("Invalid hostname", -1); // error, no lookup
++        const Dns::LookupDetails details("Invalid hostname", -1, -1); // error, no lookup
+         if (handler)
+             handler(NULL, details, handlerData);
+         return;
+     }
+ 
+     if ((addrs = ipcacheCheckNumeric(name))) {
+         debugs(14, 4, "ipcache_nbgethostbyname: BYPASS for '" << name << "' (already numeric)");
+         ++IpcacheStats.numeric_hits;
+         const Dns::LookupDetails details; // no error, no lookup
+         if (handler)
+             handler(addrs, details, handlerData);
+         return;
+     }
+ 
+     i = ipcache_get(name);
+ 
+     if (NULL == i) {
+         /* miss */
+         (void) 0;
+     } else if (ipcacheExpiredEntry(i)) {
+
+=== modified file 'src/neighbors.cc'
+--- src/neighbors.cc	2016-01-01 00:12:18 +0000
++++ src/neighbors.cc	2016-05-17 04:37:21 +0000
+@@ -1,38 +1,39 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 15    Neighbor Routines */
+ 
+ #include "squid.h"
+ #include "acl/FilledChecklist.h"
+ #include "anyp/PortCfg.h"
+ #include "base/EnumIterator.h"
+ #include "CacheDigest.h"
+ #include "CachePeer.h"
+ #include "comm/Connection.h"
+ #include "comm/ConnOpener.h"
++#include "dns/LookupDetails.h"
+ #include "event.h"
+ #include "FwdState.h"
+ #include "globals.h"
+ #include "htcp.h"
+ #include "HttpRequest.h"
+ #include "icmp/net_db.h"
+ #include "ICP.h"
+ #include "int.h"
+ #include "ip/Address.h"
+ #include "ip/tools.h"
+ #include "ipcache.h"
+ #include "MemObject.h"
+ #include "mgr/Registration.h"
+ #include "multicast.h"
+ #include "neighbors.h"
+ #include "NeighborTypeDomainList.h"
+ #include "pconn.h"
+ #include "PeerDigest.h"
+ #include "PeerPoolMgr.h"
+ #include "PeerSelectState.h"
+@@ -544,41 +545,44 @@ neighbors_init(void)
+ 
+             if (0 != strcmp(thisPeer->host, me))
+                 continue;
+ 
+             for (AnyP::PortCfgPointer s = HttpPortList; s != NULL; s = s->next) {
+                 if (thisPeer->http_port != s->s.port())
+                     continue;
+ 
+                 debugs(15, DBG_IMPORTANT, "WARNING: Peer looks like this host");
+ 
+                 debugs(15, DBG_IMPORTANT, "         Ignoring " <<
+                        neighborTypeStr(thisPeer) << " " << thisPeer->host <<
+                        "/" << thisPeer->http_port << "/" <<
+                        thisPeer->icp.port);
+ 
+                 neighborRemove(thisPeer);
+             }
+         }
+     }
+ 
+-    peerRefreshDNS((void *) 1);
++    eventDelete(peerRefreshDNS, NULL);
++
++    for (CachePeer *p = Config.peers; p; p = p->next)
++        ipcache_nbgethostbyname(p->host, peerDNSConfigure, p);
+ 
+     sep = getservbyname("echo", "udp");
+     echo_port = sep ? ntohs((unsigned short) sep->s_port) : 7;
+ 
+     first_ping = Config.peers;
+ }
+ 
+ int
+ neighborsUdpPing(HttpRequest * request,
+                  StoreEntry * entry,
+                  IRCB * callback,
+                  void *callback_data,
+                  int *exprep,
+                  int *timeout)
+ {
+     const char *url = entry->url();
+     MemObject *mem = entry->mem_obj;
+     CachePeer *p = NULL;
+     int i;
+     int reqnum = 0;
+@@ -1145,145 +1149,143 @@ neighborUp(const CachePeer * p)
+ 
+     if (p->stats.probe_start != 0 &&
+             squid_curtime - p->stats.probe_start > Config.Timeout.deadPeer) {
+         debugs(15, 8, "neighborUp: DOWN (dead): " << p->host << " (" << p->in_addr << ")");
+         return 0;
+     }
+ 
+     debugs(15, 8, "neighborUp: UP: " << p->host << " (" << p->in_addr << ")");
+     return 1;
+ }
+ 
+ void
+ peerNoteDigestGone(CachePeer * p)
+ {
+ #if USE_CACHE_DIGESTS
+     cbdataReferenceDone(p->digest);
+ #endif
+ }
+ 
+ static void
+-peerDNSConfigure(const ipcache_addrs *ia, const Dns::LookupDetails &, void *data)
++peerDNSConfigure(const ipcache_addrs *ia, const Dns::LookupDetails &details, void *data)
+ {
+     // TODO: connections to no-longer valid IP addresses should be
+     // closed when we can detect such IP addresses.
+ 
+     CachePeer *p = (CachePeer *)data;
+ 
+     int j;
+ 
+     if (p->n_addresses == 0) {
+         debugs(15, DBG_IMPORTANT, "Configuring " << neighborTypeStr(p) << " " << p->host << "/" << p->http_port << "/" << p->icp.port);
+ 
+         if (p->type == PEER_MULTICAST)
+             debugs(15, DBG_IMPORTANT, "    Multicast TTL = " << p->mcast.ttl);
+     }
+ 
+     p->n_addresses = 0;
+ 
+     if (ia == NULL) {
+         debugs(0, DBG_CRITICAL, "WARNING: DNS lookup for '" << p->host << "' failed!");
++        eventAdd("peerRefreshDNS", peerRefreshDNS, cbdataReference(p), Config.negativeDnsTtl, 1);
+         return;
+     }
+ 
+     if ((int) ia->count < 1) {
+         debugs(0, DBG_CRITICAL, "WARNING: No IP address found for '" << p->host << "'!");
++        eventAdd("peerRefreshDNS", peerRefreshDNS, cbdataReference(p), Config.negativeDnsTtl, 1);
+         return;
+     }
+ 
+     p->tcp_up = p->connect_fail_limit;
+ 
+     for (j = 0; j < (int) ia->count && j < PEER_MAX_ADDRESSES; ++j) {
+         p->addresses[j] = ia->in_addrs[j];
+         debugs(15, 2, "--> IP address #" << j << ": " << p->addresses[j]);
+         ++ p->n_addresses;
+     }
+ 
+     p->in_addr.setEmpty();
+     p->in_addr = p->addresses[0];
+     p->in_addr.port(p->icp.port);
+ 
+     if (p->type == PEER_MULTICAST)
+         peerCountMcastPeersSchedule(p, 10);
+ 
+ #if USE_ICMP
+     if (p->type != PEER_MULTICAST && IamWorkerProcess())
+         if (!p->options.no_netdb_exchange)
+             eventAddIsh("netdbExchangeStart", netdbExchangeStart, p, 30.0, 1);
+ #endif
+ 
+     if (p->standby.mgr.valid())
+         PeerPoolMgr::Checkpoint(p->standby.mgr, "resolved peer");
++
++    time_t ttl = details.ttl;
++
++    if (ttl <= 0)
++        ttl = Config.positiveDnsTtl;
++
++    eventAdd("peerRefreshDNS", peerRefreshDNS, cbdataReference(p), ttl, 1);
+ }
+ 
+ static void
+ peerRefreshDNS(void *data)
+ {
+-    CachePeer *p = NULL;
+-
+-    if (eventFind(peerRefreshDNS, NULL))
+-        eventDelete(peerRefreshDNS, NULL);
+-
+-    if (!data && 0 == stat5minClientRequests()) {
+-        /* no recent client traffic, wait a bit */
+-        eventAddIsh("peerRefreshDNS", peerRefreshDNS, NULL, 180.0, 1);
+-        return;
+-    }
+-
+-    for (p = Config.peers; p; p = p->next)
++    if (cbdataReferenceValid(data)) {
++        CachePeer *p = (CachePeer *)data;
+         ipcache_nbgethostbyname(p->host, peerDNSConfigure, p);
+-
+-    /* Reconfigure the peers every hour */
+-    eventAddIsh("peerRefreshDNS", peerRefreshDNS, NULL, 3600.0, 1);
++    }
++    cbdataReferenceDone(data);
+ }
+ 
+ static void
+ peerConnectFailedSilent(CachePeer * p)
+ {
+     p->stats.last_connect_failure = squid_curtime;
+ 
+     if (!p->tcp_up) {
+         debugs(15, 2, "TCP connection to " << p->host << "/" << p->http_port <<
+                " dead");
+         return;
+     }
+ 
+     -- p->tcp_up;
+ 
+     if (!p->tcp_up) {
+         debugs(15, DBG_IMPORTANT, "Detected DEAD " << neighborTypeStr(p) << ": " << p->name);
+         p->stats.logged_state = PEER_DEAD;
+     }
+ }
+ 
+ void
+ peerConnectFailed(CachePeer *p)
+ {
+     debugs(15, DBG_IMPORTANT, "TCP connection to " << p->host << "/" << p->http_port << " failed");
+     peerConnectFailedSilent(p);
+ }
+ 
+ void
+-peerConnectSucceded(CachePeer * p)
++peerConnectSucceeded(CachePeer * p)
+ {
+     if (!p->tcp_up) {
+-        debugs(15, 2, "TCP connection to " << p->host << "/" << p->http_port << " succeded");
++        debugs(15, 2, "TCP connection to " << p->host << "/" << p->http_port << " succeeded");
+         p->tcp_up = p->connect_fail_limit; // NP: so peerAlive(p) works properly.
+         peerAlive(p);
+         if (!p->n_addresses)
+             ipcache_nbgethostbyname(p->host, peerDNSConfigure, p);
+     } else
+         p->tcp_up = p->connect_fail_limit;
+ }
+ 
+ /*
+ * peerProbeConnect will be called on dead peers by neighborUp
+ */
+ static bool
+ peerProbeConnect(CachePeer * p)
+ {
+     time_t ctimeout = p->connect_timeout > 0 ? p->connect_timeout : Config.Timeout.peer_connect;
+     bool ret = (squid_curtime - p->stats.last_connect_failure) > (ctimeout * 10);
+ 
+     if (p->testing_now > 0)
+         return ret;/* probe already running */
+ 
+@@ -1300,41 +1302,41 @@ peerProbeConnect(CachePeer * p)
+ 
+         ++ p->testing_now;
+ 
+         AsyncCall::Pointer call = commCbCall(15,3, "peerProbeConnectDone", CommConnectCbPtrFun(peerProbeConnectDone, p));
+         Comm::ConnOpener *cs = new Comm::ConnOpener(conn, call, ctimeout);
+         cs->setHost(p->host);
+         AsyncJob::Start(cs);
+     }
+ 
+     p->stats.last_connect_probe = squid_curtime;
+ 
+     return ret;
+ }
+ 
+ static void
+ peerProbeConnectDone(const Comm::ConnectionPointer &conn, Comm::Flag status, int, void *data)
+ {
+     CachePeer *p = (CachePeer*)data;
+ 
+     if (status == Comm::OK) {
+-        peerConnectSucceded(p);
++        peerConnectSucceeded(p);
+     } else {
+         peerConnectFailedSilent(p);
+     }
+ 
+     -- p->testing_now;
+     conn->close();
+     // TODO: log this traffic.
+ }
+ 
+ static void
+ peerCountMcastPeersSchedule(CachePeer * p, time_t when)
+ {
+     if (p->mcast.flags.count_event_pending)
+         return;
+ 
+     eventAdd("peerCountMcastPeersStart",
+              peerCountMcastPeersStart,
+              p,
+              (double) when, 1);
+ 
+
+=== modified file 'src/neighbors.h'
+--- src/neighbors.h	2016-01-01 00:12:18 +0000
++++ src/neighbors.h	2016-05-11 00:35:28 +0000
+@@ -39,35 +39,35 @@ void neighborsUdpAck(const cache_key *,
+ void neighborAdd(const char *, const char *, int, int, int, int, int);
+ void neighbors_init(void);
+ #if USE_HTCP
+ void neighborsHtcpClear(StoreEntry *, const char *, HttpRequest *, const HttpRequestMethod &, htcp_clr_reason);
+ #endif
+ CachePeer *peerFindByName(const char *);
+ CachePeer *peerFindByNameAndPort(const char *, unsigned short);
+ CachePeer *getDefaultParent(HttpRequest * request);
+ CachePeer *getRoundRobinParent(HttpRequest * request);
+ CachePeer *getWeightedRoundRobinParent(HttpRequest * request);
+ void peerClearRRStart(void);
+ void peerClearRR(void);
+ lookup_t peerDigestLookup(CachePeer * p, HttpRequest * request);
+ CachePeer *neighborsDigestSelect(HttpRequest * request);
+ void peerNoteDigestLookup(HttpRequest * request, CachePeer * p, lookup_t lookup);
+ void peerNoteDigestGone(CachePeer * p);
+ int neighborUp(const CachePeer * e);
+ const char *neighborTypeStr(const CachePeer * e);
+ peer_t neighborType(const CachePeer *, const URL &);
+ void peerConnectFailed(CachePeer *);
+-void peerConnectSucceded(CachePeer *);
++void peerConnectSucceeded(CachePeer *);
+ void dump_peer_options(StoreEntry *, CachePeer *);
+ int peerHTTPOkay(const CachePeer *, HttpRequest *);
+ 
+ /// Whether we can open new connections to the peer (e.g., despite max-conn)
+ bool peerCanOpenMore(const CachePeer *p);
+ /// Whether the peer has idle or standby connections that can be used now
+ bool peerHasConnAvailable(const CachePeer *p);
+ /// Notifies peer of an associated connection closure.
+ void peerConnClosed(CachePeer *p);
+ 
+ CachePeer *whichPeer(const Ip::Address &from);
+ 
+ #endif /* SQUID_NEIGHBORS_H_ */
+ 
+

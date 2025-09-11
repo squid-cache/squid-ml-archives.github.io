@@ -1,0 +1,3519 @@
+transaction_initiator ACL for detecting various unusual transactions
+
+This ACL is essential in several use cases, including:
+
+* After fetching a missing intermediate certificate, Squid uses the
+  regular cache (and regular caching rules) to store the response. Squid
+  deployments that do not want to cache regular traffic need to cache
+  fetched certificates and only them.
+
+  acl fetched_certificate transaction_initiator certificate-fetching
+  cache allow fetched_certificate
+  cache deny all
+
+* Many traffic policies and tools assume the existence of an HTTP client
+  behind every transaction. Internal Squid requests violate that
+  assumption. Identifying internal requests protects external ACLs, log
+  analyzers, and other mechanisms from the transactions they mishandle.
+
+  acl skip_logging transaction_initiator internal
+  access_log ... !skip_logging
+
+
+The new transaction_initiator ACL classifies transactions based on their
+initiator. Currently supported initiators are esi, certificate-fetching,
+cache-digest, internal, client, and all. In the future, the same ACL
+will be able to identify HTTP/2 push transactions using the "server"
+initiator. See src/cf.data.pre for details.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/AclRegs.cc'
+--- src/AclRegs.cc	2017-05-16 14:27:49 +0000
++++ src/AclRegs.cc	2017-06-07 15:52:32 +0000
+@@ -76,40 +76,41 @@
+ #include "acl/SourceDomain.h"
+ #include "acl/SourceIp.h"
+ #include "acl/SquidError.h"
+ #include "acl/SquidErrorData.h"
+ #if USE_OPENSSL
+ #include "acl/Certificate.h"
+ #include "acl/CertificateData.h"
+ #include "acl/ServerName.h"
+ #include "acl/SslError.h"
+ #include "acl/SslErrorData.h"
+ #endif
+ #include "acl/Strategised.h"
+ #include "acl/Strategy.h"
+ #include "acl/StringData.h"
+ #if USE_OPENSSL
+ #include "acl/ServerCertificate.h"
+ #endif
+ #include "acl/Tag.h"
+ #include "acl/Time.h"
+ #include "acl/TimeData.h"
++#include "acl/TransactionInitiator.h"
+ #include "acl/Url.h"
+ #include "acl/UrlLogin.h"
+ #include "acl/UrlPath.h"
+ #include "acl/UrlPort.h"
+ #include "acl/UserData.h"
+ #if USE_AUTH
+ #include "auth/AclMaxUserIp.h"
+ #include "auth/AclProxyAuth.h"
+ #endif
+ #include "base/RegexPattern.h"
+ #if USE_IDENT
+ #include "ident/AclIdent.h"
+ #endif
+ 
+ ACL::Prototype ACLBrowser::RegistryProtoype(&ACLBrowser::RegistryEntry_, "browser");
+ ACLStrategised<char const *> ACLBrowser::RegistryEntry_(new ACLRegexData, ACLRequestHeaderStrategy<Http::HdrType::USER_AGENT>::Instance(), "browser");
+ ACLFlag  DestinationDomainFlags[] = {ACL_F_NO_LOOKUP, ACL_F_END};
+ ACL::Prototype ACLDestinationDomain::LiteralRegistryProtoype(&ACLDestinationDomain::LiteralRegistryEntry_, "dstdomain");
+ ACLStrategised<char const *> ACLDestinationDomain::LiteralRegistryEntry_(new ACLDomainData, ACLDestinationDomainStrategy::Instance(), "dstdomain", DestinationDomainFlags);
+ ACL::Prototype ACLDestinationDomain::RegexRegistryProtoype(&ACLDestinationDomain::RegexRegistryEntry_, "dstdom_regex");
+@@ -229,23 +230,26 @@
+ ACL::Prototype ACLNote::RegistryProtoype(&ACLNote::RegistryEntry_, "note");
+ ACLStrategised<NotePairs::Entry *> ACLNote::RegistryEntry_(new ACLNoteData, ACLNoteStrategy::Instance(), "note");
+ 
+ ACL::Prototype ACLAnnotateClient::RegistryProtoype(&ACLAnnotateClient::RegistryEntry_, "annotate_client");
+ ACLStrategised<NotePairs::Entry *> ACLAnnotateClient::RegistryEntry_(new ACLAnnotationData, ACLAnnotateClientStrategy::Instance(), "annotate_client");
+ 
+ ACL::Prototype ACLAnnotateTransaction::RegistryProtoype(&ACLAnnotateTransaction::RegistryEntry_, "annotate_transaction");
+ ACLStrategised<NotePairs::Entry *> ACLAnnotateTransaction::RegistryEntry_(new ACLAnnotationData, ACLAnnotateTransactionStrategy::Instance(), "annotate_transaction");
+ 
+ #if USE_ADAPTATION
+ ACL::Prototype ACLAdaptationService::RegistryProtoype(&ACLAdaptationService::RegistryEntry_, "adaptation_service");
+ ACLStrategised<const char *> ACLAdaptationService::RegistryEntry_(new ACLAdaptationServiceData, ACLAdaptationServiceStrategy::Instance(), "adaptation_service");
+ #endif
+ 
+ ACL::Prototype ACLSquidError::RegistryProtoype(&ACLSquidError::RegistryEntry_, "squid_error");
+ ACLStrategised<err_type> ACLSquidError::RegistryEntry_(new ACLSquidErrorData, ACLSquidErrorStrategy::Instance(), "squid_error");
+ 
+ ACL::Prototype Acl::ConnectionsEncrypted::RegistryProtoype(&Acl::ConnectionsEncrypted::RegistryEntry_, "connections_encrypted");
+ Acl::ConnectionsEncrypted Acl::ConnectionsEncrypted::RegistryEntry_("connections_encrypted");
+ 
++ACL::Prototype Acl::TransactionInitiator::RegistryProtoype(&Acl::TransactionInitiator::RegistryEntry_, "transaction_initiator");
++Acl::TransactionInitiator Acl::TransactionInitiator::RegistryEntry_("transaction_initiator");
++
+ ACL::Prototype ACLHasComponent::RegistryProtoype(&ACLHasComponent::RegistryEntry_, "has");
+ ACLStrategised<ACLChecklist *> ACLHasComponent::RegistryEntry_(new ACLHasComponentData, ACLHasComponentStrategy::Instance(), "has");
+ 
+
+=== modified file 'src/Downloader.cc'
+--- src/Downloader.cc	2017-01-01 00:12:22 +0000
++++ src/Downloader.cc	2017-06-07 15:52:32 +0000
+@@ -46,45 +46,46 @@
+ DownloaderContext::~DownloaderContext()
+ {
+     debugs(33, 6, "DownloaderContext destructed, this=" << (void*)this);
+     if (http)
+         finished();
+ }
+ 
+ void
+ DownloaderContext::finished()
+ {
+     delete http;
+     http = nullptr;
+ }
+ 
+ void
+ Downloader::CbDialer::print(std::ostream &os) const
+ {
+     os << " Http Status:" << status << Raw("body data", object.rawContent(), 64).hex();
+ }
+ 
+-Downloader::Downloader(SBuf &url, AsyncCall::Pointer &aCallback, unsigned int level):
++Downloader::Downloader(SBuf &url, AsyncCall::Pointer &aCallback, const XactionInitiator initiator, unsigned int level):
+     AsyncJob("Downloader"),
+     url_(url),
+     callback_(aCallback),
+-    level_(level)
++    level_(level),
++    initiator_(initiator)
+ {
+ }
+ 
+ Downloader::~Downloader()
+ {
+     debugs(33, 6, this);
+ }
+ 
+ void
+ Downloader::swanSong()
+ {
+     debugs(33, 6, this);
+     if (context_) {
+         context_->finished();
+         context_ = nullptr;
+     }
+ }
+ 
+ bool
+ Downloader::doneAll() const
+@@ -111,50 +112,50 @@
+     assert(context);
+ 
+     if (context->downloader.valid())
+         context->downloader->handleReply(node, http, rep, receivedData);
+ }
+ 
+ static void
+ downloaderDetach(clientStreamNode * node, ClientHttpRequest * http)
+ {
+     debugs(33, 5, MYNAME);
+     clientStreamDetach(node, http);
+ }
+ 
+ /// Initializes and starts the HTTP GET request to the remote server
+ bool
+ Downloader::buildRequest()
+ {
+     const HttpRequestMethod method = Http::METHOD_GET;
+ 
+     char *uri = xstrdup(url_.c_str());
+-    HttpRequest *const request = HttpRequest::CreateFromUrl(uri, method);
++    const MasterXaction::Pointer mx = new MasterXaction(initiator_);
++    HttpRequest *const request = HttpRequest::FromUrl(uri, mx, method);
+     if (!request) {
+         debugs(33, 5, "Invalid URI: " << url_);
+         xfree(uri);
+         return false; //earlyError(...)
+     }
+     request->http_ver = Http::ProtocolVersion();
+     request->header.putStr(Http::HdrType::HOST, request->url.host());
+     request->header.putTime(Http::HdrType::DATE, squid_curtime);
+-    request->flags.internalClient = true;
+     request->client_addr.setNoAddr();
+ #if FOLLOW_X_FORWARDED_FOR
+     request->indirect_client_addr.setNoAddr();
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+     request->my_addr.setNoAddr();   /* undefined for internal requests */
+     request->my_addr.port(0);
+     request->downloader = this;
+ 
+     debugs(11, 2, "HTTP Client Downloader " << this << "/" << id);
+     debugs(11, 2, "HTTP Client REQUEST:\n---------\n" <<
+            request->method << " " << url_ << " " << request->http_ver << "\n" <<
+            "\n----------");
+ 
+     ClientHttpRequest *const http = new ClientHttpRequest(nullptr);
+     http->request = request;
+     HTTPMSGLOCK(http->request);
+     http->req_sz = 0;
+     http->uri = uri;
+     setLogUri (http, urlCanonicalClean(request));
+ 
+
+=== modified file 'src/Downloader.h'
+--- src/Downloader.h	2017-01-01 00:12:22 +0000
++++ src/Downloader.h	2017-06-06 10:53:34 +0000
+@@ -1,84 +1,87 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_DOWNLOADER_H
+ #define SQUID_DOWNLOADER_H
+ 
+ #include "base/AsyncJob.h"
+ #include "defines.h"
+ #include "http/forward.h"
+ #include "http/StatusCode.h"
+ #include "sbuf/SBuf.h"
++#include "XactionInitiator.h"
+ 
+ class ClientHttpRequest;
+ class StoreIOBuffer;
+ class clientStreamNode;
+ class DownloaderContext;
+ typedef RefCount<DownloaderContext> DownloaderContextPointer;
+ 
+ /// The Downloader class fetches SBuf-storable things for other Squid
+ /// components/transactions using internal requests. For example, it is used
+ /// to fetch missing intermediate certificates when validating origin server
+ /// certificate chains.
+ class Downloader: virtual public AsyncJob
+ {
+     CBDATA_CLASS(Downloader);
+ public:
+ 
+     /// Callback data to use with Downloader callbacks.
+     class CbDialer: public CallDialer {
+     public:
+         CbDialer(): status(Http::scNone) {}
+         virtual ~CbDialer() {}
+ 
+         /* CallDialer API */
+         virtual bool canDial(AsyncCall &call) = 0;
+         virtual void dial(AsyncCall &call) = 0;
+         virtual void print(std::ostream &os) const;
+ 
+         SBuf object;
+         Http::StatusCode status;
+     };
+ 
+-    Downloader(SBuf &url, AsyncCall::Pointer &aCallback, unsigned int level = 0);
++    Downloader(SBuf &url, AsyncCall::Pointer &aCallback, const XactionInitiator initiator, unsigned int level = 0);
+     virtual ~Downloader();
+     virtual void swanSong();
+ 
+     /// delays destruction to protect doCallouts()
+     void downloadFinished();
+ 
+     /// The nested level of Downloader object (downloads inside downloads).
+     unsigned int nestedLevel() const {return level_;}
+ 
+     void handleReply(clientStreamNode *, ClientHttpRequest *, HttpReply *, StoreIOBuffer);
+ 
+ protected:
+ 
+     /* AsyncJob API */
+     virtual bool doneAll() const;
+     virtual void start();
+ 
+ private:
+ 
+     bool buildRequest();
+     void callBack(Http::StatusCode const status);
+ 
+     /// The maximum allowed object size.
+     static const size_t MaxObjectSize = 1*1024*1024;
+ 
+     SBuf url_; ///< the url to download
+     AsyncCall::Pointer callback_; ///< callback to call when download finishes
+     SBuf object_; ///< the object body data
+     const unsigned int level_; ///< holds the nested downloads level
++    /// The initiator of the download request.
++    XactionInitiator initiator_;
+ 
+     /// Pointer to an object that stores the clientStream required info
+     DownloaderContextPointer context_;
+ };
+ 
+ #endif
+ 
+
+=== modified file 'src/HttpRequest.cc'
+--- src/HttpRequest.cc	2017-05-05 19:23:07 +0000
++++ src/HttpRequest.cc	2017-06-07 15:52:32 +0000
+@@ -21,49 +21,53 @@
+ #include "http.h"
+ #include "http/one/RequestParser.h"
+ #include "http/Stream.h"
+ #include "HttpHdrCc.h"
+ #include "HttpHeaderRange.h"
+ #include "HttpRequest.h"
+ #include "log/Config.h"
+ #include "MemBuf.h"
+ #include "sbuf/StringConvert.h"
+ #include "SquidConfig.h"
+ #include "Store.h"
+ #include "URL.h"
+ 
+ #if USE_AUTH
+ #include "auth/UserRequest.h"
+ #endif
+ #if ICAP_CLIENT
+ #include "adaptation/icap/icap_log.h"
+ #endif
+ 
+-HttpRequest::HttpRequest() :
+-    Http::Message(hoRequest)
++HttpRequest::HttpRequest(const MasterXaction::Pointer &mx) :
++    Http::Message(hoRequest),
++    masterXaction(mx)
+ {
++    assert(mx);
+     init();
+ }
+ 
+-HttpRequest::HttpRequest(const HttpRequestMethod& aMethod, AnyP::ProtocolType aProtocol, const char *aSchemeImg, const char *aUrlpath) :
+-    Http::Message(hoRequest)
++HttpRequest::HttpRequest(const HttpRequestMethod& aMethod, AnyP::ProtocolType aProtocol, const char *aSchemeImg, const char *aUrlpath, const MasterXaction::Pointer &mx) :
++    Http::Message(hoRequest),
++    masterXaction(mx)
+ {
++    assert(mx);
+     static unsigned int id = 1;
+     debugs(93,7, HERE << "constructed, this=" << this << " id=" << ++id);
+     init();
+     initHTTP(aMethod, aProtocol, aSchemeImg, aUrlpath);
+ }
+ 
+ HttpRequest::~HttpRequest()
+ {
+     clean();
+     debugs(93,7, HERE << "destructed, this=" << this);
+ }
+ 
+ void
+ HttpRequest::initHTTP(const HttpRequestMethod& aMethod, AnyP::ProtocolType aProtocol, const char *aSchemeImg, const char *aUrlpath)
+ {
+     method = aMethod;
+     url.setScheme(aProtocol, aSchemeImg);
+     url.path(aUrlpath);
+ }
+ 
+@@ -153,41 +157,41 @@
+     etag.clean();
+ 
+ #if USE_ADAPTATION
+     adaptHistory_ = NULL;
+ #endif
+ #if ICAP_CLIENT
+     icapHistory_ = NULL;
+ #endif
+ }
+ 
+ void
+ HttpRequest::reset()
+ {
+     clean();
+     init();
+ }
+ 
+ HttpRequest *
+ HttpRequest::clone() const
+ {
+-    HttpRequest *copy = new HttpRequest();
++    HttpRequest *copy = new HttpRequest(masterXaction);
+     copy->method = method;
+     // TODO: move common cloning clone to Msg::copyTo() or copy ctor
+     copy->header.append(&header);
+     copy->hdrCacheInit();
+     copy->hdr_sz = hdr_sz;
+     copy->http_ver = http_ver;
+     copy->pstate = pstate; // TODO: should we assert a specific state here?
+     copy->body_pipe = body_pipe;
+ 
+     copy->url = url;
+ 
+     // range handled in hdrCacheInit()
+     copy->ims = ims;
+     copy->imslen = imslen;
+     copy->hier = hier; // Is it safe to copy? Should we?
+ 
+     copy->errType = errType;
+ 
+     // XXX: what to do with copy->peer_login?
+ 
+@@ -310,48 +314,45 @@
+             --end;
+ 
+         ++end;                 // back to space
+ 
+         if (2 != sscanf(ver + 5, "%d.%d", &http_ver.major, &http_ver.minor)) {
+             debugs(73, DBG_IMPORTANT, "parseRequestLine: Invalid HTTP identifier.");
+             return false;
+         }
+     } else {
+         http_ver.major = 0;
+         http_ver.minor = 9;
+     }
+ 
+     if (end < start)   // missing URI
+         return false;
+ 
+     char save = *end;
+ 
+     * (char *) end = '\0';     // temp terminate URI, XXX dangerous?
+ 
+-    HttpRequest *tmp = urlParse(method, (char *) start, this);
++    const bool ret = urlParse(method, (char *) start, *this);
+ 
+     * (char *) end = save;
+ 
+-    if (NULL == tmp)
+-        return false;
+-
+-    return true;
++    return ret;
+ }
+ 
+ /* swaps out request using httpRequestPack */
+ void
+ HttpRequest::swapOut(StoreEntry * e)
+ {
+     assert(e);
+     e->buffer();
+     pack(e);
+     e->flush();
+ }
+ 
+ /* packs request-line and headers, appends <crlf> terminator */
+ void
+ HttpRequest::pack(Packable * p) const
+ {
+     assert(p);
+     /* pack request-line */
+     p->appendf(SQUIDSBUFPH " " SQUIDSBUFPH " HTTP/%d.%d\r\n",
+                SQUIDSBUFPRINT(method.image()), SQUIDSBUFPRINT(url.path()),
+@@ -501,43 +502,46 @@
+         expectBody = true;
+         theSize = -1;
+     } else if (content_length >= 0) {
+         expectBody = true;
+         theSize = content_length;
+     } else {
+         expectBody = false;
+         // theSize undefined
+     }
+ 
+     return expectBody;
+ }
+ 
+ /*
+  * Create a Request from a URL and METHOD.
+  *
+  * If the METHOD is CONNECT, then a host:port pair is looked for instead of a URL.
+  * If the request cannot be created cleanly, NULL is returned
+  */
+ HttpRequest *
+-HttpRequest::CreateFromUrl(char * url, const HttpRequestMethod& method)
++HttpRequest::FromUrl(char * url, const MasterXaction::Pointer &mx, const HttpRequestMethod& method)
+ {
+-    return urlParse(method, url, NULL);
++    std::unique_ptr<HttpRequest> req(new HttpRequest(mx));
++    if (urlParse(method, url, *req))
++        return req.release();
++    return nullptr;
+ }
+ 
+ /**
+  * Are responses to this request possible cacheable ?
+  * If false then no matter what the response must not be cached.
+  */
+ bool
+ HttpRequest::maybeCacheable()
+ {
+     // Intercepted request with Host: header which cannot be trusted.
+     // Because it failed verification, or someone bypassed the security tests
+     // we cannot cache the reponse for sharing between clients.
+     // TODO: update cache to store for particular clients only (going to same Host: and destination IP)
+     if (!flags.hostVerified && (flags.intercepted || flags.interceptTproxy))
+         return false;
+ 
+     switch (url.getScheme()) {
+     case AnyP::PROTO_HTTP:
+     case AnyP::PROTO_HTTPS:
+         if (!method.respMaybeCacheable())
+
+=== modified file 'src/HttpRequest.h'
+--- src/HttpRequest.h	2017-02-16 11:51:56 +0000
++++ src/HttpRequest.h	2017-06-07 15:50:53 +0000
+@@ -1,72 +1,73 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_HTTPREQUEST_H
+ #define SQUID_HTTPREQUEST_H
+ 
+ #include "base/CbcPointer.h"
+ #include "dns/forward.h"
+ #include "err_type.h"
++#include "forward.h"
+ #include "HierarchyLogEntry.h"
+ #include "http/Message.h"
+ #include "http/RequestMethod.h"
+ #include "Notes.h"
+ #include "RequestFlags.h"
+ #include "URL.h"
+ 
+ #if USE_AUTH
+ #include "auth/UserRequest.h"
+ #endif
+ #if USE_ADAPTATION
+ #include "adaptation/History.h"
+ #endif
+ #if ICAP_CLIENT
+ #include "adaptation/icap/History.h"
+ #endif
+ #if USE_SQUID_EUI
+ #include "eui/Eui48.h"
+ #include "eui/Eui64.h"
+ #endif
+ 
+ class ConnStateData;
+ class Downloader;
+ 
+ /*  Http Request */
+ void httpRequestPack(void *obj, Packable *p);
+ 
+ class HttpHdrRange;
+ 
+ class HttpRequest: public Http::Message
+ {
+     MEMPROXY_CLASS(HttpRequest);
+ 
+ public:
+     typedef RefCount<HttpRequest> Pointer;
+ 
+-    HttpRequest();
+-    HttpRequest(const HttpRequestMethod& aMethod, AnyP::ProtocolType aProtocol, const char *schemeImage, const char *aUrlpath);
++    HttpRequest(const MasterXactionPointer &);
++    HttpRequest(const HttpRequestMethod& aMethod, AnyP::ProtocolType aProtocol, const char *schemeImage, const char *aUrlpath, const MasterXactionPointer &);
+     ~HttpRequest();
+     virtual void reset();
+ 
+     void initHTTP(const HttpRequestMethod& aMethod, AnyP::ProtocolType aProtocol, const char *schemeImage, const char *aUrlpath);
+ 
+     virtual HttpRequest *clone() const;
+ 
+     /// Whether response to this request is potentially cachable
+     /// \retval false  Not cacheable.
+     /// \retval true   Possibly cacheable. Response factors will determine.
+     bool maybeCacheable();
+ 
+     bool conditional() const; ///< has at least one recognized If-* header
+ 
+     /// whether the client is likely to be able to handle a 1xx reply
+     bool canHandle1xx() const;
+ 
+ #if USE_ADAPTATION
+     /// Returns possibly nil history, creating it if adapt. logging is enabled
+     Adaptation::History::Pointer adaptLogHistory() const;
+@@ -176,61 +177,64 @@
+     /// whether we have responded with HTTP 100 or FTP 150 already
+     bool forcedBodyContinuation;
+ 
+ public:
+     bool multipartRangeRequest() const;
+ 
+     bool parseFirstLine(const char *start, const char *end);
+ 
+     virtual bool expectingBody(const HttpRequestMethod& unused, int64_t&) const;
+ 
+     bool bodyNibbled() const; // the request has a [partially] consumed body
+ 
+     int prefixLen() const;
+ 
+     void swapOut(StoreEntry * e);
+ 
+     void pack(Packable * p) const;
+ 
+     static void httpRequestPack(void *obj, Packable *p);
+ 
+-    static HttpRequest * CreateFromUrl(char * url, const HttpRequestMethod &method = Http::METHOD_GET);
++    static HttpRequest * FromUrl(char * url, const MasterXactionPointer &, const HttpRequestMethod &method = Http::METHOD_GET);
+ 
+     ConnStateData *pinnedConnection();
+ 
+     /**
+      * Returns the current StoreID for the request as a nul-terminated char*.
+      * Always returns the current id for the request
+      * (either the effective request URI or modified ID by the helper).
+      */
+     const SBuf storeId();
+ 
+     /**
+      * The client connection manager, if known;
+      * Used for any response actions needed directly to the client.
+      * ie 1xx forwarding or connection pinning state changes
+      */
+     CbcPointer<ConnStateData> clientConnectionManager;
+ 
+     /// The Downloader object which initiated the HTTP request if any
+     CbcPointer<Downloader> downloader;
+ 
++    /// the master transaction this request belongs to. Never nil.
++    MasterXactionPointer masterXaction;
++
+     /// forgets about the cached Range header (for a reason)
+     void ignoreRange(const char *reason);
+     int64_t getRangeOffsetLimit(); /* the result of this function gets cached in rangeOffsetLimit */
+ 
+     /// \returns existing non-empty transaction annotations,
+     /// creates and returns empty annotations otherwise
+     NotePairs::Pointer notes();
+     bool hasNotes() const { return bool(theNotes) && !theNotes->empty(); }
+ 
+ private:
+     mutable int64_t rangeOffsetLimit;  /* caches the result of getRangeOffsetLimit */
+ 
+     /// annotations added by the note directive and helpers
+     /// and(or) by annotate_transaction/annotate_client ACLs.
+     NotePairs::Pointer theNotes;
+ protected:
+     virtual void packFirstLineInto(Packable * p, bool full_uri) const;
+ 
+     virtual bool sanityCheckStartLine(const char *buf, const size_t hdr_len, Http::StatusCode *error);
+ 
+
+=== modified file 'src/Makefile.am'
+--- src/Makefile.am	2017-05-23 08:31:54 +0000
++++ src/Makefile.am	2017-06-06 15:48:37 +0000
+@@ -469,40 +469,42 @@
+ 	MemStore.h \
+ 	time.cc \
+ 	TimeOrTag.h \
+ 	tools.h \
+ 	tools.cc \
+ 	tunnel.cc \
+ 	typedefs.h \
+ 	$(UNLINKDSOURCE) \
+ 	url.cc \
+ 	URL.h \
+ 	urn.h \
+ 	urn.cc \
+ 	wccp.h \
+ 	wccp.cc \
+ 	wccp2.h \
+ 	wccp2.cc \
+ 	whois.h \
+ 	whois.cc \
+ 	wordlist.h \
+ 	wordlist.cc \
++	XactionInitiator.h \
++	XactionInitiator.cc \
+ 	$(WIN32_SOURCE) \
+ 	$(WINSVC_SOURCE)
+ 
+ EXTRA_squid_SOURCES = \
+ 	$(all_AUTHMODULES) \
+ 	ConfigOption.h \
+ 	$(DELAY_POOL_ALL_SOURCE) \
+ 	htcp.cc \
+ 	htcp.h \
+ 	ipc.cc \
+ 	ipc_win32.cc \
+ 	ProfStats.cc \
+ 	LeakFinder.cc \
+ 	LeakFinder.h \
+ 	$(SNMP_ALL_SOURCE) \
+ 	$(UNLINKDSOURCE) \
+ 	$(WIN32_ALL_SOURCE) \
+ 	$(LOADABLE_MODULES_SOURCES)
+ 
+ noinst_HEADERS = \
+
+=== modified file 'src/MasterXaction.h'
+--- src/MasterXaction.h	2017-01-01 00:12:22 +0000
++++ src/MasterXaction.h	2017-06-07 14:43:59 +0000
+@@ -1,54 +1,62 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SRC_MASTERXACTION_H
+ #define SQUID_SRC_MASTERXACTION_H
+ 
+ #include "anyp/forward.h"
++#include "anyp/PortCfg.h"
+ #include "base/InstanceId.h"
+ #include "base/Lock.h"
++#include "base/RefCount.h"
+ #include "comm/forward.h"
++#include "XactionInitiator.h"
+ 
+ /** Master transaction details.
+  *
+  * Aggregates historical data from individual related protocol-specific
+  * transactions such as an HTTP client transaction and the corresponding
+  * HTTP or FTP server transaction.
+  *
+  * Individual transaction information worth sending or logging should be
+  * recorded here, ideally without exposing other master transaction users
+  * to internal details of individual transactions. For example, storing an
+  * HTTP client IP address is a good idea but storing a pointer to some
+  * client-side job which maintains that address is not.
+  *
+  * A master transaction is created by a newly accepted client connection,
+  * a new request on the existing client connection, or an internal request
+  * generated by Squid. All client-side protocols, including HTTP, HTCP, ICP,
+  * and SNMP will eventually create master transactions.
+  *
+  * A master transaction is auto-destroyed when its last user is gone.
+  */
+ class MasterXaction : public RefCountable
+ {
+ public:
+     typedef RefCount<MasterXaction> Pointer;
+ 
++    explicit MasterXaction(const XactionInitiator anInitiator) : initiator(anInitiator) {};
++
+     /// transaction ID.
+     InstanceId<MasterXaction> id;
+ 
+     /// the listening port which originated this transaction
+     AnyP::PortCfgPointer squidPort;
+ 
+     /// the client TCP connection which originated this transaction
+     Comm::ConnectionPointer tcpClient;
+ 
++    /// the initiator of this transaction
++    XactionInitiator initiator;
++
+     // TODO: add state from other Jobs in the transaction
+ };
+ 
+ #endif /* SQUID_SRC_MASTERXACTION_H */
+ 
+
+=== modified file 'src/PeerPoolMgr.cc'
+--- src/PeerPoolMgr.cc	2017-04-12 23:34:50 +0000
++++ src/PeerPoolMgr.cc	2017-06-07 15:52:32 +0000
+@@ -1,40 +1,41 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "AccessLogEntry.h"
+ #include "base/AsyncJobCalls.h"
+ #include "base/RunnersRegistry.h"
+ #include "CachePeer.h"
+ #include "comm/Connection.h"
+ #include "comm/ConnOpener.h"
+ #include "Debug.h"
+ #include "fd.h"
+ #include "FwdState.h"
+ #include "globals.h"
+ #include "HttpRequest.h"
++#include "MasterXaction.h"
+ #include "neighbors.h"
+ #include "pconn.h"
+ #include "PeerPoolMgr.h"
+ #include "security/BlindPeerConnector.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ 
+ CBDATA_CLASS_INIT(PeerPoolMgr);
+ 
+ /// Gives Security::PeerConnector access to Answer in the PeerPoolMgr callback dialer.
+ class MyAnswerDialer: public UnaryMemFunT<PeerPoolMgr, Security::EncryptorAnswer, Security::EncryptorAnswer&>,
+     public Security::PeerConnector::CbDialer
+ {
+ public:
+     MyAnswerDialer(const JobPointer &aJob, Method aMethod):
+         UnaryMemFunT<PeerPoolMgr, Security::EncryptorAnswer, Security::EncryptorAnswer&>(aJob, aMethod, Security::EncryptorAnswer()) {}
+ 
+     /* Security::PeerConnector::CbDialer API */
+     virtual Security::EncryptorAnswer &answer() { return arg1; }
+ };
+@@ -42,43 +43,44 @@
+ PeerPoolMgr::PeerPoolMgr(CachePeer *aPeer): AsyncJob("PeerPoolMgr"),
+     peer(cbdataReference(aPeer)),
+     request(),
+     opener(),
+     securer(),
+     closer(),
+     addrUsed(0)
+ {
+ }
+ 
+ PeerPoolMgr::~PeerPoolMgr()
+ {
+     cbdataReferenceDone(peer);
+ }
+ 
+ void
+ PeerPoolMgr::start()
+ {
+     AsyncJob::start();
+ 
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initPeerPool);
+     // ErrorState, getOutgoingAddress(), and other APIs may require a request.
+     // We fake one. TODO: Optionally send this request to peers?
+-    request = new HttpRequest(Http::METHOD_OPTIONS, AnyP::PROTO_HTTP, "http", "*");
++    request = new HttpRequest(Http::METHOD_OPTIONS, AnyP::PROTO_HTTP, "http", "*", mx);
+     request->url.host(peer->host);
+ 
+     checkpoint("peer initialized");
+ }
+ 
+ void
+ PeerPoolMgr::swanSong()
+ {
+     AsyncJob::swanSong();
+ }
+ 
+ bool
+ PeerPoolMgr::validPeer() const
+ {
+     return peer && cbdataReferenceValid(peer) && peer->standby.pool;
+ }
+ 
+ bool
+ PeerPoolMgr::doneAll() const
+ {
+
+=== modified file 'src/RequestFlags.h'
+--- src/RequestFlags.h	2017-01-01 00:12:22 +0000
++++ src/RequestFlags.h	2017-02-13 09:16:38 +0000
+@@ -55,43 +55,40 @@
+      * always use noCacheHack() for reading.
+      * \note only meaningful if USE_HTTP_VIOLATIONS is defined at build time
+      */
+     bool nocacheHack = false;
+     /** this request is accelerated (reverse-proxy) */
+     bool accelerated = false;
+     /** if set, ignore Cache-Control headers */
+     bool ignoreCc = false;
+     /** set for intercepted requests */
+     bool intercepted = false;
+     /** set if the Host: header passed verification */
+     bool hostVerified = false;
+     /// Set for requests handled by a "tproxy" port.
+     bool interceptTproxy = false;
+     /// The client IP address should be spoofed when connecting to the web server.
+     /// This applies to TPROXY traffic that has not had spoofing disabled through
+     /// the spoof_client_ip squid.conf ACL.
+     bool spoofClientIp = false;
+     /** set if the request is internal (\see ClientHttpRequest::flags.internal)*/
+     bool internal = false;
+-    //XXX this is set in in clientBeginRequest, but never tested.
+-    /** set for internally-generated requests */
+-    bool internalClient = false;
+     /** if set, request to try very hard to keep the connection alive */
+     bool mustKeepalive = false;
+     /** set if the rquest wants connection oriented auth */
+     bool connectionAuth = false;
+     /** set if connection oriented auth can not be supported */
+     bool connectionAuthDisabled = false;
+     // XXX This is set in clientCheckPinning but never tested
+     /** Request wants connection oriented auth */
+     bool connectionProxyAuth = false;
+     /** set if the request was sent on a pinned connection */
+     bool pinned = false;
+     /** Authentication was already sent upstream (e.g. due tcp-level auth) */
+     bool authSent = false;
+     /** Deny direct forwarding unless overriden by always_direct
+      * Used in accelerator mode */
+     bool noDirect = false;
+     /** Reply with chunked transfer encoding */
+     bool chunkedReply = false;
+     /** set if stream error has occured */
+     bool streamError = false;
+
+=== modified file 'src/URL.h'
+--- src/URL.h	2017-01-01 00:12:22 +0000
++++ src/URL.h	2017-02-13 07:21:38 +0000
+@@ -149,41 +149,41 @@
+ operator <<(std::ostream &os, const URL &url)
+ {
+     // none means explicit empty string for scheme.
+     if (url.getScheme() != AnyP::PROTO_NONE)
+         os << url.getScheme().image();
+     os << ":";
+ 
+     // no authority section on URN
+     if (url.getScheme() != AnyP::PROTO_URN)
+         os << "//" << url.authority();
+ 
+     // path is what it is - including absent
+     os << url.path();
+     return os;
+ }
+ 
+ class HttpRequest;
+ class HttpRequestMethod;
+ 
+ void urlInitialize(void);
+-HttpRequest *urlParse(const HttpRequestMethod&, char *, HttpRequest *request = NULL);
++bool urlParse(const HttpRequestMethod&, char *, HttpRequest &request);
+ char *urlCanonicalClean(const HttpRequest *);
+ const char *urlCanonicalFakeHttps(const HttpRequest * request);
+ bool urlIsRelative(const char *);
+ char *urlMakeAbsolute(const HttpRequest *, const char *);
+ char *urlRInternal(const char *host, unsigned short port, const char *dir, const char *name);
+ char *urlInternal(const char *dir, const char *name);
+ 
+ enum MatchDomainNameFlags {
+     mdnNone = 0,
+     mdnHonorWildcards = 1 << 0,
+     mdnRejectSubsubDomains = 1 << 1
+ };
+ 
+ /**
+  * matchDomainName() matches a hostname (usually extracted from traffic)
+  * with a domainname when mdnNone or mdnRejectSubsubDomains flags are used
+  * according to the following rules:
+  *
+  *    HOST      |   DOMAIN    |   mdnNone | mdnRejectSubsubDomains
+  * -------------|-------------|-----------|-----------------------
+
+=== added file 'src/XactionInitiator.cc'
+--- src/XactionInitiator.cc	1970-01-01 00:00:00 +0000
++++ src/XactionInitiator.cc	2017-06-08 08:57:46 +0000
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "cache_cf.h"
++#include "Debug.h"
++#include "XactionInitiator.h"
++
++XactionInitiator::Initiators
++XactionInitiator::ParseInitiators(const char *name)
++{
++    typedef std::map<std::string, XactionInitiator::Initiators> InitiatorsMap;
++    static InitiatorsMap SupportedInitiators = {
++        {"client", initClient},
++        {"peer-pool", initPeerPool},
++        {"certificate-fetching", initCertFetcher},
++        {"esi", initEsi},
++        {"cache-digest", initCacheDigest},
++        {"server", initServer},
++        {"htcp", initHtcp},
++        {"icp", initIcp},
++        {"icmp", initIcmp},
++        {"asn", initAsn},
++        {"ipc", initIpc},
++        {"adaptation", initAdaptation},
++        {"icon", initIcon},
++        {"peer-mcast", initPeerMcast},
++        {"internal", InternalInitiators()},
++        {"all", AllInitiators()}
++    };
++    const auto it = SupportedInitiators.find(name);
++    if (it != SupportedInitiators.cend())
++        return it->second;
++
++    debugs(28, DBG_CRITICAL, "FATAL: Invalid transaction_initiator value near " << name);
++    self_destruct();
++    return 0;
++}
+
+=== added file 'src/XactionInitiator.h'
+--- src/XactionInitiator.h	1970-01-01 00:00:00 +0000
++++ src/XactionInitiator.h	2017-06-08 08:58:49 +0000
+@@ -0,0 +1,67 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SRC_XACTION_INITIATOR_H
++#define SQUID_SRC_XACTION_INITIATOR_H
++
++/// identifies a protocol agent or Squid feature initiating transactions
++class XactionInitiator {
++public:
++    /// transaction triggers
++    enum Initiator {
++        initUnknown = 0,
++        initClient = 1 << 0, ///< HTTP or FTP client
++        initPeerPool = 1 << 1, ///< PeerPool manager
++        initCertFetcher = 1 << 2, ///< Missing intermediate certificates fetching code
++        initEsi = 1 << 3, ///< ESI processing code
++        initCacheDigest = 1 << 4, ///< Cache Digest fetching code
++        initHtcp = 1<< 5, ///< HTCP client
++        initIcp = 1 << 6, ///< the ICP/neighbors subsystem
++        initIcmp = 1 << 7, ///< the ICMP RTT database (NetDB) neighbors exchange subsystem
++        initAsn = 1 << 8, ///< the ASN db subsystem
++        initIpc = 1 << 9, ///< the IPC subsystem
++        initAdaptation = 1 << 10,  ///< ICAP/ECAP requests generated by Squid
++        initIcon = 1 << 11, ///< internal icons
++        initPeerMcast = 1 << 12, ///< neighbor multicast
++        initServer = 1 << 13, ///< HTTP/2 push request (not yet supported by Squid)
++
++        initAdaptationOrphan_ = 1 << 31 ///< eCAP-created HTTP message w/o an associated HTTP transaction (not ACL-detectable)
++    };
++
++    typedef uint32_t Initiators; ///< Initiator set
++
++    // this class is a just a trivial wrapper so we allow explicit conversions
++    XactionInitiator(Initiator i) : initiator(i) {}
++
++    /// whether this initiator belongs to the given set
++    bool in(Initiators setOfInitiators) const {return (initiator & setOfInitiators) != 0;}
++
++    /// whether the transaction was initiated by an internal subsystem
++    bool internalClient() const {
++        return (initiator & InternalInitiators()) != 0;
++    }
++
++    /// internally generated requests
++    static Initiators InternalInitiators() {
++        return initPeerPool | initCertFetcher | initEsi | initCacheDigest | initIcp | initIcmp | initIpc | initAdaptation | initIcon | initPeerMcast;
++    }
++
++    /// all initiators
++    static Initiators AllInitiators() {
++        return 0xFFFFFFFF;
++    }
++
++    static Initiators ParseInitiators(const char *name);
++
++private:
++    XactionInitiator() {}
++
++    Initiator initiator;
++};
++
++#endif // SQUID_SRC_XACTION_INITIATOR_H
+
+=== modified file 'src/acl/Asn.cc'
+--- src/acl/Asn.cc	2017-01-01 00:12:22 +0000
++++ src/acl/Asn.cc	2017-06-07 15:52:36 +0000
+@@ -2,40 +2,41 @@
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 53    AS Number handling */
+ 
+ #include "squid.h"
+ #include "acl/Acl.h"
+ #include "acl/Asn.h"
+ #include "acl/Checklist.h"
+ #include "acl/DestinationAsn.h"
+ #include "acl/DestinationIp.h"
+ #include "acl/SourceAsn.h"
+ #include "FwdState.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+ #include "ipcache.h"
++#include "MasterXaction.h"
+ #include "mgr/Registration.h"
+ #include "radix.h"
+ #include "RequestFlags.h"
+ #include "SquidConfig.h"
+ #include "Store.h"
+ #include "StoreClient.h"
+ 
+ #define WHOIS_PORT 43
+ #define AS_REQBUF_SZ    4096
+ 
+ /* BEGIN of definitions for radix tree entries */
+ 
+ /* 32/128 bits address in memory with length */
+ class m_ADDR
+ {
+ public:
+     uint8_t len;
+     Ip::Address addr;
+ 
+     m_ADDR() : len(sizeof(Ip::Address)) {};
+@@ -222,41 +223,42 @@
+ }
+ 
+ static void
+ asnStats(StoreEntry * sentry)
+ {
+     storeAppendPrintf(sentry, "Address    \tAS Numbers\n");
+     squid_rn_walktree(AS_tree_head, printRadixNode, sentry);
+ }
+ 
+ /* PRIVATE */
+ 
+ static void
+ asnCacheStart(int as)
+ {
+     LOCAL_ARRAY(char, asres, 4096);
+     StoreEntry *e;
+     ASState *asState = new ASState;
+     debugs(53, 3, "AS " << as);
+     snprintf(asres, 4096, "whois://%s/!gAS%d", Config.as_whois_server, as);
+     asState->as_number = as;
+-    asState->request = HttpRequest::CreateFromUrl(asres);
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initAsn);
++    asState->request = HttpRequest::FromUrl(asres, mx);
+     assert(asState->request != NULL);
+ 
+     if ((e = storeGetPublic(asres, Http::METHOD_GET)) == NULL) {
+         e = storeCreateEntry(asres, asres, RequestFlags(), Http::METHOD_GET);
+         asState->sc = storeClientListAdd(e, asState);
+         FwdState::fwdStart(Comm::ConnectionPointer(), e, asState->request.getRaw());
+     } else {
+         e->lock("Asn");
+         asState->sc = storeClientListAdd(e, asState);
+     }
+ 
+     asState->entry = e;
+     StoreIOBuffer readBuffer (AS_REQBUF_SZ, asState->offset, asState->reqbuf);
+     storeClientCopy(asState->sc, e, readBuffer, asHandleReply, asState);
+ }
+ 
+ static void
+ asHandleReply(void *data, StoreIOBuffer result)
+ {
+     ASState *asState = (ASState *)data;
+
+=== modified file 'src/acl/Makefile.am'
+--- src/acl/Makefile.am	2017-05-16 14:27:49 +0000
++++ src/acl/Makefile.am	2017-06-02 13:33:51 +0000
+@@ -119,40 +119,42 @@
+ 	Random.h \
+ 	Referer.cc \
+ 	Referer.h \
+ 	ReplyHeaderStrategy.h \
+ 	ReplyMimeType.cc \
+ 	ReplyMimeType.h \
+ 	RequestHeaderStrategy.h \
+ 	RequestMimeType.cc \
+ 	RequestMimeType.h \
+ 	SourceAsn.h \
+ 	SourceDomain.cc \
+ 	SourceDomain.h \
+ 	SourceIp.cc \
+ 	SourceIp.h \
+ 	SquidError.h \
+ 	SquidError.cc \
+ 	SquidErrorData.cc \
+ 	SquidErrorData.h \
+ 	Tag.cc \
+ 	Tag.h \
++	TransactionInitiator.cc \
++	TransactionInitiator.h \
+ 	Url.cc \
+ 	Url.h \
+ 	UrlLogin.cc \
+ 	UrlLogin.h \
+ 	UrlPath.cc \
+ 	UrlPath.h \
+ 	UrlPort.cc \
+ 	UrlPort.h \
+ 	UserData.cc \
+ 	UserData.h \
+ 	AclNameList.h \
+ 	AclDenyInfoList.h \
+ 	Gadgets.cc \
+ 	Gadgets.h \
+ 	AclSizeLimit.cc \
+ 	AclSizeLimit.h
+ 
+ ## Add conditional sources
+ ## TODO: move these to their respective dirs when those dirs are created
+ 
+
+=== added file 'src/acl/TransactionInitiator.cc'
+--- src/acl/TransactionInitiator.cc	1970-01-01 00:00:00 +0000
++++ src/acl/TransactionInitiator.cc	2017-06-08 09:10:39 +0000
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++/* DEBUG: section 28    Access Control */
++
++#include "squid.h"
++#include "acl/TransactionInitiator.h"
++#include "acl/FilledChecklist.h"
++#include "cache_cf.h"
++#include "Debug.h"
++#include "HttpRequest.h"
++#include "MasterXaction.h"
++#include "SquidConfig.h"
++
++ACL *
++Acl::TransactionInitiator::clone() const
++{
++    return new Acl::TransactionInitiator(*this);
++}
++
++Acl::TransactionInitiator::TransactionInitiator (const char *aClass) : class_ (aClass), initiators_(0)
++{}
++
++char const *
++Acl::TransactionInitiator::typeString() const
++{
++    return class_;
++}
++
++bool
++Acl::TransactionInitiator::empty () const
++{
++    return false;
++}
++
++void
++Acl::TransactionInitiator::parse()
++{
++    while (const char *s = ConfigParser::strtokFile()) {
++        initiators_ |= XactionInitiator::ParseInitiators(s);
++        cfgWords.push_back(SBuf(s));
++    }
++}
++
++int
++Acl::TransactionInitiator::match(ACLChecklist *checklist)
++{
++    ACLFilledChecklist *filled = Filled((ACLChecklist*)checklist);
++    assert(filled->request);
++    assert(filled->request->masterXaction);
++    const XactionInitiator requestInitiator = filled->request->masterXaction->initiator;
++    return requestInitiator.in(initiators_) ? 1 : 0;
++}
++
++SBufList
++Acl::TransactionInitiator::dump() const
++{
++    return cfgWords;
++}
++
+
+=== added file 'src/acl/TransactionInitiator.h'
+--- src/acl/TransactionInitiator.h	1970-01-01 00:00:00 +0000
++++ src/acl/TransactionInitiator.h	2017-06-08 09:10:47 +0000
+@@ -0,0 +1,46 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_ACL_TRANSACTION_INITIATOR_H
++#define SQUID_ACL_TRANSACTION_INITIATOR_H
++
++#include "acl/Acl.h"
++#include "acl/Checklist.h"
++#include "XactionInitiator.h"
++
++namespace Acl
++{
++
++/// transaction_initiator ACL
++class TransactionInitiator : public ACL
++{
++    MEMPROXY_CLASS(TransactionInitiator);
++
++public:
++    TransactionInitiator(char const *);
++
++    virtual ACL *clone()const;
++    virtual char const *typeString() const;
++    virtual void parse();
++    virtual int match(ACLChecklist *checklist);
++    virtual bool requiresRequest() const { return true; }
++    virtual SBufList dump() const;
++    virtual bool empty () const;
++
++protected:
++    static Prototype RegistryProtoype;
++    static TransactionInitiator RegistryEntry_;
++    char const *class_;
++    XactionInitiator::Initiators initiators_;
++    SBufList cfgWords; /// initiator names in the configured order
++};
++
++} // namespace Acl
++
++#endif /* SQUID_ACL_TRANSACTION_INITIATOR_H */
++
+
+=== modified file 'src/adaptation/ecap/Host.cc'
+--- src/adaptation/ecap/Host.cc	2017-01-01 00:12:22 +0000
++++ src/adaptation/ecap/Host.cc	2017-06-08 08:17:39 +0000
+@@ -1,40 +1,41 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 93    eCAP Interface */
+ 
+ #include "squid.h"
+ #include <libecap/adapter/service.h>
+ #include <libecap/common/names.h>
+ #include <libecap/common/registry.h>
+ #include "adaptation/ecap/Host.h"
+ #include "adaptation/ecap/MessageRep.h"
+ #include "adaptation/ecap/ServiceRep.h"
+ #include "base/TextException.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
++#include "MasterXaction.h"
+ 
+ const libecap::Name Adaptation::Ecap::protocolInternal("internal", libecap::Name::NextId());
+ const libecap::Name Adaptation::Ecap::protocolCacheObj("cache_object", libecap::Name::NextId());
+ const libecap::Name Adaptation::Ecap::protocolIcp("ICP", libecap::Name::NextId());
+ #if USE_HTCP
+ const libecap::Name Adaptation::Ecap::protocolHtcp("Htcp", libecap::Name::NextId());
+ #endif
+ const libecap::Name Adaptation::Ecap::protocolIcy("ICY", libecap::Name::NextId());
+ const libecap::Name Adaptation::Ecap::protocolUnknown("_unknown_", libecap::Name::NextId());
+ 
+ const libecap::Name Adaptation::Ecap::metaBypassable("bypassable", libecap::Name::NextId());
+ 
+ /// the host application (i.e., Squid) wrapper registered with libecap
+ static libecap::shared_ptr<Adaptation::Ecap::Host> TheHost;
+ 
+ Adaptation::Ecap::Host::Host()
+ {
+     // assign our host-specific IDs to well-known names
+     // this code can run only once
+ 
+@@ -145,39 +146,40 @@
+ std::ostream *
+ Adaptation::Ecap::Host::openDebug(libecap::LogVerbosity lv)
+ {
+     const int squidLevel = SquidLogLevel(lv);
+     const int squidSection = 93; // XXX: this should be a global constant
+     return Debug::Enabled(squidSection, squidLevel) ?
+            &Debug::Start(squidSection, squidLevel) :
+            nullptr;
+ }
+ 
+ void
+ Adaptation::Ecap::Host::closeDebug(std::ostream *debug)
+ {
+     if (debug)
+         Debug::Finish();
+ }
+ 
+ Adaptation::Ecap::Host::MessagePtr
+ Adaptation::Ecap::Host::newRequest() const
+ {
+-    return MessagePtr(new Adaptation::Ecap::MessageRep(new HttpRequest));
++    static const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initAdaptationOrphan_);
++    return MessagePtr(new Adaptation::Ecap::MessageRep(new HttpRequest(mx)));
+ }
+ 
+ Adaptation::Ecap::Host::MessagePtr
+ Adaptation::Ecap::Host::newResponse() const
+ {
+     return MessagePtr(new Adaptation::Ecap::MessageRep(new HttpReply));
+ }
+ 
+ void
+ Adaptation::Ecap::Host::Register()
+ {
+     if (!TheHost && SupportedVersion(libecap::VersionString(),
+                                      "Squid executable dynamically linked")) {
+         TheHost.reset(new Adaptation::Ecap::Host);
+         libecap::RegisterHost(TheHost);
+     }
+ }
+ 
+
+=== modified file 'src/adaptation/ecap/MessageRep.cc'
+--- src/adaptation/ecap/MessageRep.cc	2017-05-25 06:12:04 +0000
++++ src/adaptation/ecap/MessageRep.cc	2017-06-07 15:52:38 +0000
+@@ -190,41 +190,41 @@
+ {
+     if (name.assignedHostId())
+         return static_cast<AnyP::ProtocolType>(name.hostId());
+     return AnyP::PROTO_UNKNOWN;
+ }
+ 
+ /* RequestHeaderRep */
+ 
+ Adaptation::Ecap::RequestLineRep::RequestLineRep(HttpRequest &aMessage):
+     FirstLineRep(aMessage), theMessage(aMessage)
+ {
+ }
+ 
+ void
+ Adaptation::Ecap::RequestLineRep::uri(const Area &aUri)
+ {
+     // TODO: if method is not set, urlPath will assume it is not connect;
+     // Can we change urlParse API to remove the method parameter?
+     // TODO: optimize: urlPath should take constant URL buffer
+     char *buf = xstrdup(aUri.toString().c_str());
+-    const bool ok = urlParse(theMessage.method, buf, &theMessage);
++    const bool ok = urlParse(theMessage.method, buf, theMessage);
+     xfree(buf);
+     Must(ok);
+ }
+ 
+ Adaptation::Ecap::RequestLineRep::Area
+ Adaptation::Ecap::RequestLineRep::uri() const
+ {
+     const SBuf &fullUrl = theMessage.effectiveRequestUri();
+     // XXX: effectiveRequestUri() cannot return NULL or even empty string, some other problem?
+     Must(!fullUrl.isEmpty());
+     // optimize: avoid copying by having an Area::Detail that locks theMessage
+     return Area::FromTempBuffer(fullUrl.rawContent(), fullUrl.length());
+ }
+ 
+ void
+ Adaptation::Ecap::RequestLineRep::method(const Name &aMethod)
+ {
+     if (aMethod.assignedHostId()) {
+         const int id = aMethod.hostId();
+         Must(Http::METHOD_NONE < id && id < Http::METHOD_ENUM_END);
+
+=== modified file 'src/adaptation/ecap/XactionRep.cc'
+--- src/adaptation/ecap/XactionRep.cc	2017-02-16 11:51:56 +0000
++++ src/adaptation/ecap/XactionRep.cc	2017-06-08 10:33:43 +0000
+@@ -6,40 +6,41 @@
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 93    eCAP Interface */
+ 
+ #include "squid.h"
+ #include <libecap/common/area.h>
+ #include <libecap/common/delay.h>
+ #include <libecap/common/named_values.h>
+ #include <libecap/common/names.h>
+ #include <libecap/adapter/xaction.h>
+ #include "adaptation/Answer.h"
+ #include "adaptation/ecap/Config.h"
+ #include "adaptation/ecap/XactionRep.h"
+ #include "adaptation/Initiator.h"
+ #include "base/AsyncJobCalls.h"
+ #include "base/TextException.h"
+ #include "format/Format.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
++#include "MasterXaction.h"
+ #include "SquidTime.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Adaptation::Ecap::XactionRep, XactionRep);
+ 
+ /// a libecap Visitor for converting adapter transaction options to HttpHeader
+ class OptionsExtractor: public libecap::NamedValueVisitor
+ {
+ public:
+     typedef libecap::Name Name;
+     typedef libecap::Area Area;
+ 
+     OptionsExtractor(HttpHeader &aMeta): meta(aMeta) {}
+ 
+     // libecap::NamedValueVisitor API
+     virtual void visit(const Name &name, const Area &value) {
+         meta.putExt(name.image().c_str(), value.toString().c_str());
+     }
+ 
+     HttpHeader &meta; ///< where to put extracted options
+ };
+@@ -720,22 +721,30 @@
+         const BodyPipePointer &ap = rep->raw().body_pipe;
+         if (!ap)
+             buf.append(" !A", 3);
+         else if (ap->stillProducing(const_cast<XactionRep*>(this)))
+             buf.append(" Ap", 3);
+         else
+             buf.append(" A?", 3);
+     }
+ 
+     buf.appendf(" %s%u]", id.prefix(), id.value);
+ 
+     buf.terminate();
+ 
+     return buf.content();
+ }
+ 
+ void
+ Adaptation::Ecap::XactionRep::updateSources(Http::Message *adapted)
+ {
+     adapted->sources |= service().cfg().connectionEncryption ? Http::Message::srcEcaps : Http::Message::srcEcap;
++
++    // Update masterXaction object for adapted HTTP requests.
++    if (HttpRequest *adaptedReq = dynamic_cast<HttpRequest*>(adapted)) {
++        HttpRequest *request = dynamic_cast<HttpRequest*> (theCauseRep ?
++                               theCauseRep->raw().header : theVirginRep.raw().header);
++        Must(request);
++        adaptedReq->masterXaction = request->masterXaction;
++    }
+ }
+ 
+
+=== modified file 'src/adaptation/icap/ModXact.cc'
+--- src/adaptation/icap/ModXact.cc	2017-05-23 06:46:26 +0000
++++ src/adaptation/icap/ModXact.cc	2017-06-07 15:52:38 +0000
+@@ -11,40 +11,41 @@
+ #include "squid.h"
+ #include "AccessLogEntry.h"
+ #include "adaptation/Answer.h"
+ #include "adaptation/History.h"
+ #include "adaptation/icap/Client.h"
+ #include "adaptation/icap/Config.h"
+ #include "adaptation/icap/History.h"
+ #include "adaptation/icap/Launcher.h"
+ #include "adaptation/icap/ModXact.h"
+ #include "adaptation/icap/ServiceRep.h"
+ #include "adaptation/Initiator.h"
+ #include "auth/UserRequest.h"
+ #include "base/TextException.h"
+ #include "base64.h"
+ #include "comm.h"
+ #include "comm/Connection.h"
+ #include "err_detail_type.h"
+ #include "http/one/TeChunkedParser.h"
+ #include "HttpHeaderTools.h"
+ #include "HttpReply.h"
++#include "MasterXaction.h"
+ #include "SquidTime.h"
+ #include "URL.h"
+ 
+ // flow and terminology:
+ //     HTTP| --> receive --> encode --> write --> |network
+ //     end | <-- send    <-- parse  <-- read  <-- |end
+ 
+ // TODO: replace gotEncapsulated() with something faster; we call it often
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Adaptation::Icap, ModXact);
+ CBDATA_NAMESPACED_CLASS_INIT(Adaptation::Icap, ModXactLauncher);
+ 
+ static const size_t TheBackupLimit = BodyPipe::MaxCapacity;
+ 
+ Adaptation::Icap::ModXact::State::State()
+ {
+     memset(this, 0, sizeof(*this));
+ }
+ 
+ Adaptation::Icap::ModXact::ModXact(Http::Message *virginHeader,
+@@ -719,41 +720,41 @@
+         debugs(93,7, HERE << "will never start bypass because " << reason);
+         canStartBypass = false;
+     }
+     if (protectGroupBypass && includingGroupBypass) {
+         debugs(93,7, HERE << "not protecting group bypass because " << reason);
+         protectGroupBypass = false;
+     }
+ }
+ 
+ // note that allocation for echoing is done in handle204NoContent()
+ void Adaptation::Icap::ModXact::maybeAllocateHttpMsg()
+ {
+     if (adapted.header) // already allocated
+         return;
+ 
+     if (gotEncapsulated("res-hdr")) {
+         adapted.setHeader(new HttpReply);
+         setOutcome(service().cfg().method == ICAP::methodReqmod ?
+                    xoSatisfied : xoModified);
+     } else if (gotEncapsulated("req-hdr")) {
+-        adapted.setHeader(new HttpRequest);
++        adapted.setHeader(new HttpRequest(virginRequest().masterXaction));
+         setOutcome(xoModified);
+     } else
+         throw TexcHere("Neither res-hdr nor req-hdr in maybeAllocateHttpMsg()");
+ }
+ 
+ void Adaptation::Icap::ModXact::parseHeaders()
+ {
+     Must(state.parsingHeaders());
+ 
+     if (state.parsing == State::psIcapHeader) {
+         debugs(93, 5, HERE << "parse ICAP headers");
+         parseIcapHead();
+     }
+ 
+     if (state.parsing == State::psHttpHeader) {
+         debugs(93, 5, HERE << "parse HTTP headers");
+         parseHttpHead();
+     }
+ 
+     if (state.parsingHeaders()) { // need more data
+@@ -953,42 +954,42 @@
+ 
+     // We want to clone the HTTP message, but we do not want
+     // to copy some non-HTTP state parts that Http::Message kids carry in them.
+     // Thus, we cannot use a smart pointer, copy constructor, or equivalent.
+     // Instead, we simply write the HTTP message and "clone" it by parsing.
+     // TODO: use Http::Message::clone()!
+ 
+     Http::Message *oldHead = virgin.header;
+     debugs(93, 7, HERE << "cloning virgin message " << oldHead);
+ 
+     MemBuf httpBuf;
+ 
+     // write the virgin message into a memory buffer
+     httpBuf.init();
+     packHead(httpBuf, oldHead);
+ 
+     // allocate the adapted message and copy metainfo
+     Must(!adapted.header);
+     {
+         Http::MessagePointer newHead;
+-        if (dynamic_cast<const HttpRequest*>(oldHead)) {
+-            newHead = new HttpRequest;
++        if (const HttpRequest *r = dynamic_cast<const HttpRequest*>(oldHead)) {
++            newHead = new HttpRequest(r->masterXaction);
+         } else if (dynamic_cast<const HttpReply*>(oldHead)) {
+             newHead = new HttpReply;
+         }
+         Must(newHead);
+ 
+         newHead->inheritProperties(oldHead);
+ 
+         adapted.setHeader(newHead.getRaw());
+     }
+ 
+     // parse the buffer back
+     Http::StatusCode error = Http::scNone;
+ 
+     httpBuf.terminate(); // Http::Message::parse requires nil-terminated buffer
+     Must(adapted.header->parse(httpBuf.content(), httpBuf.contentSize(), true, &error));
+     Must(adapted.header->hdr_sz == httpBuf.contentSize()); // no leftovers
+ 
+     httpBuf.clean();
+ 
+     debugs(93, 7, HERE << "cloned virgin message " << oldHead << " to " <<
+@@ -1577,41 +1578,41 @@
+             uint8_t base64buf[base64_encode_len(MAX_LOGIN_SZ)];
+             size_t resultLen = base64_encode_update(&ctx, base64buf, strlen(value), reinterpret_cast<const uint8_t*>(value));
+             resultLen += base64_encode_final(&ctx, base64buf+resultLen);
+             buf.appendf("%s: %.*s\r\n", TheConfig.client_username_header, (int)resultLen, base64buf);
+         } else
+             buf.appendf("%s: %s\r\n", TheConfig.client_username_header, value);
+     }
+ #endif
+ }
+ 
+ void
+ Adaptation::Icap::ModXact::encapsulateHead(MemBuf &icapBuf, const char *section, MemBuf &httpBuf, const Http::Message *head)
+ {
+     // update ICAP header
+     icapBuf.appendf("%s=%d, ", section, (int) httpBuf.contentSize());
+ 
+     // begin cloning
+     Http::MessagePointer headClone;
+ 
+     if (const HttpRequest* old_request = dynamic_cast<const HttpRequest*>(head)) {
+-        HttpRequest::Pointer new_request(new HttpRequest);
++        HttpRequest::Pointer new_request(new HttpRequest(old_request->masterXaction));
+         // copy the request-line details
+         new_request->method = old_request->method;
+         new_request->url = old_request->url;
+         new_request->http_ver = old_request->http_ver;
+         headClone = new_request.getRaw();
+     } else if (const HttpReply *old_reply = dynamic_cast<const HttpReply*>(head)) {
+         HttpReply::Pointer new_reply(new HttpReply);
+         new_reply->sline = old_reply->sline;
+         headClone = new_reply.getRaw();
+     }
+     Must(headClone);
+     headClone->inheritProperties(head);
+ 
+     HttpHeaderPos pos = HttpHeaderInitPos;
+     while (HttpHeaderEntry* p_head_entry = head->header.getEntry(&pos))
+         headClone->header.addEntry(p_head_entry->clone());
+ 
+     // end cloning
+ 
+     // remove all hop-by-hop headers from the clone
+
+=== modified file 'src/adaptation/icap/Xaction.cc'
+--- src/adaptation/icap/Xaction.cc	2017-02-16 11:51:56 +0000
++++ src/adaptation/icap/Xaction.cc	2017-06-07 15:52:38 +0000
+@@ -80,41 +80,42 @@
+     icapReply(NULL),
+     attempts(0),
+     connection(NULL),
+     theService(aService),
+     commEof(false),
+     reuseConnection(true),
+     isRetriable(true),
+     isRepeatable(true),
+     ignoreLastWrite(false),
+     stopReason(NULL),
+     connector(NULL),
+     reader(NULL),
+     writer(NULL),
+     closer(NULL),
+     alep(new AccessLogEntry),
+     al(*alep),
+     cs(NULL)
+ {
+     debugs(93,3, typeName << " constructed, this=" << this <<
+            " [icapx" << id << ']'); // we should not call virtual status() here
+-    icapRequest = new HttpRequest;
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initAdaptation);
++    icapRequest = new HttpRequest(mx);
+     HTTPMSGLOCK(icapRequest);
+     icap_tr_start = current_time;
+     memset(&icap_tio_start, 0, sizeof(icap_tio_start));
+     memset(&icap_tio_finish, 0, sizeof(icap_tio_finish));
+ }
+ 
+ Adaptation::Icap::Xaction::~Xaction()
+ {
+     debugs(93,3, typeName << " destructed, this=" << this <<
+            " [icapx" << id << ']'); // we should not call virtual status() here
+     HTTPMSGUNLOCK(icapRequest);
+ }
+ 
+ AccessLogEntry::Pointer
+ Adaptation::Icap::Xaction::masterLogEntry()
+ {
+     AccessLogEntry::Pointer nil;
+     return nil;
+ }
+ 
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2017-05-16 14:27:49 +0000
++++ src/cf.data.pre	2017-06-07 15:13:45 +0000
+@@ -1282,40 +1282,62 @@
+ 	  #  ssl_bump bump acl3 markBumped
+ 	  #  ssl_bump splice all
+ 	  #
+ 	  #  # Second, do not send marked transactions to the redirector:
+ 	  #  acl markedBumped note bumped true
+ 	  #  url_rewrite_access deny markedBumped
+ 	  #
+ 	  #  # Note that the following would not have worked because acl3 alone
+ 	  #  # does not determine whether the connection is going to be bumped:
+ 	  #  url_rewrite_access deny acl3 # Wrong!
+ 
+ 	acl aclname adaptation_service service ...
+ 	  # Matches the name of any icap_service, ecap_service,
+ 	  # adaptation_service_set, or adaptation_service_chain that Squid
+ 	  # has used (or attempted to use) for the master transaction.
+ 	  # This ACL must be defined after the corresponding adaptation
+ 	  # service is named in squid.conf. This ACL is usable with
+ 	  # adaptation_meta because it starts matching immediately after
+ 	  # the service has been selected for adaptation.
+ 
++	acl aclname transaction_initiator initiator ...
++	  # Matches transaction's initiator [fast]
++	  #
++	  # Supported initiators are:
++	  #  esi: matches transactions fetching ESI resources
++	  #  certificate-fetching: matches transactions fetching
++	  #     a missing intermediate TLS certificate
++	  #  cache-digest: matches transactions fetching Cache Digests
++	  #     from a cache_peer
++	  #  htcp: matches HTCP requests from peers
++	  #  icp: matches ICP requests to peers
++	  #  icmp: matches ICMP RTT database (NetDB) requests to peers
++	  #  asn: matches asns db requests
++	  #  internal: matches any of the above
++	  #  client: matches transactions containing an HTTP or FTP
++	  #     client request received at a Squid *_port
++	  #  all: matches any transaction, including internal transactions
++	  #     without a configurable initiator and hopefully rare
++	  #     transactions without a known-to-Squid initiator
++	  #
++	  # Multiple initiators are ORed.
++
+ 	acl aclname has component
+ 	  # matches a transaction "component" [fast]
+ 	  #
+ 	  # Supported transaction components are:
+ 	  #  request: transaction has a request header (at least)
+ 	  #  response: transaction has a response header (at least)
+ 	  #  ALE: transaction has an internally-generated Access Log Entry
+ 	  #       structure; bugs notwithstanding, all transaction have it
+ 	  #
+ 	  # For example, the following configuration helps when dealing with HTTP
+ 	  # clients that close connections without sending a request header:
+ 	  #
+ 	  #  acl hasRequest has request
+ 	  #  acl logMe note important_transaction
+ 	  #  # avoid "logMe ACL is used in context without an HTTP request" warnings
+ 	  #  access_log ... logformat=detailed hasRequest logMe
+ 	  #  # log request-less transactions, instead of ignoring them
+ 	  #  access_log ... logformat=brief !hasRequest
+ 	  #
+ 	  # Multiple components are not supported for one "acl" rule, but
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2017-05-07 21:53:15 +0000
++++ src/client_side.cc	2017-06-07 15:52:32 +0000
+@@ -2777,43 +2777,45 @@
+         commSetTcpKeepalive(params.conn->fd, s->tcp_keepalive.idle, s->tcp_keepalive.interval, s->tcp_keepalive.timeout);
+     }
+     ++incoming_sockets_accepted;
+ 
+     // Socket is ready, setup the connection manager to start using it
+     auto *srv = Https::NewServer(xact);
+     AsyncJob::Start(srv); // usually async-calls postHttpsAccept()
+ }
+ 
+ void
+ ConnStateData::postHttpsAccept()
+ {
+     if (port->flags.tunnelSslBumping) {
+         debugs(33, 5, "accept transparent connection: " << clientConnection);
+ 
+         if (!Config.accessList.ssl_bump) {
+             httpsSslBumpAccessCheckDone(ACCESS_DENIED, this);
+             return;
+         }
+ 
++        MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
++        mx->tcpClient = clientConnection;
+         // Create a fake HTTP request for ssl_bump ACL check,
+         // using tproxy/intercept provided destination IP and port.
+-        HttpRequest *request = new HttpRequest();
++        HttpRequest *request = new HttpRequest(mx);
+         static char ip[MAX_IPSTRLEN];
+         assert(clientConnection->flags & (COMM_TRANSPARENT | COMM_INTERCEPTION));
+         request->url.host(clientConnection->local.toStr(ip, sizeof(ip)));
+         request->url.port(clientConnection->local.port());
+         request->myportname = port->name;
+ 
+         ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(Config.accessList.ssl_bump, request, NULL);
+         acl_checklist->src_addr = clientConnection->remote;
+         acl_checklist->my_addr = port->s;
+         // Build a local AccessLogEntry to allow requiresAle() acls work
+         acl_checklist->al = new AccessLogEntry;
+         acl_checklist->al->cache.start_time = current_time;
+         acl_checklist->al->tcpClient = clientConnection;
+         acl_checklist->al->cache.port = port;
+         acl_checklist->al->cache.caddr = log_addr;
+         HTTPMSGUNLOCK(acl_checklist->al->request);
+         acl_checklist->al->request = request;
+         HTTPMSGLOCK(acl_checklist->al->request);
+         acl_checklist->nonBlockingCheck(httpsSslBumpAccessCheckDone, this);
+         return;
+@@ -3420,43 +3422,45 @@
+     StoreIOBuffer tempBuffer;
+     tempBuffer.data = stream->reqbuf;
+     tempBuffer.length = HTTP_REQBUF_SZ;
+ 
+     ClientStreamData newServer = new clientReplyContext(http);
+     ClientStreamData newClient = stream;
+     clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, newServer, clientSocketRecipient,
+                      clientSocketDetach, newClient, tempBuffer);
+ 
+     http->uri = SBufToCstring(useHost);
+     stream->flags.parsed_ok = 1; // Do we need it?
+     stream->mayUseConnection(true);
+ 
+     AsyncCall::Pointer timeoutCall = commCbCall(5, 4, "clientLifetimeTimeout",
+                                      CommTimeoutCbPtrFun(clientLifetimeTimeout, stream->http));
+     commSetConnTimeout(clientConnection, Config.Timeout.lifetime, timeoutCall);
+ 
+     stream->registerWithConn();
+ 
++    MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
++    mx->tcpClient = clientConnection;
+     // Setup Http::Request object. Maybe should be replaced by a call to (modified)
+     // clientProcessRequest
+-    HttpRequest::Pointer request = new HttpRequest();
++    HttpRequest::Pointer request = new HttpRequest(mx);
+     AnyP::ProtocolType proto = (method == Http::METHOD_NONE) ? AnyP::PROTO_AUTHORITY_FORM : AnyP::PROTO_HTTP;
+     request->url.setScheme(proto, nullptr);
+     request->method = method;
+     request->url.host(useHost.c_str());
+     request->url.port(usePort);
+     http->request = request.getRaw();
+     HTTPMSGLOCK(http->request);
+ 
+     request->clientConnectionManager = this;
+ 
+     if (proto == AnyP::PROTO_HTTP)
+         request->header.putStr(Http::HOST, useHost.c_str());
+     request->flags.intercepted = ((clientConnection->flags & COMM_INTERCEPTION) != 0);
+     request->flags.interceptTproxy = ((clientConnection->flags & COMM_TRANSPARENT) != 0 );
+     request->sources |= ((switchedToHttps() || port->transport.protocol == AnyP::PROTO_HTTPS) ? Http::Message::srcHttps : Http::Message::srcHttp);
+ #if USE_AUTH
+     if (getAuth())
+         request->auth_user_request = getAuth();
+ #endif
+     request->client_addr = clientConnection->remote;
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2017-03-05 06:46:20 +0000
++++ src/client_side.h	2017-06-07 14:18:02 +0000
+@@ -1,36 +1,37 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 33    Client-side Routines */
+ 
+ #ifndef SQUID_CLIENTSIDE_H
+ #define SQUID_CLIENTSIDE_H
+ 
+ #include "base/RunnersRegistry.h"
+ #include "clientStreamForward.h"
+ #include "comm.h"
++#include "forward.h"
+ #include "helper/forward.h"
+ #include "http/forward.h"
+ #include "HttpControlMsg.h"
+ #include "ipc/FdNotes.h"
+ #include "sbuf/SBuf.h"
+ #include "servers/Server.h"
+ #if USE_AUTH
+ #include "auth/UserRequest.h"
+ #endif
+ #if USE_OPENSSL
+ #include "security/Handshake.h"
+ #include "ssl/support.h"
+ #endif
+ #if USE_DELAY_POOLS
+ #include "MessageBucket.h"
+ #endif
+ 
+ class ClientHttpRequest;
+ class HttpHdrRangeSpec;
+ 
+@@ -52,41 +53,41 @@
+  * fulfilled and what happens to the queue if the current one causes the client
+  * connection to be closed early.
+  *
+  * Act as a manager for the client connection and passes data in buffer to a
+  * Parser relevant to the state (message headers vs body) that is being
+  * processed.
+  *
+  * Performs HTTP message processing to kick off the actual HTTP request
+  * handling objects (Http::Stream, ClientHttpRequest, HttpRequest).
+  *
+  * Performs SSL-Bump processing for switching between HTTP and HTTPS protocols.
+  *
+  * To terminate a ConnStateData close() the client Comm::Connection it is
+  * managing, or for graceful half-close use the stopReceiving() or
+  * stopSending() methods.
+  */
+ class ConnStateData : public Server, public HttpControlMsgSink, private IndependentRunner
+ {
+ 
+ public:
+-    explicit ConnStateData(const MasterXaction::Pointer &xact);
++    explicit ConnStateData(const MasterXactionPointer &xact);
+     virtual ~ConnStateData();
+ 
+     /* ::Server API */
+     virtual void receivedFirstByte();
+     virtual bool handleReadData();
+     virtual void afterClientRead();
+     virtual void afterClientWrite(size_t);
+ 
+     /* HttpControlMsgSink API */
+     virtual void sendControlMsg(HttpControlMsg);
+     virtual void doneWithControlMsg();
+ 
+     /// Traffic parsing
+     bool clientParseRequests();
+     void readNextRequest();
+ 
+     /// try to make progress on a transaction or read more I/O
+     void kick();
+ 
+     bool isOpen() const;
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2017-03-23 12:55:36 +0000
++++ src/client_side_reply.cc	2017-06-07 15:52:32 +0000
+@@ -2256,41 +2256,42 @@
+         }
+     }
+ 
+     holdingBuffer = result;
+     processReplyAccess();
+     return;
+ }
+ 
+ /* Using this breaks the client layering just a little!
+  */
+ void
+ clientReplyContext::createStoreEntry(const HttpRequestMethod& m, RequestFlags reqFlags)
+ {
+     assert(http != NULL);
+     /*
+      * For erroneous requests, we might not have a h->request,
+      * so make a fake one.
+      */
+ 
+     if (http->request == NULL) {
+-        http->request = new HttpRequest(m, AnyP::PROTO_NONE, "http", null_string);
++        const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
++        http->request = new HttpRequest(m, AnyP::PROTO_NONE, "http", null_string, mx);
+         HTTPMSGLOCK(http->request);
+     }
+ 
+     StoreEntry *e = storeCreateEntry(storeId(), http->log_uri, reqFlags, m);
+ 
+     // Make entry collapsable ASAP, to increase collapsing chances for others,
+     // TODO: every must-revalidate and similar request MUST reach the origin,
+     // but do we have to prohibit others from collapsing on that request?
+     if (Config.onoff.collapsed_forwarding && reqFlags.cachable &&
+             !reqFlags.needValidation &&
+             (m == Http::METHOD_GET || m == Http::METHOD_HEAD)) {
+         // make the entry available for future requests now
+         Store::Root().allowCollapsing(e, reqFlags, m);
+     }
+ 
+     sc = storeClientListAdd(e, this);
+ 
+ #if USE_DELAY_POOLS
+     sc->setDelayId(DelayId::DelayClient(http));
+ #endif
+
+=== modified file 'src/client_side_request.cc'
+--- src/client_side_request.cc	2017-05-07 21:53:15 +0000
++++ src/client_side_request.cc	2017-06-07 15:52:32 +0000
+@@ -303,90 +303,88 @@
+         cbdataReferenceDone(conn_);
+ 
+     /* moving to the next connection is handled by the context free */
+     dlinkDelete(&active, &ClientActiveRequests);
+ 
+     PROF_stop(httpRequestFree);
+ }
+ 
+ /**
+  * Create a request and kick it off
+  *
+  * \retval 0     success
+  * \retval -1    failure
+  *
+  * TODO: Pass in the buffers to be used in the inital Read request, as they are
+  * determined by the user
+  */
+ int
+ clientBeginRequest(const HttpRequestMethod& method, char const *url, CSCB * streamcallback,
+                    CSD * streamdetach, ClientStreamData streamdata, HttpHeader const *header,
+-                   char *tailbuf, size_t taillen)
++                   char *tailbuf, size_t taillen, const MasterXaction::Pointer &mx)
+ {
+     size_t url_sz;
+     ClientHttpRequest *http = new ClientHttpRequest(NULL);
+     HttpRequest *request;
+     StoreIOBuffer tempBuffer;
+     if (http->al != NULL)
+         http->al->cache.start_time = current_time;
+     /* this is only used to adjust the connection offset in client_side.c */
+     http->req_sz = 0;
+     tempBuffer.length = taillen;
+     tempBuffer.data = tailbuf;
+     /* client stream setup */
+     clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, new clientReplyContext(http), streamcallback,
+                      streamdetach, streamdata, tempBuffer);
+     /* make it visible in the 'current acctive requests list' */
+     /* Set flags */
+     /* internal requests only makes sense in an
+      * accelerator today. TODO: accept flags ? */
+     http->flags.accel = true;
+     /* allow size for url rewriting */
+     url_sz = strlen(url) + Config.appendDomainLen + 5;
+     http->uri = (char *)xcalloc(url_sz, 1);
+     strcpy(http->uri, url);
+ 
+-    if ((request = HttpRequest::CreateFromUrl(http->uri, method)) == NULL) {
++    if ((request = HttpRequest::FromUrl(http->uri, mx, method)) == NULL) {
+         debugs(85, 5, "Invalid URL: " << http->uri);
+         return -1;
+     }
+ 
+     /*
+      * now update the headers in request with our supplied headers. urlParse
+      * should return a blank header set, but we use Update to be sure of
+      * correctness.
+      */
+     if (header)
+         request->header.update(header);
+ 
+     http->log_uri = xstrdup(urlCanonicalClean(request));
+ 
+     /* http struct now ready */
+ 
+     /*
+      * build new header list *? TODO
+      */
+     request->flags.accelerated = http->flags.accel;
+ 
+-    request->flags.internalClient = true;
+-
+     /* this is an internally created
+      * request, not subject to acceleration
+      * target overrides */
+     /*
+      * FIXME? Do we want to detect and handle internal requests of internal
+      * objects ?
+      */
+ 
+     /* Internally created requests cannot have bodies today */
+     request->content_length = 0;
+ 
+     request->client_addr.setNoAddr();
+ 
+ #if FOLLOW_X_FORWARDED_FOR
+     request->indirect_client_addr.setNoAddr();
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+ 
+     request->my_addr.setNoAddr();   /* undefined for internal requests */
+ 
+     request->my_addr.port(0);
+@@ -1259,41 +1257,41 @@
+             if (status == Http::scMovedPermanently
+                     || status == Http::scFound
+                     || status == Http::scSeeOther
+                     || status == Http::scPermanentRedirect
+                     || status == Http::scTemporaryRedirect) {
+                 http->redirect.status = status;
+                 http->redirect.location = xstrdup(urlNote);
+                 // TODO: validate the URL produced here is RFC 2616 compliant absolute URI
+             } else {
+                 debugs(85, DBG_CRITICAL, "ERROR: URL-rewrite produces invalid " << status << " redirect Location: " << urlNote);
+             }
+         } else {
+             // URL-rewrite wanted. Ew.
+             urlNote = reply.notes.findFirst("rewrite-url");
+ 
+             // prevent broken helpers causing too much damage. If old URL == new URL skip the re-write.
+             if (urlNote != NULL && strcmp(urlNote, http->uri)) {
+                 // XXX: validate the URL properly *without* generating a whole new request object right here.
+                 // XXX: the clone() should be done only AFTER we know the new URL is valid.
+                 HttpRequest *new_request = old_request->clone();
+-                if (urlParse(old_request->method, const_cast<char*>(urlNote), new_request)) {
++                if (urlParse(old_request->method, const_cast<char*>(urlNote), *new_request)) {
+                     debugs(61, 2, "URL-rewriter diverts URL from " << old_request->effectiveRequestUri() << " to " << new_request->effectiveRequestUri());
+ 
+                     // update the new request to flag the re-writing was done on it
+                     new_request->flags.redirected = true;
+ 
+                     // unlink bodypipe from the old request. Not needed there any longer.
+                     if (old_request->body_pipe != NULL) {
+                         old_request->body_pipe = NULL;
+                         debugs(61,2, HERE << "URL-rewriter diverts body_pipe " << new_request->body_pipe <<
+                                " from request " << old_request << " to " << new_request);
+                     }
+ 
+                     // update the current working ClientHttpRequest fields
+                     xfree(http->uri);
+                     http->uri = SBufToCstring(new_request->effectiveRequestUri());
+                     HTTPMSGUNLOCK(old_request);
+                     http->request = new_request;
+                     HTTPMSGLOCK(http->request);
+                 } else {
+                     debugs(85, DBG_CRITICAL, "ERROR: URL-rewrite produces invalid request: " <<
+
+=== modified file 'src/client_side_request.h'
+--- src/client_side_request.h	2017-02-16 11:51:56 +0000
++++ src/client_side_request.h	2017-06-07 14:18:51 +0000
+@@ -1,51 +1,52 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_CLIENTSIDEREQUEST_H
+ #define SQUID_CLIENTSIDEREQUEST_H
+ 
+ #include "AccessLogEntry.h"
+ #include "acl/forward.h"
+ #include "client_side.h"
+ #include "clientStream.h"
++#include "forward.h"
+ #include "http/forward.h"
+ #include "HttpHeaderRange.h"
+ #include "LogTags.h"
+ #include "Store.h"
+ 
+ #if USE_ADAPTATION
+ #include "adaptation/forward.h"
+ #include "adaptation/Initiator.h"
+ #endif
+ 
+ class ClientRequestContext;
+ class ConnStateData;
+ class MemObject;
+ 
+ /* client_side_request.c - client side request related routines (pure logic) */
+-int clientBeginRequest(const HttpRequestMethod&, char const *, CSCB *, CSD *, ClientStreamData, HttpHeader const *, char *, size_t);
++int clientBeginRequest(const HttpRequestMethod&, char const *, CSCB *, CSD *, ClientStreamData, HttpHeader const *, char *, size_t, const MasterXactionPointer &);
+ 
+ class ClientHttpRequest
+ #if USE_ADAPTATION
+     : public Adaptation::Initiator, // to start adaptation transactions
+       public BodyConsumer     // to receive reply bodies in request satisf. mode
+ #endif
+ {
+     CBDATA_CLASS(ClientHttpRequest);
+ 
+ public:
+     ClientHttpRequest(ConnStateData *csd);
+     ~ClientHttpRequest();
+     /* Not implemented - present to prevent synthetic operations */
+     ClientHttpRequest(ClientHttpRequest const &);
+     ClientHttpRequest& operator=(ClientHttpRequest const &);
+ 
+     String rangeBoundaryStr() const;
+     void freeResources();
+     void updateCounters();
+     void logRequest();
+
+=== modified file 'src/comm/TcpAcceptor.cc'
+--- src/comm/TcpAcceptor.cc	2017-02-04 16:30:49 +0000
++++ src/comm/TcpAcceptor.cc	2017-06-07 15:52:36 +0000
+@@ -311,41 +311,41 @@
+ void
+ Comm::TcpAcceptor::acceptNext()
+ {
+     Must(IsConnOpen(conn));
+     debugs(5, 2, HERE << "connection on " << conn);
+     acceptOne();
+ }
+ 
+ void
+ Comm::TcpAcceptor::notify(const Comm::Flag flag, const Comm::ConnectionPointer &newConnDetails) const
+ {
+     // listener socket handlers just abandon the port with Comm::ERR_CLOSING
+     // it should only happen when this object is deleted...
+     if (flag == Comm::ERR_CLOSING) {
+         return;
+     }
+ 
+     if (theCallSub != NULL) {
+         AsyncCall::Pointer call = theCallSub->callback();
+         CommAcceptCbParams &params = GetCommParams<CommAcceptCbParams>(call);
+-        params.xaction = new MasterXaction;
++        params.xaction = new MasterXaction(XactionInitiator::initClient);
+         params.xaction->squidPort = listenPort_;
+         params.fd = conn->fd;
+         params.conn = params.xaction->tcpClient = newConnDetails;
+         params.flag = flag;
+         params.xerrno = errcode;
+         ScheduleCallHere(call);
+     }
+ }
+ 
+ /**
+  * accept() and process
+  * Wait for an incoming connection on our listener socket.
+  *
+  * \retval Comm::OK         success. details parameter filled.
+  * \retval Comm::NOMESSAGE  attempted accept() but nothing useful came in.
+  * \retval Comm::COMM_ERROR      an outright failure occured.
+  *                         Or if this client has too many connections already.
+  */
+ Comm::Flag
+ Comm::TcpAcceptor::oldAccept(Comm::ConnectionPointer &details)
+
+=== modified file 'src/esi/Include.cc'
+--- src/esi/Include.cc	2017-01-01 00:12:22 +0000
++++ src/esi/Include.cc	2017-06-07 15:52:36 +0000
+@@ -282,42 +282,42 @@
+     tempheaders.removeHopByHopEntries();
+ }
+ 
+ void
+ ESIInclude::Start (ESIStreamContext::Pointer stream, char const *url, ESIVarState *vars)
+ {
+     if (!stream.getRaw())
+         return;
+ 
+     HttpHeader tempheaders(hoRequest);
+ 
+     prepareRequestHeaders(tempheaders, vars);
+ 
+     /* Ensure variable state is clean */
+     vars->feedData(url, strlen (url));
+ 
+     /* tempUrl is eaten by the request */
+     char const *tempUrl = vars->extractChar ();
+ 
+     debugs(86, 5, "ESIIncludeStart: Starting subrequest with url '" << tempUrl << "'");
+-
+-    if (clientBeginRequest(Http::METHOD_GET, tempUrl, esiBufferRecipient, esiBufferDetach, stream.getRaw(), &tempheaders, stream->localbuffer->buf, HTTP_REQBUF_SZ)) {
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initEsi);
++    if (clientBeginRequest(Http::METHOD_GET, tempUrl, esiBufferRecipient, esiBufferDetach, stream.getRaw(), &tempheaders, stream->localbuffer->buf, HTTP_REQBUF_SZ, mx)) {
+         debugs(86, DBG_CRITICAL, "starting new ESI subrequest failed");
+     }
+ 
+     tempheaders.clean();
+ }
+ 
+ ESIInclude::ESIInclude(esiTreeParentPtr aParent, int attrcount, char const **attr, ESIContext *aContext) :
+     varState(NULL),
+     srcurl(NULL),
+     alturl(NULL),
+     parent(aParent),
+     started(false),
+     sent(false)
+ {
+     assert (aContext);
+     memset(&flags, 0, sizeof(flags));
+ 
+     for (int i = 0; i < attrcount && attr[i]; i += 2) {
+         if (!strcmp(attr[i],"src")) {
+             /* Start a request for thisNode url */
+
+=== added file 'src/forward.h'
+--- src/forward.h	1970-01-01 00:00:00 +0000
++++ src/forward.h	2017-06-07 14:22:17 +0000
+@@ -0,0 +1,16 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SRC_FORWARD_H
++#define SQUID_SRC_FORWARD_H
++
++class MasterXaction;
++template <class C> class RefCount;
++typedef RefCount<MasterXaction> MasterXactionPointer;
++
++#endif
+
+=== modified file 'src/htcp.cc'
+--- src/htcp.cc	2017-01-01 00:12:22 +0000
++++ src/htcp.cc	2017-06-07 15:52:32 +0000
+@@ -661,41 +661,42 @@
+ 
+     /* Set REQ-HDRS */
+     s->req_hdrs = buf;
+     buf += l;
+     sz -= l;
+     s->reqHdrsSz = l;
+     debugs(31, 6, "htcpUnpackSpecifier: REQ-HDRS (" << l << "/" << sz << ") '" << s->req_hdrs << "'");
+ 
+     debugs(31, 3, "htcpUnpackSpecifier: " << sz << " bytes left");
+ 
+     /*
+      * Add terminating null to REQ-HDRS. This is possible because we allocated
+      * an extra byte when we received the packet. This will overwrite any following
+      * AUTH block.
+      */
+     *buf = '\0';
+ 
+     // Parse the request
+     method.HttpRequestMethodXXX(s->method);
+ 
+-    s->request = HttpRequest::CreateFromUrl(s->uri, method == Http::METHOD_NONE ? HttpRequestMethod(Http::METHOD_GET) : method);
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initHtcp);
++    s->request = HttpRequest::FromUrl(s->uri, mx, method == Http::METHOD_NONE ? HttpRequestMethod(Http::METHOD_GET) : method);
+     return s;
+ }
+ 
+ /*
+  * Unpack an HTCP DETAIL in place
+  * This will overwrite any following AUTH block
+  */
+ static htcpDetail *
+ htcpUnpackDetail(char *buf, int sz)
+ {
+     htcpDetail *d = new htcpDetail;
+ 
+     /* Find length of RESP-HDRS */
+     uint16_t l = ntohs(*(uint16_t *) buf);
+     sz -= 2;
+     buf += 2;
+ 
+     if (l > sz) {
+         debugs(31, 3, "htcpUnpackDetail: failed to unpack RESP_HDRS");
+         delete d;
+
+=== modified file 'src/icmp/net_db.cc'
+--- src/icmp/net_db.cc	2017-03-18 07:43:03 +0000
++++ src/icmp/net_db.cc	2017-06-07 15:52:36 +0000
+@@ -1257,41 +1257,42 @@
+     memFree(buf, MEM_4K_BUF);
+ #else
+ 
+     reply->setHeaders(Http::scBadRequest, "Bad Request", NULL, -1, squid_curtime, -2);
+     s->replaceHttpReply(reply);
+     storeAppendPrintf(s, "NETDB support not compiled into this Squid cache.\n");
+ #endif
+ 
+     s->complete();
+ }
+ 
+ void
+ netdbExchangeStart(void *data)
+ {
+ #if USE_ICMP
+     CachePeer *p = (CachePeer *)data;
+     static const SBuf netDB("netdb");
+     char *uri = internalRemoteUri(p->host, p->http_port, "/squid-internal-dynamic/", netDB);
+     debugs(38, 3, "netdbExchangeStart: Requesting '" << uri << "'");
+     assert(NULL != uri);
+-    HttpRequestPointer req(HttpRequest::CreateFromUrl(uri));
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initIcmp);
++    HttpRequestPointer req(HttpRequest::FromUrl(uri, mx));
+ 
+     if (!req) {
+         debugs(38, DBG_IMPORTANT, "netdbExchangeStart: Bad URI " << uri);
+         return;
+     }
+ 
+     netdbExchangeState *ex = new netdbExchangeState(p, req);
+     ex->e = storeCreateEntry(uri, uri, RequestFlags(), Http::METHOD_GET);
+     assert(NULL != ex->e);
+ 
+     StoreIOBuffer tempBuffer;
+     tempBuffer.length = ex->buf_sz;
+     tempBuffer.data = ex->buf;
+ 
+     ex->sc = storeClientListAdd(ex->e, ex);
+ 
+     storeClientCopy(ex->sc, ex->e, tempBuffer,
+                     netdbExchangeHandleReply, ex);
+     ex->r->flags.loopDetected = true;   /* cheat! -- force direct */
+ 
+
+=== modified file 'src/icp_v2.cc'
+--- src/icp_v2.cc	2017-01-01 00:12:22 +0000
++++ src/icp_v2.cc	2017-06-07 15:52:32 +0000
+@@ -422,42 +422,42 @@
+ 
+ char const *
+ icpGetUrlToSend(char *url)
+ {
+     if (strpbrk(url, w_space))
+         return rfc1738_escape(url);
+     else
+         return url;
+ }
+ 
+ HttpRequest *
+ icpGetRequest(char *url, int reqnum, int fd, Ip::Address &from)
+ {
+     if (strpbrk(url, w_space)) {
+         url = rfc1738_escape(url);
+         icpCreateAndSend(ICP_ERR, 0, rfc1738_escape(url), reqnum, 0, fd, from);
+         return NULL;
+     }
+ 
+     HttpRequest *result;
+-
+-    if ((result = HttpRequest::CreateFromUrl(url)) == NULL)
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initIcp);
++    if ((result = HttpRequest::FromUrl(url, mx)) == NULL)
+         icpCreateAndSend(ICP_ERR, 0, url, reqnum, 0, fd, from);
+ 
+     return result;
+ 
+ }
+ 
+ static void
+ doV2Query(int fd, Ip::Address &from, char *buf, icp_common_t header)
+ {
+     int rtt = 0;
+     int src_rtt = 0;
+     uint32_t flags = 0;
+     /* We have a valid packet */
+     char *url = buf + sizeof(icp_common_t) + sizeof(uint32_t);
+     HttpRequest *icp_request = icpGetRequest(url, header.reqnum, fd, from);
+ 
+     if (!icp_request)
+         return;
+ 
+     HTTPMSGLOCK(icp_request);
+
+=== modified file 'src/mgr/Inquirer.cc'
+--- src/mgr/Inquirer.cc	2017-01-01 00:12:22 +0000
++++ src/mgr/Inquirer.cc	2017-06-07 15:52:36 +0000
+@@ -59,41 +59,42 @@
+ Mgr::Inquirer::removeCloseHandler()
+ {
+     if (closer != NULL) {
+         comm_remove_close_handler(conn->fd, closer);
+         closer = NULL;
+     }
+ }
+ 
+ void
+ Mgr::Inquirer::start()
+ {
+     debugs(16, 5, HERE);
+     Ipc::Inquirer::start();
+     Must(Comm::IsConnOpen(conn));
+     Must(aggrAction != NULL);
+ 
+     std::unique_ptr<MemBuf> replyBuf;
+     if (strands.empty()) {
+         LOCAL_ARRAY(char, url, MAX_URL);
+         snprintf(url, MAX_URL, "%s", aggrAction->command().params.httpUri.termedBuf());
+-        HttpRequest *req = HttpRequest::CreateFromUrl(url);
++        const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initIpc);
++        HttpRequest *req = HttpRequest::FromUrl(url, mx);
+         ErrorState err(ERR_INVALID_URL, Http::scNotFound, req);
+         std::unique_ptr<HttpReply> reply(err.BuildHttpReply());
+         replyBuf.reset(reply->pack());
+     } else {
+         std::unique_ptr<HttpReply> reply(new HttpReply);
+         reply->setHeaders(Http::scOkay, NULL, "text/plain", -1, squid_curtime, squid_curtime);
+         reply->header.putStr(Http::HdrType::CONNECTION, "close"); // until we chunk response
+         replyBuf.reset(reply->pack());
+     }
+     writer = asyncCall(16, 5, "Mgr::Inquirer::noteWroteHeader",
+                        CommCbMemFunT<Inquirer, CommIoCbParams>(this, &Inquirer::noteWroteHeader));
+     Comm::Write(conn, replyBuf.get(), writer);
+ }
+ 
+ /// called when we wrote the response header
+ void
+ Mgr::Inquirer::noteWroteHeader(const CommIoCbParams& params)
+ {
+     debugs(16, 5, HERE);
+     writer = NULL;
+
+=== modified file 'src/mime.cc'
+--- src/mime.cc	2017-03-10 18:12:05 +0000
++++ src/mime.cc	2017-06-07 15:52:32 +0000
+@@ -386,41 +386,42 @@
+     }
+ 
+     struct stat sb;
+     errno = 0;
+     if (status == Http::scOkay && fstat(fd, &sb) < 0) {
+         int xerrno = errno;
+         debugs(25, DBG_CRITICAL, "ERROR: opening icon file " << path << " FD " << fd << ", fstat error " << xstrerr(xerrno));
+         file_close(fd);
+         status = Http::scNoContent;
+     }
+ 
+     // fill newEntry with a canned 2xx response object
+     RequestFlags flags;
+     flags.cachable = true;
+     StoreEntry *e = storeCreateEntry(url_,url_,flags,Http::METHOD_GET);
+     assert(e != NULL);
+     EBIT_SET(e->flags, ENTRY_SPECIAL);
+     e->setPublicKey();
+     e->buffer();
+ 
+-    HttpRequestPointer r(HttpRequest::CreateFromUrl(url_));
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initIcon);
++    HttpRequestPointer r(HttpRequest::FromUrl(url_, mx));
+     if (!r)
+         fatalf("mimeLoadIcon: cannot parse internal URL: %s", url_);
+ 
+     e->mem_obj->request = r;
+ 
+     HttpReplyPointer reply(new HttpReply);
+ 
+     if (status == Http::scNoContent)
+         reply->setHeaders(status, NULL, NULL, 0, -1, -1);
+     else
+         reply->setHeaders(status, NULL, mimeGetContentType(icon_.c_str()), sb.st_size, sb.st_mtime, -1);
+     reply->cache_control = new HttpHdrCc();
+     reply->cache_control->maxAge(86400);
+     reply->header.putCc(reply->cache_control);
+     e->replaceHttpReply(reply.getRaw());
+ 
+     if (status == Http::scOkay) {
+         /* read the file into the buffer and append it to store */
+         int n;
+         std::array<char, 4096> buf;
+
+=== modified file 'src/neighbors.cc'
+--- src/neighbors.cc	2017-05-22 16:49:36 +0000
++++ src/neighbors.cc	2017-06-07 15:52:32 +0000
+@@ -1365,41 +1365,42 @@
+ 
+     p->mcast.flags.count_event_pending = true;
+ }
+ 
+ static void
+ peerCountMcastPeersStart(void *data)
+ {
+     CachePeer *p = (CachePeer *)data;
+     ps_state *psstate;
+     StoreEntry *fake;
+     MemObject *mem;
+     icp_common_t *query;
+     int reqnum;
+     LOCAL_ARRAY(char, url, MAX_URL);
+     assert(p->type == PEER_MULTICAST);
+     p->mcast.flags.count_event_pending = false;
+     snprintf(url, MAX_URL, "http://");
+     p->in_addr.toUrl(url+7, MAX_URL -8 );
+     strcat(url, "/");
+     fake = storeCreateEntry(url, url, RequestFlags(), Http::METHOD_GET);
+-    HttpRequest *req = HttpRequest::CreateFromUrl(url);
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initPeerMcast);
++    HttpRequest *req = HttpRequest::FromUrl(url, mx);
+     psstate = new ps_state;
+     psstate->request = req;
+     HTTPMSGLOCK(psstate->request);
+     psstate->entry = fake;
+     psstate->callback = NULL;
+     psstate->callback_data = cbdataReference(p);
+     psstate->ping.start = current_time;
+     mem = fake->mem_obj;
+     mem->request = psstate->request;
+     mem->start_ping = current_time;
+     mem->ping_reply_callback = peerCountHandleIcpReply;
+     mem->ircb_data = psstate;
+     mcastSetTtl(icpOutgoingConn->fd, p->mcast.ttl);
+     p->mcast.id = mem->id;
+     reqnum = icpSetCacheKey((const cache_key *)fake->key);
+     query = _icp_common_t::createMessage(ICP_QUERY, 0, url, reqnum, 0);
+     icpUdpSend(icpOutgoingConn->fd, p->in_addr, query, LOG_ICP_QUERY, 0);
+     fake->ping_status = PING_WAITING;
+     eventAdd("peerCountMcastPeersDone",
+              peerCountMcastPeersDone,
+
+=== modified file 'src/peer_digest.cc'
+--- src/peer_digest.cc	2017-03-10 18:12:05 +0000
++++ src/peer_digest.cc	2017-06-07 15:52:32 +0000
+@@ -302,41 +302,42 @@
+ static void
+ peerDigestRequest(PeerDigest * pd)
+ {
+     CachePeer *p = pd->peer;
+     StoreEntry *e, *old_e;
+     char *url = NULL;
+     const cache_key *key;
+     HttpRequest *req;
+     StoreIOBuffer tempBuffer;
+ 
+     pd->req_result = NULL;
+     pd->flags.requested = true;
+ 
+     /* compute future request components */
+ 
+     if (p->digest_url)
+         url = xstrdup(p->digest_url);
+     else
+         url = xstrdup(internalRemoteUri(p->host, p->http_port, "/squid-internal-periodic/", SBuf(StoreDigestFileName)));
+ 
+-    req = HttpRequest::CreateFromUrl(url);
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initCacheDigest);
++    req = HttpRequest::FromUrl(url, mx);
+ 
+     assert(req);
+ 
+     key = storeKeyPublicByRequest(req);
+ 
+     debugs(72, 2, "peerDigestRequest: " << url << " key: " << storeKeyText(key));
+ 
+     /* add custom headers */
+     assert(!req->header.len);
+ 
+     req->header.putStr(Http::HdrType::ACCEPT, StoreDigestMimeStr);
+ 
+     req->header.putStr(Http::HdrType::ACCEPT, "text/html");
+ 
+     if (p->login &&
+             p->login[0] != '*' &&
+             strcmp(p->login, "PASS") != 0 &&
+             strcmp(p->login, "PASSTHRU") != 0 &&
+             strncmp(p->login, "NEGOTIATE",9) != 0 &&
+             strcmp(p->login, "PROXYPASS") != 0) {
+
+=== modified file 'src/security/PeerConnector.cc'
+--- src/security/PeerConnector.cc	2017-02-15 03:10:55 +0000
++++ src/security/PeerConnector.cc	2017-06-07 15:52:36 +0000
+@@ -612,41 +612,41 @@
+ 
+     PeerConnectorCertDownloaderDialer(Method method, Security::PeerConnector *pc):
+         method_(method),
+         peerConnector_(pc) {}
+ 
+     /* CallDialer API */
+     virtual bool canDial(AsyncCall &call) { return peerConnector_.valid(); }
+     virtual void dial(AsyncCall &call) { ((&(*peerConnector_))->*method_)(object, status); }
+     Method method_; ///< The Security::PeerConnector method to dial
+     CbcPointer<Security::PeerConnector> peerConnector_; ///< The Security::PeerConnector object
+ };
+ 
+ void
+ Security::PeerConnector::startCertDownloading(SBuf &url)
+ {
+     AsyncCall::Pointer certCallback = asyncCall(81, 4,
+                                       "Security::PeerConnector::certDownloadingDone",
+                                       PeerConnectorCertDownloaderDialer(&Security::PeerConnector::certDownloadingDone, this));
+ 
+     const Downloader *csd = (request ? dynamic_cast<const Downloader*>(request->downloader.valid()) : nullptr);
+-    Downloader *dl = new Downloader(url, certCallback, csd ? csd->nestedLevel() + 1 : 1);
++    Downloader *dl = new Downloader(url, certCallback, XactionInitiator::initCertFetcher, csd ? csd->nestedLevel() + 1 : 1);
+     AsyncJob::Start(dl);
+ }
+ 
+ void
+ Security::PeerConnector::certDownloadingDone(SBuf &obj, int downloadStatus)
+ {
+     ++certsDownloads;
+     debugs(81, 5, "Certificate downloading status: " << downloadStatus << " certificate size: " << obj.length());
+ 
+     // get ServerBio from SSL object
+     const int fd = serverConnection()->fd;
+     Security::SessionPointer session(fd_table[fd].ssl);
+     BIO *b = SSL_get_rbio(session.get());
+     Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(BIO_get_data(b));
+ 
+     // Parse Certificate. Assume that it is in DER format.
+     // According to RFC 4325:
+     //  The server must provide a DER encoded certificate or a collection
+     // collection of certificates in a "certs-only" CMS message.
+     //  The applications MUST accept DER encoded certificates and SHOULD
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2017-02-19 06:12:04 +0000
++++ src/servers/FtpServer.cc	2017-06-07 15:52:36 +0000
+@@ -711,41 +711,43 @@
+         }
+ 
+         // process USER request now because it sets FTP peer host name
+         if (cmd == cmdUser()) {
+             if (Http::Stream *errCtx = handleUserRequest(cmd, params))
+                 return errCtx;
+         }
+     }
+ 
+     if (!Ftp::SupportedCommand(cmd))
+         return earlyError(EarlyErrorKind::UnsupportedCommand);
+ 
+     const HttpRequestMethod method =
+         cmd == cmdAppe() || cmd == cmdStor() || cmd == cmdStou() ?
+         Http::METHOD_PUT : Http::METHOD_GET;
+ 
+     const SBuf *path = (params.length() && CommandHasPathParameter(cmd)) ?
+                        &params : NULL;
+     calcUri(path);
+     char *newUri = xstrdup(uri.c_str());
+-    HttpRequest *const request = HttpRequest::CreateFromUrl(newUri, method);
++    MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
++    mx->tcpClient = clientConnection;
++    HttpRequest *const request = HttpRequest::FromUrl(newUri, mx, method);
+     if (!request) {
+         debugs(33, 5, "Invalid FTP URL: " << uri);
+         uri.clear();
+         safe_free(newUri);
+         return earlyError(EarlyErrorKind::InvalidUri);
+     }
+ 
+     request->flags.ftpNative = true;
+     request->http_ver = Http::ProtocolVersion(Ftp::ProtocolVersion().major, Ftp::ProtocolVersion().minor);
+ 
+     // Our fake Request-URIs are not distinctive enough for caching to work
+     request->flags.cachable = false; // XXX: reset later by maybeCacheable()
+     request->flags.noCache = true;
+ 
+     request->header.putStr(Http::HdrType::FTP_COMMAND, cmd.c_str());
+     request->header.putStr(Http::HdrType::FTP_ARGUMENTS, params.c_str()); // may be ""
+     if (method == Http::METHOD_PUT) {
+         request->header.putStr(Http::HdrType::EXPECT, "100-continue");
+         request->header.putStr(Http::HdrType::TRANSFER_ENCODING, "chunked");
+     }
+
+=== modified file 'src/servers/Http1Server.cc'
+--- src/servers/Http1Server.cc	2017-01-30 12:46:15 +0000
++++ src/servers/Http1Server.cc	2017-06-07 15:52:36 +0000
+@@ -115,41 +115,43 @@
+             break;
+         default:
+             if (parser_->method() == METHOD_NONE || parser_->requestUri().length() == 0)
+                 // no method or url parsed, probably is wrong protocol
+                 errPage = ERR_PROTOCOL_UNKNOWN;
+             // else use default ERR_INVALID_REQ set above.
+             break;
+         }
+         // setLogUri should called before repContext->setReplyToError
+         setLogUri(http, http->uri, true);
+         const char * requestErrorBytes = inBuf.c_str();
+         if (!clientTunnelOnError(this, context, request, parser_->method(), errPage)) {
+             setReplyError(context, request, parser_->method(), errPage, parser_->parseStatusCode, requestErrorBytes);
+             // HttpRequest object not build yet, there is no reason to call
+             // clientProcessRequestFinished method
+         }
+ 
+         return false;
+     }
+ 
+-    if ((request = HttpRequest::CreateFromUrl(http->uri, parser_->method())) == NULL) {
++    MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
++    mx->tcpClient = clientConnection;
++    if ((request = HttpRequest::FromUrl(http->uri, mx, parser_->method())) == NULL) {
+         debugs(33, 5, "Invalid URL: " << http->uri);
+         // setLogUri should called before repContext->setReplyToError
+         setLogUri(http, http->uri, true);
+ 
+         const char * requestErrorBytes = inBuf.c_str();
+         if (!clientTunnelOnError(this, context, request, parser_->method(), ERR_INVALID_URL)) {
+             setReplyError(context, request, parser_->method(), ERR_INVALID_URL, Http::scBadRequest, requestErrorBytes);
+             // HttpRequest object not build yet, there is no reason to call
+             // clientProcessRequestFinished method
+         }
+         return false;
+     }
+ 
+     /* RFC 2616 section 10.5.6 : handle unsupported HTTP major versions cleanly. */
+     /* We currently only support 0.9, 1.0, 1.1 properly */
+     /* TODO: move HTTP-specific processing into servers/HttpServer and such */
+     if ( (parser_->messageProtocol().major == 0 && parser_->messageProtocol().minor != 9) ||
+             (parser_->messageProtocol().major > 1) ) {
+ 
+         debugs(33, 5, "Unsupported HTTP version discovered. :\n" << parser_->messageProtocol());
+
+=== modified file 'src/servers/Server.h'
+--- src/servers/Server.h	2017-01-01 00:12:22 +0000
++++ src/servers/Server.h	2017-06-07 14:21:02 +0000
+@@ -1,50 +1,51 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 33    Client-side Routines */
+ 
+ #ifndef SQUID_SERVERS_SERVER_H
+ #define SQUID_SERVERS_SERVER_H
+ 
+ #include "anyp/forward.h"
+ #include "anyp/ProtocolVersion.h"
+ #include "base/AsyncJob.h"
+ #include "BodyPipe.h"
+ #include "comm/Write.h"
+ #include "CommCalls.h"
++#include "forward.h"
+ #include "Pipeline.h"
+ #include "sbuf/SBuf.h"
+ 
+ /**
+  * Common base for all Server classes used
+  * to manage connections from clients.
+  */
+ class Server : virtual public AsyncJob, public BodyProducer
+ {
+ public:
+-    Server(const MasterXaction::Pointer &xact);
++    Server(const MasterXactionPointer &xact);
+     virtual ~Server() {}
+ 
+     /* AsyncJob API */
+     virtual void start();
+     virtual bool doneAll() const;
+     virtual void swanSong();
+ 
+     /// ??
+     virtual bool connFinishedWithConn(int size) = 0;
+ 
+     /// maybe grow the inBuf and schedule Comm::Read()
+     void readSomeData();
+ 
+     /**
+      * called when new request data has been read from the socket
+      *
+      * \retval false called comm_close or setReplyToError (the caller should bail)
+      * \retval true  we did not call comm_close or setReplyToError
+      */
+     virtual bool handleReadData() = 0;
+
+=== modified file 'src/store_digest.cc'
+--- src/store_digest.cc	2017-03-10 18:12:05 +0000
++++ src/store_digest.cc	2017-06-07 15:52:32 +0000
+@@ -404,41 +404,42 @@
+     RequestFlags flags;
+     char *url;
+     StoreEntry *e;
+ 
+     assert(store_digest);
+     /* prevent overlapping if rewrite schedule is too tight */
+ 
+     if (sd_state.rewrite_lock) {
+         debugs(71, DBG_IMPORTANT, "storeDigestRewrite: overlap detected, consider increasing rewrite period");
+         return;
+     }
+ 
+     debugs(71, 2, "storeDigestRewrite: start rewrite #" << sd_state.rewrite_count + 1);
+     /* make new store entry */
+     url = internalLocalUri("/squid-internal-periodic/", SBuf(StoreDigestFileName));
+     flags.cachable = true;
+     e = storeCreateEntry(url, url, flags, Http::METHOD_GET);
+     assert(e);
+     sd_state.rewrite_lock = e;
+     debugs(71, 3, "storeDigestRewrite: url: " << url << " key: " << e->getMD5Text());
+-    e->mem_obj->request = HttpRequest::CreateFromUrl(url);
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initCacheDigest);
++    e->mem_obj->request = HttpRequest::FromUrl(url, mx);
+     /* wait for rebuild (if any) to finish */
+ 
+     if (sd_state.rebuild_lock) {
+         debugs(71, 2, "storeDigestRewriteStart: waiting for rebuild to finish.");
+         return;
+     }
+ 
+     storeDigestRewriteResume();
+ }
+ 
+ static void
+ storeDigestRewriteResume(void)
+ {
+     StoreEntry *e;
+ 
+     assert(sd_state.rewrite_lock);
+     assert(!sd_state.rebuild_lock);
+     e = sd_state.rewrite_lock;
+     sd_state.rewrite_offset = 0;
+     EBIT_SET(e->flags, ENTRY_SPECIAL);
+
+=== modified file 'src/tests/stub_HttpRequest.cc'
+--- src/tests/stub_HttpRequest.cc	2017-02-16 11:51:56 +0000
++++ src/tests/stub_HttpRequest.cc	2017-06-07 15:52:36 +0000
+@@ -1,60 +1,61 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "AccessLogEntry.h"
+ #include "HttpRequest.h"
++#include "MasterXaction.h"
+ 
+ #define STUB_API "HttpRequest.cc"
+ #include "tests/STUB.h"
+ 
+ // void httpRequestPack(void *obj, Packable *p);
+ 
+-HttpRequest::HttpRequest() : Http::Message(hoRequest) {STUB}
+-HttpRequest::HttpRequest(const HttpRequestMethod &, AnyP::ProtocolType, const char *, const char *) : Http::Message(hoRequest) {STUB}
++HttpRequest::HttpRequest(const MasterXactionPointer&) : Http::Message(hoRequest) {STUB}
++HttpRequest::HttpRequest(const HttpRequestMethod &, AnyP::ProtocolType, const char *, const char *, const MasterXactionPointer &) : Http::Message(hoRequest) {STUB}
+ HttpRequest::~HttpRequest() STUB
+ void HttpRequest::reset() STUB
+ void HttpRequest::initHTTP(const HttpRequestMethod &, AnyP::ProtocolType, const char *, const char *) STUB
+ HttpRequest * HttpRequest::clone() const STUB_RETVAL(NULL)
+ bool HttpRequest::maybeCacheable() STUB_RETVAL(false)
+ bool HttpRequest::conditional() const STUB_RETVAL(false)
+ bool HttpRequest::canHandle1xx() const STUB_RETVAL(false)
+ #if USE_ADAPTATION
+ Adaptation::History::Pointer HttpRequest::adaptLogHistory() const STUB_RETVAL(Adaptation::History::Pointer())
+ Adaptation::History::Pointer HttpRequest::adaptHistory(bool) const STUB_RETVAL(Adaptation::History::Pointer())
+ void HttpRequest::adaptHistoryImport(const HttpRequest &) STUB
+ #endif
+ #if ICAP_CLIENT
+ Adaptation::Icap::History::Pointer HttpRequest::icapHistory() const STUB_RETVAL(Adaptation::Icap::History::Pointer())
+ #endif
+ void HttpRequest::recordLookup(const Dns::LookupDetails &) STUB
+ void HttpRequest::detailError(err_type, int) STUB
+ void HttpRequest::clearError() STUB
+ void HttpRequest::clean() STUB
+ void HttpRequest::init() STUB
+ static const SBuf nilSBuf;
+ const SBuf &HttpRequest::effectiveRequestUri() const STUB_RETVAL(nilSBuf)
+ bool HttpRequest::multipartRangeRequest() const STUB_RETVAL(false)
+ bool HttpRequest::parseFirstLine(const char *, const char *) STUB_RETVAL(false)
+ bool HttpRequest::expectingBody(const HttpRequestMethod &, int64_t &) const STUB_RETVAL(false)
+ bool HttpRequest::bodyNibbled() const STUB_RETVAL(false)
+ int HttpRequest::prefixLen() const STUB_RETVAL(0)
+ void HttpRequest::swapOut(StoreEntry *) STUB
+ void HttpRequest::pack(Packable *) const STUB
+ void HttpRequest::httpRequestPack(void *, Packable *) STUB
+-HttpRequest * HttpRequest::CreateFromUrl(char *, const HttpRequestMethod &) STUB_RETVAL(NULL)
++HttpRequest * HttpRequest::FromUrl(char *, const MasterXaction::Pointer &, const HttpRequestMethod &) STUB_RETVAL(NULL)
+ ConnStateData *HttpRequest::pinnedConnection() STUB_RETVAL(NULL)
+ const SBuf HttpRequest::storeId() STUB_RETVAL(SBuf("."))
+ void HttpRequest::ignoreRange(const char *) STUB
+ int64_t HttpRequest::getRangeOffsetLimit() STUB_RETVAL(0)
+ void HttpRequest::packFirstLineInto(Packable *, bool) const STUB
+ bool HttpRequest::sanityCheckStartLine(const char *, const size_t, Http::StatusCode *) STUB_RETVAL(false)
+ void HttpRequest::hdrCacheInit() STUB
+ bool HttpRequest::inheritProperties(const Http::Message *) STUB_RETVAL(false)
+ NotePairs::Pointer HttpRequest::notes() STUB_RETVAL(NotePairs::Pointer())
+ 
+
+=== modified file 'src/tests/stub_url.cc'
+--- src/tests/stub_url.cc	2017-05-23 12:12:15 +0000
++++ src/tests/stub_url.cc	2017-06-07 15:52:36 +0000
+@@ -13,32 +13,32 @@
+ 
+ #include "URL.h"
+ URL::URL(AnyP::UriScheme const &) {STUB}
+ void URL::touch() STUB
+ void URL::host(const char *) STUB
+ static SBuf nil;
+ const SBuf &URL::path() const STUB_RETVAL(nil)
+ const SBuf &URL::SlashPath()
+ {
+     static SBuf slash("/");
+     return slash;
+ }
+ const SBuf &URL::Asterisk()
+ {
+     static SBuf asterisk("*");
+     return asterisk;
+ }
+ SBuf &URL::authority(bool) const STUB_RETVAL(nil)
+ SBuf &URL::absolute() const STUB_RETVAL(nil)
+ void urlInitialize() STUB
+-HttpRequest *urlParse(const HttpRequestMethod&, char *, HttpRequest *) STUB_RETVAL(nullptr)
++bool urlParse(const HttpRequestMethod&, char *, HttpRequest &) STUB_RETVAL(true)
+ char *urlCanonicalClean(const HttpRequest *) STUB_RETVAL(nullptr)
+ const char *urlCanonicalFakeHttps(const HttpRequest *) STUB_RETVAL(nullptr)
+ bool urlIsRelative(const char *) STUB_RETVAL(false)
+ char *urlMakeAbsolute(const HttpRequest *, const char *)STUB_RETVAL(nullptr)
+ char *urlRInternal(const char *, unsigned short, const char *, const char *) STUB_RETVAL(nullptr)
+ char *urlInternal(const char *, const char *) STUB_RETVAL(nullptr)
+ int matchDomainName(const char *, const char *, uint) STUB_RETVAL(0)
+ int urlCheckRequest(const HttpRequest *) STUB_RETVAL(0)
+ char *urlHostname(const char *) STUB_RETVAL(nullptr)
+ void urlExtMethodConfigure() STUB
+ 
+
+=== modified file 'src/tests/testHttpRequest.cc'
+--- src/tests/testHttpRequest.cc	2017-03-03 23:18:25 +0000
++++ src/tests/testHttpRequest.cc	2017-06-07 15:52:36 +0000
+@@ -1,174 +1,179 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ 
+ #include <cppunit/TestAssert.h>
+ 
+ #include "HttpHeader.h"
+ #include "HttpRequest.h"
+ #include "mime_header.h"
++#include "MasterXaction.h"
+ #include "testHttpRequest.h"
+ #include "unitTestMain.h"
+ 
+ CPPUNIT_TEST_SUITE_REGISTRATION( testHttpRequest );
+ 
+ /** wrapper for testing HttpRequest object private and protected functions */
+ class PrivateHttpRequest : public HttpRequest
+ {
+ public:
++    PrivateHttpRequest(const MasterXactionPointer &mx) : HttpRequest(mx) {}
+     bool doSanityCheckStartLine(const char *b, const size_t h, Http::StatusCode *e) { return sanityCheckStartLine(b,h,e); };
+ };
+ 
+ /* init memory pools */
+ 
+ void
+ testHttpRequest::setUp()
+ {
+     Mem::Init();
+     AnyP::UriScheme::Init();
+     httpHeaderInitModule();
+ }
+ 
+ /*
+  * Test creating an HttpRequest object from a Url and method
+  */
+ void
+ testHttpRequest::testCreateFromUrl()
+ {
+     /* vanilla url, implict method */
+     unsigned short expected_port;
+     char * url = xstrdup("http://foo:90/bar");
+-    HttpRequest *aRequest = HttpRequest::CreateFromUrl(url);
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
++    HttpRequest *aRequest = HttpRequest::FromUrl(url, mx);
+     expected_port = 90;
+     CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_GET);
+     CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(SBuf("/bar"), aRequest->url.path());
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://foo:90/bar"), String(url));
+     xfree(url);
+ 
+     /* vanilla url */
+     url = xstrdup("http://foo:90/bar");
+-    aRequest = HttpRequest::CreateFromUrl(url, Http::METHOD_GET);
++    aRequest = HttpRequest::FromUrl(url, mx, Http::METHOD_GET);
+     expected_port = 90;
+     CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_GET);
+     CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(SBuf("/bar"), aRequest->url.path());
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://foo:90/bar"), String(url));
+     xfree(url);
+ 
+     /* vanilla url, different method */
+     url = xstrdup("http://foo/bar");
+-    aRequest = HttpRequest::CreateFromUrl(url, Http::METHOD_PUT);
++    aRequest = HttpRequest::FromUrl(url, mx, Http::METHOD_PUT);
+     expected_port = 80;
+     CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_PUT);
+     CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(SBuf("/bar"), aRequest->url.path());
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://foo/bar"), String(url));
+     xfree(url);
+ 
+     /* a connect url with non-CONNECT data */
+     HttpRequest *nullRequest = nullptr;
+     url = xstrdup(":foo/bar");
+-    aRequest = HttpRequest::CreateFromUrl(url, Http::METHOD_CONNECT);
++    aRequest = HttpRequest::FromUrl(url, mx, Http::METHOD_CONNECT);
+     xfree(url);
+     CPPUNIT_ASSERT_EQUAL(nullRequest, aRequest);
+ 
+     /* a CONNECT url with CONNECT data */
+     url = xstrdup("foo:45");
+-    aRequest = HttpRequest::CreateFromUrl(url, Http::METHOD_CONNECT);
++    aRequest = HttpRequest::FromUrl(url, mx, Http::METHOD_CONNECT);
+     expected_port = 45;
+     CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_CONNECT);
+     CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(SBuf(), aRequest->url.path());
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_NONE, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("foo:45"), String(url));
+     xfree(url);
+ 
+     // XXX: check METHOD_NONE input handling
+ }
+ 
+ /*
+  * Test BUG: URL '2000:800:45' opens host 2000 port 800 !!
+  */
+ void
+ testHttpRequest::testIPv6HostColonBug()
+ {
+     unsigned short expected_port;
+     char * url = NULL;
+     HttpRequest *aRequest = NULL;
+ 
+     /* valid IPv6 address without port */
+     url = xstrdup("http://[2000:800::45]/foo");
+-    aRequest = HttpRequest::CreateFromUrl(url, Http::METHOD_GET);
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
++    aRequest = HttpRequest::FromUrl(url, mx, Http::METHOD_GET);
+     expected_port = 80;
+     CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_GET);
+     CPPUNIT_ASSERT_EQUAL(String("[2000:800::45]"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(SBuf("/foo"), aRequest->url.path());
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://[2000:800::45]/foo"), String(url));
+     xfree(url);
+ 
+     /* valid IPv6 address with port */
+     url = xstrdup("http://[2000:800::45]:90/foo");
+-    aRequest = HttpRequest::CreateFromUrl(url, Http::METHOD_GET);
++    aRequest = HttpRequest::FromUrl(url, mx, Http::METHOD_GET);
+     expected_port = 90;
+     CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_GET);
+     CPPUNIT_ASSERT_EQUAL(String("[2000:800::45]"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(SBuf("/foo"), aRequest->url.path());
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://[2000:800::45]:90/foo"), String(url));
+     xfree(url);
+ 
+     /* IPv6 address as invalid (bug trigger) */
+     url = xstrdup("http://2000:800::45/foo");
+-    aRequest = HttpRequest::CreateFromUrl(url, Http::METHOD_GET);
++    aRequest = HttpRequest::FromUrl(url, mx, Http::METHOD_GET);
+     expected_port = 80;
+     CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_GET);
+     CPPUNIT_ASSERT_EQUAL(String("[2000:800::45]"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(SBuf("/foo"), aRequest->url.path());
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://2000:800::45/foo"), String(url));
+     xfree(url);
+ }
+ 
+ void
+ testHttpRequest::testSanityCheckStartLine()
+ {
+     MemBuf input;
+-    PrivateHttpRequest engine;
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
++    PrivateHttpRequest engine(mx);
+     Http::StatusCode error = Http::scNone;
+     size_t hdr_len;
+     input.init();
+ 
+     // a valid request line
+     input.append("GET / HTTP/1.1\n\n", 16);
+     hdr_len = headersEnd(input.content(), input.contentSize());
+     CPPUNIT_ASSERT(engine.doSanityCheckStartLine(input.content(), hdr_len, &error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append("GET  /  HTTP/1.1\n\n", 18);
+     hdr_len = headersEnd(input.content(), input.contentSize());
+     CPPUNIT_ASSERT(engine.doSanityCheckStartLine(input.content(), hdr_len, &error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     // strange but valid methods
+
+=== modified file 'src/url.cc'
+--- src/url.cc	2017-02-20 13:10:21 +0000
++++ src/url.cc	2017-06-07 15:52:32 +0000
+@@ -1,47 +1,47 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 23    URL Parsing */
+ 
+ #include "squid.h"
+ #include "globals.h"
+ #include "HttpRequest.h"
+ #include "rfc1738.h"
+ #include "SquidConfig.h"
+ #include "SquidString.h"
+ #include "URL.h"
+ 
+-static HttpRequest *urlParseFinish(const HttpRequestMethod& method,
++static bool urlParseFinish(const HttpRequestMethod& method,
+                                    const AnyP::ProtocolType protocol,
+                                    const char *const protoStr,
+                                    const char *const urlpath,
+                                    const char *const host,
+                                    const SBuf &login,
+                                    const int port,
+-                                   HttpRequest *request);
+-static HttpRequest *urnParse(const HttpRequestMethod& method, char *urn, HttpRequest *request);
++                                   HttpRequest &request);
++static bool urnParse(const HttpRequestMethod& method, char *urn, HttpRequest &request);
+ static const char valid_hostname_chars_u[] =
+     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+     "abcdefghijklmnopqrstuvwxyz"
+     "0123456789-._"
+     "[:]"
+     ;
+ static const char valid_hostname_chars[] =
+     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+     "abcdefghijklmnopqrstuvwxyz"
+     "0123456789-."
+     "[:]"
+     ;
+ 
+ const SBuf &
+ URL::Asterisk()
+ {
+     static SBuf star("*");
+     return star;
+ }
+ 
+@@ -162,60 +162,59 @@
+         return AnyP::PROTO_WAIS;
+ 
+     if (strncasecmp(b, "cache_object", len) == 0)
+         return AnyP::PROTO_CACHE_OBJECT;
+ 
+     if (strncasecmp(b, "urn", len) == 0)
+         return AnyP::PROTO_URN;
+ 
+     if (strncasecmp(b, "whois", len) == 0)
+         return AnyP::PROTO_WHOIS;
+ 
+     if (len > 0)
+         return AnyP::PROTO_UNKNOWN;
+ 
+     return AnyP::PROTO_NONE;
+ }
+ 
+ /*
+  * Parse a URI/URL.
+  *
+- * If the 'request' arg is non-NULL, put parsed values there instead
+- * of allocating a new HttpRequest.
++ * Stores parsed values in the `request` argument.
+  *
+  * This abuses HttpRequest as a way of representing the parsed url
+  * and its components.
+  * method is used to switch parsers and to init the HttpRequest.
+  * If method is Http::METHOD_CONNECT, then rather than a URL a hostname:port is
+  * looked for.
+  * The url is non const so that if its too long we can NULL-terminate it in place.
+  */
+ 
+ /*
+  * This routine parses a URL. Its assumed that the URL is complete -
+  * ie, the end of the string is the end of the URL. Don't pass a partial
+  * URL here as this routine doesn't have any way of knowing whether
+  * its partial or not (ie, it handles the case of no trailing slash as
+  * being "end of host with implied path of /".
+  */
+-HttpRequest *
+-urlParse(const HttpRequestMethod& method, char *url, HttpRequest *request)
++bool
++urlParse(const HttpRequestMethod& method, char *url, HttpRequest &request)
+ {
+     LOCAL_ARRAY(char, proto, MAX_URL);
+     LOCAL_ARRAY(char, login, MAX_URL);
+     LOCAL_ARRAY(char, host, MAX_URL);
+     LOCAL_ARRAY(char, urlpath, MAX_URL);
+     char *t = NULL;
+     char *q = NULL;
+     int port;
+     AnyP::ProtocolType protocol = AnyP::PROTO_NONE;
+     int l;
+     int i;
+     const char *src;
+     char *dst;
+     proto[0] = host[0] = urlpath[0] = login[0] = '\0';
+ 
+     if ((l = strlen(url)) + Config.appendDomainLen > (MAX_URL - 1)) {
+         /* terminate so it doesn't overflow other buffers */
+         *(url + (MAX_URL >> 1)) = '\0';
+         debugs(23, DBG_IMPORTANT, "urlParse: URL too large (" << l << " bytes)");
+         return NULL;
+@@ -429,72 +428,63 @@
+             t = q = urlpath;
+             while (*t) {
+                 if (!xisspace(*t)) {
+                     *q = *t;
+                     ++q;
+                 }
+                 ++t;
+             }
+             *q = '\0';
+         }
+     }
+ 
+     return urlParseFinish(method, protocol, proto, urlpath, host, SBuf(login), port, request);
+ }
+ 
+ /**
+  * Update request with parsed URI data.  If the request arg is
+  * non-NULL, put parsed values there instead of allocating a new
+  * HttpRequest.
+  */
+-static HttpRequest *
++static bool
+ urlParseFinish(const HttpRequestMethod& method,
+                const AnyP::ProtocolType protocol,
+                const char *const protoStr, // for unknown protocols
+                const char *const urlpath,
+                const char *const host,
+                const SBuf &login,
+                const int port,
+-               HttpRequest *request)
++               HttpRequest &request)
+ {
+-    if (NULL == request)
+-        request = new HttpRequest(method, protocol, protoStr, urlpath);
+-    else {
+-        request->initHTTP(method, protocol, protoStr, urlpath);
+-    }
+-
+-    request->url.host(host);
+-    request->url.userInfo(login);
+-    request->url.port(port);
+-    return request;
++    request.initHTTP(method, protocol, protoStr, urlpath);
++    request.url.host(host);
++    request.url.userInfo(login);
++    request.url.port(port);
++    return true;
+ }
+ 
+-static HttpRequest *
+-urnParse(const HttpRequestMethod& method, char *urn, HttpRequest *request)
++static bool
++urnParse(const HttpRequestMethod& method, char *urn, HttpRequest &request)
+ {
+     debugs(50, 5, "urnParse: " << urn);
+-    if (request) {
+-        request->initHTTP(method, AnyP::PROTO_URN, "urn", urn + 4);
+-        return request;
+-    }
+-
+-    return new HttpRequest(method, AnyP::PROTO_URN, "urn", urn + 4);
++    request.initHTTP(method, AnyP::PROTO_URN, "urn", urn + 4);
++    return true;
+ }
+ 
+ void
+ URL::touch()
+ {
+     absolute_.clear();
+     authorityHttp_.clear();
+     authorityWithPort_.clear();
+ }
+ 
+ SBuf &
+ URL::authority(bool requirePort) const
+ {
+     if (authorityHttp_.isEmpty()) {
+ 
+         // both formats contain Host/IP
+         authorityWithPort_.append(host());
+         authorityHttp_ = authorityWithPort_;
+ 
+         // authorityForm_ only has :port if it is non-default
+
+=== modified file 'src/urn.cc'
+--- src/urn.cc	2017-01-01 00:12:22 +0000
++++ src/urn.cc	2017-06-07 15:52:32 +0000
+@@ -134,41 +134,41 @@
+ 
+     return SBufToCstring(urlpath);
+ }
+ 
+ void
+ UrnState::setUriResFromRequest(HttpRequest *r)
+ {
+     static const SBuf menu(".menu");
+     if (r->url.path().startsWith(menu)) {
+         r->url.path(r->url.path().substr(5)); // strip prefix "menu."
+         flags.force_menu = true;
+     }
+ 
+     SBuf uri = r->url.path();
+     LOCAL_ARRAY(char, local_urlres, 4096);
+     char *host = getHost(uri);
+     snprintf(local_urlres, 4096, "http://%s/uri-res/N2L?urn:" SQUIDSBUFPH, host, SQUIDSBUFPRINT(uri));
+     safe_free(host);
+     safe_free(urlres);
+     urlres = xstrdup(local_urlres);
+-    urlres_r = HttpRequest::CreateFromUrl(urlres);
++    urlres_r = HttpRequest::FromUrl(urlres, r->masterXaction);
+ 
+     if (urlres_r == NULL) {
+         debugs(52, 3, "urnStart: Bad uri-res URL " << urlres);
+         ErrorState *err = new ErrorState(ERR_URN_RESOLVE, Http::scNotFound, r);
+         err->url = urlres;
+         urlres = NULL;
+         errorAppendEntry(entry, err);
+         return;
+     }
+ 
+     urlres_r->header.putStr(Http::HdrType::ACCEPT, "text/plain");
+ }
+ 
+ void
+ UrnState::start(HttpRequest * r, StoreEntry * e)
+ {
+     debugs(52, 3, "urnStart: '" << e->url() << "'" );
+     entry = e;
+     request = r;
+ 
+

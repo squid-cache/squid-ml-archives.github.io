@@ -1,0 +1,2388 @@
+Fix [reopened] bug 2833.
+
+A security fix made in r14979 had a negative effect on collapsed
+forwarding. All "private" entries were considered automatically
+non-shareable among collapsed clients. However this is not true: there
+are many situations when collapsed forwarding should work despite of
+"private" entry status: 304/5xx responses are good examples of that.
+This patch fixes that by means of a new StoreEntry::shareableWhenPrivate
+flag.
+
+The suggested fix is not complete: to cover all possible situations we
+need to decide whether StoreEntry::shareableWhenPrivate is true or not
+for all contexts where StoreEntry::setPrivateKey() is used. This patch
+fixes only few important cases inside http.cc, making CF (as well
+collapsed revalidation) work for some [non-cacheable] response status
+codes, including 3xx, 5xx and some others.
+
+Also: avoid sending 304 responses for non-conditional requests.
+Before this change, the original 'non-conditional' HttpRequest was still
+marked (and processed) as 'conditional' after revalidation completion.
+That happened because 'Last-Modified' and 'ETag' values were not
+saved/restored while performing internal revalidation request.
+
+=== modified file 'src/MemStore.cc'
+--- src/MemStore.cc	2017-02-20 04:56:00 +0000
++++ src/MemStore.cc	2017-05-07 22:08:14 +0000
+@@ -447,61 +447,61 @@ MemStore::updateCollapsedWith(StoreEntry
+ }
+ 
+ /// anchors StoreEntry to an already locked map entry
+ void
+ MemStore::anchorEntry(StoreEntry &e, const sfileno index, const Ipc::StoreMapAnchor &anchor)
+ {
+     const Ipc::StoreMapAnchor::Basics &basics = anchor.basics;
+ 
+     e.swap_file_sz = basics.swap_file_sz;
+     e.lastref = basics.lastref;
+     e.timestamp = basics.timestamp;
+     e.expires = basics.expires;
+     e.lastModified(basics.lastmod);
+     e.refcount = basics.refcount;
+     e.flags = basics.flags;
+ 
+     assert(e.mem_obj);
+     if (anchor.complete()) {
+         e.store_status = STORE_OK;
+         e.mem_obj->object_sz = e.swap_file_sz;
+         e.setMemStatus(IN_MEMORY);
+     } else {
+         e.store_status = STORE_PENDING;
+         assert(e.mem_obj->object_sz < 0);
+         e.setMemStatus(NOT_IN_MEMORY);
+     }
+     assert(e.swap_status == SWAPOUT_NONE); // set in StoreEntry constructor
+     e.ping_status = PING_NONE;
+ 
+     EBIT_CLR(e.flags, RELEASE_REQUEST);
+-    EBIT_CLR(e.flags, KEY_PRIVATE);
++    e.clearPrivate();
+     EBIT_SET(e.flags, ENTRY_VALIDATED);
+ 
+     MemObject::MemCache &mc = e.mem_obj->memCache;
+     mc.index = index;
+     mc.io = MemObject::ioReading;
+ }
+ 
+ /// copies the entire entry from shared to local memory
+ bool
+ MemStore::copyFromShm(StoreEntry &e, const sfileno index, const Ipc::StoreMapAnchor &anchor)
+ {
+     debugs(20, 7, "mem-loading entry " << index << " from " << anchor.start);
+     assert(e.mem_obj);
+ 
+     // emulate the usual Store code but w/o inapplicable checks and callbacks:
+ 
+     Ipc::StoreMapSliceId sid = anchor.start; // optimize: remember the last sid
+     bool wasEof = anchor.complete() && sid < 0;
+     int64_t sliceOffset = 0;
+     while (sid >= 0) {
+         const Ipc::StoreMapSlice &slice = map->readableSlice(index, sid);
+         // slice state may change during copying; take snapshots now
+         wasEof = anchor.complete() && slice.next < 0;
+         const Ipc::StoreMapSlice::Size wasSize = slice.size;
+ 
+         debugs(20, 9, "entry " << index << " slice " << sid << " eof " <<
+                wasEof << " wasSize " << wasSize << " <= " <<
+                anchor.basics.swap_file_sz << " sliceOffset " << sliceOffset <<
+                " mem.endOffset " << e.mem_obj->endOffset());
+ 
+
+=== modified file 'src/Store.h'
+--- src/Store.h	2017-04-12 00:00:22 +0000
++++ src/Store.h	2017-05-07 22:08:14 +0000
+@@ -56,69 +56,73 @@ public:
+      * \retval true   Store contains 0 bytes of data.
+      * \retval false  Store contains 1 or more bytes of data.
+      * \retval false  Store contains negative content !!!!!!
+      */
+     virtual bool isEmpty() const {
+         assert (mem_obj);
+         return mem_obj->endOffset() == 0;
+     }
+     virtual bool isAccepting() const;
+     virtual size_t bytesWanted(Range<size_t> const aRange, bool ignoreDelayPool = false) const;
+     /// flags [truncated or too big] entry with ENTRY_BAD_LENGTH and releases it
+     void lengthWentBad(const char *reason);
+     virtual void complete();
+     virtual store_client_t storeClientType() const;
+     virtual char const *getSerialisedMetaData();
+     /// Store a prepared error response. MemObject locks the reply object.
+     void storeErrorResponse(HttpReply *reply);
+     void replaceHttpReply(HttpReply *, bool andStartWriting = true);
+     void startWriting(); ///< pack and write reply headers and, maybe, body
+     /// whether we may start writing to disk (now or in the future)
+     virtual bool mayStartSwapOut();
+     virtual void trimMemory(const bool preserveSwappable);
+ 
+     // called when a decision to cache in memory has been made
+     void memOutDecision(const bool willCacheInRam);
+     // called when a decision to cache on disk has been made
+     void swapOutDecision(const MemObject::SwapOut::Decision &decision);
+ 
+     void abort();
+     void makePublic(const KeyScope keyScope = ksDefault);
+-    void makePrivate();
++    void makePrivate(const bool shareable);
++    /// A low-level method just resetting "private key" flags.
++    /// To avoid key inconsistency please use forcePublicKey()
++    /// or similar instead.
++    void clearPrivate();
+     void setPublicKey(const KeyScope keyScope = ksDefault);
+     /// Resets existing public key to a public key with default scope,
+     /// releasing the old default-scope entry (if any).
+     /// Does nothing if the existing public key already has default scope.
+     void clearPublicKeyScope();
+-    void setPrivateKey();
++    void setPrivateKey(const bool shareable);
+     void expireNow();
+-    void releaseRequest();
++    void releaseRequest(const bool shareable = false);
+     void negativeCache();
+     void cacheNegatively();     /** \todo argh, why both? */
+     void invokeHandlers();
+     void purgeMem();
+     void cacheInMemory(); ///< start or continue storing in memory cache
+     void swapOut();
+     /// whether we are in the process of writing this entry to disk
+     bool swappingOut() const { return swap_status == SWAPOUT_WRITING; }
+     void swapOutFileClose(int how);
+     const char *url() const;
+     /// Satisfies cachability requirements shared among disk and RAM caches.
+     /// Encapsulates common checks of mayStartSwapOut() and memoryCachable().
+     /// TODO: Rename and make private so only those two methods can call this.
+     bool checkCachable();
+     int checkNegativeHit() const;
+     int locked() const;
+     int validToSend() const;
+     bool memoryCachable(); ///< checkCachable() and can be cached in memory
+ 
+     /// if needed, initialize mem_obj member w/o URI-related information
+     MemObject *makeMemObject();
+ 
+     /// initialize mem_obj member (if needed) and supply URI-related info
+     void createMemObject(const char *storeId, const char *logUri, const HttpRequestMethod &aMethod);
+ 
+     void dump(int debug_lvl) const;
+     void hashDelete();
+     void hashInsert(const cache_key *);
+     void registerAbort(STABH * cb, void *);
+     void reset();
+@@ -185,95 +189,110 @@ public:
+     static void getPublic(StoreClient * aClient, const char *uri, const HttpRequestMethod& method);
+ 
+     virtual bool isNull() {
+         return false;
+     };
+ 
+     void *operator new(size_t byteCount);
+     void operator delete(void *address);
+     void setReleaseFlag();
+ #if USE_SQUID_ESI
+ 
+     ESIElement::Pointer cachedESITree;
+ #endif
+     virtual int64_t objectLen() const;
+     virtual int64_t contentLen() const;
+ 
+     /// claim shared ownership of this entry (for use in a given context)
+     /// matching lock() and unlock() contexts eases leak triage but is optional
+     void lock(const char *context);
+ 
+     /// disclaim shared ownership; may remove entry from store and delete it
+     /// returns remaning lock level (zero for unlocked and possibly gone entry)
+     int unlock(const char *context);
+ 
+     /// returns a local concurrent use counter, for debugging
+     int locks() const { return static_cast<int>(lock_count); }
+ 
+     /// update last reference timestamp and related Store metadata
+     void touch();
+ 
+-    virtual void release();
++    virtual void release(const bool shareable = false);
++
++    /// May the caller commit to treating this [previously locked]
++    /// entry as a cache hit?
++    bool mayStartHitting() const {
++        return !EBIT_TEST(flags, KEY_PRIVATE) || shareableWhenPrivate;
++    }
+ 
+ #if USE_ADAPTATION
+     /// call back producer when more buffer space is available
+     void deferProducer(const AsyncCall::Pointer &producer);
+     /// calls back producer registered with deferProducer
+     void kickProducer();
+ #endif
+ 
+     /* Packable API */
+     virtual void append(char const *, int);
+     virtual void vappendf(const char *, va_list);
+     virtual void buffer();
+     virtual void flush();
+ 
+ protected:
+     void transientsAbandonmentCheck();
+ 
+ private:
+     bool checkTooBig() const;
+     void forcePublicKey(const cache_key *newkey);
+     void adjustVary();
+     const cache_key *calcPublicKey(const KeyScope keyScope);
+ 
+     static MemAllocator *pool;
+ 
+     unsigned short lock_count;      /* Assume < 65536! */
+ 
++    /// Nobody can find/lock KEY_PRIVATE entries, but some transactions
++    /// (e.g., collapsed requests) find/lock a public entry before it becomes
++    /// private. May such transactions start using the now-private entry
++    /// they previously locked? This member should not affect transactions
++    /// that already started reading from the entry.
++    bool shareableWhenPrivate;
++
+ #if USE_ADAPTATION
+     /// producer callback registered with deferProducer
+     AsyncCall::Pointer deferredProducer;
+ #endif
+ 
+     bool validLength() const;
+     bool hasOneOfEtags(const String &reqETags, const bool allowWeakMatch) const;
++
++    friend std::ostream &operator <<(std::ostream &os, const StoreEntry &e);
+ };
+ 
+ std::ostream &operator <<(std::ostream &os, const StoreEntry &e);
+ 
+ /// \ingroup StoreAPI
+ class NullStoreEntry:public StoreEntry
+ {
+ 
+ public:
+     static NullStoreEntry *getInstance();
+     bool isNull() {
+         return true;
+     }
+ 
+     const char *getMD5Text() const;
+     HttpReply const *getReply() const { return NULL; }
+     void write (StoreIOBuffer) {}
+ 
+     bool isEmpty () const {return true;}
+ 
+     virtual size_t bytesWanted(Range<size_t> const aRange, bool) const { return aRange.end; }
+ 
+     void operator delete(void *address);
+     void complete() {}
+ 
+ private:
+     store_client_t storeClientType() const {return STORE_MEM_CLIENT;}
+ 
+     char const *getSerialisedMetaData();
+     virtual bool mayStartSwapOut() { return false; }
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2017-03-23 12:55:36 +0000
++++ src/client_side_reply.cc	2017-05-07 22:08:14 +0000
+@@ -63,60 +63,61 @@ clientReplyContext::~clientReplyContext(
+     deleting = true;
+     /* This may trigger a callback back into SendMoreData as the cbdata
+      * is still valid
+      */
+     removeClientStoreReference(&sc, http);
+     /* old_entry might still be set if we didn't yet get the reply
+      * code in HandleIMSReply() */
+     removeStoreReference(&old_sc, &old_entry);
+     safe_free(tempBuffer.data);
+     cbdataReferenceDone(http);
+     HTTPMSGUNLOCK(reply);
+ }
+ 
+ clientReplyContext::clientReplyContext(ClientHttpRequest *clientContext) :
+     purgeStatus(Http::scNone),
+     lookingforstore(0),
+     http(cbdataReference(clientContext)),
+     headers_sz(0),
+     sc(NULL),
+     old_reqsize(0),
+     reqsize(0),
+     reqofs(0),
+ #if USE_CACHE_DIGESTS
+     lookup_type(NULL),
+ #endif
+     ourNode(NULL),
+     reply(NULL),
+     old_entry(NULL),
+     old_sc(NULL),
+     deleting(false),
++    oldLastmod(0),
+     collapsedRevalidation(crNone)
+ {
+     *tempbuf = 0;
+ }
+ 
+ /** Create an error in the store awaiting the client side to read it.
+  *
+  * This may be better placed in the clientStream logic, but it has not been
+  * relocated there yet
+  */
+ void
+ clientReplyContext::setReplyToError(
+     err_type err, Http::StatusCode status, const HttpRequestMethod& method, char const *uri,
+     Ip::Address &addr, HttpRequest * failedrequest, const char *unparsedrequest,
+ #if USE_AUTH
+     Auth::UserRequest::Pointer auth_user_request
+ #else
+     void*
+ #endif
+ )
+ {
+     ErrorState *errstate = clientBuildError(err, status, uri, addr, failedrequest);
+ 
+     if (unparsedrequest)
+         errstate->request_hdrs = xstrdup(unparsedrequest);
+ 
+ #if USE_AUTH
+     errstate->auth_user_request = auth_user_request;
+ #endif
+     setReplyToError(method, errstate);
+@@ -178,83 +179,89 @@ void
+ clientReplyContext::removeStoreReference(store_client ** scp,
+         StoreEntry ** ep)
+ {
+     StoreEntry *e;
+     store_client *sc_tmp = *scp;
+ 
+     if ((e = *ep) != NULL) {
+         *ep = NULL;
+         storeUnregister(sc_tmp, e, this);
+         *scp = NULL;
+         e->unlock("clientReplyContext::removeStoreReference");
+     }
+ }
+ 
+ void
+ clientReplyContext::removeClientStoreReference(store_client **scp, ClientHttpRequest *aHttpRequest)
+ {
+     StoreEntry *reference = aHttpRequest->storeEntry();
+     removeStoreReference(scp, &reference);
+     aHttpRequest->storeEntry(reference);
+ }
+ 
+ void
+ clientReplyContext::saveState()
+ {
+     assert(old_sc == NULL);
+     debugs(88, 3, "clientReplyContext::saveState: saving store context");
+     old_entry = http->storeEntry();
+     old_sc = sc;
+     old_reqsize = reqsize;
++    oldLastmod = http->request->lastmod;
++    oldEtag = http->request->etag;
+     tempBuffer.offset = reqofs;
+     /* Prevent accessing the now saved entries */
+     http->storeEntry(NULL);
+     sc = NULL;
+     reqsize = 0;
+     reqofs = 0;
+ }
+ 
+ void
+ clientReplyContext::restoreState()
+ {
+     assert(old_sc != NULL);
+     debugs(88, 3, "clientReplyContext::restoreState: Restoring store context");
+     removeClientStoreReference(&sc, http);
+     http->storeEntry(old_entry);
+     sc = old_sc;
+     reqsize = old_reqsize;
+     reqofs = tempBuffer.offset;
++    http->request->lastmod = oldLastmod;
++    http->request->etag = oldEtag;
+     /* Prevent accessed the old saved entries */
+     old_entry = NULL;
+     old_sc = NULL;
+     old_reqsize = 0;
+     tempBuffer.offset = 0;
++    oldLastmod = 0;
++    oldEtag.clean();
+ }
+ 
+ void
+ clientReplyContext::startError(ErrorState * err)
+ {
+     createStoreEntry(http->request->method, RequestFlags());
+     triggerInitialStoreRead();
+     errorAppendEntry(http->storeEntry(), err);
+ }
+ 
+ clientStreamNode *
+ clientReplyContext::getNextNode() const
+ {
+     return (clientStreamNode *)ourNode->node.next->data;
+ }
+ 
+ /* This function is wrong - the client parameters don't include the
+  * header offset
+  */
+ void
+ clientReplyContext::triggerInitialStoreRead()
+ {
+     /* when confident, 0 becomes reqofs, and then this factors into
+      * startSendProcess
+      */
+     assert(reqofs == 0);
+     StoreIOBuffer localTempBuffer (next()->readBuffer.length, 0, next()->readBuffer.data);
+     storeClientCopy(sc, http->storeEntry(), localTempBuffer, SendMoreData, this);
+ }
+ 
+@@ -388,62 +395,62 @@ clientReplyContext::sendClientOldEntry()
+     /* Get the old request back */
+     restoreState();
+     /* here the data to send is in the next nodes buffers already */
+     assert(!EBIT_TEST(http->storeEntry()->flags, ENTRY_ABORTED));
+     /* sendMoreData tracks the offset as well.
+      * Force it back to zero */
+     reqofs = 0;
+     StoreIOBuffer tempresult (reqsize, reqofs, next()->readBuffer.data);
+     sendMoreData(tempresult);
+ }
+ 
+ /* This is the workhorse of the HandleIMSReply callback.
+  *
+  * It is called when we've got data back from the origin following our
+  * IMS request to revalidate a stale entry.
+  */
+ void
+ clientReplyContext::handleIMSReply(StoreIOBuffer result)
+ {
+     if (deleting)
+         return;
+ 
+     debugs(88, 3, http->storeEntry()->url() << ", " << (long unsigned) result.length << " bytes");
+ 
+     if (http->storeEntry() == NULL)
+         return;
+ 
+     if (result.flags.error && !EBIT_TEST(http->storeEntry()->flags, ENTRY_ABORTED))
+         return;
+ 
+-    if (collapsedRevalidation == crSlave && EBIT_TEST(http->storeEntry()->flags, KEY_PRIVATE)) {
+-        debugs(88, 3, "CF slave hit private " << *http->storeEntry() << ". MISS");
++    if (collapsedRevalidation == crSlave && !http->storeEntry()->mayStartHitting()) {
++        debugs(88, 3, "CF slave hit private non-shareable " << *http->storeEntry() << ". MISS");
+         // restore context to meet processMiss() expectations
+         restoreState();
+         http->logType = LOG_TCP_MISS;
+         processMiss();
+         return;
+     }
+ 
+     /* update size of the request */
+     reqsize = result.length + reqofs;
+ 
+     const Http::StatusCode status = http->storeEntry()->getReply()->sline.status();
+ 
+     // request to origin was aborted
+     if (EBIT_TEST(http->storeEntry()->flags, ENTRY_ABORTED)) {
+         debugs(88, 3, "request to origin aborted '" << http->storeEntry()->url() << "', sending old entry to client");
+         http->logType = LOG_TCP_REFRESH_FAIL_OLD;
+         sendClientOldEntry();
+     }
+ 
+     const HttpReply *old_rep = old_entry->getReply();
+ 
+     // origin replied 304
+     if (status == Http::scNotModified) {
+         http->logType = LOG_TCP_REFRESH_UNMODIFIED;
+         http->request->flags.staleIfHit = false; // old_entry is no longer stale
+ 
+         // update headers on existing entry
+         Store::Root().updateOnNotModified(old_entry, *http->storeEntry());
+ 
+         // if client sent IMS
+@@ -521,61 +528,61 @@ clientReplyContext::CacheHit(void *data,
+ void
+ clientReplyContext::cacheHit(StoreIOBuffer result)
+ {
+     /** Ignore if the HIT object is being deleted. */
+     if (deleting) {
+         debugs(88, 3, "HIT object being deleted. Ignore the HIT.");
+         return;
+     }
+ 
+     StoreEntry *e = http->storeEntry();
+ 
+     HttpRequest *r = http->request;
+ 
+     debugs(88, 3, "clientCacheHit: " << http->uri << ", " << result.length << " bytes");
+ 
+     if (http->storeEntry() == NULL) {
+         debugs(88, 3, "clientCacheHit: request aborted");
+         return;
+     } else if (result.flags.error) {
+         /* swap in failure */
+         debugs(88, 3, "clientCacheHit: swapin failure for " << http->uri);
+         http->logType = LOG_TCP_SWAPFAIL_MISS;
+         removeClientStoreReference(&sc, http);
+         processMiss();
+         return;
+     }
+ 
+     // The previously identified hit suddenly became unsharable!
+     // This is common for collapsed forwarding slaves but might also
+     // happen to regular hits because we are called asynchronously.
+-    if (EBIT_TEST(e->flags, KEY_PRIVATE)) {
++    if (!e->mayStartHitting()) {
+         debugs(88, 3, "unsharable " << *e << ". MISS");
+         http->logType = LOG_TCP_MISS;
+         processMiss();
+         return;
+     }
+ 
+     if (result.length == 0) {
+         debugs(88, 5, "store IO buffer has no content. MISS");
+         /* the store couldn't get enough data from the file for us to id the
+          * object
+          */
+         /* treat as a miss */
+         http->logType = LOG_TCP_MISS;
+         processMiss();
+         return;
+     }
+ 
+     assert(!EBIT_TEST(e->flags, ENTRY_ABORTED));
+     /* update size of the request */
+     reqsize = result.length + reqofs;
+ 
+     /*
+      * Got the headers, now grok them
+      */
+     assert(http->logType.oldType == LOG_TCP_HIT);
+ 
+     if (http->request->storeId().cmp(e->mem_obj->storeId()) != 0) {
+         debugs(33, DBG_IMPORTANT, "clientProcessHit: URL mismatch, '" << e->mem_obj->storeId() << "' != '" << http->request->storeId() << "'");
+         http->logType = LOG_TCP_MISS; // we lack a more precise LOG_*_MISS code
+         processMiss();
+
+=== modified file 'src/client_side_reply.h'
+--- src/client_side_reply.h	2017-01-01 00:12:22 +0000
++++ src/client_side_reply.h	2017-05-07 22:08:14 +0000
+@@ -106,42 +106,44 @@ private:
+     void pushStreamData(StoreIOBuffer const &result, char *source);
+     clientStreamNode * next() const;
+     StoreIOBuffer holdingBuffer;
+     HttpReply *reply;
+     void processReplyAccess();
+     static ACLCB ProcessReplyAccessResult;
+     void processReplyAccessResult(const allow_t &accessAllowed);
+     void cloneReply();
+     void buildReplyHeader ();
+     bool alwaysAllowResponse(Http::StatusCode sline) const;
+     int checkTransferDone();
+     void processOnlyIfCachedMiss();
+     bool processConditional(StoreIOBuffer &result);
+     void cacheHit(StoreIOBuffer result);
+     void handleIMSReply(StoreIOBuffer result);
+     void sendMoreData(StoreIOBuffer result);
+     void triggerInitialStoreRead();
+     void sendClientOldEntry();
+     void purgeAllCached();
+     void forgetHit();
+     bool blockedHit() const;
+ 
+     void sendBodyTooLargeError();
+     void sendPreconditionFailedError();
+     void sendNotModified();
+     void sendNotModifiedOrPreconditionFailedError();
+ 
+     StoreEntry *old_entry;
+     store_client *old_sc;   /* ... for entry to be validated */
+     bool deleting;
++    time_t oldLastmod;
++    String oldEtag;
+ 
+     typedef enum {
+         crNone = 0, ///< collapsed revalidation is not allowed for this context
+         crInitiator, ///< we initiated collapsed revalidation request
+         crSlave ///< we collapsed on the existing revalidation request
+     } CollapsedRevalidation;
+ 
+     CollapsedRevalidation collapsedRevalidation;
+ };
+ 
+ #endif /* SQUID_CLIENTSIDEREPLY_H */
+ 
+
+=== modified file 'src/fs/rock/RockSwapDir.cc'
+--- src/fs/rock/RockSwapDir.cc	2017-02-23 10:44:48 +0000
++++ src/fs/rock/RockSwapDir.cc	2017-05-07 22:08:14 +0000
+@@ -110,61 +110,61 @@ bool
+ Rock::SwapDir::updateCollapsedWith(StoreEntry &collapsed, const Ipc::StoreMapAnchor &anchor)
+ {
+     collapsed.swap_file_sz = anchor.basics.swap_file_sz;
+     return true;
+ }
+ 
+ void
+ Rock::SwapDir::anchorEntry(StoreEntry &e, const sfileno filen, const Ipc::StoreMapAnchor &anchor)
+ {
+     const Ipc::StoreMapAnchor::Basics &basics = anchor.basics;
+ 
+     e.swap_file_sz = basics.swap_file_sz;
+     e.lastref = basics.lastref;
+     e.timestamp = basics.timestamp;
+     e.expires = basics.expires;
+     e.lastModified(basics.lastmod);
+     e.refcount = basics.refcount;
+     e.flags = basics.flags;
+ 
+     if (anchor.complete()) {
+         e.store_status = STORE_OK;
+         e.swap_status = SWAPOUT_DONE;
+     } else {
+         e.store_status = STORE_PENDING;
+         e.swap_status = SWAPOUT_WRITING; // even though another worker writes?
+     }
+ 
+     e.ping_status = PING_NONE;
+ 
+     EBIT_CLR(e.flags, RELEASE_REQUEST);
+-    EBIT_CLR(e.flags, KEY_PRIVATE);
++    e.clearPrivate();
+     EBIT_SET(e.flags, ENTRY_VALIDATED);
+ 
+     e.swap_dirn = index;
+     e.swap_filen = filen;
+ }
+ 
+ void Rock::SwapDir::disconnect(StoreEntry &e)
+ {
+     assert(e.swap_dirn == index);
+     assert(e.swap_filen >= 0);
+     // cannot have SWAPOUT_NONE entry with swap_filen >= 0
+     assert(e.swap_status != SWAPOUT_NONE);
+ 
+     // do not rely on e.swap_status here because there is an async delay
+     // before it switches from SWAPOUT_WRITING to SWAPOUT_DONE.
+ 
+     // since e has swap_filen, its slot is locked for reading and/or writing
+     // but it is difficult to know whether THIS worker is reading or writing e,
+     // especially since we may switch from writing to reading. This code relies
+     // on Rock::IoState::writeableAnchor_ being set when we locked for writing.
+     if (e.mem_obj && e.mem_obj->swapout.sio != NULL &&
+             dynamic_cast<IoState&>(*e.mem_obj->swapout.sio).writeableAnchor_) {
+         map->abortWriting(e.swap_filen);
+         e.swap_dirn = -1;
+         e.swap_filen = -1;
+         e.swap_status = SWAPOUT_NONE;
+         dynamic_cast<IoState&>(*e.mem_obj->swapout.sio).writeableAnchor_ = NULL;
+         Store::Root().transientsAbandon(e); // broadcasts after the change
+     } else {
+         map->closeForReading(e.swap_filen);
+
+=== modified file 'src/fs/ufs/UFSSwapDir.cc'
+--- src/fs/ufs/UFSSwapDir.cc	2017-02-23 10:46:27 +0000
++++ src/fs/ufs/UFSSwapDir.cc	2017-05-07 22:08:14 +0000
+@@ -789,61 +789,61 @@ StoreEntry *
+ Fs::Ufs::UFSSwapDir::addDiskRestore(const cache_key * key,
+                                     sfileno file_number,
+                                     uint64_t swap_file_sz,
+                                     time_t expires,
+                                     time_t timestamp,
+                                     time_t lastref,
+                                     time_t lastmod,
+                                     uint32_t refcount,
+                                     uint16_t newFlags,
+                                     int)
+ {
+     StoreEntry *e = NULL;
+     debugs(47, 5, HERE << storeKeyText(key)  <<
+            ", fileno="<< std::setfill('0') << std::hex << std::uppercase << std::setw(8) << file_number);
+     /* if you call this you'd better be sure file_number is not
+      * already in use! */
+     e = new StoreEntry();
+     e->store_status = STORE_OK;
+     e->setMemStatus(NOT_IN_MEMORY);
+     e->swap_status = SWAPOUT_DONE;
+     e->swap_filen = file_number;
+     e->swap_dirn = index;
+     e->swap_file_sz = swap_file_sz;
+     e->lastref = lastref;
+     e->timestamp = timestamp;
+     e->expires = expires;
+     e->lastModified(lastmod);
+     e->refcount = refcount;
+     e->flags = newFlags;
+     EBIT_CLR(e->flags, RELEASE_REQUEST);
+-    EBIT_CLR(e->flags, KEY_PRIVATE);
++    e->clearPrivate();
+     e->ping_status = PING_NONE;
+     EBIT_CLR(e->flags, ENTRY_VALIDATED);
+     mapBitSet(e->swap_filen);
+     cur_size += fs.blksize * sizeInBlocks(e->swap_file_sz);
+     ++n_disk_objects;
+     e->hashInsert(key); /* do it after we clear KEY_PRIVATE */
+     replacementAdd (e);
+     return e;
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::undoAddDiskRestore(StoreEntry *e)
+ {
+     debugs(47, 5, HERE << *e);
+     replacementRemove(e); // checks swap_dirn so do it before we invalidate it
+     // Do not unlink the file as it might be used by a subsequent entry.
+     mapBitReset(e->swap_filen);
+     e->swap_filen = -1;
+     e->swap_dirn = -1;
+     cur_size -= fs.blksize * sizeInBlocks(e->swap_file_sz);
+     --n_disk_objects;
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::rebuild()
+ {
+     ++StoreController::store_dirs_rebuilding;
+     eventAdd("storeRebuild", Fs::Ufs::RebuildState::RebuildStep, new Fs::Ufs::RebuildState(this), 0.0, 1);
+ }
+ 
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2017-05-05 19:23:07 +0000
++++ src/http.cc	2017-05-08 12:57:07 +0000
+@@ -261,358 +261,339 @@ httpMaybeRemovePublic(StoreEntry * e, Ht
+ 
+     /** \par
+      * Also remove any cached HEAD response in case the object has
+      * changed.
+      */
+     if (e->mem_obj->request)
+         pe = storeGetPublicByRequestMethod(e->mem_obj->request.getRaw(), Http::METHOD_HEAD);
+     else
+         pe = storeGetPublic(e->mem_obj->storeId(), Http::METHOD_HEAD);
+ 
+     if (pe != NULL) {
+         assert(e != pe);
+ #if USE_HTCP
+         neighborsHtcpClear(e, nullptr, e->mem_obj->request.getRaw(), HttpRequestMethod(Http::METHOD_HEAD), HTCP_CLR_INVALIDATION);
+ #endif
+         pe->release();
+     }
+ }
+ 
+ void
+ HttpStateData::processSurrogateControl(HttpReply *reply)
+ {
+     if (request->flags.accelerated && reply->surrogate_control) {
+         HttpHdrScTarget *sctusable = reply->surrogate_control->getMergedTarget(Config.Accel.surrogate_id);
+ 
+         if (sctusable) {
+             if (sctusable->hasNoStore() ||
+                     (Config.onoff.surrogate_is_remote
+                      && sctusable->noStoreRemote())) {
+                 surrogateNoStore = true;
+-                entry->makePrivate();
++                // Be conservative for now and make it non-shareable because
++                // there is no enough information here to make the decision.
++                entry->makePrivate(false);
+             }
+ 
+             /* The HttpHeader logic cannot tell if the header it's parsing is a reply to an
+              * accelerated request or not...
+              * Still, this is an abstraction breach. - RC
+              */
+             if (sctusable->hasMaxAge()) {
+                 if (sctusable->maxAge() < sctusable->maxStale())
+                     reply->expires = reply->date + sctusable->maxAge();
+                 else
+                     reply->expires = reply->date + sctusable->maxStale();
+ 
+                 /* And update the timestamps */
+                 entry->timestampsSet();
+             }
+ 
+             /* We ignore cache-control directives as per the Surrogate specification */
+             ignoreCacheControl = true;
+ 
+             delete sctusable;
+         }
+     }
+ }
+ 
+-int
+-HttpStateData::cacheableReply()
++HttpStateData::ReuseDecision::Answers
++HttpStateData::reusableReply(HttpStateData::ReuseDecision &decision)
+ {
+     HttpReply const *rep = finalReply();
+     HttpHeader const *hdr = &rep->header;
+     const char *v;
+ #if USE_HTTP_VIOLATIONS
+ 
+     const RefreshPattern *R = NULL;
+ 
+     /* This strange looking define first looks up the refresh pattern
+      * and then checks if the specified flag is set. The main purpose
+      * of this is to simplify the refresh pattern lookup and USE_HTTP_VIOLATIONS
+      * condition
+      */
+ #define REFRESH_OVERRIDE(flag) \
+     ((R = (R ? R : refreshLimits(entry->mem_obj->storeId()))) , \
+     (R && R->flags.flag))
+ #else
+ #define REFRESH_OVERRIDE(flag) 0
+ #endif
+ 
+-    if (EBIT_TEST(entry->flags, RELEASE_REQUEST)) {
+-        debugs(22, 3, "NO because " << *entry << " has been released.");
+-        return 0;
+-    }
++    if (EBIT_TEST(entry->flags, RELEASE_REQUEST))
++        return decision.make(ReuseDecision::reuseNot, "the entry has been released");
+ 
+     // RFC 7234 section 4: a cache MUST use the most recent response
+     // (as determined by the Date header field)
+-    if (sawDateGoBack) {
+-        debugs(22, 3, "NO because " << *entry << " has an older date header.");
+-        return 0;
+-    }
++    // TODO: whether such responses could be shareable?
++    if (sawDateGoBack)
++        return decision.make(ReuseDecision::reuseNot, "the response has an older date header");
+ 
+     // Check for Surrogate/1.0 protocol conditions
+     // NP: reverse-proxy traffic our parent server has instructed us never to cache
+-    if (surrogateNoStore) {
+-        debugs(22, 3, HERE << "NO because Surrogate-Control:no-store");
+-        return 0;
+-    }
++    if (surrogateNoStore)
++        return decision.make(ReuseDecision::reuseNot, "Surrogate-Control:no-store");
+ 
+     // RFC 2616: HTTP/1.1 Cache-Control conditions
+     if (!ignoreCacheControl) {
+         // XXX: check to see if the request headers alone were enough to prevent caching earlier
+         // (ie no-store request header) no need to check those all again here if so.
+         // for now we are not reliably doing that so we waste CPU re-checking request CC
+ 
+         // RFC 2616 section 14.9.2 - MUST NOT cache any response with request CC:no-store
+         if (request && request->cache_control && request->cache_control->hasNoStore() &&
+-                !REFRESH_OVERRIDE(ignore_no_store)) {
+-            debugs(22, 3, HERE << "NO because client request Cache-Control:no-store");
+-            return 0;
+-        }
++                !REFRESH_OVERRIDE(ignore_no_store))
++            return decision.make(ReuseDecision::reuseNot,
++                                 "client request Cache-Control:no-store");
+ 
+         // NP: request CC:no-cache only means cache READ is forbidden. STORE is permitted.
+         if (rep->cache_control && rep->cache_control->hasNoCacheWithParameters()) {
+             /* TODO: we are allowed to cache when no-cache= has parameters.
+              * Provided we strip away any of the listed headers unless they are revalidated
+              * successfully (ie, must revalidate AND these headers are prohibited on stale replies).
+              * That is a bit tricky for squid right now so we avoid caching entirely.
+              */
+-            debugs(22, 3, HERE << "NO because server reply Cache-Control:no-cache has parameters");
+-            return 0;
++            return decision.make(ReuseDecision::reuseNot,
++                                 "server reply Cache-Control:no-cache has parameters");
+         }
+ 
+         // NP: request CC:private is undefined. We ignore.
+         // NP: other request CC flags are limiters on HIT/MISS. We don't care about here.
+ 
+         // RFC 2616 section 14.9.2 - MUST NOT cache any response with CC:no-store
+         if (rep->cache_control && rep->cache_control->hasNoStore() &&
+-                !REFRESH_OVERRIDE(ignore_no_store)) {
+-            debugs(22, 3, HERE << "NO because server reply Cache-Control:no-store");
+-            return 0;
+-        }
++                !REFRESH_OVERRIDE(ignore_no_store))
++            return decision.make(ReuseDecision::reuseNot,
++                                 "server reply Cache-Control:no-store");
+ 
+         // RFC 2616 section 14.9.1 - MUST NOT cache any response with CC:private in a shared cache like Squid.
+         // CC:private overrides CC:public when both are present in a response.
+         // TODO: add a shared/private cache configuration possibility.
+         if (rep->cache_control &&
+                 rep->cache_control->hasPrivate() &&
+                 !REFRESH_OVERRIDE(ignore_private)) {
+             /* TODO: we are allowed to cache when private= has parameters.
+              * Provided we strip away any of the listed headers unless they are revalidated
+              * successfully (ie, must revalidate AND these headers are prohibited on stale replies).
+              * That is a bit tricky for squid right now so we avoid caching entirely.
+              */
+-            debugs(22, 3, HERE << "NO because server reply Cache-Control:private");
+-            return 0;
++            return decision.make(ReuseDecision::reuseNot,
++                                 "server reply Cache-Control:private");
+         }
+     }
+ 
+     // RFC 2068, sec 14.9.4 - MUST NOT cache any response with Authentication UNLESS certain CC controls are present
+     // allow HTTP violations to IGNORE those controls (ie re-block caching Auth)
+     if (request && (request->flags.auth || request->flags.authSent)) {
+-        if (!rep->cache_control) {
+-            debugs(22, 3, HERE << "NO because Authenticated and server reply missing Cache-Control");
+-            return 0;
+-        }
+-
+-        if (ignoreCacheControl) {
+-            debugs(22, 3, HERE << "NO because Authenticated and ignoring Cache-Control");
+-            return 0;
+-        }
++        if (!rep->cache_control)
++            return decision.make(ReuseDecision::reuseNot,
++                                 "authenticated and server reply missing Cache-Control");
++
++        if (ignoreCacheControl)
++            return decision.make(ReuseDecision::reuseNot,
++                                 "authenticated and ignoring Cache-Control");
+ 
+         bool mayStore = false;
+         // HTTPbis pt6 section 3.2: a response CC:public is present
+         if (rep->cache_control->hasPublic()) {
+             debugs(22, 3, HERE << "Authenticated but server reply Cache-Control:public");
+             mayStore = true;
+ 
+             // HTTPbis pt6 section 3.2: a response CC:must-revalidate is present
+         } else if (rep->cache_control->hasMustRevalidate()) {
+             debugs(22, 3, HERE << "Authenticated but server reply Cache-Control:must-revalidate");
+             mayStore = true;
+ 
+ #if USE_HTTP_VIOLATIONS
+             // NP: given the must-revalidate exception we should also be able to exempt no-cache.
+             // HTTPbis WG verdict on this is that it is omitted from the spec due to being 'unexpected' by
+             // some. The caching+revalidate is not exactly unsafe though with Squids interpretation of no-cache
+             // (without parameters) as equivalent to must-revalidate in the reply.
+         } else if (rep->cache_control->hasNoCacheWithoutParameters()) {
+             debugs(22, 3, HERE << "Authenticated but server reply Cache-Control:no-cache (equivalent to must-revalidate)");
+             mayStore = true;
+ #endif
+ 
+             // HTTPbis pt6 section 3.2: a response CC:s-maxage is present
+         } else if (rep->cache_control->hasSMaxAge()) {
+             debugs(22, 3, HERE << "Authenticated but server reply Cache-Control:s-maxage");
+             mayStore = true;
+         }
+ 
+-        if (!mayStore) {
+-            debugs(22, 3, HERE << "NO because Authenticated transaction");
+-            return 0;
+-        }
++        if (!mayStore)
++            return decision.make(ReuseDecision::reuseNot, "authenticated transaction");
+ 
+         // NP: response CC:no-cache is equivalent to CC:must-revalidate,max-age=0. We MAY cache, and do so.
+         // NP: other request CC flags are limiters on HIT/MISS/REFRESH. We don't care about here.
+     }
+ 
+     /* HACK: The "multipart/x-mixed-replace" content type is used for
+      * continuous push replies.  These are generally dynamic and
+      * probably should not be cachable
+      */
+     if ((v = hdr->getStr(Http::HdrType::CONTENT_TYPE)))
+-        if (!strncasecmp(v, "multipart/x-mixed-replace", 25)) {
+-            debugs(22, 3, HERE << "NO because Content-Type:multipart/x-mixed-replace");
+-            return 0;
+-        }
++        if (!strncasecmp(v, "multipart/x-mixed-replace", 25))
++            return decision.make(ReuseDecision::reuseNot, "Content-Type:multipart/x-mixed-replace");
++
++    // TODO: if possible, provide more specific message for each status code
++    static const char *shareableError = "shareable error status code";
++    static const char *nonShareableError = "non-shareable error status code";
++    ReuseDecision::Answers statusAnswer = ReuseDecision::reuseNot;
++    const char *statusReason = nonShareableError;
+ 
+     switch (rep->sline.status()) {
++
++    /* There are several situations when a non-cacheable response may be
++     * still shareable (e.g., among collapsed clients). We assume that these
++     * are 3xx and 5xx responses, indicating server problems and some of
++     * 4xx responses, common for all clients with a given cache key (e.g.,
++     * 404 Not Found or 414 URI Too Long). On the other hand, we should not
++     * share non-cacheable client-specific errors, such as 400 Bad Request
++     * or 406 Not Acceptable.
++     */
++
+     /* Responses that are cacheable */
+ 
+     case Http::scOkay:
+ 
+     case Http::scNonAuthoritativeInformation:
+ 
+     case Http::scMultipleChoices:
+ 
+     case Http::scMovedPermanently:
+     case Http::scPermanentRedirect:
+ 
+     case Http::scGone:
+         /*
+          * Don't cache objects that need to be refreshed on next request,
+          * unless we know how to refresh it.
+          */
+ 
+-        if (!refreshIsCachable(entry) && !REFRESH_OVERRIDE(store_stale)) {
+-            debugs(22, 3, "NO because refreshIsCachable() returned non-cacheable..");
+-            return 0;
+-        } else {
+-            debugs(22, 3, HERE << "YES because HTTP status " << rep->sline.status());
+-            return 1;
+-        }
+-        /* NOTREACHED */
++        if (refreshIsCachable(entry) || REFRESH_OVERRIDE(store_stale))
++            decision.make(ReuseDecision::cachePositively, "refresh check returned cacheable");
++        else
++            decision.make(ReuseDecision::doNotCacheButShare, "refresh check returned non-cacheable");
+         break;
+ 
+     /* Responses that only are cacheable if the server says so */
+ 
+     case Http::scFound:
+     case Http::scTemporaryRedirect:
+-        if (rep->date <= 0) {
+-            debugs(22, 3, HERE << "NO because HTTP status " << rep->sline.status() << " and Date missing/invalid");
+-            return 0;
+-        }
+-        if (rep->expires > rep->date) {
+-            debugs(22, 3, HERE << "YES because HTTP status " << rep->sline.status() << " and Expires > Date");
+-            return 1;
+-        } else {
+-            debugs(22, 3, HERE << "NO because HTTP status " << rep->sline.status() << " and Expires <= Date");
+-            return 0;
+-        }
+-        /* NOTREACHED */
++        if (rep->date <= 0)
++            decision.make(ReuseDecision::doNotCacheButShare, "Date is missing/invalid");
++        if (rep->expires > rep->date)
++            decision.make(ReuseDecision::cachePositively, "Expires > Date");
++        else
++            decision.make(ReuseDecision::doNotCacheButShare, "Expires <= Date");
+         break;
+ 
+-    /* Errors can be negatively cached */
+-
++    /* Some responses can be negatively cached */
+     case Http::scNoContent:
+-
+     case Http::scUseProxy:
+-
+-    case Http::scBadRequest:
+-
+     case Http::scForbidden:
+-
+     case Http::scNotFound:
+-
+     case Http::scMethodNotAllowed:
+-
+     case Http::scUriTooLong:
+-
+     case Http::scInternalServerError:
+-
+     case Http::scNotImplemented:
+-
+     case Http::scBadGateway:
+-
+     case Http::scServiceUnavailable:
+-
+     case Http::scGatewayTimeout:
+     case Http::scMisdirectedRequest:
+ 
+-        debugs(22, 3, "MAYBE because HTTP status " << rep->sline.status());
+-        return -1;
++        statusAnswer = ReuseDecision::doNotCacheButShare;
++        statusReason = shareableError;
++    case Http::scBadRequest:
+ 
+-        /* NOTREACHED */
++#if USE_HTTP_VIOLATIONS
++        if (Config.negativeTtl > 0)
++            decision.make(ReuseDecision::cacheNegatively, "Config.negativeTtl > 0");
++        else
++#endif
++            decision.make(statusAnswer, statusReason);
+         break;
+ 
+-    /* Some responses can never be cached */
+-
+-    case Http::scPartialContent:    /* Not yet supported */
+-
++    /* these responses can never be cached, some
++       of them can be shared though */
+     case Http::scSeeOther:
+-
+     case Http::scNotModified:
+-
+     case Http::scUnauthorized:
+-
+     case Http::scProxyAuthenticationRequired:
+-
+-    case Http::scInvalidHeader: /* Squid header parsing error */
+-
+-    case Http::scHeaderTooLarge:
+-
+     case Http::scPaymentRequired:
++    case Http::scInsufficientStorage:
++        // TODO: use more specific reason for non-error status codes
++        decision.make(ReuseDecision::doNotCacheButShare, shareableError);
++        break;
++
++    case Http::scPartialContent: /* Not yet supported. TODO: make shareable for suitable ranges */
+     case Http::scNotAcceptable:
+-    case Http::scRequestTimeout:
+-    case Http::scConflict:
++    case Http::scRequestTimeout: // TODO: is this shareable?
++    case Http::scConflict: // TODO: is this shareable?
+     case Http::scLengthRequired:
+     case Http::scPreconditionFailed:
+     case Http::scPayloadTooLarge:
+     case Http::scUnsupportedMediaType:
+     case Http::scUnprocessableEntity:
+-    case Http::scLocked:
++    case Http::scLocked: // TODO: is this shareable?
+     case Http::scFailedDependency:
+-    case Http::scInsufficientStorage:
+     case Http::scRequestedRangeNotSatisfied:
+     case Http::scExpectationFailed:
+-
+-        debugs(22, 3, HERE << "NO because HTTP status " << rep->sline.status());
+-        return 0;
++    case Http::scInvalidHeader: /* Squid header parsing error */
++    case Http::scHeaderTooLarge:
++        decision.make(ReuseDecision::reuseNot, nonShareableError);
++        break;
+ 
+     default:
+         /* RFC 2616 section 6.1.1: an unrecognized response MUST NOT be cached. */
+-        debugs (11, 3, HERE << "NO because unknown HTTP status code " << rep->sline.status());
+-        return 0;
+-
+-        /* NOTREACHED */
++        decision.make(ReuseDecision::reuseNot, "unknown status code");
+         break;
+     }
+ 
+-    /* NOTREACHED */
++    return decision.answer;
+ }
+ 
+ /// assemble a variant key (vary-mark) from the given Vary header and HTTP request
+ static void
+ assembleVaryKey(String &vary, SBuf &vstr, const HttpRequest &request)
+ {
+     static const SBuf asterisk("*");
+     const char *pos = nullptr;
+     const char *item = nullptr;
+     int ilen = 0;
+ 
+     while (strListGetItem(&vary, ',', &item, &ilen, &pos)) {
+         SBuf name(item, ilen);
+         if (name == asterisk) {
+             vstr = asterisk;
+             break;
+         }
+         name.toLower();
+         if (!vstr.isEmpty())
+             vstr.append(", ", 2);
+         vstr.append(name);
+         String hdr(request.header.getByName(name));
+         const char *value = hdr.termedBuf();
+         if (value) {
+             value = rfc1738_escape_part(value);
+             vstr.append("=\"", 2);
+             vstr.append(value);
+             vstr.append("\"", 1);
+         }
+ 
+@@ -894,128 +875,132 @@ HttpStateData::peerSupportsConnectionPin
+ 
+     /*if the peer configured with originserver just allow connection
+         pinning (squid 2.6 behaviour)
+      */
+     if (_peer->options.originserver)
+         return true;
+ 
+     /*if the connections it is already pinned it is OK*/
+     if (request->flags.pinned)
+         return true;
+ 
+     /*Allow pinned connections only if the Proxy-support header exists in
+       reply and has in its list the "Session-Based-Authentication"
+       which means that the peer supports connection pinning.
+      */
+     if (rep->header.hasListMember(Http::HdrType::PROXY_SUPPORT, "Session-Based-Authentication", ','))
+         return true;
+ 
+     return false;
+ }
+ 
+ // Called when we parsed (and possibly adapted) the headers but
+ // had not starting storing (a.k.a., sending) the body yet.
+ void
+ HttpStateData::haveParsedReplyHeaders()
+ {
+     Client::haveParsedReplyHeaders();
+ 
+     Ctx ctx = ctx_enter(entry->mem_obj->urlXXX());
+     HttpReply *rep = finalReply();
++    const Http::StatusCode statusCode = rep->sline.status();
+ 
+     entry->timestampsSet();
+ 
+     /* Check if object is cacheable or not based on reply code */
+-    debugs(11, 3, "HTTP CODE: " << rep->sline.status());
++    debugs(11, 3, "HTTP CODE: " << statusCode);
+ 
+     if (const StoreEntry *oldEntry = findPreviouslyCachedEntry(entry))
+         sawDateGoBack = rep->olderThan(oldEntry->getReply());
+ 
+     if (neighbors_do_private_keys && !sawDateGoBack)
+         httpMaybeRemovePublic(entry, rep->sline.status());
+ 
+     bool varyFailure = false;
+     if (rep->header.has(Http::HdrType::VARY)
+ #if X_ACCELERATOR_VARY
+             || rep->header.has(Http::HdrType::HDR_X_ACCELERATOR_VARY)
+ #endif
+        ) {
+         const SBuf vary(httpMakeVaryMark(request.getRaw(), rep));
+ 
+         if (vary.isEmpty()) {
+-            entry->makePrivate();
++            // TODO: check whether such responses are shareable.
++            // Do not share for now.
++            entry->makePrivate(false);
+             if (!fwd->reforwardableStatus(rep->sline.status()))
+                 EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+             varyFailure = true;
+         } else {
+             entry->mem_obj->vary_headers = vary;
+ 
+             // RFC 7231 section 7.1.4
+             // Vary:* can be cached, but has mandatory revalidation
+             static const SBuf asterisk("*");
+             if (vary == asterisk)
+                 EBIT_SET(entry->flags, ENTRY_REVALIDATE_ALWAYS);
+         }
+     }
+ 
+     if (!varyFailure) {
+         /*
+          * If its not a reply that we will re-forward, then
+          * allow the client to get it.
+          */
+         if (!fwd->reforwardableStatus(rep->sline.status()))
+             EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+ 
+-        switch (cacheableReply()) {
++        ReuseDecision decision(entry, statusCode);
+ 
+-        case 1:
+-            entry->makePublic();
++        switch (reusableReply(decision)) {
++
++        case ReuseDecision::reuseNot:
++            entry->makePrivate(false);
+             break;
+ 
+-        case 0:
+-            entry->makePrivate();
++        case ReuseDecision::cachePositively:
++            entry->makePublic();
+             break;
+ 
+-        case -1:
++        case ReuseDecision::cacheNegatively:
++            entry->cacheNegatively();
++            break;
+ 
+-#if USE_HTTP_VIOLATIONS
+-            if (Config.negativeTtl > 0)
+-                entry->cacheNegatively();
+-            else
+-#endif
+-                entry->makePrivate();
++        case ReuseDecision::doNotCacheButShare:
++            entry->makePrivate(true);
+             break;
+ 
+         default:
+             assert(0);
+             break;
+         }
++        debugs(11, 3, "decided: " << decision);
+     }
+ 
+     if (!ignoreCacheControl) {
+         if (rep->cache_control) {
+             // We are required to revalidate on many conditions.
+             // For security reasons we do so even if storage was caused by refresh_pattern ignore-* option
+ 
+             // CC:must-revalidate or CC:proxy-revalidate
+             const bool ccMustRevalidate = (rep->cache_control->hasProxyRevalidate() || rep->cache_control->hasMustRevalidate());
+ 
+             // CC:no-cache (only if there are no parameters)
+             const bool ccNoCacheNoParams = rep->cache_control->hasNoCacheWithoutParameters();
+ 
+             // CC:s-maxage=N
+             const bool ccSMaxAge = rep->cache_control->hasSMaxAge();
+ 
+             // CC:private (yes, these can sometimes be stored)
+             const bool ccPrivate = rep->cache_control->hasPrivate();
+ 
+             if (ccNoCacheNoParams || ccPrivate)
+                 EBIT_SET(entry->flags, ENTRY_REVALIDATE_ALWAYS);
+             else if (ccMustRevalidate || ccSMaxAge)
+                 EBIT_SET(entry->flags, ENTRY_REVALIDATE_STALE);
+         }
+ #if USE_HTTP_VIOLATIONS // response header Pragma::no-cache is undefined in HTTP
+         else {
+             // Expensive calculation. So only do it IF the CC: header is not present.
+ 
+             /* HACK: Pragma: no-cache in _replies_ is not documented in HTTP,
+              * but servers like "Active Imaging Webcast/2.0" sure do use it */
+@@ -2430,30 +2415,56 @@ HttpStateData::handleRequestBodyProducer
+         // We usually get here when ICAP REQMOD aborts during body processing.
+         // We might also get here if client-side aborts, but then our response
+         // should not matter because either client-side will provide its own or
+         // there will be no response at all (e.g., if the the client has left).
+         ErrorState *err = new ErrorState(ERR_ICAP_FAILURE, Http::scInternalServerError, fwd->request);
+         err->detailError(ERR_DETAIL_SRV_REQMOD_REQ_BODY);
+         fwd->fail(err);
+     }
+ 
+     abortTransaction("request body producer aborted");
+ }
+ 
+ // called when we wrote request headers(!) or a part of the body
+ void
+ HttpStateData::sentRequestBody(const CommIoCbParams &io)
+ {
+     if (io.size > 0)
+         statCounter.server.http.kbytes_out += io.size;
+ 
+     Client::sentRequestBody(io);
+ }
+ 
+ void
+ HttpStateData::abortAll(const char *reason)
+ {
+     debugs(11,5, HERE << "aborting transaction for " << reason <<
+            "; " << serverConnection << ", this " << this);
+     mustStop(reason);
+ }
+ 
++HttpStateData::ReuseDecision::ReuseDecision(const StoreEntry *e, const Http::StatusCode code)
++    : answer(HttpStateData::ReuseDecision::reuseNot), reason(nullptr), entry(e), statusCode(code) {}
++
++HttpStateData::ReuseDecision::Answers
++HttpStateData::ReuseDecision::make(const HttpStateData::ReuseDecision::Answers ans, const char *why)
++{
++    answer = ans;
++    reason = why;
++    return answer;
++}
++
++std::ostream &operator <<(std::ostream &os, const HttpStateData::ReuseDecision &d)
++{
++    static const char *ReuseMessages[] = {
++        "do not cache and do not share", // reuseNot
++        "cache positively and share", // cachePositively
++        "cache negatively and share", // cacheNegatively
++        "do not cache but share" // doNotCacheButShare
++    };
++
++    assert(d.answer >= HttpStateData::ReuseDecision::reuseNot &&
++            d.answer <= HttpStateData::ReuseDecision::doNotCacheButShare);
++    return os << ReuseMessages[d.answer] << " because " << d.reason <<
++        "; HTTP status " << d.statusCode << " " << *(d.entry);
++}
++
+
+=== modified file 'src/http.h'
+--- src/http.h	2017-01-01 00:12:22 +0000
++++ src/http.h	2017-05-07 22:08:14 +0000
+@@ -1,74 +1,91 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_HTTP_H
+ #define SQUID_HTTP_H
+ 
+ #include "clients/Client.h"
+ #include "comm.h"
+ #include "http/forward.h"
+ #include "http/StateFlags.h"
+ #include "sbuf/SBuf.h"
+ 
+ class FwdState;
+ class HttpHeader;
+ 
+ class HttpStateData : public Client
+ {
+     CBDATA_CLASS(HttpStateData);
+ 
+ public:
++
++    /// assists in making and relaying entry caching/sharing decision
++    class ReuseDecision
++    {
++    public:
++        enum Answers { reuseNot = 0, cachePositively, cacheNegatively, doNotCacheButShare };
++
++        ReuseDecision(const StoreEntry *e, const Http::StatusCode code);
++        /// stores the corresponding decision
++        Answers make(const Answers ans, const char *why);
++
++        Answers answer; ///< the decision id
++        const char *reason; ///< the decision reason
++        const StoreEntry *entry; ///< entry for debugging
++        const Http::StatusCode statusCode; ///< HTTP status for debugging
++    };
++
+     HttpStateData(FwdState *);
+     ~HttpStateData();
+ 
+     static void httpBuildRequestHeader(HttpRequest * request,
+                                        StoreEntry * entry,
+                                        const AccessLogEntryPointer &al,
+                                        HttpHeader * hdr_out,
+                                        const Http::StateFlags &flags);
+ 
+     virtual const Comm::ConnectionPointer & dataConnection() const;
+     /* should be private */
+     bool sendRequest();
+     void processReplyHeader();
+     void processReplyBody();
+     void readReply(const CommIoCbParams &io);
+     virtual void maybeReadVirginBody(); // read response data from the network
+ 
+-    // Determine whether the response is a cacheable representation
+-    int cacheableReply();
++    // Checks whether the response is cacheable/shareable.
++    ReuseDecision::Answers reusableReply(ReuseDecision &decision);
+ 
+     CachePeer *_peer;       /* CachePeer request made to */
+     int eof;            /* reached end-of-object? */
+     int lastChunk;      /* reached last chunk of a chunk-encoded reply */
+     Http::StateFlags flags;
+     size_t read_sz;
+     SBuf inBuf;                ///< I/O buffer for receiving server responses
+     bool ignoreCacheControl;
+     bool surrogateNoStore;
+ 
+     void processSurrogateControl(HttpReply *);
+ 
+ protected:
+     void processReply();
+     void proceedAfter1xx();
+     void handle1xx(HttpReply *msg);
+ 
+ private:
+     /**
+      * The current server connection.
+      * Maybe open, closed, or NULL.
+      * Use doneWithServer() to check if the server is available for use.
+      */
+     Comm::ConnectionPointer serverConnection;
+     AsyncCall::Pointer closeHandler;
+     enum ConnectionStatus {
+         INCOMPLETE_MSG,
+         COMPLETE_PERSISTENT_MSG,
+         COMPLETE_NONPERSISTENT_MSG
+     };
+@@ -108,36 +125,38 @@ private:
+     void writeReplyBody();
+     bool decodeAndWriteReplyBody();
+     bool finishingBrokenPost();
+     bool finishingChunkedRequest();
+     void doneSendingRequestBody();
+     void requestBodyHandler(MemBuf &);
+     virtual void sentRequestBody(const CommIoCbParams &io);
+     void wroteLast(const CommIoCbParams &io);
+     void sendComplete();
+     void httpStateConnClosed(const CommCloseCbParams &params);
+     void httpTimeout(const CommTimeoutCbParams &params);
+ 
+     mb_size_t buildRequestPrefix(MemBuf * mb);
+     static bool decideIfWeDoRanges (HttpRequest * orig_request);
+     bool peerSupportsConnectionPinning() const;
+ 
+     /// Parser being used at present to parse the HTTP/ICY server response.
+     Http1::ResponseParserPointer hp;
+     Http1::TeChunkedParser *httpChunkDecoder;
+ 
+     /// amount of message payload/body received so far.
+     int64_t payloadSeen;
+     /// positive when we read more than we wanted
+     int64_t payloadTruncated;
+ 
+     /// Whether we received a Date header older than that of a matching
+     /// cached response.
+     bool sawDateGoBack;
+ };
+ 
++std::ostream &operator <<(std::ostream &os, const HttpStateData::ReuseDecision &d);
++
+ int httpCachable(const HttpRequestMethod&);
+ void httpStart(FwdState *);
+ SBuf httpMakeVaryMark(HttpRequest * request, HttpReply const * reply);
+ 
+ #endif /* SQUID_HTTP_H */
+ 
+
+=== modified file 'src/store.cc'
+--- src/store.cc	2017-03-03 22:15:10 +0000
++++ src/store.cc	2017-05-08 09:30:59 +0000
+@@ -120,65 +120,72 @@ Store::Stats(StoreEntry * output)
+ 
+ // XXX: new/delete operators need to be replaced with MEMPROXY_CLASS
+ // definitions but doing so exposes bug 4370, and maybe 4354 and 4355
+ void *
+ StoreEntry::operator new (size_t bytecount)
+ {
+     assert(bytecount == sizeof (StoreEntry));
+ 
+     if (!pool) {
+         pool = memPoolCreate ("StoreEntry", bytecount);
+     }
+ 
+     return pool->alloc();
+ }
+ 
+ void
+ StoreEntry::operator delete (void *address)
+ {
+     pool->freeOne(address);
+ }
+ 
+ void
+ StoreEntry::makePublic(const KeyScope scope)
+ {
+     /* This object can be cached for a long time */
+     if (!EBIT_TEST(flags, RELEASE_REQUEST))
+         setPublicKey(scope);
+ }
+ 
+ void
+-StoreEntry::makePrivate()
++StoreEntry::makePrivate(const bool shareable)
+ {
+     /* This object should never be cached at all */
+     expireNow();
+-    releaseRequest(); /* delete object when not used */
++    releaseRequest(shareable); /* delete object when not used */
++}
++
++void
++StoreEntry::clearPrivate()
++{
++    EBIT_CLR(flags, KEY_PRIVATE);
++    shareableWhenPrivate = false;
+ }
+ 
+ void
+ StoreEntry::cacheNegatively()
+ {
+     /* This object may be negatively cached */
+     negativeCache();
+     makePublic();
+ }
+ 
+ size_t
+ StoreEntry::inUseCount()
+ {
+     if (!pool)
+         return 0;
+     return pool->getInUseCount();
+ }
+ 
+ const char *
+ StoreEntry::getMD5Text() const
+ {
+     return storeKeyText((const cache_key *)key);
+ }
+ 
+ #include "comm.h"
+ 
+ void
+ StoreEntry::DeferReader(void *theContext, CommRead const &aRead)
+ {
+     StoreEntry *anEntry = (StoreEntry *)theContext;
+@@ -300,61 +307,62 @@ StoreEntry::storeClientType() const
+      * If there is no disk file to open yet, we must make this a
+      * mem client.  If we can't open the swapin file before writing
+      * to the client, there is no guarantee that we will be able
+      * to open it later when we really need it.
+      */
+     if (swap_status == SWAPOUT_NONE)
+         return STORE_MEM_CLIENT;
+ 
+     /*
+      * otherwise, make subsequent clients read from disk so they
+      * can not delay the first, and vice-versa.
+      */
+     return STORE_DISK_CLIENT;
+ }
+ 
+ StoreEntry::StoreEntry() :
+     mem_obj(NULL),
+     timestamp(-1),
+     lastref(-1),
+     expires(-1),
+     lastModified_(-1),
+     swap_file_sz(0),
+     refcount(0),
+     flags(0),
+     swap_filen(-1),
+     swap_dirn(-1),
+     mem_status(NOT_IN_MEMORY),
+     ping_status(PING_NONE),
+     store_status(STORE_PENDING),
+     swap_status(SWAPOUT_NONE),
+-    lock_count(0)
++    lock_count(0),
++    shareableWhenPrivate(false)
+ {
+     debugs(20, 5, "StoreEntry constructed, this=" << this);
+ }
+ 
+ StoreEntry::~StoreEntry()
+ {
+     debugs(20, 5, "StoreEntry destructed, this=" << this);
+ }
+ 
+ #if USE_ADAPTATION
+ void
+ StoreEntry::deferProducer(const AsyncCall::Pointer &producer)
+ {
+     if (!deferredProducer)
+         deferredProducer = producer;
+     else
+         debugs(20, 5, HERE << "Deferred producer call is allready set to: " <<
+                *deferredProducer << ", requested call: " << *producer);
+ }
+ 
+ void
+ StoreEntry::kickProducer()
+ {
+     if (deferredProducer != NULL) {
+         ScheduleCallHere(deferredProducer);
+         deferredProducer = NULL;
+     }
+ }
+ #endif
+ 
+@@ -436,68 +444,68 @@ StoreEntry::purgeMem()
+         release();
+ }
+ 
+ void
+ StoreEntry::lock(const char *context)
+ {
+     ++lock_count;
+     debugs(20, 3, context << " locked key " << getMD5Text() << ' ' << *this);
+ }
+ 
+ void
+ StoreEntry::touch()
+ {
+     lastref = squid_curtime;
+ }
+ 
+ void
+ StoreEntry::setReleaseFlag()
+ {
+     if (EBIT_TEST(flags, RELEASE_REQUEST))
+         return;
+ 
+     debugs(20, 3, "StoreEntry::setReleaseFlag: '" << getMD5Text() << "'");
+ 
+     EBIT_SET(flags, RELEASE_REQUEST);
+ 
+     Store::Root().markForUnlink(*this);
+ }
+ 
+ void
+-StoreEntry::releaseRequest()
++StoreEntry::releaseRequest(const bool shareable)
+ {
+     if (EBIT_TEST(flags, RELEASE_REQUEST))
+         return;
+ 
+     setReleaseFlag(); // makes validToSend() false, preventing future hits
+ 
+-    setPrivateKey();
++    setPrivateKey(shareable);
+ }
+ 
+ int
+ StoreEntry::unlock(const char *context)
+ {
+     debugs(20, 3, (context ? context : "somebody") <<
+            " unlocking key " << getMD5Text() << ' ' << *this);
+     assert(lock_count > 0);
+     --lock_count;
+ 
+     if (lock_count)
+         return (int) lock_count;
+ 
+     if (store_status == STORE_PENDING)
+         setReleaseFlag();
+ 
+     assert(storePendingNClients(this) == 0);
+ 
+     if (EBIT_TEST(flags, RELEASE_REQUEST)) {
+         this->release();
+         return 0;
+     }
+ 
+     if (EBIT_TEST(flags, KEY_PRIVATE))
+         debugs(20, DBG_IMPORTANT, "WARNING: " << __FILE__ << ":" << __LINE__ << ": found KEY_PRIVATE");
+ 
+     Store::Root().handleIdleEntry(*this); // may delete us
+     return 0;
+ }
+ 
+@@ -555,145 +563,153 @@ storeGetPublicByRequest(HttpRequest * re
+     StoreEntry *e = storeGetPublicByRequestMethod(req, req->method, keyScope);
+ 
+     if (e == NULL && req->method == Http::METHOD_HEAD)
+         /* We can generate a HEAD reply from a cached GET object */
+         e = storeGetPublicByRequestMethod(req, Http::METHOD_GET, keyScope);
+ 
+     return e;
+ }
+ 
+ static int
+ getKeyCounter(void)
+ {
+     static int key_counter = 0;
+ 
+     if (++key_counter < 0)
+         key_counter = 1;
+ 
+     return key_counter;
+ }
+ 
+ /* RBC 20050104 AFAICT this should become simpler:
+  * rather than reinserting with a special key it should be marked
+  * as 'released' and then cleaned up when refcounting indicates.
+  * the StoreHashIndex could well implement its 'released' in the
+  * current manner.
+  * Also, clean log writing should skip over ia,t
+  * Otherwise, we need a 'remove from the index but not the store
+  * concept'.
+  */
+ void
+-StoreEntry::setPrivateKey()
++StoreEntry::setPrivateKey(const bool shareable)
+ {
+-    if (key && EBIT_TEST(flags, KEY_PRIVATE))
+-        return;                 /* is already private */
++    if (key && EBIT_TEST(flags, KEY_PRIVATE)) {
++        // The entry is already private, but it may be still shareable.
++        if (!shareable)
++            shareableWhenPrivate = false;
++        return;
++    }
+ 
+     if (key) {
+         setReleaseFlag(); // will markForUnlink(); all caches/workers will know
+ 
+         // TODO: move into SwapDir::markForUnlink() already called by Root()
+         if (swap_filen > -1)
+             storeDirSwapLog(this, SWAP_LOG_DEL);
+ 
+         hashDelete();
+     }
+ 
+     if (mem_obj && mem_obj->hasUris())
+         mem_obj->id = getKeyCounter();
+     const cache_key *newkey = storeKeyPrivate();
+ 
+     assert(hash_lookup(store_table, newkey) == NULL);
+     EBIT_SET(flags, KEY_PRIVATE);
++    shareableWhenPrivate = shareable;
+     hashInsert(newkey);
+ }
+ 
+ void
+ StoreEntry::setPublicKey(const KeyScope scope)
+ {
+     if (key && !EBIT_TEST(flags, KEY_PRIVATE))
+         return;                 /* is already public */
+ 
+     assert(mem_obj);
+ 
+     /*
+      * We can't make RELEASE_REQUEST objects public.  Depending on
+      * when RELEASE_REQUEST gets set, we might not be swapping out
+      * the object.  If we're not swapping out, then subsequent
+      * store clients won't be able to access object data which has
+      * been freed from memory.
+      *
+      * If RELEASE_REQUEST is set, setPublicKey() should not be called.
+      */
+ #if MORE_DEBUG_OUTPUT
+ 
+     if (EBIT_TEST(flags, RELEASE_REQUEST))
+         debugs(20, DBG_IMPORTANT, "assertion failed: RELEASE key " << key << ", url " << mem_obj->url);
+ 
+ #endif
+ 
+     assert(!EBIT_TEST(flags, RELEASE_REQUEST));
+ 
+     adjustVary();
+     forcePublicKey(calcPublicKey(scope));
+ }
+ 
+ void
+ StoreEntry::clearPublicKeyScope()
+ {
+     if (!key || EBIT_TEST(flags, KEY_PRIVATE))
+         return; // probably the old public key was deleted or made private
+ 
+     // TODO: adjustVary() when collapsed revalidation supports that
+ 
+     const cache_key *newKey = calcPublicKey(ksDefault);
+     if (!storeKeyHashCmp(key, newKey))
+         return; // probably another collapsed revalidation beat us to this change
+ 
+     forcePublicKey(newKey);
+ }
+ 
+ /// Unconditionally sets public key for this store entry.
+ /// Releases the old entry with the same public key (if any).
+ void
+ StoreEntry::forcePublicKey(const cache_key *newkey)
+ {
+     if (StoreEntry *e2 = (StoreEntry *)hash_lookup(store_table, newkey)) {
+         assert(e2 != this);
+         debugs(20, 3, "Making old " << *e2 << " private.");
+-        e2->setPrivateKey();
+-        e2->release();
++
++        // TODO: check whether there is any sense in keeping old entry
++        // shareable here. Leaving it non-shareable for now.
++        e2->setPrivateKey(false);
++        e2->release(false);
+     }
+ 
+     if (key)
+         hashDelete();
+ 
+-    EBIT_CLR(flags, KEY_PRIVATE);
++    clearPrivate();
+ 
+     hashInsert(newkey);
+ 
+     if (swap_filen > -1)
+         storeDirSwapLog(this, SWAP_LOG_ADD);
+ }
+ 
+ /// Calculates correct public key for feeding forcePublicKey().
+ /// Assumes adjustVary() has been called for this entry already.
+ const cache_key *
+ StoreEntry::calcPublicKey(const KeyScope keyScope)
+ {
+     assert(mem_obj);
+     return mem_obj->request ? storeKeyPublicByRequest(mem_obj->request.getRaw(), keyScope) :
+            storeKeyPublic(mem_obj->storeId(), mem_obj->method, keyScope);
+ }
+ 
+ /// Updates mem_obj->request->vary_headers to reflect the current Vary.
+ /// The vary_headers field is used to calculate the Vary marker key.
+ /// Releases the old Vary marker with an outdated key (if any).
+ void
+ StoreEntry::adjustVary()
+ {
+     assert(mem_obj);
+ 
+     if (!mem_obj->request)
+         return;
+ 
+     HttpRequestPointer request(mem_obj->request);
+ 
+@@ -761,61 +777,61 @@ storeCreatePureEntry(const char *url, co
+ {
+     StoreEntry *e = NULL;
+     debugs(20, 3, "storeCreateEntry: '" << url << "'");
+ 
+     e = new StoreEntry();
+     e->makeMemObject();
+     e->mem_obj->setUris(url, log_url, method);
+ 
+     if (flags.cachable) {
+         EBIT_CLR(e->flags, RELEASE_REQUEST);
+     } else {
+         e->releaseRequest();
+     }
+ 
+     e->store_status = STORE_PENDING;
+     e->refcount = 0;
+     e->lastref = squid_curtime;
+     e->timestamp = -1;          /* set in StoreEntry::timestampsSet() */
+     e->ping_status = PING_NONE;
+     EBIT_SET(e->flags, ENTRY_VALIDATED);
+     return e;
+ }
+ 
+ StoreEntry *
+ storeCreateEntry(const char *url, const char *logUrl, const RequestFlags &flags, const HttpRequestMethod& method)
+ {
+     StoreEntry *e = storeCreatePureEntry(url, logUrl, flags, method);
+     e->lock("storeCreateEntry");
+ 
+     if (neighbors_do_private_keys || !flags.hierarchical)
+-        e->setPrivateKey();
++        e->setPrivateKey(false);
+     else
+         e->setPublicKey();
+ 
+     return e;
+ }
+ 
+ /* Mark object as expired */
+ void
+ StoreEntry::expireNow()
+ {
+     debugs(20, 3, "StoreEntry::expireNow: '" << getMD5Text() << "'");
+     expires = squid_curtime;
+ }
+ 
+ void
+ StoreEntry::write (StoreIOBuffer writeBuffer)
+ {
+     assert(mem_obj != NULL);
+     /* This assert will change when we teach the store to update */
+     PROF_start(StoreEntry_write);
+     assert(store_status == STORE_PENDING);
+ 
+     // XXX: caller uses content offset, but we also store headers
+     if (const HttpReplyPointer reply = mem_obj->getReply())
+         writeBuffer.offset += reply->hdr_sz;
+ 
+     debugs(20, 5, "storeWrite: writing " << writeBuffer.length << " bytes for '" << getMD5Text() << "'");
+     PROF_stop(StoreEntry_write);
+     storeGetMemSpace(writeBuffer.length);
+     mem_obj->write(writeBuffer);
+@@ -1205,81 +1221,81 @@ storeGetMemSpace(int size)
+     }
+ 
+     walker->Done(walker);
+     debugs(20, 3, "storeGetMemSpace stats:");
+     debugs(20, 3, "  " << std::setw(6) << hot_obj_count  << " HOT objects");
+     debugs(20, 3, "  " << std::setw(6) << released  << " were released");
+     PROF_stop(storeGetMemSpace);
+ }
+ 
+ /* thunk through to Store::Root().maintain(). Note that this would be better still
+  * if registered against the root store itself, but that requires more complex
+  * update logic - bigger fish to fry first. Long term each store when
+  * it becomes active will self register
+  */
+ void
+ Store::Maintain(void *)
+ {
+     Store::Root().maintain();
+ 
+     /* Reregister a maintain event .. */
+     eventAdd("MaintainSwapSpace", Maintain, NULL, 1.0, 1);
+ 
+ }
+ 
+ /* The maximum objects to scan for maintain storage space */
+ #define MAINTAIN_MAX_SCAN       1024
+ #define MAINTAIN_MAX_REMOVE     64
+ 
+ /* release an object from a cache */
+ void
+-StoreEntry::release()
++StoreEntry::release(const bool shareable)
+ {
+     PROF_start(storeRelease);
+     debugs(20, 3, "releasing " << *this << ' ' << getMD5Text());
+     /* If, for any reason we can't discard this object because of an
+      * outstanding request, mark it for pending release */
+ 
+     if (locked()) {
+         expireNow();
+         debugs(20, 3, "storeRelease: Only setting RELEASE_REQUEST bit");
+-        releaseRequest();
++        releaseRequest(shareable);
+         PROF_stop(storeRelease);
+         return;
+     }
+ 
+     if (Store::Controller::store_dirs_rebuilding && swap_filen > -1) {
+         /* TODO: Teach disk stores to handle releases during rebuild instead. */
+ 
+         Store::Root().memoryUnlink(*this);
+ 
+-        setPrivateKey();
++        setPrivateKey(shareable);
+ 
+         // lock the entry until rebuilding is done
+         lock("storeLateRelease");
+         setReleaseFlag();
+         LateReleaseStack.push(this);
+         return;
+     }
+ 
+     storeLog(STORE_LOG_RELEASE, this);
+     if (swap_filen > -1 && !EBIT_TEST(flags, KEY_PRIVATE)) {
+         // log before unlink() below clears swap_filen
+         storeDirSwapLog(this, SWAP_LOG_DEL);
+     }
+ 
+     Store::Root().unlink(*this);
+     destroyStoreEntry(static_cast<hash_link *>(this));
+     PROF_stop(storeRelease);
+ }
+ 
+ static void
+ storeLateRelease(void *)
+ {
+     StoreEntry *e;
+     static int n = 0;
+ 
+     if (Store::Controller::store_dirs_rebuilding) {
+         eventAdd("storeLateRelease", storeLateRelease, NULL, 1.0, 1);
+         return;
+     }
+ 
+@@ -2071,61 +2087,65 @@ std::ostream &operator <<(std::ostream &
+     if (e.mem_obj) {
+         if (e.mem_obj->xitTable.index > -1)
+             os << 't' << e.mem_obj->xitTable.index;
+         if (e.mem_obj->memCache.index > -1)
+             os << 'm' << e.mem_obj->memCache.index;
+     }
+     if (e.swap_filen > -1 || e.swap_dirn > -1)
+         os << 'd' << e.swap_filen << '@' << e.swap_dirn;
+ 
+     os << '=';
+ 
+     // print only non-default status values, using unique letters
+     if (e.mem_status != NOT_IN_MEMORY ||
+             e.store_status != STORE_PENDING ||
+             e.swap_status != SWAPOUT_NONE ||
+             e.ping_status != PING_NONE) {
+         if (e.mem_status != NOT_IN_MEMORY) os << 'm';
+         if (e.store_status != STORE_PENDING) os << 's';
+         if (e.swap_status != SWAPOUT_NONE) os << 'w' << e.swap_status;
+         if (e.ping_status != PING_NONE) os << 'p' << e.ping_status;
+     }
+ 
+     // print only set flags, using unique letters
+     if (e.flags) {
+         if (EBIT_TEST(e.flags, ENTRY_SPECIAL)) os << 'S';
+         if (EBIT_TEST(e.flags, ENTRY_REVALIDATE_ALWAYS)) os << 'R';
+         if (EBIT_TEST(e.flags, DELAY_SENDING)) os << 'P';
+         if (EBIT_TEST(e.flags, RELEASE_REQUEST)) os << 'X';
+         if (EBIT_TEST(e.flags, REFRESH_REQUEST)) os << 'F';
+         if (EBIT_TEST(e.flags, ENTRY_REVALIDATE_STALE)) os << 'E';
+-        if (EBIT_TEST(e.flags, ENTRY_DISPATCHED)) os << 'D';
++        if (EBIT_TEST(e.flags, KEY_PRIVATE)) {
++            os << 'I';
++            if (e.shareableWhenPrivate)
++                os << 'H';
++        }
+         if (EBIT_TEST(e.flags, KEY_PRIVATE)) os << 'I';
+         if (EBIT_TEST(e.flags, ENTRY_FWD_HDR_WAIT)) os << 'W';
+         if (EBIT_TEST(e.flags, ENTRY_NEGCACHED)) os << 'N';
+         if (EBIT_TEST(e.flags, ENTRY_VALIDATED)) os << 'V';
+         if (EBIT_TEST(e.flags, ENTRY_BAD_LENGTH)) os << 'L';
+         if (EBIT_TEST(e.flags, ENTRY_ABORTED)) os << 'A';
+     }
+ 
+     if (e.mem_obj && e.mem_obj->smpCollapsed)
+         os << 'O';
+ 
+     return os << '/' << &e << '*' << e.locks();
+ }
+ 
+ /* NullStoreEntry */
+ 
+ NullStoreEntry NullStoreEntry::_instance;
+ 
+ NullStoreEntry *
+ NullStoreEntry::getInstance()
+ {
+     return &_instance;
+ }
+ 
+ char const *
+ NullStoreEntry::getMD5Text() const
+ {
+     return "N/A";
+ }
+ 
+
+=== modified file 'src/tests/stub_store.cc'
+--- src/tests/stub_store.cc	2017-01-01 00:12:22 +0000
++++ src/tests/stub_store.cc	2017-05-07 22:08:14 +0000
+@@ -11,116 +11,116 @@
+ 
+ #define STUB_API "store.cc"
+ #include "tests/STUB.h"
+ 
+ const char *storeStatusStr[] = { };
+ const char *pingStatusStr[] = { };
+ const char *memStatusStr[] = { };
+ const char *swapStatusStr[] = { };
+ 
+ #include "RemovalPolicy.h"
+ RemovalPolicy * createRemovalPolicy(RemovalPolicySettings * settings) STUB_RETVAL(NULL)
+ 
+ #include "Store.h"
+ StoreIoStats store_io_stats;
+ bool StoreEntry::checkDeferRead(int fd) const STUB_RETVAL(false)
+ const char *StoreEntry::getMD5Text() const STUB_RETVAL(NULL)
+ StoreEntry::StoreEntry() STUB
+ StoreEntry::~StoreEntry() STUB
+ HttpReply const *StoreEntry::getReply() const STUB_RETVAL(NULL)
+ void StoreEntry::write(StoreIOBuffer) STUB
+ bool StoreEntry::isAccepting() const STUB_RETVAL(false)
+ size_t StoreEntry::bytesWanted(Range<size_t> const, bool) const STUB_RETVAL(0)
+ void StoreEntry::complete() STUB
+ store_client_t StoreEntry::storeClientType() const STUB_RETVAL(STORE_NON_CLIENT)
+ char const *StoreEntry::getSerialisedMetaData() STUB_RETVAL(NULL)
+ void StoreEntry::replaceHttpReply(HttpReply *, bool andStartWriting) STUB
+ bool StoreEntry::mayStartSwapOut() STUB_RETVAL(false)
+ void StoreEntry::trimMemory(const bool preserveSwappable) STUB
+ void StoreEntry::abort() STUB
+ void StoreEntry::makePublic(const KeyScope scope) STUB
+-void StoreEntry::makePrivate() STUB
++void StoreEntry::makePrivate(const bool shareable) STUB
+ void StoreEntry::setPublicKey(const KeyScope scope) STUB
+-void StoreEntry::setPrivateKey() STUB
++void StoreEntry::setPrivateKey(const bool shareable) STUB
+ void StoreEntry::expireNow() STUB
+-void StoreEntry::releaseRequest() STUB
++void StoreEntry::releaseRequest(const bool shareable) STUB
+ void StoreEntry::negativeCache() STUB
+ void StoreEntry::cacheNegatively() STUB
+ void StoreEntry::purgeMem() STUB
+ void StoreEntry::swapOut() STUB
+ void StoreEntry::swapOutFileClose(int how) STUB
+ const char *StoreEntry::url() const STUB_RETVAL(NULL)
+ bool StoreEntry::checkCachable() STUB_RETVAL(false)
+ int StoreEntry::checkNegativeHit() const STUB_RETVAL(0)
+ int StoreEntry::locked() const STUB_RETVAL(0)
+ int StoreEntry::validToSend() const STUB_RETVAL(0)
+ bool StoreEntry::memoryCachable() STUB_RETVAL(false)
+ MemObject *StoreEntry::makeMemObject() STUB_RETVAL(NULL)
+ void StoreEntry::createMemObject(const char *, const char *, const HttpRequestMethod &aMethod) STUB
+ void StoreEntry::dump(int debug_lvl) const STUB
+ void StoreEntry::hashDelete() STUB
+ void StoreEntry::hashInsert(const cache_key *) STUB
+ void StoreEntry::registerAbort(STABH * cb, void *) STUB
+ void StoreEntry::reset() STUB
+ void StoreEntry::setMemStatus(mem_status_t) STUB
+ bool StoreEntry::timestampsSet() STUB_RETVAL(false)
+ void StoreEntry::unregisterAbort() STUB
+ void StoreEntry::destroyMemObject() STUB
+ int StoreEntry::checkTooSmall() STUB_RETVAL(0)
+ void StoreEntry::delayAwareRead(const Comm::ConnectionPointer&, char *buf, int len, AsyncCall::Pointer callback) STUB
+ void StoreEntry::setNoDelay (bool const) STUB
+ bool StoreEntry::modifiedSince(const time_t, const int) const STUB_RETVAL(false)
+ bool StoreEntry::hasIfMatchEtag(const HttpRequest &request) const STUB_RETVAL(false)
+ bool StoreEntry::hasIfNoneMatchEtag(const HttpRequest &request) const STUB_RETVAL(false)
+ Store::Disk &StoreEntry::disk() const STUB_RETREF(Store::Disk)
+ size_t StoreEntry::inUseCount() STUB_RETVAL(0)
+ void StoreEntry::getPublicByRequestMethod(StoreClient * aClient, HttpRequest * request, const HttpRequestMethod& method) STUB
+ void StoreEntry::getPublicByRequest(StoreClient * aClient, HttpRequest * request) STUB
+ void StoreEntry::getPublic(StoreClient * aClient, const char *uri, const HttpRequestMethod& method) STUB
+ void *StoreEntry::operator new(size_t byteCount)
+ {
+     STUB
+     return new StoreEntry();
+ }
+ void StoreEntry::operator delete(void *address) STUB
+ void StoreEntry::setReleaseFlag() STUB
+ //#if USE_SQUID_ESI
+ //ESIElement::Pointer StoreEntry::cachedESITree STUB_RETVAL(NULL)
+ //#endif
+ void StoreEntry::buffer() STUB
+ void StoreEntry::flush() STUB
+ int StoreEntry::unlock(const char *) STUB_RETVAL(0)
+ int64_t StoreEntry::objectLen() const STUB_RETVAL(0)
+ int64_t StoreEntry::contentLen() const STUB_RETVAL(0)
+ void StoreEntry::lock(const char *) STUB
+ void StoreEntry::touch() STUB
+-void StoreEntry::release() STUB
++void StoreEntry::release(const bool shareable) STUB
+ void StoreEntry::append(char const *, int) STUB
+ void StoreEntry::vappendf(const char *, va_list) STUB
+ 
+ NullStoreEntry *NullStoreEntry::getInstance() STUB_RETVAL(NULL)
+ const char *NullStoreEntry::getMD5Text() const STUB_RETVAL(NULL)
+ void NullStoreEntry::operator delete(void *address) STUB
+ // private virtual. Why is this linked from outside?
+ const char *NullStoreEntry::getSerialisedMetaData() STUB_RETVAL(NULL)
+ 
+ Store::Controller &Store::Root() STUB_RETREF(Store::Controller)
+ void Store::Init(Store::Controller *root) STUB
+ void Store::FreeMemory() STUB
+ void Store::Stats(StoreEntry * output) STUB
+ void Store::Maintain(void *unused) STUB
+ int Store::Controller::store_dirs_rebuilding = 0;
+ StoreSearch *Store::Controller::search() STUB_RETVAL(NULL)
+ void Store::Controller::maintain() STUB
+ 
+ std::ostream &operator <<(std::ostream &os, const StoreEntry &)
+ {
+     STUB
+     return os;
+ }
+ 
+ size_t storeEntryInUse() STUB_RETVAL(0)
+ void storeEntryReplaceObject(StoreEntry *, HttpReply *) STUB
+ StoreEntry *storeGetPublic(const char *uri, const HttpRequestMethod& method) STUB_RETVAL(NULL)
+ StoreEntry *storeGetPublicByRequest(HttpRequest * request, const KeyScope scope) STUB_RETVAL(NULL)
+ StoreEntry *storeGetPublicByRequestMethod(HttpRequest * request, const HttpRequestMethod& method, const KeyScope scope) STUB_RETVAL(NULL)
+ StoreEntry *storeCreateEntry(const char *, const char *, const RequestFlags &, const HttpRequestMethod&) STUB_RETVAL(NULL)
+
+=== modified file 'src/tests/testStoreController.cc'
+--- src/tests/testStoreController.cc	2017-01-01 00:12:22 +0000
++++ src/tests/testStoreController.cc	2017-05-07 22:08:14 +0000
+@@ -87,61 +87,61 @@ testStoreController::testMaxSize()
+ }
+ 
+ static StoreEntry *
+ addedEntry(Store::Disk *aStore,
+            String name,
+            String varySpec,
+            String varyKey
+ 
+           )
+ {
+     StoreEntry *e = new StoreEntry();
+     e->store_status = STORE_OK;
+     e->setMemStatus(NOT_IN_MEMORY);
+     e->swap_status = SWAPOUT_DONE; /* bogus haha */
+     e->swap_filen = 0; /* garh - lower level*/
+     e->swap_dirn = -1;
+ 
+     for (int i=0; i < Config.cacheSwap.n_configured; ++i) {
+         if (INDEXSD(i) == aStore)
+             e->swap_dirn = i;
+     }
+ 
+     CPPUNIT_ASSERT (e->swap_dirn != -1);
+     e->swap_file_sz = 0; /* garh lower level */
+     e->lastref = squid_curtime;
+     e->timestamp = squid_curtime;
+     e->expires = squid_curtime;
+     e->lastModified(squid_curtime);
+     e->refcount = 1;
+     EBIT_CLR(e->flags, RELEASE_REQUEST);
+-    EBIT_CLR(e->flags, KEY_PRIVATE);
++    e->clearPrivate();
+     e->ping_status = PING_NONE;
+     EBIT_CLR(e->flags, ENTRY_VALIDATED);
+     e->hashInsert((const cache_key *)name.termedBuf()); /* do it after we clear KEY_PRIVATE */
+     return e;
+ }
+ 
+ /* TODO make this a cbdata class */
+ 
+ static bool cbcalled;
+ 
+ static void
+ searchCallback(void *cbdata)
+ {
+     cbcalled = true;
+ }
+ 
+ void
+ testStoreController::testSearch()
+ {
+     commonInit();
+     Store::Init();
+     TestSwapDirPointer aStore (new TestSwapDir);
+     TestSwapDirPointer aStore2 (new TestSwapDir);
+     addSwapDir(aStore);
+     addSwapDir(aStore2);
+     Store::Root().init();
+     StoreEntry * entry1 = addedEntry(aStore.getRaw(), "name", NULL, NULL);
+     StoreEntry * entry2 = addedEntry(aStore2.getRaw(), "name2", NULL, NULL);
+     StoreSearchPointer search = Store::Root().search(); /* search for everything in the store */
+ 
+
+=== modified file 'src/tests/testStoreHashIndex.cc'
+--- src/tests/testStoreHashIndex.cc	2017-01-01 00:12:22 +0000
++++ src/tests/testStoreHashIndex.cc	2017-05-07 22:08:14 +0000
+@@ -65,61 +65,61 @@ testStoreHashIndex::testMaxSize()
+ }
+ 
+ StoreEntry *
+ addedEntry(Store::Disk *aStore,
+            String name,
+            String varySpec,
+            String varyKey
+ 
+           )
+ {
+     StoreEntry *e = new StoreEntry();
+     e->store_status = STORE_OK;
+     e->setMemStatus(NOT_IN_MEMORY);
+     e->swap_status = SWAPOUT_DONE; /* bogus haha */
+     e->swap_filen = 0; /* garh - lower level*/
+     e->swap_dirn = -1;
+ 
+     for (int i=0; i < Config.cacheSwap.n_configured; ++i) {
+         if (INDEXSD(i) == aStore)
+             e->swap_dirn = i;
+     }
+ 
+     CPPUNIT_ASSERT (e->swap_dirn != -1);
+     e->swap_file_sz = 0; /* garh lower level */
+     e->lastref = squid_curtime;
+     e->timestamp = squid_curtime;
+     e->expires = squid_curtime;
+     e->lastModified(squid_curtime);
+     e->refcount = 1;
+     EBIT_CLR(e->flags, RELEASE_REQUEST);
+-    EBIT_CLR(e->flags, KEY_PRIVATE);
++    e->clearPrivate();
+     e->ping_status = PING_NONE;
+     EBIT_CLR(e->flags, ENTRY_VALIDATED);
+     e->hashInsert((const cache_key *)name.termedBuf()); /* do it after we clear KEY_PRIVATE */
+     return e;
+ }
+ 
+ void commonInit()
+ {
+     static bool inited = false;
+ 
+     if (inited)
+         return;
+ 
+     Mem::Init();
+ 
+     Config.Store.avgObjectSize = 1024;
+ 
+     Config.Store.objectsPerBucket = 20;
+ 
+     Config.Store.maxObjectSize = 2048;
+ }
+ 
+ /* TODO make this a cbdata class */
+ 
+ static bool cbcalled;
+ 
+ static void
+ searchCallback(void *cbdata)
+ {
+     cbcalled = true;
+

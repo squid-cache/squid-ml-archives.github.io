@@ -1,0 +1,167 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Case-insensitive URI schemes
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Case-insensitive%20URI%20schemes&In-Reply-To=%3C23c730b91294cecb5d78b59c2120fa27%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="007692.html">
+   <LINK REL="Next"  HREF="007721.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Case-insensitive URI schemes</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Case-insensitive%20URI%20schemes&In-Reply-To=%3C23c730b91294cecb5d78b59c2120fa27%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] Case-insensitive URI schemes">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Fri Jan  6 12:27:58 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007692.html">[squid-dev] [PATCH] Case-insensitive URI schemes
+</A></li>
+        <LI>Next message: <A HREF="007721.html">[squid-dev] [PATCH] Case-insensitive URI schemes
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7698">[ date ]</a>
+              <a href="thread.html#7698">[ thread ]</a>
+              <a href="subject.html#7698">[ subject ]</a>
+              <a href="author.html#7698">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 2017-01-06 10:24, Eduard Bagdasaryan wrote:
+&gt;<i> Hello,
+</I>&gt;<i> 
+</I>&gt;<i> This patch fixes URI schemes to be case-insensitive (r14802 
+</I>&gt;<i> regression).
+</I>&gt;<i> 
+</I>&gt;<i> The bug was introduced by r14802 (better support of unknown
+</I>&gt;<i> URL schemes). AnyP::UriScheme constructor had a problem: the
+</I>&gt;<i> explicitly-specified img parameter (always provided by 
+</I>&gt;<i> URL::setScheme())
+</I>&gt;<i> was used for all schemes, not only for unknown ones (as it obviously
+</I>&gt;<i> should be).
+</I>
+The situation is not so obvious. Alex and I already had a rather long 
+audit discussion about the finer points of that before the 14802 commit.
+  The problem is rooted in the unfortunate fact that transport protocol 
+labels are conflated into the scheme types, and are both upper-case + 
+case-sensitive.
+
+For context please read:
+  
+&lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/2016-June/005995.html">http://lists.squid-cache.org/pipermail/squid-dev/2016-June/005995.html</A>&gt;
+
+
+&gt;<i> As a result, the code responsible for lower-case
+</I>&gt;<i> transformation was not executed.
+</I>
+That is intentional behaviour for several reasons;
+
+1) it improves transparency and reduces risks from proxy fingerprinting 
+by systems probing the URI scheme handling by the transport agents (ie, 
+fingerprinting Squid).
+
+2) unknown URI schemes are not necessarily handled properly as 
+case-insensitive by the experimental agents sending and receiving the 
+messages.
+
+also, (and more importantly);
+
+3) the transport protocol label and URI scheme label are still 
+conflated. The scheme down-casing procedure is _only_ applicable when 
+translating from ProtocolType_str labels (upper case) to scheme label 
+(lower case).
+  - as we improve the code to remove the conflation problem the uses of 
+that logic path should trend towards zero, then we can drop it entirely.
+
+  - with unknown protocols the UriScheme object will have to be used as 
+the transport representation (ew, but that what we have today). So 
+retaining the upper case version there on unknown things is currently 
+important while being not-harmful for the scheme comparisons which 
+should be ignoring case anyhow.
+
+  - we do not yet properly handle scheme comparisons for unknown schemes, 
+so down-casing for that reason is not part of the existing code. The #1 
+security consideration will need to be balanced into the logic when that 
+is eventually fixed.
+
+
+4) storing the down-cased string for registered protocols of each URI 
+avoids many explicit down-casing operations on use/display of the URI 
+scheme. Note that is specific to the known protocols.
+
+  - There are many more points of code displaying the scheme than setting 
+it. So this is a significant performance gain despite the overhead of 
+allocating and own-casing a new SBuf per UriScheme object your patch 
+notes with an XXX.
+
+
+5) the most common cases for this method being called are internal uses 
+where img is passed with a static lower-cased value, and input from 
+urlParse() parsing an absolute-URI from clients sending properly 
+lower-cased URI schemes.
+
+  - So checking for (img &amp;&amp; scheme == (NONE or UNKNOWN)) is unnecessary 
+extra logic to begin with and by causing the lower-casing logic to be 
+applied for registered schemes is also re-adding a major performance 
+regression in the common traffic case.
+
+
+&gt;<i> 
+</I>&gt;<i> There are a couple of XXX and one of them (about &quot;broken caller&quot; for
+</I>&gt;<i> PROTO_NONE) needs clarification. This caller uses PROTO_NONE
+</I>&gt;<i> (i.e., absent scheme) together with &quot;http&quot; scheme image inside
+</I>&gt;<i> clientReplyContext::createStoreEntry() which looks inconsistent and
+</I>&gt;<i> probably is a bug. Am I missing anything there?
+</I>
+Thats an odd case. I'm not exactly sure what we should be doing there. 
+Thus the unusual parameter combo. It was done that way to minimize 
+breakage with old code - so the request can be detected as missing 
+scheme (avoid confusing with a real HTTP URL) if anything tries to 
+compare it, but still generates a reasonably correct URL if its dumped 
+to store files.
+
+Amos
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007692.html">[squid-dev] [PATCH] Case-insensitive URI schemes
+</A></li>
+	<LI>Next message: <A HREF="007721.html">[squid-dev] [PATCH] Case-insensitive URI schemes
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7698">[ date ]</a>
+              <a href="thread.html#7698">[ thread ]</a>
+              <a href="subject.html#7698">[ subject ]</a>
+              <a href="author.html#7698">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

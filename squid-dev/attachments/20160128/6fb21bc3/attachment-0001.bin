@@ -1,0 +1,1070 @@
+Fix external_acl problems after trunk r14351
+(Support logformat %macros in external_acl_type format).
+
+The above changes created the following problems:
+ - external_acl requires AccessLogEntry but ALE is not available
+   in many cases such as ssl_bump ACLs.
+ - The %<cert_subject stopped working because it was supported by
+   external_acl code and not by logformat code.
+
+This patch:
+  - Passes AccessLogEntry in most cases.
+    For example, PeerConnector-related classes are now covered.
+  - Implements the %<cert_subject formating code for logformat.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2016-01-11 14:56:01 +0000
++++ src/FwdState.cc	2016-01-28 15:39:53 +0000
+@@ -685,43 +685,43 @@
+     comm_add_close_handler(serverConnection()->fd, fwdServerClosedWrapper, this);
+ 
+ #if USE_OPENSSL
+     if (!request->flags.pinned) {
+         const CachePeer *p = serverConnection()->getPeer();
+         const bool peerWantsTls = p && p->secure.encryptTransport;
+         // userWillTlsToPeerForUs assumes CONNECT == HTTPS
+         const bool userWillTlsToPeerForUs = p && p->options.originserver &&
+                                             request->method == Http::METHOD_CONNECT;
+         const bool needTlsToPeer = peerWantsTls && !userWillTlsToPeerForUs;
+         const bool needTlsToOrigin = !p && request->url.getScheme() == AnyP::PROTO_HTTPS;
+         if (needTlsToPeer || needTlsToOrigin || request->flags.sslPeek) {
+             HttpRequest::Pointer requestPointer = request;
+             AsyncCall::Pointer callback = asyncCall(17,4,
+                                                     "FwdState::ConnectedToPeer",
+                                                     FwdStatePeerAnswerDialer(&FwdState::connectedToPeer, this));
+             // Use positive timeout when less than one second is left.
+             const time_t sslNegotiationTimeout = max(static_cast<time_t>(1), timeLeft());
+             Ssl::PeerConnector *connector = NULL;
+             if (request->flags.sslPeek)
+-                connector = new Ssl::PeekingPeerConnector(requestPointer, serverConnection(), clientConn, callback, sslNegotiationTimeout);
++                connector = new Ssl::PeekingPeerConnector(requestPointer, serverConnection(), clientConn, callback, al, sslNegotiationTimeout);
+             else
+-                connector = new Ssl::BlindPeerConnector(requestPointer, serverConnection(), callback, sslNegotiationTimeout);
++                connector = new Ssl::BlindPeerConnector(requestPointer, serverConnection(), callback, al, sslNegotiationTimeout);
+             AsyncJob::Start(connector); // will call our callback
+             return;
+         }
+     }
+ #endif
+ 
+     // if not encrypting just run the post-connect actions
+     Security::EncryptorAnswer nil;
+     connectedToPeer(nil);
+ }
+ 
+ void
+ FwdState::connectedToPeer(Security::EncryptorAnswer &answer)
+ {
+     if (ErrorState *error = answer.error.get()) {
+         fail(error);
+         answer.error.clear(); // preserve error for errorSendComplete()
+         if (CachePeer *p = serverConnection()->getPeer())
+             peerConnectFailed(p);
+         retryOrBail();
+
+=== modified file 'src/PeerPoolMgr.cc'
+--- src/PeerPoolMgr.cc	2016-01-01 00:12:18 +0000
++++ src/PeerPoolMgr.cc	2016-01-28 15:39:53 +0000
+@@ -113,41 +113,41 @@
+ 
+     Must(params.conn != NULL);
+ 
+ #if USE_OPENSSL
+     // Handle SSL peers.
+     if (peer->secure.encryptTransport) {
+         typedef CommCbMemFunT<PeerPoolMgr, CommCloseCbParams> CloserDialer;
+         closer = JobCallback(48, 3, CloserDialer, this,
+                              PeerPoolMgr::handleSecureClosure);
+         comm_add_close_handler(params.conn->fd, closer);
+ 
+         securer = asyncCall(48, 4, "PeerPoolMgr::handleSecuredPeer",
+                             MyAnswerDialer(this, &PeerPoolMgr::handleSecuredPeer));
+ 
+         const int peerTimeout = peer->connect_timeout > 0 ?
+                                 peer->connect_timeout : Config.Timeout.peer_connect;
+         const int timeUsed = squid_curtime - params.conn->startTime();
+         // Use positive timeout when less than one second is left for conn.
+         const int timeLeft = max(1, (peerTimeout - timeUsed));
+         Ssl::BlindPeerConnector *connector =
+-            new Ssl::BlindPeerConnector(request, params.conn, securer, timeLeft);
++            new Ssl::BlindPeerConnector(request, params.conn, securer, NULL, timeLeft);
+         AsyncJob::Start(connector); // will call our callback
+         return;
+     }
+ #endif
+ 
+     pushNewConnection(params.conn);
+ }
+ 
+ void
+ PeerPoolMgr::pushNewConnection(const Comm::ConnectionPointer &conn)
+ {
+     Must(validPeer());
+     Must(Comm::IsConnOpen(conn));
+     peer->standby.pool->push(conn, NULL /* domain */);
+     // push() will trigger a checkpoint()
+ }
+ 
+ void
+ PeerPoolMgr::handleSecuredPeer(Security::EncryptorAnswer &answer)
+ {
+
+=== modified file 'src/adaptation/icap/ModXact.h'
+--- src/adaptation/icap/ModXact.h	2016-01-01 00:12:18 +0000
++++ src/adaptation/icap/ModXact.h	2016-01-28 16:12:53 +0000
+@@ -127,40 +127,42 @@
+     virtual void handleCommWrote(size_t size);
+     virtual void handleCommRead(size_t size);
+     void handleCommWroteHeaders();
+     void handleCommWroteBody();
+ 
+     // service waiting
+     void noteServiceReady();
+     void noteServiceAvailable();
+ 
+ public:
+     InOut virgin;
+     InOut adapted;
+ 
+     // bypasses exceptions if needed and possible
+     virtual void callException(const std::exception &e);
+ 
+     /// record error detail in the virgin request if possible
+     virtual void detailError(int errDetail);
+     // Icap::Xaction API
+     virtual void clearError();
++    /// The master transaction log entry
++    virtual AccessLogEntry::Pointer masterLogEntry() { return alMaster; }
+ 
+ private:
+     virtual void start();
+ 
+     /// locates the request, either as a cause or as a virgin message itself
+     const HttpRequest &virginRequest() const; // Must always be available
+ 
+     void estimateVirginBody();
+     void makeAdaptedBodyPipe(const char *what);
+ 
+     void waitForService();
+ 
+     // will not send anything [else] on the adapted pipe
+     bool doneSending() const;
+ 
+     void startWriting();
+     void writeMore();
+     void writePreviewBody();
+     void writePrimeBody();
+     void writeSomeBody(const char *label, size_t size);
+
+=== modified file 'src/adaptation/icap/Xaction.cc'
+--- src/adaptation/icap/Xaction.cc	2016-01-11 14:56:01 +0000
++++ src/adaptation/icap/Xaction.cc	2016-01-28 18:06:03 +0000
+@@ -38,43 +38,45 @@
+ class MyIcapAnswerDialer: public UnaryMemFunT<Adaptation::Icap::Xaction, Security::EncryptorAnswer, Security::EncryptorAnswer&>,
+     public Ssl::PeerConnector::CbDialer
+ {
+ public:
+     MyIcapAnswerDialer(const JobPointer &aJob, Method aMethod):
+         UnaryMemFunT<Adaptation::Icap::Xaction, Security::EncryptorAnswer, Security::EncryptorAnswer&>(aJob, aMethod, Security::EncryptorAnswer()) {}
+ 
+     /* Ssl::PeerConnector::CbDialer API */
+     virtual Security::EncryptorAnswer &answer() { return arg1; }
+ };
+ 
+ namespace Ssl
+ {
+ /// A simple PeerConnector for Secure ICAP services. No SslBump capabilities.
+ class IcapPeerConnector: public PeerConnector {
+     CBDATA_CLASS(IcapPeerConnector);
+ public:
+     IcapPeerConnector(
+         Adaptation::Icap::ServiceRep::Pointer &service,
+         const Comm::ConnectionPointer &aServerConn,
+-        AsyncCall::Pointer &aCallback, const time_t timeout = 0):
++        AsyncCall::Pointer &aCallback,
++        AccessLogEntry::Pointer const &alp,
++        const time_t timeout = 0):
+         AsyncJob("Ssl::IcapPeerConnector"),
+-        PeerConnector(aServerConn, aCallback, timeout), icapService(service) {}
++        PeerConnector(aServerConn, aCallback, alp, timeout), icapService(service) {}
+ 
+     /* PeerConnector API */
+     virtual Security::SessionPointer initializeSsl();
+     virtual void noteNegotiationDone(ErrorState *error);
+     virtual Security::ContextPtr getSslContext() {return icapService->sslContext;}
+ 
+ private:
+     Adaptation::Icap::ServiceRep::Pointer icapService;
+ };
+ } // namespace Ssl
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, IcapPeerConnector);
+ #endif
+ 
+ Adaptation::Icap::Xaction::Xaction(const char *aTypeName, Adaptation::Icap::ServiceRep::Pointer &aService):
+     AsyncJob(aTypeName),
+     Adaptation::Initiate(aTypeName),
+     icapRequest(NULL),
+     icapReply(NULL),
+     attempts(0),
+@@ -93,40 +95,47 @@
+     alep(new AccessLogEntry),
+     al(*alep),
+     cs(NULL)
+ {
+     debugs(93,3, typeName << " constructed, this=" << this <<
+            " [icapx" << id << ']'); // we should not call virtual status() here
+     icapRequest = new HttpRequest;
+     HTTPMSGLOCK(icapRequest);
+     icap_tr_start = current_time;
+     memset(&icap_tio_start, 0, sizeof(icap_tio_start));
+     memset(&icap_tio_finish, 0, sizeof(icap_tio_finish));
+ }
+ 
+ Adaptation::Icap::Xaction::~Xaction()
+ {
+     debugs(93,3, typeName << " destructed, this=" << this <<
+            " [icapx" << id << ']'); // we should not call virtual status() here
+     HTTPMSGUNLOCK(icapRequest);
+ }
+ 
++AccessLogEntry::Pointer
++Adaptation::Icap::Xaction::masterLogEntry()
++{
++    AccessLogEntry::Pointer nil;
++    return nil;
++}
++
+ Adaptation::Icap::ServiceRep &
+ Adaptation::Icap::Xaction::service()
+ {
+     Must(theService != NULL);
+     return *theService;
+ }
+ 
+ void Adaptation::Icap::Xaction::disableRetries()
+ {
+     debugs(93,5, typeName << (isRetriable ? " from now on" : " still") <<
+            " cannot be retried " << status());
+     isRetriable = false;
+ }
+ 
+ void Adaptation::Icap::Xaction::disableRepeats(const char *reason)
+ {
+     debugs(93,5, typeName << (isRepeatable ? " from now on" : " still") <<
+            " cannot be repeated because " << reason << status());
+     isRepeatable = false;
+ }
+@@ -287,41 +296,41 @@
+     AsyncCall::Pointer timeoutCall =  asyncCall(93, 5, "Adaptation::Icap::Xaction::noteCommTimedout",
+                                       TimeoutDialer(this,&Adaptation::Icap::Xaction::noteCommTimedout));
+     commSetConnTimeout(io.conn, TheConfig.connect_timeout(service().cfg().bypass), timeoutCall);
+ 
+     typedef CommCbMemFunT<Adaptation::Icap::Xaction, CommCloseCbParams> CloseDialer;
+     closer =  asyncCall(93, 5, "Adaptation::Icap::Xaction::noteCommClosed",
+                         CloseDialer(this,&Adaptation::Icap::Xaction::noteCommClosed));
+     comm_add_close_handler(io.conn->fd, closer);
+ 
+ #if USE_OPENSSL
+     // If it is a reused connection and the SSL object is build
+     // we should not negotiate new SSL session
+     auto ssl = fd_table[io.conn->fd].ssl;
+     if (!ssl && service().cfg().secure.encryptTransport) {
+         CbcPointer<Adaptation::Icap::Xaction> me(this);
+         securer = asyncCall(93, 4, "Adaptation::Icap::Xaction::handleSecuredPeer",
+                             MyIcapAnswerDialer(me, &Adaptation::Icap::Xaction::handleSecuredPeer));
+ 
+         Ssl::PeerConnector::HttpRequestPointer tmpReq(NULL);
+         Ssl::IcapPeerConnector *sslConnector =
+-            new Ssl::IcapPeerConnector(theService, io.conn, securer, TheConfig.connect_timeout(service().cfg().bypass));
++            new Ssl::IcapPeerConnector(theService, io.conn, securer, masterLogEntry(), TheConfig.connect_timeout(service().cfg().bypass));
+         AsyncJob::Start(sslConnector); // will call our callback
+         return;
+     }
+ #endif
+ 
+ // ??    fd_table[io.conn->fd].noteUse(icapPconnPool);
+     service().noteConnectionUse(connection);
+ 
+     handleCommConnected();
+ }
+ 
+ void Adaptation::Icap::Xaction::dieOnConnectionFailure()
+ {
+     debugs(93, 2, HERE << typeName <<
+            " failed to connect to " << service().cfg().uri);
+     service().noteConnectionFailed("failure");
+     detailError(ERR_DETAIL_ICAP_XACT_START);
+     throw TexcHere("cannot connect to the ICAP service");
+ }
+ 
+
+=== modified file 'src/adaptation/icap/Xaction.h'
+--- src/adaptation/icap/Xaction.h	2016-01-11 14:56:01 +0000
++++ src/adaptation/icap/Xaction.h	2016-01-28 16:11:30 +0000
+@@ -97,40 +97,41 @@
+     bool doneWithIo() const;
+     virtual bool doneAll() const;
+ 
+     // called just before the 'done' transaction is deleted
+     virtual void swanSong();
+ 
+     // returns a temporary string depicting transaction status, for debugging
+     virtual const char *status() const;
+     virtual void fillPendingStatus(MemBuf &buf) const;
+     virtual void fillDoneStatus(MemBuf &buf) const;
+ 
+     // useful for debugging
+     virtual bool fillVirginHttpHeader(MemBuf&) const;
+ 
+ public:
+     // custom exception handling and end-of-call checks
+     virtual void callException(const std::exception  &e);
+     virtual void callEnd();
+     /// clear stored error details, if any; used for retries/repeats
+     virtual void clearError() {}
++    virtual AccessLogEntry::Pointer masterLogEntry();
+     void dnsLookupDone(const ipcache_addrs *ia);
+ 
+ protected:
+     // logging
+     void setOutcome(const XactOutcome &xo);
+     virtual void finalizeLogInfo();
+ 
+ public:
+     ServiceRep &service();
+ 
+ private:
+     void tellQueryAborted();
+     void maybeLog();
+ 
+ protected:
+     Comm::ConnectionPointer connection;     ///< ICAP server connection
+     Adaptation::Icap::ServiceRep::Pointer theService;
+ 
+     SBuf readBuf;
+     bool commEof;
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-01-11 14:56:01 +0000
++++ src/client_side.cc	2016-01-28 17:38:07 +0000
+@@ -3464,71 +3464,77 @@
+ static void
+ httpsAccept(const CommAcceptCbParams &params)
+ {
+     MasterXaction::Pointer xact = params.xaction;
+     const AnyP::PortCfgPointer s = xact->squidPort;
+ 
+     // NP: it is possible the port was reconfigured when the call or accept() was queued.
+ 
+     if (params.flag != Comm::OK) {
+         // Its possible the call was still queued when the client disconnected
+         debugs(33, 2, "httpsAccept: " << s->listenConn << ": accept failure: " << xstrerr(params.xerrno));
+         return;
+     }
+ 
+     debugs(33, 4, HERE << params.conn << " accepted, starting SSL negotiation.");
+     fd_note(params.conn->fd, "client https connect");
+ 
+     if (s->tcp_keepalive.enabled) {
+         commSetTcpKeepalive(params.conn->fd, s->tcp_keepalive.idle, s->tcp_keepalive.interval, s->tcp_keepalive.timeout);
+     }
+-
+     ++incoming_sockets_accepted;
+ 
+     // Socket is ready, setup the connection manager to start using it
+     ConnStateData *connState = Https::NewServer(xact);
+     AsyncJob::Start(connState); // usually async-calls postHttpsAccept()
+ }
+ 
+ void
+ ConnStateData::postHttpsAccept()
+ {
+     if (port->flags.tunnelSslBumping) {
+         debugs(33, 5, "accept transparent connection: " << clientConnection);
+ 
+         if (!Config.accessList.ssl_bump) {
+             httpsSslBumpAccessCheckDone(ACCESS_DENIED, this);
+             return;
+         }
+ 
+         // Create a fake HTTP request for ssl_bump ACL check,
+         // using tproxy/intercept provided destination IP and port.
+         HttpRequest *request = new HttpRequest();
+         static char ip[MAX_IPSTRLEN];
+         assert(clientConnection->flags & (COMM_TRANSPARENT | COMM_INTERCEPTION));
+         request->url.host(clientConnection->local.toStr(ip, sizeof(ip)));
+         request->url.port(clientConnection->local.port());
+         request->myportname = port->name;
+ 
+         ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(Config.accessList.ssl_bump, request, NULL);
+         acl_checklist->src_addr = clientConnection->remote;
+         acl_checklist->my_addr = port->s;
++        // Build a local AccessLogEntry to allow requiresAle() acls work
++        acl_checklist->al = new AccessLogEntry;
++        acl_checklist->al->cache.start_time = current_time;
++        acl_checklist->al->tcpClient = clientConnection;
++        acl_checklist->al->cache.port = port;
++        acl_checklist->al->cache.caddr = log_addr;
++        acl_checklist->al->request = request;
+         acl_checklist->nonBlockingCheck(httpsSslBumpAccessCheckDone, this);
+         return;
+     } else {
+         httpsEstablish(this, port->secure.staticContext.get());
+     }
+ }
+ 
+ void
+ ConnStateData::sslCrtdHandleReplyWrapper(void *data, const Helper::Reply &reply)
+ {
+     ConnStateData * state_data = (ConnStateData *)(data);
+     state_data->sslCrtdHandleReply(reply);
+ }
+ 
+ void
+ ConnStateData::sslCrtdHandleReply(const Helper::Reply &reply)
+ {
+     if (!isOpen()) {
+         debugs(33, 3, "Connection gone while waiting for ssl_crtd helper reply; helper reply:" << reply);
+         return;
+@@ -3962,55 +3968,59 @@
+         temp.append(rbuf.content(), rbuf.contentSize());
+         fakeAConnectRequest("intercepted TLS spliced", temp);
+     } else {
+         // XXX: assuming that there was an HTTP/1.1 CONNECT to begin with...
+ 
+         // reset the current protocol to HTTP/1.1 (was "HTTPS" for the bumping process)
+         transferProtocol = Http::ProtocolVersion();
+         // inBuf still has the "CONNECT ..." request data, reset it to SSL hello message
+         inBuf.append(rbuf.content(), rbuf.contentSize());
+         ClientSocketContext::Pointer context = pipeline.front();
+         ClientHttpRequest *http = context->http;
+         tunnelStart(http);
+     }
+ }
+ 
+ void
+ ConnStateData::startPeekAndSpliceDone()
+ {
+     // This is the Step2 of the SSL bumping
+     assert(sslServerBump);
++    ClientSocketContext::Pointer context = pipeline.front();
++    ClientHttpRequest *http = context ? context->http : NULL;
++
+     if (sslServerBump->step == Ssl::bumpStep1) {
+         sslServerBump->step = Ssl::bumpStep2;
+         // Run a accessList check to check if want to splice or continue bumping
+ 
+         ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(Config.accessList.ssl_bump, sslServerBump->request.getRaw(), NULL);
++        acl_checklist->al = http ? http->al : NULL;
+         //acl_checklist->src_addr = params.conn->remote;
+         //acl_checklist->my_addr = s->s;
+         acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpNone));
+         acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpClientFirst));
+         acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpServerFirst));
+         acl_checklist->nonBlockingCheck(httpsSslBumpStep2AccessCheckDone, this);
+         return;
+     }
+ 
+-    FwdState::fwdStart(clientConnection, sslServerBump->entry, sslServerBump->request.getRaw());
++    FwdState::Start(clientConnection, sslServerBump->entry, sslServerBump->request.getRaw(), http ? http->al : NULL);
+ }
+ 
+ void
+ ConnStateData::doPeekAndSpliceStep()
+ {
+     auto ssl = fd_table[clientConnection->fd].ssl;
+     BIO *b = SSL_get_rbio(ssl);
+     assert(b);
+     Ssl::ClientBio *bio = static_cast<Ssl::ClientBio *>(b->ptr);
+ 
+     debugs(33, 5, "PeekAndSplice mode, proceed with client negotiation. Currrent state:" << SSL_state_string_long(ssl));
+     bio->hold(false);
+ 
+     Comm::SetSelect(clientConnection->fd, COMM_SELECT_WRITE, clientNegotiateSSL, this, 0);
+     switchedToHttps_ = true;
+ }
+ 
+ void
+ ConnStateData::httpsPeeked(Comm::ConnectionPointer serverConnection)
+ {
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2016-01-01 00:12:18 +0000
++++ src/format/Format.cc	2016-01-28 15:39:53 +0000
+@@ -1245,41 +1245,50 @@
+                     for (Ssl::CertErrors *sslError = srvBump->sslErrors; sslError != NULL;  sslError = sslError->next) {
+                         if (sb.size())
+                             sb.append(separator);
+                         if (const char *errorName = Ssl::GetErrorName(sslError->element.code))
+                             sb.append(errorName);
+                         else
+                             sb.append(sslErrorName(sslError->element.code, tmp, sizeof(tmp)));
+                         if (sslError->element.depth >= 0) {
+                             snprintf(tmp, sizeof(tmp), "@depth=%d", sslError->element.depth);
+                             sb.append(tmp);
+                         }
+                     }
+                     if (sb.size())
+                         out = sb.termedBuf();
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_SERVER_CERT_ISSUER:
+         case LFT_SSL_SERVER_CERT_SUBJECT:
+-            // Not implemented
++            if (al->request && al->request->clientConnectionManager.valid()) {
++                if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
++                    if (X509 *serverCert = srvBump->serverCert.get()) {
++                        if (fmt->type == LFT_SSL_SERVER_CERT_SUBJECT)
++                            out = Ssl::GetX509UserAttribute(serverCert, "DN");
++                        else
++                            out = Ssl::GetX509CAAttribute(serverCert, "DN");
++                    }
++                }
++            }
+             break;
+ 
+         case LFT_TLS_CLIENT_NEGOTIATED_VERSION:
+             if (al->tcpClient != nullptr && al->tcpClient->hasTlsNegotiations())
+                 out = al->tcpClient->hasTlsNegotiations()->negotiatedVersion();
+             break;
+ 
+         case LFT_TLS_SERVER_NEGOTIATED_VERSION:
+             if (al->hier.tcpServer != nullptr && al->hier.tcpServer->hasTlsNegotiations())
+                 out = al->hier.tcpServer->hasTlsNegotiations()->negotiatedVersion();
+             break;
+ 
+         case LFT_TLS_CLIENT_RECEIVED_HELLO_VERSION:
+             if (al->tcpClient != nullptr && al->tcpClient->hasTlsNegotiations())
+                 out = al->tcpClient->hasTlsNegotiations()->helloVersion();
+             break;
+ 
+         case LFT_TLS_SERVER_RECEIVED_HELLO_VERSION:
+             if (al->hier.tcpServer != nullptr && al->hier.tcpServer->hasTlsNegotiations())
+                 out = al->hier.tcpServer->hasTlsNegotiations()->helloVersion();
+
+=== modified file 'src/format/Token.cc'
+--- src/format/Token.cc	2016-01-01 00:12:18 +0000
++++ src/format/Token.cc	2016-01-28 15:39:53 +0000
+@@ -199,42 +199,42 @@
+ 
+     TokenTableEntry(">h",  LFT_ICAP_REQ_HEADER),
+     TokenTableEntry("<h",  LFT_ICAP_REP_HEADER),
+ 
+     TokenTableEntry("tr",  LFT_ICAP_TR_RESPONSE_TIME),
+     TokenTableEntry("tio", LFT_ICAP_IO_TIME),
+     TokenTableEntry("to",  LFT_ICAP_OUTCOME),
+     TokenTableEntry("Hs",  LFT_ICAP_STATUS_CODE),
+ 
+     TokenTableEntry(NULL, LFT_NONE)           /* this must be last */
+ };
+ #endif
+ 
+ #if USE_OPENSSL
+ // SSL (ssl::) tokens
+ static TokenTableEntry TokenTableSsl[] = {
+     TokenTableEntry("bump_mode", LFT_SSL_BUMP_MODE),
+     TokenTableEntry(">cert_subject", LFT_SSL_USER_CERT_SUBJECT),
+     TokenTableEntry(">cert_issuer", LFT_SSL_USER_CERT_ISSUER),
+     TokenTableEntry(">sni", LFT_SSL_CLIENT_SNI),
+-    /*TokenTableEntry("<cert_subject", LFT_SSL_SERVER_CERT_SUBJECT), */
+-    /*TokenTableEntry("<cert_issuer", LFT_SSL_SERVER_CERT_ISSUER), */
++    TokenTableEntry("<cert_subject", LFT_SSL_SERVER_CERT_SUBJECT),
++    TokenTableEntry("<cert_issuer", LFT_SSL_SERVER_CERT_ISSUER),
+     TokenTableEntry("<cert_errors", LFT_SSL_SERVER_CERT_ERRORS),
+     TokenTableEntry(">negotiated_version", LFT_TLS_CLIENT_NEGOTIATED_VERSION),
+     TokenTableEntry("<negotiated_version", LFT_TLS_SERVER_NEGOTIATED_VERSION),
+     TokenTableEntry(">negotiated_cipher", LFT_TLS_CLIENT_NEGOTIATED_CIPHER),
+     TokenTableEntry("<negotiated_cipher", LFT_TLS_SERVER_NEGOTIATED_CIPHER),
+     TokenTableEntry(">received_hello_version", LFT_TLS_CLIENT_RECEIVED_HELLO_VERSION),
+     TokenTableEntry("<received_hello_version", LFT_TLS_SERVER_RECEIVED_HELLO_VERSION),
+     TokenTableEntry(">received_supported_version", LFT_TLS_CLIENT_SUPPORTED_VERSION),
+     TokenTableEntry("<received_supported_version", LFT_TLS_SERVER_SUPPORTED_VERSION),
+     TokenTableEntry(NULL, LFT_NONE)
+ };
+ #endif
+ } // namespace Format
+ 
+ /// Register all components custom format tokens
+ void
+ Format::Token::Init()
+ {
+     // TODO standard log tokens
+ 
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2016-01-11 14:56:01 +0000
++++ src/ssl/PeerConnector.cc	2016-01-28 15:39:53 +0000
+@@ -18,44 +18,45 @@
+ #include "fde.h"
+ #include "globals.h"
+ #include "helper/ResultCode.h"
+ #include "HttpRequest.h"
+ #include "neighbors.h"
+ #include "security/NegotiationHistory.h"
+ #include "SquidConfig.h"
+ #include "ssl/bio.h"
+ #include "ssl/cert_validate_message.h"
+ #include "ssl/Config.h"
+ #include "ssl/ErrorDetail.h"
+ #include "ssl/helper.h"
+ #include "ssl/PeerConnector.h"
+ #include "ssl/ServerBump.h"
+ #include "ssl/support.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeerConnector);
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, BlindPeerConnector);
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeekingPeerConnector);
+ 
+-Ssl::PeerConnector::PeerConnector(const Comm::ConnectionPointer &aServerConn, AsyncCall::Pointer &aCallback, const time_t timeout) :
++Ssl::PeerConnector::PeerConnector(const Comm::ConnectionPointer &aServerConn, AsyncCall::Pointer &aCallback, const AccessLogEntryPointer &alp, const time_t timeout) :
+     AsyncJob("Ssl::PeerConnector"),
+     serverConn(aServerConn),
+     certErrors(NULL),
++    al(alp),
+     callback(aCallback),
+     negotiationTimeout(timeout),
+     startTime(squid_curtime),
+     useCertValidator_(false)
+ {
+     // if this throws, the caller's cb dialer is not our CbDialer
+     Must(dynamic_cast<CbDialer*>(callback->getDialer()));
+ }
+ 
+ Ssl::PeerConnector::~PeerConnector()
+ {
+     cbdataReferenceDone(certErrors);
+     debugs(83, 5, "Peer connector " << this << " gone");
+ }
+ 
+ bool Ssl::PeerConnector::doneAll() const
+ {
+     return (!callback || callback->canceled()) && AsyncJob::doneAll();
+ }
+ 
+@@ -108,40 +109,41 @@
+     const int fd = serverConnection()->fd;
+ 
+     SSL *ssl = Ssl::CreateClient(sslContext, fd, "server https start");
+     if (!ssl) {
+         ErrorState *anErr = new ErrorState(ERR_SOCKET_FAILURE, Http::scInternalServerError, request.getRaw());
+         anErr->xerrno = errno;
+         debugs(83, DBG_IMPORTANT, "Error allocating SSL handle: " << ERR_error_string(ERR_get_error(), NULL));
+ 
+         noteNegotiationDone(anErr);
+         bail(anErr);
+         return NULL;
+     }
+ 
+     // If CertValidation Helper used do not lookup checklist for errors,
+     // but keep a list of errors to send it to CertValidator
+     if (!Ssl::TheConfig.ssl_crt_validator) {
+         // Create the ACL check list now, while we have access to more info.
+         // The list is used in ssl_verify_cb() and is freed in ssl_free().
+         if (acl_access *acl = ::Config.ssl_client.cert_error) {
+             ACLFilledChecklist *check = new ACLFilledChecklist(acl, request.getRaw(), dash_str);
++            check->al = al;
+             // check->fd(fd); XXX: need client FD here
+             SSL_set_ex_data(ssl, ssl_ex_index_cert_error_check, check);
+         }
+     }
+     return ssl;
+ }
+ 
+ void
+ Ssl::PeerConnector::setReadTimeout()
+ {
+     int timeToRead;
+     if (negotiationTimeout) {
+         const int timeUsed = squid_curtime - startTime;
+         const int timeLeft = max(0, static_cast<int>(negotiationTimeout - timeUsed));
+         timeToRead = min(static_cast<int>(::Config.Timeout.read), timeLeft);
+     } else
+         timeToRead = ::Config.Timeout.read;
+     AsyncCall::Pointer nil;
+     commSetConnTimeout(serverConnection(), timeToRead, nil);
+ }
+@@ -226,40 +228,41 @@
+                                       static_cast<Ssl::BumpMode>(answer.kind):
+                                       checkForPeekAndSpliceGuess();
+     checkForPeekAndSpliceMatched(finalAction);
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::checkForPeekAndSplice()
+ {
+     // Mark Step3 of bumping
+     if (request->clientConnectionManager.valid()) {
+         if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
+             serverBump->step = Ssl::bumpStep3;
+         }
+     }
+ 
+     handleServerCertificate();
+ 
+     ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(
+         ::Config.accessList.ssl_bump,
+         request.getRaw(), NULL);
++    acl_checklist->al = al;
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpNone));
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpPeek));
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpStare));
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpClientFirst));
+     acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpServerFirst));
+     SSL *ssl = fd_table[serverConn->fd].ssl;
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
+     if (!srvBio->canSplice())
+         acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpSplice));
+     if (!srvBio->canBump())
+         acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpBump));
+     acl_checklist->nonBlockingCheck(Ssl::PeekingPeerConnector::cbCheckForPeekAndSpliceDone, this);
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::checkForPeekAndSpliceMatched(const Ssl::BumpMode action)
+ {
+     SSL *ssl = fd_table[serverConn->fd].ssl;
+     BIO *b = SSL_get_rbio(ssl);
+@@ -348,42 +351,44 @@
+         anErr =  new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scServiceUnavailable, request.getRaw());
+         anErr->detail = errDetails;
+         /*anErr->xerrno= Should preserved*/
+     }
+ 
+     noteNegotiationDone(anErr);
+     bail(anErr);
+     serverConn->close();
+     return;
+ }
+ 
+ /// Checks errors in the cert. validator response against sslproxy_cert_error.
+ /// The first honored error, if any, is returned via errDetails parameter.
+ /// The method returns all seen errors except SSL_ERROR_NONE as Ssl::CertErrors.
+ Ssl::CertErrors *
+ Ssl::PeerConnector::sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &resp, Ssl::ErrorDetail *& errDetails)
+ {
+     Ssl::CertErrors *errs = NULL;
+ 
+     ACLFilledChecklist *check = NULL;
+-    if (acl_access *acl = ::Config.ssl_client.cert_error)
++    if (acl_access *acl = ::Config.ssl_client.cert_error) {
+         check = new ACLFilledChecklist(acl, request.getRaw(), dash_str);
++        check->al = al;
++    }
+ 
+     SSL *ssl = fd_table[serverConnection()->fd].ssl;
+     typedef Ssl::CertValidationResponse::RecvdErrors::const_iterator SVCRECI;
+     for (SVCRECI i = resp.errors.begin(); i != resp.errors.end(); ++i) {
+         debugs(83, 7, "Error item: " << i->error_no << " " << i->error_reason);
+ 
+         assert(i->error_no != SSL_ERROR_NONE);
+ 
+         if (!errDetails) {
+             bool allowed = false;
+             if (check) {
+                 check->sslErrors = new Ssl::CertErrors(Ssl::CertError(i->error_no, i->cert.get(), i->error_depth));
+                 if (check->fastCheck() == ACCESS_ALLOWED)
+                     allowed = true;
+             }
+             // else the Config.ssl_client.cert_error access list is not defined
+             // and the first error will cause the error page
+ 
+             if (allowed) {
+                 debugs(83, 3, "bypassing SSL error " << i->error_no << " in " << "buffer");
+
+=== modified file 'src/ssl/PeerConnector.h'
+--- src/ssl/PeerConnector.h	2016-01-01 00:12:18 +0000
++++ src/ssl/PeerConnector.h	2016-01-28 15:39:53 +0000
+@@ -2,40 +2,42 @@
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SSL_PEER_CONNECTOR_H
+ #define SQUID_SSL_PEER_CONNECTOR_H
+ 
+ #include "acl/Acl.h"
+ #include "base/AsyncCbdataCalls.h"
+ #include "base/AsyncJob.h"
+ #include "CommCalls.h"
+ #include "security/EncryptorAnswer.h"
+ #include "ssl/support.h"
+ #include <iosfwd>
+ 
+ class HttpRequest;
+ class ErrorState;
++class AccessLogEntry;
++typedef RefCount<AccessLogEntry> AccessLogEntryPointer;
+ 
+ namespace Ssl
+ {
+ 
+ class ErrorDetail;
+ class CertValidationResponse;
+ typedef RefCount<CertValidationResponse> CertValidationResponsePointer;
+ 
+ /**
+  \par
+  * Connects Squid to SSL/TLS-capable peers or services.
+  * Contains common code and interfaces of various specialized PeerConnectors,
+  * including peer certificate validation code.
+  \par
+  * The caller receives a call back with Security::EncryptorAnswer. If answer.error
+  * is not nil, then there was an error and the SSL connection to the SSL peer
+  * was not fully established. The error object is suitable for error response
+  * generation.
+  \par
+  * The caller must monitor the connection for closure because this
+@@ -57,41 +59,43 @@
+  * closes the connection, this job simply quits without informing the caller.
+  */
+ class PeerConnector: virtual public AsyncJob
+ {
+     CBDATA_CLASS(PeerConnector);
+ 
+ public:
+     /// Callback dialier API to allow PeerConnector to set the answer.
+     class CbDialer
+     {
+     public:
+         virtual ~CbDialer() {}
+         /// gives PeerConnector access to the in-dialer answer
+         virtual Security::EncryptorAnswer &answer() = 0;
+     };
+ 
+     typedef RefCount<HttpRequest> HttpRequestPointer;
+ 
+ public:
+     PeerConnector(const Comm::ConnectionPointer &aServerConn,
+-                  AsyncCall::Pointer &aCallback, const time_t timeout = 0);
++                  AsyncCall::Pointer &aCallback,
++                  const AccessLogEntryPointer &alp,
++                  const time_t timeout = 0);
+     virtual ~PeerConnector();
+ 
+ protected:
+     // AsyncJob API
+     virtual void start();
+     virtual bool doneAll() const;
+     virtual void swanSong();
+     virtual const char *status() const;
+ 
+     /// The comm_close callback handler.
+     void commCloseHandler(const CommCloseCbParams &params);
+ 
+     /// Inform us that the connection is closed. Does the required clean-up.
+     void connectionClosed(const char *reason);
+ 
+     /// Sets up TCP socket-related notification callbacks if things go wrong.
+     /// If socket already closed return false, else install the comm_close
+     /// handler to monitor the socket.
+     bool prepareSocket();
+ 
+@@ -136,100 +140,105 @@
+     /// \param error if not NULL the SSL negotiation was aborted with an error
+     virtual void noteNegotiationDone(ErrorState *error) {}
+ 
+     /// Must implemented by the kid classes to return the Security::ContextPtr object to use
+     /// for building the SSL objects.
+     virtual Security::ContextPtr getSslContext() = 0;
+ 
+     /// mimics FwdState to minimize changes to FwdState::initiate/negotiateSsl
+     Comm::ConnectionPointer const &serverConnection() const { return serverConn; }
+ 
+     void bail(ErrorState *error); ///< Return an error to the PeerConnector caller
+ 
+     /// If called the certificates validator will not used
+     void bypassCertValidator() {useCertValidator_ = false;}
+ 
+     HttpRequestPointer request; ///< peer connection trigger or cause
+     Comm::ConnectionPointer serverConn; ///< TCP connection to the peer
+     /// Certificate errors found from SSL validation procedure or from cert
+     /// validator
+     Ssl::CertErrors *certErrors;
++    AccessLogEntryPointer al; ///< info for the future access.log entry
+ private:
+     PeerConnector(const PeerConnector &); // not implemented
+     PeerConnector &operator =(const PeerConnector &); // not implemented
+ 
+     /// Callback the caller class, and pass the ready to communicate secure
+     /// connection or an error if PeerConnector failed.
+     void callBack();
+ 
+     /// Process response from cert validator helper
+     void sslCrtvdHandleReply(Ssl::CertValidationResponsePointer);
+ 
+     /// Check SSL errors returned from cert validator against sslproxy_cert_error access list
+     Ssl::CertErrors *sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &, Ssl::ErrorDetail *&);
+ 
+     /// A wrapper function for negotiateSsl for use with Comm::SetSelect
+     static void NegotiateSsl(int fd, void *data);
+     AsyncCall::Pointer callback; ///< we call this with the results
+     AsyncCall::Pointer closeHandler; ///< we call this when the connection closed
+     time_t negotiationTimeout; ///< the SSL connection timeout to use
+     time_t startTime; ///< when the peer connector negotiation started
+     bool useCertValidator_; ///< whether the certificate validator should bypassed
+ };
+ 
+ /// A simple PeerConnector for SSL/TLS cache_peers. No SslBump capabilities.
+ class BlindPeerConnector: public PeerConnector {
+     CBDATA_CLASS(BlindPeerConnector);
+ public:
+     BlindPeerConnector(HttpRequestPointer &aRequest,
+                        const Comm::ConnectionPointer &aServerConn,
+-                       AsyncCall::Pointer &aCallback, const time_t timeout = 0) :
++                       AsyncCall::Pointer &aCallback,
++                       const AccessLogEntryPointer &alp,
++                       const time_t timeout = 0) :
+         AsyncJob("Ssl::BlindPeerConnector"),
+-        PeerConnector(aServerConn, aCallback, timeout)
++            PeerConnector(aServerConn, aCallback, alp, timeout)
+     {
+         request = aRequest;
+     }
+ 
+     /* PeerConnector API */
+ 
+     /// Calls parent initializeSSL, configure the created SSL object to try reuse SSL session
+     /// and sets the hostname to use for certificates validation
+     virtual SSL *initializeSsl();
+ 
+     /// Return the configured Security::ContextPtr object
+     virtual Security::ContextPtr getSslContext();
+ 
+     /// On error calls peerConnectFailed function, on success store the used SSL session
+     /// for later use
+     virtual void noteNegotiationDone(ErrorState *error);
+ };
+ 
+ /// A PeerConnector for HTTP origin servers. Capable of SslBumping.
+ class PeekingPeerConnector: public PeerConnector {
+     CBDATA_CLASS(PeekingPeerConnector);
+ public:
+     PeekingPeerConnector(HttpRequestPointer &aRequest,
+                          const Comm::ConnectionPointer &aServerConn,
+                          const Comm::ConnectionPointer &aClientConn,
+-                         AsyncCall::Pointer &aCallback, const time_t timeout = 0) :
++                         AsyncCall::Pointer &aCallback,
++                         const AccessLogEntryPointer &alp,
++                         const time_t timeout = 0) :
+         AsyncJob("Ssl::PeekingPeerConnector"),
+-        PeerConnector(aServerConn, aCallback, timeout),
++            PeerConnector(aServerConn, aCallback, alp, timeout),
+         clientConn(aClientConn),
+         splice(false),
+         resumingSession(false),
+         serverCertificateHandled(false)
+     {
+         request = aRequest;
+     }
+ 
+     /* PeerConnector API */
+     virtual SSL *initializeSsl();
+     virtual Security::ContextPtr getSslContext();
+     virtual void noteWantWrite();
+     virtual void noteSslNegotiationError(const int result, const int ssl_error, const int ssl_lib_error);
+     virtual void noteNegotiationDone(ErrorState *error);
+ 
+     /// Updates associated client connection manager members
+     /// if the server certificate was received from the server.
+     void handleServerCertificate();
+ 
+     /// Initiates the ssl_bump acl check in step3 SSL bump step to decide
+
+=== modified file 'src/tunnel.cc'
+--- src/tunnel.cc	2016-01-01 00:12:18 +0000
++++ src/tunnel.cc	2016-01-28 17:42:20 +0000
+@@ -1086,41 +1086,41 @@
+     AsyncCall::Pointer timeoutCall = commCbCall(5, 4, "tunnelTimeout",
+                                      CommTimeoutCbPtrFun(tunnelTimeout, tunnelState));
+     commSetConnTimeout(tunnelState->client.conn, Config.Timeout.lifetime, timeoutCall);
+ 
+     peerSelect(&(tunnelState->serverDestinations), request, http->al,
+                NULL,
+                tunnelPeerSelectComplete,
+                tunnelState);
+ }
+ 
+ void
+ TunnelStateData::connectToPeer()
+ {
+ #if USE_OPENSSL
+     if (CachePeer *p = server.conn->getPeer()) {
+         if (p->secure.encryptTransport) {
+             AsyncCall::Pointer callback = asyncCall(5,4,
+                                                     "TunnelStateData::ConnectedToPeer",
+                                                     MyAnswerDialer(&TunnelStateData::connectedToPeer, this));
+             Ssl::BlindPeerConnector *connector =
+-                new Ssl::BlindPeerConnector(request, server.conn, callback);
++                new Ssl::BlindPeerConnector(request, server.conn, callback, al);
+             AsyncJob::Start(connector); // will call our callback
+             return;
+         }
+     }
+ #endif
+ 
+     Security::EncryptorAnswer nil;
+     connectedToPeer(nil);
+ }
+ 
+ void
+ TunnelStateData::connectedToPeer(Security::EncryptorAnswer &answer)
+ {
+     if (ErrorState *error = answer.error.get()) {
+         *status_ptr = error->httpStatus;
+         error->callback = tunnelErrorComplete;
+         error->callback_data = this;
+         errorSend(client.conn, error);
+         answer.error.clear(); // preserve error for errorSendComplete()
+         return;
+@@ -1236,40 +1236,41 @@
+     debugs(26, 3, request->method << " " << url << " " << request->http_ver);
+     ++statCounter.server.all.requests;
+     ++statCounter.server.other.requests;
+ 
+     tunnelState = new TunnelStateData;
+     tunnelState->url = SBufToCstring(url);
+     tunnelState->request = request;
+     tunnelState->server.size_ptr = NULL; //Set later if ClientSocketContext is available
+ 
+     // Temporary static variable to store the unneeded for our case status code
+     static int status_code = 0;
+     tunnelState->status_ptr = &status_code;
+     tunnelState->client.conn = clientConn;
+ 
+     ConnStateData *conn;
+     if ((conn = request->clientConnectionManager.get())) {
+         ClientSocketContext::Pointer context = conn->pipeline.front();
+         if (context != nullptr && context->http != nullptr) {
+             tunnelState->logTag_ptr = &context->http->logType;
+             tunnelState->server.size_ptr = &context->http->out.size;
++            tunnelState->al = context->http->al;
+ 
+ #if USE_DELAY_POOLS
+             /* no point using the delayIsNoDelay stuff since tunnel is nice and simple */
+             if (srvConn->getPeer() && srvConn->getPeer()->options.no_delay)
+                 tunnelState->server.setDelayId(DelayId::DelayClient(context->http));
+ #endif
+         }
+     }
+ 
+     comm_add_close_handler(tunnelState->client.conn->fd,
+                            tunnelClientClosed,
+                            tunnelState);
+ 
+     AsyncCall::Pointer timeoutCall = commCbCall(5, 4, "tunnelTimeout",
+                                      CommTimeoutCbPtrFun(tunnelTimeout, tunnelState));
+     commSetConnTimeout(tunnelState->client.conn, Config.Timeout.lifetime, timeoutCall);
+     fd_table[clientConn->fd].read_method = &default_read_method;
+     fd_table[clientConn->fd].write_method = &default_write_method;
+ 
+     tunnelState->request->hier.note(srvConn, tunnelState->getHost());
+

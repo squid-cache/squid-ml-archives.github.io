@@ -1,0 +1,261 @@
+Add chained certificates and signing certificate to peek-then-bumped connections.
+
+The scenario this patch addresses is when Squid is configured with an
+intermediate signing CA certificate, and clients have the root CA installed on
+their machines. What happens is that the generated certificates come down with
+an unknown issuer (the intermediate signing certificate), with no
+intermediates, so they are rejected. By adding the configured certificate chain
+as old client-first mode did, the intermediate and root certificates come down
+as well, resulting in the issuer being identified and the connection being
+established "securely".
+
+This work is submitted on behalf of Bloomberg L.P.
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-04-03 23:41:58 +0000
++++ src/client_side.cc	2016-04-05 04:02:26 +0000
+@@ -2850,40 +2850,43 @@ ConnStateData::sslCrtdHandleReply(const
+ 
+     if (reply.result == Helper::BrokenHelper) {
+         debugs(33, 5, HERE << "Certificate for " << sslConnectHostOrIp << " cannot be generated. ssl_crtd response: " << reply);
+     } else if (!reply.other().hasContent()) {
+         debugs(1, DBG_IMPORTANT, HERE << "\"ssl_crtd\" helper returned <NULL> reply.");
+     } else {
+         Ssl::CrtdMessage reply_message(Ssl::CrtdMessage::REPLY);
+         if (reply_message.parse(reply.other().content(), reply.other().contentSize()) != Ssl::CrtdMessage::OK) {
+             debugs(33, 5, HERE << "Reply from ssl_crtd for " << sslConnectHostOrIp << " is incorrect");
+         } else {
+             if (reply.result != Helper::Okay) {
+                 debugs(33, 5, HERE << "Certificate for " << sslConnectHostOrIp << " cannot be generated. ssl_crtd response: " << reply_message.getBody());
+             } else {
+                 debugs(33, 5, HERE << "Certificate for " << sslConnectHostOrIp << " was successfully recieved from ssl_crtd");
+                 if (sslServerBump && (sslServerBump->act.step1 == Ssl::bumpPeek || sslServerBump->act.step1 == Ssl::bumpStare)) {
+                     doPeekAndSpliceStep();
+                     auto ssl = fd_table[clientConnection->fd].ssl.get();
+                     bool ret = Ssl::configureSSLUsingPkeyAndCertFromMemory(ssl, reply_message.getBody().c_str(), *port);
+                     if (!ret)
+                         debugs(33, 5, "Failed to set certificates to ssl object for PeekAndSplice mode");
++
++                    SSL_CTX *sslContext = SSL_get_SSL_CTX(ssl);
++                    Ssl::configureUnconfiguredSslContext(sslContext, signAlgorithm, *port);
+                 } else {
+                     auto ctx = Ssl::generateSslContextUsingPkeyAndCertFromMemory(reply_message.getBody().c_str(), *port);
+                     getSslContextDone(ctx, true);
+                 }
+                 return;
+             }
+         }
+     }
+     getSslContextDone(NULL);
+ }
+ 
+ void ConnStateData::buildSslCertGenerationParams(Ssl::CertificateProperties &certProperties)
+ {
+     certProperties.commonName =  sslCommonName_.isEmpty() ? sslConnectHostOrIp.termedBuf() : sslCommonName_.c_str();
+ 
+     // fake certificate adaptation requires bump-server-first mode
+     if (!sslServerBump) {
+         assert(port->signingCert.get());
+         certProperties.signWithX509.resetAndLock(port->signingCert.get());
+         if (port->signPkey.get())
+@@ -3009,66 +3012,62 @@ ConnStateData::getSslContextStart()
+             request_message.setCode(Ssl::CrtdMessage::code_new_certificate);
+             request_message.composeRequest(certProperties);
+             debugs(33, 5, HERE << "SSL crtd request: " << request_message.compose().c_str());
+             Ssl::Helper::GetInstance()->sslSubmit(request_message, sslCrtdHandleReplyWrapper, this);
+             return;
+         } catch (const std::exception &e) {
+             debugs(33, DBG_IMPORTANT, "ERROR: Failed to compose ssl_crtd " <<
+                    "request for " << certProperties.commonName <<
+                    " certificate: " << e.what() << "; will now block to " <<
+                    "generate that certificate.");
+             // fall through to do blocking in-process generation.
+         }
+ #endif // USE_SSL_CRTD
+ 
+         debugs(33, 5, HERE << "Generating SSL certificate for " << certProperties.commonName);
+         if (sslServerBump && (sslServerBump->act.step1 == Ssl::bumpPeek || sslServerBump->act.step1 == Ssl::bumpStare)) {
+             doPeekAndSpliceStep();
+             auto ssl = fd_table[clientConnection->fd].ssl.get();
+             if (!Ssl::configureSSL(ssl, certProperties, *port))
+                 debugs(33, 5, "Failed to set certificates to ssl object for PeekAndSplice mode");
++
++            SSL_CTX *sslContext = SSL_get_SSL_CTX(ssl);
++            Ssl::configureUnconfiguredSslContext(sslContext, certProperties.signAlgorithm, *port);
+         } else {
+             auto dynCtx = Ssl::generateSslContext(certProperties, *port);
+             getSslContextDone(dynCtx, true);
+         }
+         return;
+     }
+     getSslContextDone(NULL);
+ }
+ 
+ void
+ ConnStateData::getSslContextDone(Security::ContextPtr sslContext, bool isNew)
+ {
+     // Try to add generated ssl context to storage.
+     if (port->generateHostCertificates && isNew) {
+ 
+-        if (signAlgorithm == Ssl::algSignTrusted) {
+-            // Add signing certificate to the certificates chain
+-            X509 *cert = port->signingCert.get();
+-            if (SSL_CTX_add_extra_chain_cert(sslContext, cert)) {
+-                // increase the certificate lock
+-                CRYPTO_add(&(cert->references),1,CRYPTO_LOCK_X509);
+-            } else {
+-                const int ssl_error = ERR_get_error();
+-                debugs(33, DBG_IMPORTANT, "WARNING: can not add signing certificate to SSL context chain: " << ERR_error_string(ssl_error, NULL));
+-            }
+-            Ssl::addChainToSslContext(sslContext, port->certsToChain.get());
++        if (sslContext && (signAlgorithm == Ssl::algSignTrusted)) {
++            Ssl::chainCertificatesToSSLContext(sslContext, *port);
++        } else if (signAlgorithm == Ssl::algSignTrusted) {
++            debugs(33, DBG_IMPORTANT, "WARNING: can not add signing certificate to SSL context chain because SSL context chain is invalid!");
+         }
+         //else it is self-signed or untrusted do not attrach any certificate
+ 
+         Ssl::LocalContextStorage *ssl_ctx_cache = Ssl::TheGlobalContextStorage.getLocalStorage(port->s);
+         assert(sslBumpCertKey.size() > 0 && sslBumpCertKey[0] != '\0');
+         if (sslContext) {
+             if (!ssl_ctx_cache || !ssl_ctx_cache->add(sslBumpCertKey.termedBuf(), new Security::ContextPointer(sslContext))) {
+                 // If it is not in storage delete after using. Else storage deleted it.
+                 fd_table[clientConnection->fd].dynamicSslContext = sslContext;
+             }
+         } else {
+             debugs(33, 2, HERE << "Failed to generate SSL cert for " << sslConnectHostOrIp);
+         }
+     }
+ 
+     // If generated ssl context = NULL, try to use static ssl context.
+     if (!sslContext) {
+         if (!port->secure.staticContext) {
+             debugs(83, DBG_IMPORTANT, "Closing " << clientConnection->remote << " as lacking TLS context");
+             clientConnection->close();
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2016-03-07 16:03:45 +0000
++++ src/ssl/support.cc	2016-04-05 04:02:26 +0000
+@@ -952,40 +952,64 @@ Ssl::generateSslContextUsingPkeyAndCertF
+ {
+     Security::CertPointer cert;
+     Ssl::EVP_PKEY_Pointer pkey;
+     if (!readCertAndPrivateKeyFromMemory(cert, pkey, data) || !cert || !pkey)
+         return nullptr;
+ 
+     return createSSLContext(cert, pkey, port);
+ }
+ 
+ Security::ContextPtr
+ Ssl::generateSslContext(CertificateProperties const &properties, AnyP::PortCfg &port)
+ {
+     Security::CertPointer cert;
+     Ssl::EVP_PKEY_Pointer pkey;
+     if (!generateSslCertificate(cert, pkey, properties) || !cert || !pkey)
+         return nullptr;
+ 
+     return createSSLContext(cert, pkey, port);
+ }
+ 
++void
++Ssl::chainCertificatesToSSLContext(SSL_CTX *sslContext, AnyP::PortCfg &port)
++{
++    assert(sslContext != NULL);
++    // Add signing certificate to the certificates chain
++    X509 *signingCert = port.signingCert.get();
++    if (SSL_CTX_add_extra_chain_cert(sslContext, signingCert)) {
++        // increase the certificate lock
++        CRYPTO_add(&(signingCert->references),1,CRYPTO_LOCK_X509);
++    } else {
++        const int ssl_error = ERR_get_error();
++        debugs(33, DBG_IMPORTANT, "WARNING: can not add signing certificate to SSL context chain: " << ERR_error_string(ssl_error, NULL));
++    }
++    Ssl::addChainToSslContext(sslContext, port.certsToChain.get());
++}
++
++void
++Ssl::configureUnconfiguredSslContext(SSL_CTX *sslContext, Ssl::CertSignAlgorithm signAlgorithm,AnyP::PortCfg &port)
++{
++    if (sslContext && signAlgorithm == Ssl::algSignTrusted) {
++        Ssl::chainCertificatesToSSLContext(sslContext, port);
++    }
++}
++
+ bool
+ Ssl::configureSSL(SSL *ssl, CertificateProperties const &properties, AnyP::PortCfg &port)
+ {
+     Security::CertPointer cert;
+     Ssl::EVP_PKEY_Pointer pkey;
+     if (!generateSslCertificate(cert, pkey, properties))
+         return false;
+ 
+     if (!cert)
+         return false;
+ 
+     if (!pkey)
+         return false;
+ 
+     if (!SSL_use_certificate(ssl, cert.get()))
+         return false;
+ 
+     if (!SSL_use_PrivateKey(ssl, pkey.get()))
+         return false;
+ 
+
+=== modified file 'src/ssl/support.h'
+--- src/ssl/support.h	2016-02-23 08:51:22 +0000
++++ src/ssl/support.h	2016-04-05 04:02:26 +0000
+@@ -223,40 +223,52 @@ Security::ContextPtr generateSslContext(
+   \param sslContext The context to check
+   \param properties Check if the context certificate matches the given properties
+   \return true if the contexts certificate is valid, false otherwise
+  */
+ bool verifySslCertificate(Security::ContextPtr sslContext,  CertificateProperties const &properties);
+ 
+ /**
+   \ingroup ServerProtocolSSLAPI
+   * Read private key and certificate from memory and generate SSL context
+   * using their.
+  */
+ Security::ContextPtr generateSslContextUsingPkeyAndCertFromMemory(const char * data, AnyP::PortCfg &port);
+ 
+ /**
+   \ingroup ServerProtocolSSLAPI
+   * Create an SSL context using the provided certificate and key
+  */
+ Security::ContextPtr createSSLContext(Security::CertPointer & x509, Ssl::EVP_PKEY_Pointer & pkey, AnyP::PortCfg &port);
+ 
+ /**
++ \ingroup ServerProtocolSSLAPI
++ * Chain signing certificate and chained certificates to an SSL Context
++ */
++void chainCertificatesToSSLContext(SSL_CTX *sslContext, AnyP::PortCfg &port);
++
++/**
++ \ingroup ServerProtocolSSLAPI
++ * Configure a previously unconfigured SSL context object.
++ */
++void configureUnconfiguredSslContext(SSL_CTX *sslContext, Ssl::CertSignAlgorithm signAlgorithm,AnyP::PortCfg &port);
++
++/**
+   \ingroup ServerProtocolSSLAPI
+   * Generates a certificate and a private key using provided properies and set it
+   * to SSL object.
+  */
+ bool configureSSL(SSL *ssl, CertificateProperties const &properties, AnyP::PortCfg &port);
+ 
+ /**
+   \ingroup ServerProtocolSSLAPI
+   * Read private key and certificate from memory and set it to SSL object
+   * using their.
+  */
+ bool configureSSLUsingPkeyAndCertFromMemory(SSL *ssl, const char *data, AnyP::PortCfg &port);
+ 
+ /**
+   \ingroup ServerProtocolSSLAPI
+   * Adds the certificates in certList to the certificate chain of the SSL context
+  */
+ void addChainToSslContext(Security::ContextPtr sslContext, STACK_OF(X509) *certList);
+ 
+ /**
+

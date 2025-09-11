@@ -1,0 +1,169 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] Implementing draft-ietf-httpbis-header-structure
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20Implementing%20draft-ietf-httpbis-header-structure&In-Reply-To=%3Cb493f654-78bd-8df7-21fe-34238731d2cb%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="008542.html">
+   <LINK REL="Next"  HREF="008544.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] Implementing draft-ietf-httpbis-header-structure</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20Implementing%20draft-ietf-httpbis-header-structure&In-Reply-To=%3Cb493f654-78bd-8df7-21fe-34238731d2cb%40measurement-factory.com%3E"
+       TITLE="[squid-dev] Implementing draft-ietf-httpbis-header-structure">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Wed Apr 26 04:14:45 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008542.html">[squid-dev] Implementing draft-ietf-httpbis-header-structure
+</A></li>
+        <LI>Next message: <A HREF="008544.html">[squid-dev] [PATCH] switch session/connection for OpenSSL
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8543">[ date ]</a>
+              <a href="thread.html#8543">[ thread ]</a>
+              <a href="subject.html#8543">[ subject ]</a>
+              <a href="author.html#8543">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 04/25/2017 02:54 PM, Amos Jeffries wrote:
+&gt;<i> The class HttpHeader currently provides a mixed bunch of methods to
+</I>&gt;<i> retrieve headers as a blob of ASCII in a String. This is causing a lot
+</I>&gt;<i> of code almost-duplication, String copying, validation difficulties,
+</I>&gt;<i> etc.
+</I>
+Agreed.
+
+
+&gt;<i> Our Parser-NG project seeks to reduce this and make it a lot more
+</I>&gt;<i> efficient by scoping the parse action inside Parser that can be audited
+</I>&gt;<i> for accuracy isolated from the complications of header semantic handling.
+</I>
+FYI: The &quot;scoping the parse action inside Parser&quot; approach is too vague
+for me to support or critique. I assume that agreeing on Parser-NG
+project goals is not really necessary for this specific email thread,
+but please correct me if I am wrong.
+
+
+&gt;<i> <A HREF="https://tools.ietf.org/html/draft-ietf-httpbis-header-structure">https://tools.ietf.org/html/draft-ietf-httpbis-header-structure</A>
+</I>
+&gt;<i> The implementation of this would be refactoring HttpHeader so most
+</I>&gt;<i> headers can be parsed and syntax validated in one place (inside
+</I>&gt;<i> HttpHeader) and callers receive a structured tree conforming as much as
+</I>&gt;<i> possible to the common header structure instead of a String blob. The
+</I>&gt;<i> callers then (at worst) only need to know what key or parameter it is
+</I>&gt;<i> looking for and how to scan the tree for that instead of parsing the
+</I>&gt;<i> whole String.
+</I>
+I assume the above plan means adding some kind of a Tree class and that
+a typical field getter would then look like this (in pseudo code):
+
+    /// \returns a generic Common Header Structure tree
+    Tree fieldFoo() const {
+        if (const auto field = findEntry(HdrType::FOO))
+            return FieldParser(field-&gt;syntax).parse(field-&gt;value);
+        return Tree();
+    }
+    ...
+    const auto foo = header-&gt;fieldFoo();
+    if (foo.element[3].asAscii().contains(&quot;bar&quot;))...
+
+If my interpretation of the above plan is anywhere close to what you
+have in mind, then please do not implement that plan! A tree-focused
+generic field parser approach is likely to make things worse for Squid.
+Instead of using tree objects and generic parsers, we should use
+field-specific [Common Header Structure] syntax directly in _code_:
+
+    /// \returns a field-specific type/object, like int or HttpHdrCc
+    Foo fieldFoo() const {
+        if (const auto field = findEntry(HdrType::FOO)) {
+            FieldParser parser(field-&gt;value);
+            // parse Foo field according to its Common Syntax
+            foo.stamp = parser.timestamp(); // h1-timestamp
+            foo.bar = parser.ascii().contains(&quot;bar&quot;); // h1-ascii-string
+            ...
+            return foo;
+        }
+        return Foo();
+    }
+    ...
+    const auto foo = header-&gt;fieldFoo();
+    if (foo.bar)...
+
+
+Why should we reject &quot;parsing in one place&quot; and &quot;callers that receive
+trees&quot;? Consider the combination of the following facts:
+
+1. Header field users do not care about the field syntax and do not want
+to scan generic parser-generated trees. They need access to
+field-specific values expressed as integers, timestamps, enums, and
+similar &quot;typed&quot; values, not generic trees. Giving an integer-expecting
+caller a String is clearly wrong, but giving it a &quot;tree&quot; could be worse!
+
+2. Configuring a generic parser to use [field-]specific syntax is
+difficult, especially when real-world fields may require adjusting that
+syntax depending on the being-parsed values. AFIK, all existing
+solutions to these problems are ugly, inflexible, complex, and/or slow.
+
+3. Squid should not police traffic by default. Many compliant fields do
+not conform to the Common Header Structure format. Many real fields are
+not fully compliant, even when they should be. In most cases, Squid
+should still forward fields as is, even if we cannot parse them. This
+means that you cannot store most header values using [just] a tree.
+
+4. Each field that Squid manipulates has a fairly simple syntax. A
+single field type does not normally contain a wide variety of valid
+inputs (unlike, say, a C++ file that may have numerous valid constructs
+for a C++ parser to deal with, requiring building a general &quot;tree&quot;).
+
+Overall, we most likely need many simple parsers instead of one generic
+but configurable Common Header Structure parser. Each Foo field getter
+is essentially a parser. All those simple field parsers will share lots
+of code, of course (e.g., they will call the same set of FieldParser
+methods). My sketch above illustrates this approach.
+
+
+HTH,
+
+Alex.
+P.S. I applaud the ongoing Common Header Structure efforts. In Squid
+context, that work may help define parsing vocabulary in the short term
+and reduce the number of odd headers we deal with in the long run.
+
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008542.html">[squid-dev] Implementing draft-ietf-httpbis-header-structure
+</A></li>
+	<LI>Next message: <A HREF="008544.html">[squid-dev] [PATCH] switch session/connection for OpenSSL
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8543">[ date ]</a>
+              <a href="thread.html#8543">[ thread ]</a>
+              <a href="subject.html#8543">[ subject ]</a>
+              <a href="author.html#8543">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

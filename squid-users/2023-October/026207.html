@@ -1,0 +1,147 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-users] very poor performance of rock cache ipc
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20very%20poor%20performance%20of%20rock%20cache%20ipc&In-Reply-To=%3Cd7cff248-ab65-4a23-803e-ddea2372a885%40googlemail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026203.html">
+   <LINK REL="Next"  HREF="026208.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-users] very poor performance of rock cache ipc</H1>
+    <B>Julian Taylor</B> 
+    <A HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20very%20poor%20performance%20of%20rock%20cache%20ipc&In-Reply-To=%3Cd7cff248-ab65-4a23-803e-ddea2372a885%40googlemail.com%3E"
+       TITLE="[squid-users] very poor performance of rock cache ipc">jtaylor.debian at googlemail.com
+       </A><BR>
+    <I>Mon Oct 16 20:24:48 UTC 2023</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="026203.html">[squid-users] very poor performance of rock cache ipc
+</A></li>
+        <LI>Next message (by thread): <A HREF="026208.html">[squid-users] very poor performance of rock cache ipc
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26207">[ date ]</a>
+              <a href="thread.html#26207">[ thread ]</a>
+              <a href="subject.html#26207">[ subject ]</a>
+              <a href="author.html#26207">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 15.10.23 05:42, Alex Rousskov wrote:
+&gt;<i> On 2023-10-14 12:04, Julian Taylor wrote:
+</I>&gt;&gt;<i> On 14.10.23 17:40, Alex Rousskov wrote:
+</I>&gt;&gt;&gt;<i> On 2023-10-13 16:01, Julian Taylor wrote:
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> The reproducer uses as single request, the same very thing can be 
+</I>&gt;&gt;<i> observed on a very busy squid
+</I>&gt;<i> 
+</I>&gt;<i> If a busy Squid sends lots of IPC messages between worker and disker, 
+</I>&gt;<i> then either there is a Squid bug we do not know about OR that disker is 
+</I>&gt;<i> just not as busy as one might expect it to be.
+</I>&gt;<i> 
+</I>&gt;<i> In Squid v6+, you can observe disker queues using mgr:store_queues cache 
+</I>&gt;<i> manager report. In your environment, do those queues always have lots of 
+</I>&gt;<i> requests when Squid is busy? Feel free to share (a pointer to) a 
+</I>&gt;<i> representative sample of those reports from your busy Squid.
+</I>&gt;<i> 
+</I>&gt;<i> N.B. Besides worker-disker IPC messages, there are also worker-worker 
+</I>&gt;<i> cache synchronization IPC messages. They also have the same &quot;do not send 
+</I>&gt;<i> IPC messages if the queue has some pending items already&quot; optimization.
+</I>&gt;<i> 
+</I>
+
+I checked the queues running with the configuration from my initial mail 
+with workers increase and the queues are generally low, around 1-10 
+items in the queue when sending around 100 parallel requests reading 
+about 100mb data files. Here is a sample: <A HREF="https://dpaste.com/8SLNRW5F8">https://dpaste.com/8SLNRW5F8</A>
+Also with the higher request rate than the single curl the majority of 
+work throughput was more than doubled by increasing the blocksize.
+
+How are the queues supposed to look like on a busy squid that is not 
+spending a large portion of its time doing notify IPC?
+
+Increasing the parallel requests does decrease the amount of overhead 
+but its still pretty large, I measured about 10%-30% cpu overhead with 
+100 parallel requests served from cache in the worker and disker
+Here a snipped of a profile:
+--22.34%--JobDialer&lt;AsyncJob&gt;::dial(AsyncCall&amp;)
+    |
+    |--21.19%--Ipc::UdsSender::start()
+    |       |
+    |        --21.13%--Ipc::UdsSender::write()
+    |           |
+    |           |--16.12%--Ipc::UdsOp::conn()
+    |           |          |
+    |           |           --15.84%--comm_open_uds(int, int, 
+sockaddr_un*, int)
+    |           |                |--1.70%--commSetCloseOnExec(int)
+    |           |                 --1.56%--commSetNonBlocking(int)
+   ...
+--12.98%--comm_close_complete(int)
+
+Clearing and constructing the large Ipc::TypedMsgHdr is also very 
+noticeable.
+
+That the overhead and maximum throughput is so low for not so busy 
+squids (say 1-10 requests per second but requests on average &gt; 1MiB) is 
+imo also a reason for concern and could be improved.
+
+If I understand the way it works correctly e.g. the worker when it gets 
+a request splits it into 4k blocks and enqueues read requests into the 
+ipc queue and if the queue is empty it emits a notify ipc so the disker 
+starts popping from the queue.
+
+On large requests that are answered immediately from the disker the 
+problem seems to be that the queue is mostly empty and it sends an ipc 
+ping pong for each 4k block.
+
+So my though was when the request is larger than 4k enqueue multiple 
+pending reads in the worker and only notify after a certain amount has 
+been added to the queue, vice versa in the disker.
+So I messed around a bit trying to reduce the notifications by delaying 
+the Notify call in src/DiskIO/IpcIo/IpcIoFile.cc for larger requests but 
+it ended up blocking after the first queue push with no notify. If I 
+understand the queue correctly this is due to the reader requires a 
+notify to initially start and and simply pushing multiple read requests 
+onto the queue without notifying will not work as trivially as I hoped.
+
+Is this approach feasible or am I misunderstanding how it works?
+
+
+I also tried to add reusing of the IPC connection between calls so the 
+major source of overhead,tearing down and reestablishing the connection, 
+is removed but that also turned out difficult as the connections are 
+closed in various places and the general complexity of the code.
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="026203.html">[squid-users] very poor performance of rock cache ipc
+</A></li>
+	<LI>Next message (by thread): <A HREF="026208.html">[squid-users] very poor performance of rock cache ipc
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26207">[ date ]</a>
+              <a href="thread.html#26207">[ thread ]</a>
+              <a href="subject.html#26207">[ subject ]</a>
+              <a href="author.html#26207">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.squid-cache.org/listinfo/squid-users">More information about the squid-users
+mailing list</a><br>
+</body></html>

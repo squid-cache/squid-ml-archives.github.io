@@ -1,0 +1,488 @@
+When a RESPMOD service aborts, mark the body it produced as truncated.
+
+Without these changes, the recipient of the truncated body often
+cannot tell that the body was actually truncated (e.g., when Squid
+uses chunked encoding for body delivery). Lying about truncation
+may result in rather serious user-level problems.
+
+=== modified file 'src/Store.h'
+--- src/Store.h	2015-05-25 14:02:29 +0000
++++ src/Store.h	2015-08-17 20:34:32 +0000
+@@ -49,40 +49,42 @@ public:
+     bool checkDeferRead(int fd) const;
+ 
+     virtual const char *getMD5Text() const;
+     StoreEntry();
+     virtual ~StoreEntry();
+ 
+     virtual HttpReply const *getReply() const;
+     virtual void write (StoreIOBuffer);
+ 
+     /** Check if the Store entry is emtpty
+      * \retval true   Store contains 0 bytes of data.
+      * \retval false  Store contains 1 or more bytes of data.
+      * \retval false  Store contains negative content !!!!!!
+      */
+     virtual bool isEmpty() const {
+         assert (mem_obj);
+         return mem_obj->endOffset() == 0;
+     }
+     virtual bool isAccepting() const;
+     virtual size_t bytesWanted(Range<size_t> const aRange, bool ignoreDelayPool = false) const;
++    /// flags [truncated or too big] entry with ENTRY_BAD_LENGTH and releases it
++    void lengthWentBad(const char *reason);
+     virtual void complete();
+     virtual store_client_t storeClientType() const;
+     virtual char const *getSerialisedMetaData();
+     /// Store a prepared error response. MemObject locks the reply object.
+     void storeErrorResponse(HttpReply *reply);
+     void replaceHttpReply(HttpReply *, bool andStartWriting = true);
+     void startWriting(); ///< pack and write reply headers and, maybe, body
+     /// whether we may start writing to disk (now or in the future)
+     virtual bool mayStartSwapOut();
+     virtual void trimMemory(const bool preserveSwappable);
+ 
+     // called when a decision to cache in memory has been made
+     void memOutDecision(const bool willCacheInRam);
+     // called when a decision to cache on disk has been made
+     void swapOutDecision(const MemObject::SwapOut::Decision &decision);
+ 
+     void abort();
+     void unlink();
+     void makePublic();
+     void makePrivate();
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2015-08-10 21:23:12 +0000
++++ src/client_side.cc	2015-08-17 20:34:32 +0000
+@@ -941,40 +941,42 @@ ClientSocketContext::lengthToSend(Range<
+     if (!http->request->range)
+         return maximum;
+ 
+     assert (canPackMoreRanges());
+ 
+     if (http->range_iter.debt() == -1)
+         return maximum;
+ 
+     assert (http->range_iter.debt() > 0);
+ 
+     /* TODO this + the last line could be a range intersection calculation */
+     if (available.start < http->range_iter.currentSpec()->offset)
+         return 0;
+ 
+     return min(http->range_iter.debt(), (int64_t)maximum);
+ }
+ 
+ void
+ ClientSocketContext::noteSentBodyBytes(size_t bytes)
+ {
++    debugs(33, 7, bytes << " body bytes");
++
+     http->out.offset += bytes;
+ 
+     if (!http->request->range)
+         return;
+ 
+     if (http->range_iter.debt() != -1) {
+         http->range_iter.debt(http->range_iter.debt() - bytes);
+         assert (http->range_iter.debt() >= 0);
+     }
+ 
+     /* debt() always stops at -1, below that is a bug */
+     assert (http->range_iter.debt() >= -1);
+ }
+ 
+ bool
+ ClientHttpRequest::multipartRangeRequest() const
+ {
+     return request->multipartRangeRequest();
+ }
+ 
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2015-08-04 19:57:07 +0000
++++ src/client_side_reply.cc	2015-08-17 20:34:32 +0000
+@@ -1221,40 +1221,45 @@ clientReplyContext::replyStatus()
+     if (EBIT_TEST(http->storeEntry()->flags, ENTRY_ABORTED)) {
+         /* TODO: Could upstream read errors (result.flags.error) be
+          * lost, and result in undersize requests being considered
+          * complete. Should we tcp reset such connections ?
+          */
+         debugs(88, 5, "clientReplyStatus: aborted storeEntry");
+         return STREAM_FAILED;
+     }
+ 
+     if ((done = checkTransferDone()) != 0 || flags.complete) {
+         debugs(88, 5, "clientReplyStatus: transfer is DONE: " << done << flags.complete);
+         /* Ok we're finished, but how? */
+ 
+         const int64_t expectedBodySize =
+             http->storeEntry()->getReply()->bodySize(http->request->method);
+         if (!http->request->flags.proxyKeepalive && expectedBodySize < 0) {
+             debugs(88, 5, "clientReplyStatus: closing, content_length < 0");
+             return STREAM_FAILED;
+         }
+ 
++        if (EBIT_TEST(http->storeEntry()->flags, ENTRY_BAD_LENGTH)) {
++            debugs(88, 5, "clientReplyStatus: truncated response body");
++            return STREAM_UNPLANNED_COMPLETE;
++        }
++
+         if (!done) {
+             debugs(88, 5, "clientReplyStatus: closing, !done, but read 0 bytes");
+             return STREAM_FAILED;
+         }
+ 
+         if (expectedBodySize >= 0 && !http->gotEnough()) {
+             debugs(88, 5, "clientReplyStatus: client didn't get all it expected");
+             return STREAM_UNPLANNED_COMPLETE;
+         }
+ 
+         debugs(88, 5, "clientReplyStatus: stream complete; keepalive=" <<
+                http->request->flags.proxyKeepalive);
+         return STREAM_COMPLETE;
+     }
+ 
+     // XXX: Should this be checked earlier? We could return above w/o checking.
+     if (reply->receivedBodyTooLarge(*http->request, http->out.offset - 4096)) {
+         /* 4096 is a margin for the HTTP headers included in out.offset */
+         debugs(88, 5, "clientReplyStatus: client reply body is too large");
+         return STREAM_FAILED;
+
+=== modified file 'src/clients/Client.cc'
+--- src/clients/Client.cc	2015-08-04 19:57:07 +0000
++++ src/clients/Client.cc	2015-08-17 20:54:16 +0000
+@@ -781,86 +781,111 @@ Client::handleAdaptedBodyProductionEnded
+ {
+     if (abortOnBadEntry("entry went bad while waiting for adapted body eof"))
+         return;
+ 
+     // end consumption if we consumed everything
+     if (adaptedBodySource != NULL && adaptedBodySource->exhausted())
+         endAdaptedBodyConsumption();
+     // else resumeBodyStorage() will eventually consume the rest
+ }
+ 
+ void
+ Client::endAdaptedBodyConsumption()
+ {
+     stopConsumingFrom(adaptedBodySource);
+     handleAdaptationCompleted();
+ }
+ 
+ // premature end of the adapted response body
+ void Client::handleAdaptedBodyProducerAborted()
+ {
++    if (abortOnBadEntry("entry went bad while waiting for the now-aborted adapted body"))
++        return;
++
++    Must(adaptedBodySource != nullptr);
++    if (!adaptedBodySource->exhausted()) {
++        debugs(11,5, "waiting to consume the remainder of the aborted adapted body");
++        return; // resumeBodyStorage() should eventually consume the rest
++    }
++
+     stopConsumingFrom(adaptedBodySource);
+-    handleAdaptationAborted();
++
++    if (handledEarlyAdaptationAbort())
++        return;
++
++    entry->lengthWentBad("body adaptation aborted");
++    handleAdaptationCompleted(); // the user should get a truncated response
+ }
+ 
+ // common part of noteAdaptationAnswer and handleAdaptedBodyProductionEnded
+ void
+ Client::handleAdaptationCompleted()
+ {
+     debugs(11,5, HERE << "handleAdaptationCompleted");
+     cleanAdaptation();
+ 
+     // We stop reading origin response because we have no place to put it(*) and
+     // cannot use it. If some origin servers do not like that or if we want to
+     // reuse more pconns, we can add code to discard unneeded origin responses.
+     // (*) TODO: Is it possible that the adaptation xaction is still running?
+     if (mayReadVirginReplyBody()) {
+         debugs(11,3, HERE << "closing origin conn due to ICAP completion");
+         closeServer();
+     }
+ 
+     completeForwarding();
+ }
+ 
+ // common part of noteAdaptation*Aborted and noteBodyConsumerAborted methods
+ void
+ Client::handleAdaptationAborted(bool bypassable)
+ {
+     debugs(11,5, HERE << "handleAdaptationAborted; bypassable: " << bypassable <<
+            ", entry empty: " << entry->isEmpty());
+ 
+     if (abortOnBadEntry("entry went bad while ICAP aborted"))
+         return;
+ 
+     // TODO: bypass if possible
++    if (!handledEarlyAdaptationAbort())
++        abortTransaction("adaptation failure with a filled entry");
++}
+ 
++/// If the store entry is still empty, fully handles adaptation abort, returning
++/// true. Otherwise just updates the request error detail and returns false.
++bool
++Client::handledEarlyAdaptationAbort()
++{
+     if (entry->isEmpty()) {
+-        debugs(11,9, HERE << "creating ICAP error entry after ICAP failure");
++        debugs(11,8, "adaptation failure with an empty entry: " << *entry);
+         ErrorState *err = new ErrorState(ERR_ICAP_FAILURE, Http::scInternalServerError, request);
+         err->detailError(ERR_DETAIL_ICAP_RESPMOD_EARLY);
+         fwd->fail(err);
+         fwd->dontRetry(true);
+-    } else if (request) { // update logged info directly
+-        request->detailError(ERR_ICAP_FAILURE, ERR_DETAIL_ICAP_RESPMOD_LATE);
++        abortTransaction("adaptation failure with an empty entry");
++        return true; // handled
+     }
+ 
+-    abortTransaction("ICAP failure");
++    if (request) // update logged info directly
++        request->detailError(ERR_ICAP_FAILURE, ERR_DETAIL_ICAP_RESPMOD_LATE);
++
++    return false; // the caller must handle
+ }
+ 
+ // adaptation service wants us to deny HTTP client access to this response
+ void
+ Client::handleAdaptationBlocked(const Adaptation::Answer &answer)
+ {
+     debugs(11,5, HERE << answer.ruleId);
+ 
+     if (abortOnBadEntry("entry went bad while ICAP aborted"))
+         return;
+ 
+     if (!entry->isEmpty()) { // too late to block (should not really happen)
+         if (request)
+             request->detailError(ERR_ICAP_FAILURE, ERR_DETAIL_RESPMOD_BLOCK_LATE);
+         abortTransaction("late adaptation block");
+         return;
+     }
+ 
+     debugs(11,7, HERE << "creating adaptation block response");
+ 
+
+=== modified file 'src/clients/Client.h'
+--- src/clients/Client.h	2015-01-23 07:43:10 +0000
++++ src/clients/Client.h	2015-08-17 20:50:27 +0000
+@@ -107,40 +107,41 @@ protected:
+     /// Entry-dependent callbacks use this check to quit if the entry went bad
+     bool abortOnBadEntry(const char *abortReason);
+ 
+     bool blockCaching();
+ 
+ #if USE_ADAPTATION
+     void startAdaptation(const Adaptation::ServiceGroupPointer &group, HttpRequest *cause);
+     void adaptVirginReplyBody(const char *buf, ssize_t len);
+     void cleanAdaptation();
+     virtual bool doneWithAdaptation() const;   /**< did we end ICAP communication? */
+ 
+     // BodyConsumer for ICAP: consume adapted response body.
+     void handleMoreAdaptedBodyAvailable();
+     void handleAdaptedBodyProductionEnded();
+     void handleAdaptedBodyProducerAborted();
+ 
+     void handleAdaptedHeader(HttpMsg *msg);
+     void handleAdaptationCompleted();
+     void handleAdaptationBlocked(const Adaptation::Answer &answer);
+     void handleAdaptationAborted(bool bypassable = false);
++    bool handledEarlyAdaptationAbort();
+ 
+     /// called by StoreEntry when it has more buffer space available
+     void resumeBodyStorage();
+     /// called when the entire adapted response body is consumed
+     void endAdaptedBodyConsumption();
+ #endif
+ 
+ protected:
+     const HttpReply *virginReply() const;
+     HttpReply *virginReply();
+     HttpReply *setVirginReply(HttpReply *r);
+ 
+     HttpReply *finalReply();
+     HttpReply *setFinalReply(HttpReply *r);
+ 
+     // Kids use these to stuff data into the response instead of messing with the entry directly
+     void adaptOrFinalizeReply();
+     void addVirginReplyBody(const char *buf, ssize_t len);
+     void storeReplyBody(const char *buf, ssize_t len);
+     /// \deprecated use SBuf I/O API and calcBufferSpaceToReserve() instead
+
+=== modified file 'src/servers/Http1Server.cc'
+--- src/servers/Http1Server.cc	2015-08-04 19:57:07 +0000
++++ src/servers/Http1Server.cc	2015-08-17 20:34:32 +0000
+@@ -2,40 +2,41 @@
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 33    Client-side Routines */
+ 
+ #include "squid.h"
+ #include "acl/FilledChecklist.h"
+ #include "client_side.h"
+ #include "client_side_reply.h"
+ #include "client_side_request.h"
+ #include "comm/Write.h"
+ #include "http/one/RequestParser.h"
+ #include "HttpHeaderTools.h"
+ #include "profiler/Profiler.h"
+ #include "servers/Http1Server.h"
+ #include "SquidConfig.h"
++#include "Store.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Http1, Server);
+ 
+ Http::One::Server::Server(const MasterXaction::Pointer &xact, bool beHttpsServer):
+     AsyncJob("Http1::Server"),
+     ConnStateData(xact),
+     isHttpsServer(beHttpsServer)
+ {
+ }
+ 
+ time_t
+ Http::One::Server::idleTimeout() const
+ {
+     return Config.Timeout.clientIdlePconn;
+ }
+ 
+ void
+ Http::One::Server::start()
+ {
+     ConnStateData::start();
+@@ -233,40 +234,41 @@ Http::One::Server::processParsedRequest(
+ void
+ Http::One::Server::noteBodyConsumerAborted(BodyPipe::Pointer ptr)
+ {
+     ConnStateData::noteBodyConsumerAborted(ptr);
+     stopReceiving("virgin request body consumer aborted"); // closes ASAP
+ }
+ 
+ void
+ Http::One::Server::handleReply(HttpReply *rep, StoreIOBuffer receivedData)
+ {
+     // the caller guarantees that we are dealing with the current context only
+     ClientSocketContext::Pointer context = getCurrentContext();
+     Must(context != NULL);
+     const ClientHttpRequest *http = context->http;
+     Must(http != NULL);
+ 
+     // After sending Transfer-Encoding: chunked (at least), always send
+     // the last-chunk if there was no error, ignoring responseFinishedOrFailed.
+     const bool mustSendLastChunk = http->request->flags.chunkedReply &&
+                                    !http->request->flags.streamError &&
++                                   !EBIT_TEST(http->storeEntry()->flags, ENTRY_BAD_LENGTH) &&
+                                    !context->startOfOutput();
+     const bool responseFinishedOrFailed = !rep &&
+                                           !receivedData.data &&
+                                           !receivedData.length;
+     if (responseFinishedOrFailed && !mustSendLastChunk) {
+         context->writeComplete(context->clientConnection, NULL, 0, Comm::OK);
+         return;
+     }
+ 
+     if (!context->startOfOutput()) {
+         context->sendBody(rep, receivedData);
+         return;
+     }
+ 
+     assert(rep);
+     http->al->reply = rep;
+     HTTPMSGLOCK(http->al->reply);
+     context->sendStartOfMessage(rep, receivedData);
+ }
+ 
+
+=== modified file 'src/store.cc'
+--- src/store.cc	2015-08-04 19:57:07 +0000
++++ src/store.cc	2015-08-17 20:34:32 +0000
+@@ -1067,67 +1067,73 @@ storeCheckCachableStats(StoreEntry *sent
+                       store_check_cachable_hist.no.wrong_content_length);
+     storeAppendPrintf(sentry, "no.negative_cached\t%d\n",
+                       store_check_cachable_hist.no.negative_cached);
+     storeAppendPrintf(sentry, "no.missing_parts\t%d\n",
+                       store_check_cachable_hist.no.missing_parts);
+     storeAppendPrintf(sentry, "no.too_big\t%d\n",
+                       store_check_cachable_hist.no.too_big);
+     storeAppendPrintf(sentry, "no.too_small\t%d\n",
+                       store_check_cachable_hist.no.too_small);
+     storeAppendPrintf(sentry, "no.private_key\t%d\n",
+                       store_check_cachable_hist.no.private_key);
+     storeAppendPrintf(sentry, "no.too_many_open_files\t%d\n",
+                       store_check_cachable_hist.no.too_many_open_files);
+     storeAppendPrintf(sentry, "no.too_many_open_fds\t%d\n",
+                       store_check_cachable_hist.no.too_many_open_fds);
+     storeAppendPrintf(sentry, "yes.default\t%d\n",
+                       store_check_cachable_hist.yes.Default);
+ }
+ 
+ void
++StoreEntry::lengthWentBad(const char *reason)
++{
++    debugs(20, 3, "because " << reason << ": " << *this);
++    EBIT_SET(flags, ENTRY_BAD_LENGTH);
++    releaseRequest();
++}
++
++void
+ StoreEntry::complete()
+ {
+     debugs(20, 3, "storeComplete: '" << getMD5Text() << "'");
+ 
+     if (store_status != STORE_PENDING) {
+         /*
+          * if we're not STORE_PENDING, then probably we got aborted
+          * and there should be NO clients on this entry
+          */
+         assert(EBIT_TEST(flags, ENTRY_ABORTED));
+         assert(mem_obj->nclients == 0);
+         return;
+     }
+ 
+     /* This is suspect: mem obj offsets include the headers. do we adjust for that
+      * in use of object_sz?
+      */
+     mem_obj->object_sz = mem_obj->endOffset();
+ 
+     store_status = STORE_OK;
+ 
+     assert(mem_status == NOT_IN_MEMORY);
+ 
+-    if (!validLength()) {
+-        EBIT_SET(flags, ENTRY_BAD_LENGTH);
+-        releaseRequest();
+-    }
++    if (!EBIT_TEST(flags, ENTRY_BAD_LENGTH) && !validLength())
++        lengthWentBad("!validLength() in complete()");
+ 
+ #if USE_CACHE_DIGESTS
+     if (mem_obj->request)
+         mem_obj->request->hier.store_complete_stop = current_time;
+ 
+ #endif
+     /*
+      * We used to call invokeHandlers, then storeSwapOut.  However,
+      * Madhukar Reddy <myreddy@persistence.com> reported that
+      * responses without content length would sometimes get released
+      * in client_side, thinking that the response is incomplete.
+      */
+     invokeHandlers();
+ }
+ 
+ /*
+  * Someone wants to abort this transfer.  Set the reason in the
+  * request structure, call the callback and mark the
+  * entry for releasing
+  */
+

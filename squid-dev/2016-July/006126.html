@@ -1,0 +1,282 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] TidyPointer removal
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20TidyPointer%20removal&In-Reply-To=%3C57794DD3.1000702%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006426.html">
+   <LINK REL="Next"  HREF="006133.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] TidyPointer removal</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20TidyPointer%20removal&In-Reply-To=%3C57794DD3.1000702%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] TidyPointer removal">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Sun Jul  3 17:39:31 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006426.html">[squid-dev] [PATCH] Fix ssl use for kerberos_ldap_group
+</A></li>
+        <LI>Next message: <A HREF="006133.html">[squid-dev] [PATCH] TidyPointer removal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6126">[ date ]</a>
+              <a href="thread.html#6126">[ thread ]</a>
+              <a href="subject.html#6126">[ subject ]</a>
+              <a href="author.html#6126">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 06/29/2016 05:45 AM, Amos Jeffries wrote:
+
+&gt;<i>  /**
+</I>&gt;<i> + * A pointer that deletes the object it points to when the pointer's owner or
+</I>&gt;<i> + * context is gone. [...]
+</I>&gt;<i>   */
+</I>...
+&gt;<i> +    explicit LockingPointer(const SelfType &amp;o) : raw(nullptr) { resetAndLock(o.get()); }
+</I>
+
+Something went wrong here: If both the class description and the copy
+constructor are correct, then the following pseudo code ought to crash
+Squid:
+
+  LockingPointer a(OpenSSL_new(...)); // a points to a new object X
+  {
+      LockingPointer b(a); // a and b point to the same object X
+      ...
+      // b context ends so b deletes X
+  }
+  ...
+  // a context ends so a deletes X
+  // Squid crashes because the same X was deleted twice
+
+
+I hope that Squid code is actually correct, but the proposed class
+description is not. LockingPointer does _not_ delete the object it
+points to when the pointer's owner or context is gone. LockingPointer is
+actually a reference counting pointer like shared_ptr (not a unique_ptr
+or auto_ptr!). There is no concept of [a single] owner here -- the
+object is _shared_ among many &quot;owners&quot;. That makes copy assignment safe.
+
+If I am right, then we need to fix the LockingPointer class description
+(and make sure the implementation matches it). There several ways to do
+that, including the following three:
+
+
+A. Provide two different LockingPointer classes, one for OpenSSL, and
+one for GnuTLS. The tricky shared pointer code will be duplicated (bad),
+but each class itself would be easy to comprehend because it will lack
+#ifdefs (good):
+
+   #if USE_OPENSSL
+     template &lt;...&gt;
+     class LockingPointer ...
+   #elif USE_GNUTLS
+     template &lt;...&gt;
+     class LockingPointer ...
+   #else
+
+
+B. Provide a single LockingPointer class along with two wrappers that
+customize template parameters, one for OpenSSL, and one for GnuTLS. No
+tricky shared pointer duplication (good), but an extra level of wrapping
+would complicate comprehension (bad):
+
+   template &lt;...&gt;
+   class LockingPointer ...
+
+   #if USE_OPENSSL
+   template &lt;...&gt;
+   using OpenSslLockingPointer = LockingPointer&lt;...&gt;
+   #elif USE_GNUTLS
+   template &lt;...&gt;
+   class GnuTlsLockingPointer = LockingPointer&lt;...&gt;
+   #else
+
+I have attached a sketch for B in case you want to see what that would
+look like.
+
+
+C. Provide a single LockingPointer class sprinkled with #ifdefs
+customizing its API and implementation for each library. No tricky
+shared pointer duplication (good), but large number of #ifdefs,
+including #ifdefs in class template parameters, will make the code
+difficult to comprehend (bad).
+
+
+We are currently doing C. I have no objections to us continuing doing C,
+at least for now. If you pick C, then the fixed LockingPointer class
+documentation may look like the following (compare that with the
+documentation for LockingPointer in the attached sketch for B):
+
+-----
+A shared pointer to a reference-counting Object with library-specific
+absorption, locking, and unlocking implementations. The API largely
+follows std::shared_ptr.
+
+The constructor and the absorb() method import a raw Object pointer.
+Normally, absorb() would just lock(), but libraries like OpenSSL
+pre-lock objects before they are fed to LockingPointer, necessitating
+this customization hook.
+
+The lock() method increments Object's reference counter.
+
+The unlock() method decrements Object's reference counter and destroys
+the object when the counter reaches zero.
+-----
+
+The absorb/lock/unlock split above may help with seamless GnuTLS
+support, assuming GnuTLS does not pre-lock objects like OpenSSL does.
+However, somebody familiar with GnuTLS should check whether it has other
+special needs not addressed by the above LockingPointer sketch. For
+example, if GnuTLS does not have a concept of locking at all, then we
+may be better of with approach A where GnuTLS code just uses
+std::shared_ptr!
+
+
+&gt;<i> +    /// Deallocate raw pointer. Become a nil pointer.
+</I>&gt;<i> +    void deletePointer() {
+</I>&gt;<i> +        if (raw)
+</I>&gt;<i> +            DeAllocator(raw);
+</I>&gt;<i> +        raw = nullptr;
+</I>&gt;<i> +    }
+</I>
+please rename to unlock(). We are not deleting the pointer here and,
+depending on the lock count, we are not deleting the object either!
+Renaming DeAllocator to Unlock or Unlocker is also a good idea -- we
+have wasted enough time being confused by OpenSSL _free() functions not
+freeing locked objects!
+
+
+&gt;<i> +    /// Reset raw pointer - delete last one and save new one.
+</I>&gt;<i> +    void reset(T *t) {
+</I>&gt;<i> +        deletePointer();
+</I>&gt;<i> +        raw = t;
+</I>&gt;<i>      }
+</I>
+I do not think we can have a reset() method like this because the
+standard shared_ptr::reset() has a very different semantics. Let's call
+this absorb(). This is like a raw pointer assignment operator, but we
+want to keep it &quot;explicit&quot; because we think this is a dangerous operation.
+
+
+&gt;<i>      void resetAndLock(T *t) {
+</I>&gt;<i>          if (t != this-&gt;get()) {
+</I>&gt;<i>              this-&gt;reset(t);
+</I>&gt;<i>  #if USE_OPENSSL
+</I>&gt;<i>              if (t)
+</I>&gt;<i>                  CRYPTO_add(&amp;t-&gt;references, 1, lock);
+</I>&gt;<i>  #elif USE_GNUTLS
+</I>&gt;<i>              // XXX: GnuTLS does not provide locking ?
+</I>&gt;<i>  #else
+</I>&gt;<i>              assert(false);
+</I>&gt;<i>  #endif
+</I>&gt;<i>          }
+</I>&gt;<i>      }
+</I>
+Please rewrite as a pair of public reset(t) and private lock(void)
+methods. reset(t) calls lock() for non-nil t, of course.
+
+Please also add a public clear(void) method that reset(t) will call
+instead of lock() when t is nil. Alternatively, add a reset(void) method
+with the same semantics as clear(void) -- that is what std::shared_ptr does.
+
+
+To resolve conflicts between abused reset() in the old code and the new
+reset(), I suggest the following procedure:
+
+1. Add absorb() and clear(void)/reset(void) methods as discussed above.
+
+2. Remove LockingPointer::reset(x). Replace all calls to
+LockingPointer::reset(x) with absorb() and clear(void)/reset(void),
+depending on whether x is nil. See earlier emails on how to find all
+those calls. IIRC, Christos has certified that all those old reset(x)
+calls are meant to be either non-locking absorption or clearance calls.
+
+3. Rename LockingPointer::resetAndLock(x) to reset(x). Replace all calls
+to LockingPointer::resetAndLock() with reset(x).
+
+You may argue that these reset()-related changes are outside this
+project scope, but I think it is too dangerous to commit LockingPointer
+with a reset(x) method that does not work like shared_ptr::reset(x). In
+the current trunk code, we are calling TidyPointer::reset(), which is
+already very ugly, but can at least be half-justified because
+TidyPointer::reset() does what it is supposed to do. Moving that method
+from TidyPointer to LockingPointer moves the needle from &quot;terribly ugly&quot;
+to &quot;unacceptably dangerous&quot; IMO.
+
+
+&gt;<i> +            void operator()(argument_type a) { sk_object ## _pop_free(a, freefunction); } \
+</I>
+If you can make this operator &quot;const&quot;, please make it &quot;const&quot;.
+
+
+Please note that the originally proposed commit message no longer
+applies to your changes so we need a new one.
+
+
+HTH,
+
+Alex.
+
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: locking-pointer-B.cc
+Type: text/x-c++src
+Size: 1703 bytes
+Desc: not available
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/attachments/20160703/f7e8935b/attachment.cc">http://lists.squid-cache.org/pipermail/squid-dev/attachments/20160703/f7e8935b/attachment.cc</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006426.html">[squid-dev] [PATCH] Fix ssl use for kerberos_ldap_group
+</A></li>
+	<LI>Next message: <A HREF="006133.html">[squid-dev] [PATCH] TidyPointer removal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6126">[ date ]</a>
+              <a href="thread.html#6126">[ thread ]</a>
+              <a href="subject.html#6126">[ subject ]</a>
+              <a href="author.html#6126">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

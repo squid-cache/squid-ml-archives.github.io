@@ -1,0 +1,319 @@
+Negotiate Kerberos authentication request size exceeds output buffer size.
+
+Despite the "must match" comment, MAX_AUTHTOKEN_LEN in
+auth/UserRequest.h got out of sync with similar constants in Negotiate helpers.
+A 32KB buffer cannot fit some helper requests (e.g., those carrying Privilege
+Account Certificate information in the client's Kerberos ticket). Each truncated 
+request blocks the negotiate helper channel, eventually causing helper queue
+overflow and possibly killing Squid.
+
+This patch increases MAX_AUTHTOKEN_LEN in UserRequest.h to 65535 which
+is also the maximum used by the negotiate helpers. The patch also adds checks
+to avoid sending truncated requests, treating them as helper errors instead.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/auth/UserRequest.h'
+--- src/auth/UserRequest.h	2015-01-13 07:25:36 +0000
++++ src/auth/UserRequest.h	2015-04-15 14:15:15 +0000
+@@ -10,42 +10,42 @@
+ #define SQUID_AUTH_USERREQUEST_H
+ 
+ #if USE_AUTH
+ 
+ #include "AccessLogEntry.h"
+ #include "auth/AuthAclState.h"
+ #include "auth/Scheme.h"
+ #include "auth/User.h"
+ #include "dlink.h"
+ #include "helper/forward.h"
+ #include "HttpHeader.h"
+ #include "ip/Address.h"
+ 
+ class ConnStateData;
+ class HttpReply;
+ class HttpRequest;
+ 
+ /**
+  * Maximum length (buffer size) for token strings.
+  */
+-// AYJ: must match re-definition in helpers/negotiate_auth/kerberos/negotiate_kerb_auth.cc
+-#define MAX_AUTHTOKEN_LEN   32768
++// XXX: Keep in sync with all others: bzr grep 'define MAX_AUTHTOKEN_LEN'
++#define MAX_AUTHTOKEN_LEN   65535
+ 
+ /**
+  * Node used to link an IP address to some user credentials
+  * for the max_user_ip ACL feature.
+  */
+ class AuthUserIP
+ {
+     MEMPROXY_CLASS(AuthUserIP);
+ 
+ public:
+     AuthUserIP(const Ip::Address &ip, time_t t) : ipaddr(ip), ip_expiretime(t) {}
+ 
+     dlink_node node;
+ 
+     /// IP address this user authenticated from
+     Ip::Address ipaddr;
+ 
+     /** When this IP should be forgotten.
+      * Set to the time of last request made from this
+      * (user,IP) pair plus authenticate_ip_ttl seconds
+
+=== modified file 'src/auth/negotiate/UserRequest.cc'
+--- src/auth/negotiate/UserRequest.cc	2015-01-31 18:12:07 +0000
++++ src/auth/negotiate/UserRequest.cc	2015-04-16 08:44:06 +0000
+@@ -52,45 +52,54 @@
+ {
+     return NULL;
+ }
+ 
+ int
+ Auth::Negotiate::UserRequest::authenticated() const
+ {
+     if (user() != NULL && user()->credentials() == Auth::Ok) {
+         debugs(29, 9, HERE << "user authenticated.");
+         return 1;
+     }
+ 
+     debugs(29, 9, HERE << "user not fully authenticated.");
+     return 0;
+ }
+ 
+ const char *
+ Auth::Negotiate::UserRequest::credentialsStr()
+ {
+     static char buf[MAX_AUTHTOKEN_LEN];
++    int printResult = 0;
+     if (user()->credentials() == Auth::Pending) {
+-        snprintf(buf, sizeof(buf), "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
++        printResult = snprintf(buf, sizeof(buf), "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
+     } else {
+-        snprintf(buf, sizeof(buf), "KK %s\n", client_blob);
++        printResult = snprintf(buf, sizeof(buf), "KK %s\n", client_blob);
+     }
++
++    // truncation is OK because we are used only for logging
++    if (printResult < 0) {
++        debugs(29, 2, "Can not build negotiate authentication credentials.");
++        buf[0] = '\0';
++    } else if (printResult >= (int)sizeof(buf))
++        debugs(29, 2, "Negotiate authentication credentials truncated.");
++
+     return buf;
+ }
+ 
+ Auth::Direction
+ Auth::Negotiate::UserRequest::module_direction()
+ {
+     /* null auth_user is checked for by Auth::UserRequest::direction() */
+ 
+     if (waiting || client_blob)
+         return Auth::CRED_LOOKUP; /* need helper response to continue */
+ 
+     if (user()->auth_type != Auth::AUTH_NEGOTIATE)
+         return Auth::CRED_ERROR;
+ 
+     switch (user()->credentials()) {
+ 
+     case Auth::Handshake:
+         assert(server_blob);
+         return Auth::CRED_CHALLENGE;
+ 
+@@ -109,50 +118,60 @@
+ void
+ Auth::Negotiate::UserRequest::startHelperLookup(HttpRequest *, AccessLogEntry::Pointer &al, AUTHCB * handler, void *data)
+ {
+     static char buf[MAX_AUTHTOKEN_LEN];
+ 
+     assert(data);
+     assert(handler);
+ 
+     assert(user() != NULL);
+     assert(user()->auth_type == Auth::AUTH_NEGOTIATE);
+ 
+     if (static_cast<Auth::Negotiate::Config*>(Auth::Config::Find("negotiate"))->authenticateProgram == NULL) {
+         debugs(29, DBG_CRITICAL, "ERROR: No Negotiate authentication program configured.");
+         handler(data);
+         return;
+     }
+ 
+     debugs(29, 8, HERE << "credentials state is '" << user()->credentials() << "'");
+ 
+     const char *keyExtras = helperRequestKeyExtras(request, al);
++    int printResult = 0;
+     if (user()->credentials() == Auth::Pending) {
+         if (keyExtras)
+-            snprintf(buf, sizeof(buf), "YR %s %s\n", client_blob, keyExtras);
++            printResult = snprintf(buf, sizeof(buf), "YR %s %s\n", client_blob, keyExtras);
+         else
+-            snprintf(buf, sizeof(buf), "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
++            printResult = snprintf(buf, sizeof(buf), "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
+     } else {
+         if (keyExtras)
+-            snprintf(buf, sizeof(buf), "KK %s %s\n", client_blob, keyExtras);
++            printResult = snprintf(buf, sizeof(buf), "KK %s %s\n", client_blob, keyExtras);
+         else
+-            snprintf(buf, sizeof(buf), "KK %s\n", client_blob);
++            printResult = snprintf(buf, sizeof(buf), "KK %s\n", client_blob);
++    }
++
++    if (printResult < 0 || printResult >= (int)sizeof(buf)) {
++        if (printResult < 0)
++            debugs(29, DBG_CRITICAL, "ERROR: Can not build negotiate authentication helper request");
++        else
++            debugs(29, DBG_CRITICAL, "ERROR: Negotiate authentication helper request too big for the " << sizeof(buf) << "-byte buffer");
++        handler(data);
++        return;
+     }
+ 
+     waiting = 1;
+ 
+     safe_free(client_blob);
+ 
+     helperStatefulSubmit(negotiateauthenticators, buf, Auth::Negotiate::UserRequest::HandleReply,
+                          new Auth::StateData(this, handler, data), authserver);
+ }
+ 
+ /**
+  * Atomic action: properly release the Negotiate auth helpers which may have been reserved
+  * for this request connections use.
+  */
+ void
+ Auth::Negotiate::UserRequest::releaseAuthServer()
+ {
+     if (authserver) {
+         debugs(29, 6, HERE << "releasing Negotiate auth server '" << authserver << "'");
+         helperStatefulReleaseServer(authserver);
+
+=== modified file 'src/auth/ntlm/UserRequest.cc'
+--- src/auth/ntlm/UserRequest.cc	2015-01-17 09:15:53 +0000
++++ src/auth/ntlm/UserRequest.cc	2015-04-16 08:45:30 +0000
+@@ -51,45 +51,54 @@
+ {
+     return NULL;
+ }
+ 
+ int
+ Auth::Ntlm::UserRequest::authenticated() const
+ {
+     if (user() != NULL && user()->credentials() == Auth::Ok) {
+         debugs(29, 9, HERE << "user authenticated.");
+         return 1;
+     }
+ 
+     debugs(29, 9, HERE << "user not fully authenticated.");
+     return 0;
+ }
+ 
+ const char *
+ Auth::Ntlm::UserRequest::credentialsStr()
+ {
+     static char buf[MAX_AUTHTOKEN_LEN];
++    int printResult;
+     if (user()->credentials() == Auth::Pending) {
+-        snprintf(buf, sizeof(buf), "YR %s\n", client_blob);
++        printResult = snprintf(buf, sizeof(buf), "YR %s\n", client_blob);
+     } else {
+-        snprintf(buf, sizeof(buf), "KK %s\n", client_blob);
++        printResult = snprintf(buf, sizeof(buf), "KK %s\n", client_blob);
+     }
++
++    // truncation is OK because we are used only for logging
++    if (printResult < 0) {
++        debugs(29, 2, "Can not build ntlm authentication credentials.");
++        buf[0] = '\0';
++    } else if (printResult >= (int)sizeof(buf))
++        debugs(29, 2, "Ntlm authentication credentials truncated.");
++
+     return buf;
+ }
+ 
+ Auth::Direction
+ Auth::Ntlm::UserRequest::module_direction()
+ {
+     /* null auth_user is checked for by Auth::UserRequest::direction() */
+ 
+     if (waiting || client_blob)
+         return Auth::CRED_LOOKUP; /* need helper response to continue */
+ 
+     if (user()->auth_type != Auth::AUTH_NTLM)
+         return Auth::CRED_ERROR;
+ 
+     switch (user()->credentials()) {
+ 
+     case Auth::Handshake:
+         assert(server_blob);
+         return Auth::CRED_CHALLENGE;
+ 
+@@ -105,53 +114,63 @@
+     }
+ }
+ 
+ void
+ Auth::Ntlm::UserRequest::startHelperLookup(HttpRequest *, AccessLogEntry::Pointer &al, AUTHCB * handler, void *data)
+ {
+     static char buf[MAX_AUTHTOKEN_LEN];
+ 
+     assert(data);
+     assert(handler);
+ 
+     if (static_cast<Auth::Ntlm::Config*>(Auth::Config::Find("ntlm"))->authenticateProgram == NULL) {
+         debugs(29, DBG_CRITICAL, "ERROR: NTLM Start: no NTLM program configured.");
+         handler(data);
+         return;
+     }
+ 
+     debugs(29, 8, HERE << "credentials state is '" << user()->credentials() << "'");
+ 
+     const char *keyExtras = helperRequestKeyExtras(request, al);
++    int printResult = 0;
+     if (user()->credentials() == Auth::Pending) {
+         if (keyExtras)
+-            snprintf(buf, sizeof(buf), "YR %s %s\n", client_blob, keyExtras);
++            printResult = snprintf(buf, sizeof(buf), "YR %s %s\n", client_blob, keyExtras);
+         else
+-            snprintf(buf, sizeof(buf), "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
++            printResult = snprintf(buf, sizeof(buf), "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
+     } else {
+         if (keyExtras)
+-            snprintf(buf, sizeof(buf), "KK %s %s\n", client_blob, keyExtras);
++            printResult = snprintf(buf, sizeof(buf), "KK %s %s\n", client_blob, keyExtras);
+         else
+-            snprintf(buf, sizeof(buf), "KK %s\n", client_blob);
++            printResult = snprintf(buf, sizeof(buf), "KK %s\n", client_blob);
+     }
+     waiting = 1;
+ 
++    if (printResult < 0 || printResult >= (int)sizeof(buf)) {
++        if (printResult < 0)
++            debugs(29, DBG_CRITICAL, "ERROR: Can not build ntlm authentication helper request");
++        else
++            debugs(29, DBG_CRITICAL, "ERROR: Ntlm authentication helper request too big for the " << sizeof(buf) << "-byte buffer.");
++        handler(data);
++        return;
++    }
++
+     safe_free(client_blob);
+     helperStatefulSubmit(ntlmauthenticators, buf, Auth::Ntlm::UserRequest::HandleReply,
+                          new Auth::StateData(this, handler, data), authserver);
+ }
+ 
+ /**
+  * Atomic action: properly release the NTLM auth helpers which may have been reserved
+  * for this request connections use.
+  */
+ void
+ Auth::Ntlm::UserRequest::releaseAuthServer()
+ {
+     if (authserver) {
+         debugs(29, 6, HERE << "releasing NTLM auth server '" << authserver << "'");
+         helperStatefulReleaseServer(authserver);
+         authserver = NULL;
+     } else
+         debugs(29, 6, HERE << "No NTLM auth server to release.");
+ }
+ 
+

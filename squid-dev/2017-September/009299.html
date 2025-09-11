@@ -1,0 +1,171 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] Changed SSL bump event ordering
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20Changed%20SSL%20bump%20event%20ordering&In-Reply-To=%3C484555c9-e926-12ac-7e51-2d3e21382f68%40opendium.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="009297.html">
+   <LINK REL="Next"  HREF="009298.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] Changed SSL bump event ordering</H1>
+    <B>Steve Hill</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20Changed%20SSL%20bump%20event%20ordering&In-Reply-To=%3C484555c9-e926-12ac-7e51-2d3e21382f68%40opendium.com%3E"
+       TITLE="[squid-dev] Changed SSL bump event ordering">steve at opendium.com
+       </A><BR>
+    <I>Tue Sep 19 09:43:39 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009297.html">[squid-dev] Changed SSL bump event ordering
+</A></li>
+        <LI>Next message: <A HREF="009298.html">[squid-dev] [RFC] The final phase of 3.5 testing/
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9299">[ date ]</a>
+              <a href="thread.html#9299">[ thread ]</a>
+              <a href="subject.html#9299">[ subject ]</a>
+              <a href="author.html#9299">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 18/09/17 19:33, Alex Rousskov wrote:
+
+&gt;<i> AFAICT, neither summary is how things should work. The first is missing
+</I>&gt;<i> IP-based CONNECT adaptation. The second is missing SNI-based CONNECT
+</I>&gt;<i> adaptation. You need just the second one, but both should be there to
+</I>&gt;<i> cover typical use cases.
+</I>&gt;<i>
+</I>&gt;<i> Also, I would expect the first adaptation and http_access checks
+</I>&gt;<i> _before_ the first ssl_bump check (as documented at the wiki page
+</I>&gt;<i> below), not after it (as shown in your second list):
+</I>
+That's definitely not what I'm seeing.
+
+Looking back, I filed a bug about 18 months ago which is somewhat related:
+   <A HREF="http://bugs.squid-cache.org/show_bug.cgi?id=4340">http://bugs.squid-cache.org/show_bug.cgi?id=4340</A>
+As far as I know that has not been fixed, so for transparent connections 
+I would still expect the ssl_bump ACL to happen before http_access.
+
+An update on my previous email: adaptation does still happen (I was 
+inadvertently denying it in the adaptation_access ACL).  So having fixed 
+that, the ordering I'm seeing now for transparent connection (from the 
+debug log) is:
+
+1. ACL: ssl_bump (stage 1) - returns sslpeek.
+2. Fake CONNECT to the web server's IP.
+3. ACL: spoof_client_ip - returns DENIED
+4. *ACL: http_access - returns ALLOWED
+5. *ACL: adaptation_access - returns ALLOWED
+6. *ICAP REQMOD for &quot;CONNECT &lt;IP&gt;:443&quot; - returns 204 (No modifications)
+7. *ACL: cache - returns DENIED
+8. sslpeek is performed - ServerBump.cc(27) ServerBump: will peek
+9. ACL: ssl_bump (stage 2) - returns sslbump.
+10. ACL: never_direct - returns DENIED
+11. sslbump is performed- client_side.cc(4447) httpsPeeked: bumped HTTPS 
+server
+12. client_side.cc(593) logRequest: clientLogRequest: al.url='&lt;web 
+server IP&gt;:443'
+13: ACL: access_log - returns ALLOWED
+14: ACL: ssl_proxy_cert_sign signUntrusted - returns DENIED
+15: ACL: ssl_proxy_cert_sign signSelf - returns DENIED
+16: ACL: ssl_proxy_cert_sign signTrusted - returns ALLOWED
+17: client_side.cc(4173) getSslContextStart: Generating SSL certificate
+
+I never see a faked &quot;CONNECT &lt;sni&gt;:443&quot; and associated http_access ACL 
+check and ICAP callout.
+
+I've also now tested this with a non-transparent proxy, making a CONNECT 
+to an IP address, and the results are more or less the same with the 
+exception that the stage 1 sslbump ACL check happens just before sslpeek 
+happens rather than right at the start:
+
+1. CONNECT request parsed
+2. *ACL: http_access - returns ALLOWED
+3. *ACL: adaptation_access - returns ALLOWED
+4. *ICAP REQMOD for &quot;CONNECT &lt;IP&gt;:443&quot; - returns 204 (No modifications)
+5. *ACL: cache - returns DENIED
+6. ACL: ssl_bump (stage 1) - returns sslpeek.
+7. sslpeek is performed: ServerBump.cc(27) ServerBump: will peek
+8. ACL: ssl_bump (stage 2) - returns sslbump.
+9. ACL: never_direct - returns DENIED
+10. sslbump is performed- client_side.cc(4447) httpsPeeked: bumped HTTPS 
+server
+11. client_side.cc(593) logRequest: clientLogRequest: al.url='&lt;web 
+server IP&gt;:443'
+12. ACL: access_log - returns ALLOWED
+13: ACL: ssl_proxy_cert_sign signUntrusted - returns DENIED
+14: ACL: ssl_proxy_cert_sign signSelf - returns DENIED
+15: ACL: ssl_proxy_cert_sign signTrusted - returns ALLOWED
+16: client_side.cc(4173) getSslContextStart: Generating SSL certificate
+
+All that said, I've looked back at the code for previous 3.5 releases 
+and it doesn't look like any of this has changed much (but I haven't 
+tried going back and running the old versions to verify how they behaved 
+yet).
+
+Anyway, hopefully more debugging today so I might be more enlightened 
+later on. :)
+
+&gt;<i>   <A HREF="https://wiki.squid-cache.org/Features/SslPeekAndSplice">https://wiki.squid-cache.org/Features/SslPeekAndSplice</A>
+</I>
+In the examples I've given above, steps marked &quot;*&quot; are part of the 
+Callout Sequence given on:
+  <A HREF="https://wiki.squid-cache.org/SquidFaq/OrderIsImportant#Callout_Sequence">https://wiki.squid-cache.org/SquidFaq/OrderIsImportant#Callout_Sequence</A>
+
+According to the SslPeekAndSplice feature page, the &quot;Callout Sequence&quot; 
+steps should be executed twice - once for the unpeeked CONNECT (a faked 
+&quot;CONNECT &lt;IP&gt;:443&quot; for transparent connections or the real CONNECT for 
+non-transparent), then again for &quot;CONNECT &lt;SNI&gt;:443&quot;.  The second 
+execution never seems to happen - as far as I can tell, the second 
+CONNECT is never generated, the &quot;Callout Sequence&quot; for it is never 
+executed and it is never logged.
+
+
+So from this I think there are 2 separate issues:
+1. As described in bug 4340, the step 1 sslbump ACL check happens early 
+for transparent connections.
+2. A second post-peek CONNECT is never faked.
+
+
+Thanks for your help - I'll go stare at the code a bit more. :)
+
+-- 
+  - Steve Hill
+    Technical Director
+    Opendium    Online Safety / Web Filtering    <A HREF="http://www.opendium.com">http://www.opendium.com</A>
+
+    Enquiries                 Support
+    ---------                 -------
+    <A HREF="http://lists.squid-cache.org/listinfo/squid-dev">sales at opendium.com</A>        <A HREF="http://lists.squid-cache.org/listinfo/squid-dev">support at opendium.com</A>
+    +44-1792-824568           +44-1792-825748
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009297.html">[squid-dev] Changed SSL bump event ordering
+</A></li>
+	<LI>Next message: <A HREF="009298.html">[squid-dev] [RFC] The final phase of 3.5 testing/
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9299">[ date ]</a>
+              <a href="thread.html#9299">[ thread ]</a>
+              <a href="subject.html#9299">[ subject ]</a>
+              <a href="author.html#9299">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

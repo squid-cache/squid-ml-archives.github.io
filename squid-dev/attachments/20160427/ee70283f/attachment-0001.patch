@@ -1,0 +1,1346 @@
+Accumulate fewer unknown-size responses to avoid overwhelming disks.
+
+Start swapping out an unknown-size entry as soon as size-based cache_dir
+selection is no longer affected by the entry growth. If the entry
+eventually exceeds the selected cache_dir entry size limits, terminate
+the swapout.
+
+The following description assumes that Squid deals with a cachable
+response that lacks a Content-Length header. These changes should not
+affect other responses.
+
+Prior to these changes, StoreEntry::mayStartSwapOut() delayed swapout
+decision until the entire response was received or the already
+accumulated portion of the response exceeded the [global] store entry
+size limit, whichever came first. This logic protected Store from
+entries with unknown sizes. AFAICT, that protection existed for two
+reasons:
+
+* Incorrect size-based cache_dir selection: When cache_dirs use
+  different min-size and/or max-size settings, Squid cannot tell which
+  cache_dir the unknown-size entry belongs to and, hence, may select the
+  wrong cache_dir.
+
+* Disk bandwidth/space waste: If the growing entry exceeds all cache_dir
+  max-size limits, the swapout has to be aborted, resulting in waste of
+  previously spent resources (primarily disk bandwidth and space).
+
+The cost of those protections include RAM waste (up to maximum cachable
+object size for each of the concurrent unknown-size entry downloads) and
+sudden disk overload (when the entire delayed entry is written to disk
+in a large burst of write requests initiated from a tight doPages() loop
+at the end of the swapout sequence when the entry size becomes known).
+The latter cost is especially high because swapping the entire large
+object out in one function call can easily overflow disker queues and/or
+block Squid while the OS drains disk write buffers in an emergency mode.
+
+FWIW, AFAICT, cache_dir selection protection was the only reason for
+introducing response accumulation (trunk r4446). The RAM cost was
+realized a year later (r4954), and the disk costs were realized during
+this project.
+
+
+This change reduces those costs by starting to swap out an unknown-size
+entry ASAP, usually immediately. In most caching environments, most
+large cachable entries should be cached. It is usually better to spend
+[disk] resources gradually than to deal with sudden bursts [of disk
+write requests]. Occasional jolts make high performance unsustainable.
+
+This change does not affect size-based cache_dir selection: Squid still
+delays swapout until future entry growth cannot affect that selection.
+Fortunately, in most configurations, the correct selection can happen
+immediately because cache_dirs lack explicit min-size and/or max-size
+settings and simply rely on the *same-for-all* minimum_object_size and
+maximum_object_size values.
+
+We could make the trade-off between costly protections (i.e., accumulate
+until the entry size is known) and occasional gradual resource waste
+(i.e., start swapping out ASAP) configurable. However, I think it is
+best to wait for the use case that requires such configuration and can
+guide the design of those new configuration options.
+
+Side changes:
+
+* Honor forgotten minimum_object_size for cache_dirs without min-size in
+  Store::Disk::objectSizeIsAcceptable() and fix its initial value to
+  correctly detect a manually configured cache_dir min-size (which may
+  be zero). However, the fixed bug is probably hidden by another (yet
+  unfixed) bug: checkTooSmall() forgets about cache_dirs with min-size!
+
+* Allow unknown-size objects into the shared memory cache, which code
+  could handle partial writes (since collapsed forwarding changes?).
+
+* Fixed Rock::SwapDir::canStore() handling of unknown-size objects. I do
+  not see how such objects could get that far before, but if they could,
+  most would probably be cached because the bug would hide the unknown
+  size from Store::Disk::canStore() that declares them unstorable.
+
+=== modified file 'src/MemStore.cc'
+--- src/MemStore.cc	2016-03-02 21:48:51 +0000
++++ src/MemStore.cc	2016-04-27 16:29:33 +0000
+@@ -609,115 +609,113 @@ MemStore::shouldCache(StoreEntry &e) con
+ 
+     if (e.mem_obj && e.mem_obj->memCache.offset > 0) {
+         debugs(20, 5, "already written to mem-cache: " << e);
+         return false;
+     }
+ 
+     if (!e.memoryCachable()) {
+         debugs(20, 7, HERE << "Not memory cachable: " << e);
+         return false; // will not cache due to entry state or properties
+     }
+ 
+     assert(e.mem_obj);
+ 
+     if (e.mem_obj->vary_headers) {
+         // XXX: We must store/load SerialisedMetaData to cache Vary in RAM
+         debugs(20, 5, "Vary not yet supported: " << e.mem_obj->vary_headers);
+         return false;
+     }
+ 
+     const int64_t expectedSize = e.mem_obj->expectedReplySize(); // may be < 0
+-
+-    // objects of unknown size are not allowed into memory cache, for now
+-    if (expectedSize < 0) {
+-        debugs(20, 5, "Unknown expected size: " << e);
+-        return false;
+-    }
+-
+     const int64_t loadedSize = e.mem_obj->endOffset();
+     const int64_t ramSize = max(loadedSize, expectedSize);
+-
+     if (ramSize > maxObjectSize()) {
+         debugs(20, 5, HERE << "Too big max(" <<
+                loadedSize << ", " << expectedSize << "): " << e);
+         return false; // will not cache due to cachable entry size limits
+     }
+ 
+     if (!e.mem_obj->isContiguous()) {
+         debugs(20, 5, "not contiguous");
+         return false;
+     }
+ 
+     if (!map) {
+         debugs(20, 5, HERE << "No map to mem-cache " << e);
+         return false;
+     }
+ 
+     if (EBIT_TEST(e.flags, ENTRY_SPECIAL)) {
+         debugs(20, 5, "Not mem-caching ENTRY_SPECIAL " << e);
+         return false;
+     }
+ 
+     return true;
+ }
+ 
+ /// locks map anchor and preps to store the entry in shared memory
+ bool
+ MemStore::startCaching(StoreEntry &e)
+ {
+     sfileno index = 0;
+     Ipc::StoreMapAnchor *slot = map->openForWriting(reinterpret_cast<const cache_key *>(e.key), index);
+     if (!slot) {
+         debugs(20, 5, HERE << "No room in mem-cache map to index " << e);
+         return false;
+     }
+ 
+     assert(e.mem_obj);
+     e.mem_obj->memCache.index = index;
+     e.mem_obj->memCache.io = MemObject::ioWriting;
+     slot->set(e);
+-    map->startAppending(index);
++    // Do not allow others to feed off an unknown-size entry because we will
++    // stop swapping it out if it grows too large.
++    if (e.mem_obj->expectedReplySize() >= 0)
++        map->startAppending(index);
+     e.memOutDecision(true);
+     return true;
+ }
+ 
+ /// copies all local data to shared memory
+ void
+ MemStore::copyToShm(StoreEntry &e)
+ {
+     // prevents remote readers from getting ENTRY_FWD_HDR_WAIT entries and
+     // not knowing when the wait is over
+     if (EBIT_TEST(e.flags, ENTRY_FWD_HDR_WAIT)) {
+         debugs(20, 5, "postponing copying " << e << " for ENTRY_FWD_HDR_WAIT");
+         return;
+     }
+ 
+     assert(map);
+     assert(e.mem_obj);
+ 
+     const int64_t eSize = e.mem_obj->endOffset();
+     if (e.mem_obj->memCache.offset >= eSize) {
+         debugs(20, 5, "postponing copying " << e << " for lack of news: " <<
+                e.mem_obj->memCache.offset << " >= " << eSize);
+         return; // nothing to do (yet)
+     }
+ 
++    // throw if an accepted unknown-size entry grew too big or max-size changed
++    Must(eSize <= maxObjectSize());
++
+     const int32_t index = e.mem_obj->memCache.index;
+     assert(index >= 0);
+     Ipc::StoreMapAnchor &anchor = map->writeableEntry(index);
+     lastWritingSlice = anchor.start;
+ 
+     // fill, skip slices that are already full
+     // Optimize: remember lastWritingSlice in e.mem_obj
+     while (e.mem_obj->memCache.offset < eSize) {
+         Ipc::StoreMap::Slice &slice = nextAppendableSlice(
+                                           e.mem_obj->memCache.index, lastWritingSlice);
+         if (anchor.start < 0)
+             anchor.start = lastWritingSlice;
+         copyToShmSlice(e, anchor, slice);
+     }
+ 
+     debugs(20, 7, "mem-cached available " << eSize << " bytes of " << e);
+ }
+ 
+ /// copies at most one slice worth of local memory to shared memory
+ void
+
+=== modified file 'src/fs/rock/RockIoState.cc'
+--- src/fs/rock/RockIoState.cc	2016-03-02 21:32:22 +0000
++++ src/fs/rock/RockIoState.cc	2016-04-26 22:22:49 +0000
+@@ -167,40 +167,43 @@ Rock::IoState::write(char const *buf, si
+     if (dtor)
+         (dtor)(const_cast<char*>(buf)); // cast due to a broken API?
+ 
+     return success;
+ }
+ 
+ /**
+  * Possibly send data to be written to disk:
+  * We only write data when full slot is accumulated or when close() is called.
+  * We buffer, in part, to avoid forcing OS to _read_ old unwritten portions of
+  * the slot when the write does not end at the page or sector boundary.
+  */
+ void
+ Rock::IoState::tryWrite(char const *buf, size_t size, off_t coreOff)
+ {
+     debugs(79, 7, swap_filen << " writes " << size << " more");
+ 
+     // either this is the first write or append; we do not support write gaps
+     assert(!coreOff || coreOff == -1);
+ 
++    // throw if an accepted unknown-size entry grew too big or max-size changed
++    Must(offset_ + size <= static_cast<uint64_t>(dir->maxObjectSize()));
++
+     // allocate the first slice during the first write
+     if (!coreOff) {
+         assert(sidCurrent < 0);
+         sidCurrent = reserveSlotForWriting(); // throws on failures
+         assert(sidCurrent >= 0);
+         writeAnchor().start = sidCurrent;
+     }
+ 
+     // buffer incoming data in slot buffer and write overflowing or final slots
+     // quit when no data left or we stopped writing on reentrant error
+     while (size > 0 && theFile != NULL) {
+         assert(sidCurrent >= 0);
+         const size_t processed = writeToBuffer(buf, size);
+         buf += processed;
+         size -= processed;
+         const bool overflow = size > 0;
+ 
+         // We do not write a full buffer without overflow because
+         // we would not yet know what to set the nextSlot to.
+         if (overflow) {
+
+=== modified file 'src/fs/rock/RockSwapDir.cc'
+--- src/fs/rock/RockSwapDir.cc	2016-03-02 21:48:51 +0000
++++ src/fs/rock/RockSwapDir.cc	2016-04-26 18:58:29 +0000
+@@ -586,41 +586,43 @@ Rock::SwapDir::validateOptions()
+         const int64_t diskWasteSize = maxSize() - static_cast<int64_t>(entriesMayOccupy);
+         debugs(47, DBG_CRITICAL, "WARNING: Rock cache_dir " << path << " wastes disk space due to slot limits:" <<
+                "\n\tconfigured db capacity: " << maxSize() << " bytes" <<
+                "\n\tconfigured db slot size: " << slotSize << " bytes" <<
+                "\n\tmaximum number of rock cache_dir slots supported by Squid: " << slotLimitAbsolute() <<
+                "\n\tdisk space all slots may use: " << slotsMayOccupy << " bytes" <<
+                "\n\tdisk space wasted: " << diskWasteSize << " bytes");
+     }
+ }
+ 
+ void
+ Rock::SwapDir::rebuild()
+ {
+     //++StoreController::store_dirs_rebuilding; // see Rock::SwapDir::init()
+     AsyncJob::Start(new Rebuild(this));
+ }
+ 
+ bool
+ Rock::SwapDir::canStore(const StoreEntry &e, int64_t diskSpaceNeeded, int &load) const
+ {
+-    if (!::SwapDir::canStore(e, sizeof(DbCellHeader)+diskSpaceNeeded, load))
++    if (diskSpaceNeeded >= 0)
++        diskSpaceNeeded += sizeof(DbCellHeader);
++    if (!::SwapDir::canStore(e, diskSpaceNeeded, load))
+         return false;
+ 
+     if (!theFile || !theFile->canWrite())
+         return false;
+ 
+     if (!map)
+         return false;
+ 
+     // Do not start I/O transaction if there are less than 10% free pages left.
+     // TODO: reserve page instead
+     if (needsDiskStrand() &&
+             Ipc::Mem::PageLevel(Ipc::Mem::PageId::ioPage) >= 0.9 * Ipc::Mem::PageLimit(Ipc::Mem::PageId::ioPage)) {
+         debugs(47, 5, HERE << "too few shared pages for IPC I/O left");
+         return false;
+     }
+ 
+     if (io->shedLoad())
+         return false;
+ 
+     load = io->load();
+
+=== modified file 'src/fs/ufs/UFSStoreState.cc'
+--- src/fs/ufs/UFSStoreState.cc	2016-01-01 00:12:18 +0000
++++ src/fs/ufs/UFSStoreState.cc	2016-04-26 22:23:43 +0000
+@@ -1,36 +1,37 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 79    Storage Manager UFS Interface */
+ 
+ #include "squid.h"
+ #include "DiskIO/DiskFile.h"
+ #include "DiskIO/DiskIOStrategy.h"
+ #include "DiskIO/ReadRequest.h"
+ #include "DiskIO/WriteRequest.h"
+ #include "Generic.h"
++#include "SquidConfig.h"
+ #include "SquidList.h"
+ #include "Store.h"
+ #include "store/Disk.h"
+ #include "UFSStoreState.h"
+ #include "UFSStrategy.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Fs::Ufs,UFSStoreState);
+ 
+ void
+ Fs::Ufs::UFSStoreState::ioCompletedNotification()
+ {
+     if (opening) {
+         opening = false;
+         debugs(79, 3, "UFSStoreState::ioCompletedNotification: dirno " <<
+                swap_dirn  << ", fileno "<< std::setfill('0') << std::hex <<
+                std::setw(8) << swap_filen  << " status "<< std::setfill(' ') <<
+                std::dec << theFile->error());
+ 
+         assert (FILE_MODE(mode) == O_RDONLY);
+         openDone();
+@@ -150,40 +151,49 @@ Fs::Ufs::UFSStoreState::read_(char *buf,
+  * DPW 2006-05-24
+  * This, the public write interface, places the write request at the end
+  * of the pending_writes queue to ensure correct ordering of writes.
+  * We could optimize things a little if there are no other pending
+  * writes and just do the write directly.  But for now we'll keep the
+  * code simpler and always go through the pending_writes queue.
+  */
+ bool
+ Fs::Ufs::UFSStoreState::write(char const *buf, size_t size, off_t aOffset, FREE * free_func)
+ {
+     debugs(79, 3, "UFSStoreState::write: dirn " << swap_dirn  << ", fileno "<<
+            std::setfill('0') << std::hex << std::uppercase << std::setw(8) << swap_filen);
+ 
+     if (theFile->error()) {
+         debugs(79, DBG_IMPORTANT,HERE << "avoid write on theFile with error");
+         debugs(79, DBG_IMPORTANT,HERE << "calling free_func for " << (void*) buf);
+         free_func((void*)buf);
+         return false;
+     }
+ 
++    const Store::Disk &dir = *INDEXSD(swap_dirn);
++    if (offset_ + size > static_cast<uint64_t>(dir.maxObjectSize())) {
++        debugs(79, 2, "accepted unknown-size entry grew too big: " << (offset_ + size) <<
++               ">" << dir.maxObjectSize());
++        free_func((void*)buf);
++        tryClosing();
++        return false;
++    }
++
+     queueWrite(buf, size, aOffset, free_func);
+     drainWriteQueue();
+     return true;
+ }
+ 
+ /*
+  * DPW 2006-05-24
+  * This, the private write method, calls the lower level write for the
+  * first write request in the pending_writes queue.  doWrite() is only
+  * called by drainWriteQueue().
+  */
+ void
+ Fs::Ufs::UFSStoreState::doWrite()
+ {
+     debugs(79, 3, HERE << this << " UFSStoreState::doWrite");
+ 
+     assert(theFile->canWrite());
+ 
+     _queued_write *q = (_queued_write *)linklistShift(&pending_writes);
+ 
+
+=== modified file 'src/store.cc'
+--- src/store.cc	2016-02-19 15:06:42 +0000
++++ src/store.cc	2016-04-24 21:40:02 +0000
+@@ -1358,74 +1358,44 @@ storeRegisterWithCacheManager(void)
+     Mgr::RegisterAction("storedir", "Store Directory Stats", Store::Stats, 0, 1);
+     Mgr::RegisterAction("store_io", "Store IO Interface Stats", &Mgr::StoreIoAction::Create, 0, 1);
+     Mgr::RegisterAction("store_check_cachable_stats", "storeCheckCachable() Stats",
+                         storeCheckCachableStats, 0, 1);
+ }
+ 
+ void
+ storeInit(void)
+ {
+     storeKeyInit();
+     mem_policy = createRemovalPolicy(Config.memPolicy);
+     storeDigestInit();
+     storeLogOpen();
+     eventAdd("storeLateRelease", storeLateRelease, NULL, 1.0, 1);
+     Store::Root().init();
+     storeRebuildStart();
+ 
+     storeRegisterWithCacheManager();
+ }
+ 
+-/// computes maximum size of a cachable object
+-/// larger objects are rejected by all (disk and memory) cache stores
+-static int64_t
+-storeCalcMaxObjSize()
+-{
+-    int64_t ms = 0; // nothing can be cached without at least one store consent
+-
+-    // global maximum is at least the disk store maximum
+-    for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+-        assert (Config.cacheSwap.swapDirs[i].getRaw());
+-        const int64_t storeMax = dynamic_cast<SwapDir *>(Config.cacheSwap.swapDirs[i].getRaw())->maxObjectSize();
+-        if (ms < storeMax)
+-            ms = storeMax;
+-    }
+-
+-    // global maximum is at least the memory store maximum
+-    // TODO: move this into a memory cache class when we have one
+-    const int64_t memMax = static_cast<int64_t>(min(Config.Store.maxInMemObjSize, Config.memMaxSize));
+-    if (ms < memMax)
+-        ms = memMax;
+-
+-    return ms;
+-}
+-
+ void
+ storeConfigure(void)
+ {
+-    store_swap_high = (long) (((float) Store::Root().maxSize() *
+-                               (float) Config.Swap.highWaterMark) / (float) 100);
+-    store_swap_low = (long) (((float) Store::Root().maxSize() *
+-                              (float) Config.Swap.lowWaterMark) / (float) 100);
+-    store_pages_max = Config.memMaxSize / sizeof(mem_node);
+-
+-    store_maxobjsize = storeCalcMaxObjSize();
++    Store::Root().updateLimits();
+ }
+ 
+ bool
+ StoreEntry::memoryCachable()
+ {
+     if (!checkCachable())
+         return 0;
+ 
+     if (mem_obj == NULL)
+         return 0;
+ 
+     if (mem_obj->data_hdr.size() == 0)
+         return 0;
+ 
+     if (mem_obj->inmem_lo != 0)
+         return 0;
+ 
+     if (!Config.onoff.memory_cache_first && swap_status == SWAPOUT_DONE && refcount == 1)
+         return 0;
+ 
+
+=== modified file 'src/store/Controller.cc'
+--- src/store/Controller.cc	2016-02-29 22:32:41 +0000
++++ src/store/Controller.cc	2016-04-27 00:36:30 +0000
+@@ -166,40 +166,57 @@ uint64_t
+ Store::Controller::currentSize() const
+ {
+     /* TODO: include memory cache ? */
+     return swapDir->currentSize();
+ }
+ 
+ uint64_t
+ Store::Controller::currentCount() const
+ {
+     /* TODO: include memory cache ? */
+     return swapDir->currentCount();
+ }
+ 
+ int64_t
+ Store::Controller::maxObjectSize() const
+ {
+     /* TODO: include memory cache ? */
+     return swapDir->maxObjectSize();
+ }
+ 
++void
++Store::Controller::updateLimits()
++{
++    swapDir->updateLimits();
++
++    store_swap_high = (long) (((float) maxSize() *
++                               (float) Config.Swap.highWaterMark) / (float) 100);
++    store_swap_low = (long) (((float) maxSize() *
++                              (float) Config.Swap.lowWaterMark) / (float) 100);
++    store_pages_max = Config.memMaxSize / sizeof(mem_node);
++
++    // TODO: move this into a memory cache class when we have one
++    const int64_t memMax = static_cast<int64_t>(min(Config.Store.maxInMemObjSize, Config.memMaxSize));
++    const int64_t disksMax = swapDir ? swapDir->maxObjectSize() : 0;
++    store_maxobjsize = std::max(disksMax, memMax);
++}
++
+ StoreSearch *
+ Store::Controller::search()
+ {
+     // this is the only kind of search we currently support
+     return NewLocalSearch();
+ }
+ 
+ void
+ Store::Controller::sync(void)
+ {
+     if (memStore)
+         memStore->sync();
+     swapDir->sync();
+ }
+ 
+ /*
+  * handle callbacks all avaliable fs'es
+  */
+ int
+ Store::Controller::callback()
+@@ -309,40 +326,47 @@ Store::Controller::find(const cache_key
+     }
+ 
+     if (memStore) {
+         if (StoreEntry *e = memStore->get(key)) {
+             debugs(20, 3, HERE << "got mem-cached entry: " << *e);
+             return e;
+         }
+     }
+ 
+     if (swapDir) {
+         if (StoreEntry *e = swapDir->get(key)) {
+             debugs(20, 3, "got disk-cached entry: " << *e);
+             return e;
+         }
+     }
+ 
+     debugs(20, 4, "cannot locate " << storeKeyText(key));
+     return nullptr;
+ }
+ 
++int64_t
++Store::Controller::accumulateMore(StoreEntry &entry) const
++{
++    return swapDir ? swapDir->accumulateMore(entry) : 0;
++    // The memory cache should not influence for-swapout accumulation decision.
++}
++
+ void
+ Store::Controller::markForUnlink(StoreEntry &e)
+ {
+     if (transients && e.mem_obj && e.mem_obj->xitTable.index >= 0)
+         transients->markForUnlink(e);
+     if (memStore && e.mem_obj && e.mem_obj->memCache.index >= 0)
+         memStore->markForUnlink(e);
+     if (swapDir && e.swap_filen >= 0)
+         swapDir->markForUnlink(e);
+ }
+ 
+ void
+ Store::Controller::unlink(StoreEntry &e)
+ {
+     memoryUnlink(e);
+     if (swapDir && e.swap_filen >= 0)
+         swapDir->unlink(e);
+ }
+ 
+ // move this into [non-shared] memory cache class when we have one
+
+=== modified file 'src/store/Controller.h'
+--- src/store/Controller.h	2016-02-29 22:32:41 +0000
++++ src/store/Controller.h	2016-04-27 00:44:21 +0000
+@@ -26,40 +26,47 @@ public:
+     Controller();
+     virtual ~Controller() override;
+ 
+     /* Storage API */
+     virtual void create() override;
+     virtual void init() override;
+     virtual StoreEntry *get(const cache_key *) override;
+     virtual uint64_t maxSize() const override;
+     virtual uint64_t minSize() const override;
+     virtual uint64_t currentSize() const override;
+     virtual uint64_t currentCount() const override;
+     virtual int64_t maxObjectSize() const override;
+     virtual void getStats(StoreInfoStats &stats) const override;
+     virtual void stat(StoreEntry &) const override;
+     virtual void sync() override;
+     virtual void maintain() override;
+     virtual void markForUnlink(StoreEntry &) override;
+     virtual void unlink(StoreEntry &) override;
+     virtual int callback() override;
+ 
++    /// Additional unknown-size entry bytes required by Store in order to
++    /// reduce the risk of selecting the wrong disk cache for the growing entry.
++    int64_t accumulateMore(StoreEntry &) const;
++
++    /// slowly calculate (and cache) hi/lo watermarks and similar limits
++    void updateLimits();
++
+     /// called when the entry is no longer needed by any transaction
+     void handleIdleEntry(StoreEntry &);
+ 
+     /// called to get rid of no longer needed entry data in RAM, if any
+     void memoryOut(StoreEntry &, const bool preserveSwappable);
+ 
+     /// update old entry metadata and HTTP headers using a newer entry
+     void updateOnNotModified(StoreEntry *old, const StoreEntry &newer);
+ 
+     /// makes the entry available for collapsing future requests
+     void allowCollapsing(StoreEntry *, const RequestFlags &, const HttpRequestMethod &);
+ 
+     /// marks the entry completed for collapsed requests
+     void transientsCompleteWriting(StoreEntry &);
+ 
+     /// Update local intransit entry after changes made by appending worker.
+     void syncCollapsed(const sfileno);
+ 
+     /// calls Root().transients->abandon() if transients are tracked
+     void transientsAbandon(StoreEntry &);
+
+=== modified file 'src/store/Disk.cc'
+--- src/store/Disk.cc	2016-01-01 00:12:18 +0000
++++ src/store/Disk.cc	2016-04-27 16:42:14 +0000
+@@ -5,41 +5,41 @@
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 20    Swap Dir base object */
+ 
+ #include "squid.h"
+ #include "cache_cf.h"
+ #include "compat/strtoll.h"
+ #include "ConfigOption.h"
+ #include "ConfigParser.h"
+ #include "globals.h"
+ #include "Parsing.h"
+ #include "SquidConfig.h"
+ #include "Store.h"
+ #include "store/Disk.h"
+ #include "StoreFileSystem.h"
+ #include "tools.h"
+ 
+ Store::Disk::Disk(char const *aType): theType(aType),
+-    max_size(0), min_objsize(0), max_objsize (-1),
++    max_size(0), min_objsize(-1), max_objsize (-1),
+     path(NULL), index(-1), disker(-1),
+     repl(NULL), removals(0), scanned(0),
+     cleanLog(NULL)
+ {
+     fs.blksize = 1024;
+ }
+ 
+ Store::Disk::~Disk()
+ {
+     // TODO: should we delete repl?
+     xfree(path);
+ }
+ 
+ void
+ Store::Disk::create() {}
+ 
+ void
+ Store::Disk::dump(StoreEntry &)const {}
+ 
+ bool
+@@ -76,40 +76,47 @@ Store::Disk::stat(StoreEntry &output) co
+ 
+         if (repl->Stats)
+             repl->Stats(repl, &output);
+     }
+ }
+ 
+ void
+ Store::Disk::statfs(StoreEntry &)const {}
+ 
+ void
+ Store::Disk::maintain() {}
+ 
+ uint64_t
+ Store::Disk::minSize() const
+ {
+     // XXX: Not all disk stores use Config.Swap.lowWaterMark
+     return ((maxSize() * Config.Swap.lowWaterMark) / 100);
+ }
+ 
+ int64_t
++Store::Disk::minObjectSize() const
++{
++    // per-store min-size=N value is authoritative
++    return min_objsize > -1 ? min_objsize : Config.Store.minObjectSize;
++}
++
++int64_t
+ Store::Disk::maxObjectSize() const
+ {
+     // per-store max-size=N value is authoritative
+     if (max_objsize > -1)
+         return max_objsize;
+ 
+     // store with no individual max limit is limited by configured maximum_object_size
+     // or the total store size, whichever is smaller
+     return min(static_cast<int64_t>(maxSize()), Config.Store.maxObjectSize);
+ }
+ 
+ void
+ Store::Disk::maxObjectSize(int64_t newMax)
+ {
+     // negative values mean no limit (-1)
+     if (newMax < 0) {
+         max_objsize = -1; // set explicitly in case it had a non-default value previously
+         return;
+     }
+ 
+@@ -131,53 +138,43 @@ Store::Disk::reference(StoreEntry &) {}
+ bool
+ Store::Disk::dereference(StoreEntry &)
+ {
+     return true; // keep in global store_table
+ }
+ 
+ void
+ Store::Disk::diskFull()
+ {
+     if (currentSize() >= maxSize())
+         return;
+ 
+     max_size = currentSize();
+ 
+     debugs(20, DBG_IMPORTANT, "WARNING: Shrinking cache_dir #" << index << " to " << currentSize() / 1024.0 << " KB");
+ }
+ 
+ bool
+ Store::Disk::objectSizeIsAcceptable(int64_t objsize) const
+ {
+-    // without limits, all object sizes are acceptable, including unknown ones
+-    if (min_objsize <= 0 && max_objsize == -1)
+-        return true;
+-
+-    // with limits, objects with unknown sizes are not acceptable
+-    if (objsize == -1)
+-        return false;
+-
+-    // without the upper limit, just check the lower limit
+-    if (max_objsize == -1)
+-        return  min_objsize <= objsize;
+-
+-    return min_objsize <= objsize && objsize < max_objsize;
++    // need either the expected or the already accumulated object size
++    assert(objsize >= 0);
++    return minObjectSize() <= objsize && objsize <= maxObjectSize();
+ }
+ 
+ bool
+ Store::Disk::canStore(const StoreEntry &e, int64_t diskSpaceNeeded, int &load) const
+ {
+     debugs(47,8, HERE << "cache_dir[" << index << "]: needs " <<
+            diskSpaceNeeded << " <? " << max_objsize);
+ 
+     if (EBIT_TEST(e.flags, ENTRY_SPECIAL))
+         return false; // we do not store Squid-generated entries
+ 
+     if (!objectSizeIsAcceptable(diskSpaceNeeded))
+         return false; // does not satisfy size limits
+ 
+     if (flags.read_only)
+         return false; // cannot write at all
+ 
+     if (currentSize() > maxSize())
+         return false; // already overflowing
+ 
+@@ -363,34 +360,34 @@ Store::Disk::optionObjectSizeParse(char
+     if (isaReconfig && *val != size) {
+         if (allowOptionReconfigure(option)) {
+             debugs(3, DBG_IMPORTANT, "cache_dir '" << path << "' object " <<
+                    option << " now " << size << " Bytes");
+         } else {
+             debugs(3, DBG_IMPORTANT, "WARNING: cache_dir '" << path << "' "
+                    "object " << option << " cannot be changed dynamically, " <<
+                    "value left unchanged (" << *val << " Bytes)");
+             return true;
+         }
+     }
+ 
+     *val = size;
+ 
+     return true;
+ }
+ 
+ void
+ Store::Disk::optionObjectSizeDump(StoreEntry * e) const
+ {
+-    if (min_objsize != 0)
++    if (min_objsize != -1)
+         storeAppendPrintf(e, " min-size=%" PRId64, min_objsize);
+ 
+     if (max_objsize != -1)
+         storeAppendPrintf(e, " max-size=%" PRId64, max_objsize);
+ }
+ 
+ // some SwapDirs may maintain their indexes and be able to lookup an entry key
+ StoreEntry *
+ Store::Disk::get(const cache_key *)
+ {
+     return NULL;
+ }
+ 
+
+=== modified file 'src/store/Disk.h'
+--- src/store/Disk.h	2016-01-01 00:12:18 +0000
++++ src/store/Disk.h	2016-04-27 13:55:09 +0000
+@@ -37,40 +37,43 @@ public:
+     virtual bool unlinkdUseful() const = 0;
+ 
+     /**
+      * Notify this disk that it is full.
+      \todo XXX move into a protected api call between store files and their stores, rather than a top level api call
+      */
+     virtual void diskFull();
+ 
+     /* Controlled API */
+     virtual void create() override;
+     virtual StoreEntry *get(const cache_key *) override;
+     virtual uint64_t maxSize() const override { return max_size; }
+     virtual uint64_t minSize() const override;
+     virtual int64_t maxObjectSize() const override;
+     virtual void getStats(StoreInfoStats &stats) const override;
+     virtual void stat(StoreEntry &) const override;
+     virtual void reference(StoreEntry &e) override;
+     virtual bool dereference(StoreEntry &e) override;
+     virtual void maintain() override;
+ 
++    /// the size of the smallest entry this cache_dir can store
++    int64_t minObjectSize() const;
++
+     /// configure the maximum object size for this storage area.
+     /// May be any size up to the total storage area.
+     void maxObjectSize(int64_t newMax);
+ 
+     /// whether we can store an object of the given size
+     /// negative objSize means the object size is currently unknown
+     bool objectSizeIsAcceptable(int64_t objSize) const;
+ 
+     /// called when the entry is about to forget its association with cache_dir
+     virtual void disconnect(StoreEntry &) {}
+ 
+     /// called when entry swap out is complete
+     virtual void swappedOut(const StoreEntry &e) = 0;
+ 
+ protected:
+     void parseOptions(int reconfiguring);
+     void dumpOptions(StoreEntry * e) const;
+     virtual ConfigOption *getOptionTree() const;
+     virtual bool allowOptionReconfigure(const char *const) const { return true; }
+ 
+
+=== modified file 'src/store/Disks.cc'
+--- src/store/Disks.cc	2016-03-02 21:32:22 +0000
++++ src/store/Disks.cc	2016-04-27 00:39:40 +0000
+@@ -10,52 +10,67 @@
+ 
+ #include "squid.h"
+ #include "Debug.h"
+ #include "globals.h"
+ #include "profiler/Profiler.h"
+ #include "SquidConfig.h"
+ #include "Store.h"
+ #include "store/Disk.h"
+ #include "store/Disks.h"
+ #include "swap_log_op.h"
+ #include "util.h" // for tvSubDsec() which should be in SquidTime.h
+ 
+ static STDIRSELECT storeDirSelectSwapDirRoundRobin;
+ static STDIRSELECT storeDirSelectSwapDirLeastLoad;
+ /**
+  * This function pointer is set according to 'store_dir_select_algorithm'
+  * in squid.conf.
+  */
+ STDIRSELECT *storeDirSelectSwapDir = storeDirSelectSwapDirLeastLoad;
+ 
++/// The entry size to use for Disk::canStore() size limit checks.
++/// This is an optimization to avoid similar calculations in every cache_dir.
++static int64_t
++objectSizeForDirSelection(const StoreEntry &entry)
++{
++    // entry.objectLen() is negative here when we are still STORE_PENDING
++    int64_t minSize = entry.mem_obj->expectedReplySize();
++
++    // If entry size is unknown, use already accumulated bytes as an estimate.
++    // Controller::accumulateMore() guarantees that there are enough of them.
++    if (minSize < 0)
++        minSize = entry.mem_obj->endOffset();
++
++    assert(minSize >= 0);
++    minSize += entry.mem_obj->swap_hdr_sz;
++    return minSize;
++}
++
+ /**
+  * This new selection scheme simply does round-robin on all SwapDirs.
+  * A SwapDir is skipped if it is over the max_size (100%) limit, or
+  * overloaded.
+  */
+ static int
+ storeDirSelectSwapDirRoundRobin(const StoreEntry * e)
+ {
+-    // e->objectLen() is negative at this point when we are still STORE_PENDING
+-    ssize_t objsize = e->mem_obj->expectedReplySize();
+-    if (objsize != -1)
+-        objsize += e->mem_obj->swap_hdr_sz;
++    const int64_t objsize = objectSizeForDirSelection(*e);
+ 
+     // Increment the first candidate once per selection (not once per
+     // iteration) to reduce bias when some disk(s) attract more entries.
+     static int firstCandidate = 0;
+     if (++firstCandidate >= Config.cacheSwap.n_configured)
+         firstCandidate = 0;
+ 
+     for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+         const int dirn = (firstCandidate + i) % Config.cacheSwap.n_configured;
+         const SwapDir *sd = dynamic_cast<SwapDir*>(INDEXSD(dirn));
+ 
+         int load = 0;
+         if (!sd->canStore(*e, objsize, load))
+             continue;
+ 
+         if (load < 0 || load > 1000) {
+             continue;
+         }
+ 
+         return dirn;
+@@ -64,93 +79,99 @@ storeDirSelectSwapDirRoundRobin(const St
+     return -1;
+ }
+ 
+ /**
+  * Spread load across all of the store directories
+  *
+  * Note: We should modify this later on to prefer sticking objects
+  * in the *tightest fit* swapdir to conserve space, along with the
+  * actual swapdir usage. But for now, this hack will do while
+  * testing, so you should order your swapdirs in the config file
+  * from smallest max-size= to largest max-size=.
+  *
+  * We also have to choose nleast == nconf since we need to consider
+  * ALL swapdirs, regardless of state. Again, this is a hack while
+  * we sort out the real usefulness of this algorithm.
+  */
+ static int
+ storeDirSelectSwapDirLeastLoad(const StoreEntry * e)
+ {
+     int64_t most_free = 0;
+-    ssize_t least_objsize = -1;
++    int64_t best_objsize = -1;
+     int least_load = INT_MAX;
+     int load;
+     int dirn = -1;
+     int i;
+     RefCount<SwapDir> SD;
+ 
+-    // e->objectLen() is negative at this point when we are still STORE_PENDING
+-    ssize_t objsize = e->mem_obj->expectedReplySize();
+-
+-    if (objsize != -1)
+-        objsize += e->mem_obj->swap_hdr_sz;
++    const int64_t objsize = objectSizeForDirSelection(*e);
+ 
+     for (i = 0; i < Config.cacheSwap.n_configured; ++i) {
+         SD = dynamic_cast<SwapDir *>(INDEXSD(i));
+         SD->flags.selected = false;
+ 
+         if (!SD->canStore(*e, objsize, load))
+             continue;
+ 
+         if (load < 0 || load > 1000)
+             continue;
+ 
+         if (load > least_load)
+             continue;
+ 
+         const int64_t cur_free = SD->maxSize() - SD->currentSize();
+ 
+         /* If the load is equal, then look in more details */
+         if (load == least_load) {
+-            /* closest max-size fit */
+-
+-            if (least_objsize != -1)
+-                if (SD->maxObjectSize() > least_objsize)
++            /* best max-size fit */
++            if (best_objsize != -1) {
++                // cache_dir with the smallest max-size gets the known-size object
++                // cache_dir with the largest max-size gets the unknown-size object
++                if ((objsize != -1 && SD->maxObjectSize() > best_objsize) ||
++                    (objsize == -1 && SD->maxObjectSize() < best_objsize))
+                     continue;
++            }
+ 
+             /* most free */
+             if (cur_free < most_free)
+                 continue;
+         }
+ 
+         least_load = load;
+-        least_objsize = SD->maxObjectSize();
++        best_objsize = SD->maxObjectSize();
+         most_free = cur_free;
+         dirn = i;
+     }
+ 
+     if (dirn >= 0)
+         dynamic_cast<SwapDir *>(INDEXSD(dirn))->flags.selected = true;
+ 
+     return dirn;
+ }
+ 
++Store::Disks::Disks():
++    largestMinimumObjectSize(-1),
++    largestMaximumObjectSize(-1),
++    secondLargestMaximumObjectSize(-1)
++{
++}
++
+ SwapDir *
+ Store::Disks::store(int const x) const
+ {
+     return INDEXSD(x);
+ }
+ 
+ SwapDir &
+ Store::Disks::dir(const int i) const
+ {
+     SwapDir *sd = INDEXSD(i);
+     assert(sd);
+     return *sd;
+ }
+ 
+ int
+ Store::Disks::callback()
+ {
+     int result = 0;
+     int j;
+     static int ndir = 0;
+@@ -313,48 +334,102 @@ Store::Disks::currentSize() const
+ 
+     return result;
+ }
+ 
+ uint64_t
+ Store::Disks::currentCount() const
+ {
+     uint64_t result = 0;
+ 
+     for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+         if (dir(i).doReportStat())
+             result += store(i)->currentCount();
+     }
+ 
+     return result;
+ }
+ 
+ int64_t
+ Store::Disks::maxObjectSize() const
+ {
+-    int64_t result = -1;
++    return largestMaximumObjectSize;
++}
++
++void
++Store::Disks::updateLimits()
++{
++    largestMinimumObjectSize = -1;
++    largestMaximumObjectSize = -1;
++    secondLargestMaximumObjectSize = -1;
+ 
+     for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+-        if (dir(i).active() && store(i)->maxObjectSize() > result)
+-            result = store(i)->maxObjectSize();
++        const auto &disk = dir(i);
++        if (!disk.active())
++            continue;
++
++        if (disk.minObjectSize() > largestMinimumObjectSize)
++            largestMinimumObjectSize = disk.minObjectSize();
++
++        const auto diskMaxObjectSize = disk.maxObjectSize();
++        if (diskMaxObjectSize > largestMaximumObjectSize) {
++            if (largestMaximumObjectSize >= 0) // was set
++                secondLargestMaximumObjectSize = largestMaximumObjectSize;
++            largestMaximumObjectSize = diskMaxObjectSize;
++        }
+     }
++}
+ 
+-    return result;
++int64_t
++Store::Disks::accumulateMore(const StoreEntry &entry) const
++{
++    const auto accumulated = entry.mem_obj->availableForSwapOut();
++
++    /* 
++     * Keep accumulating more bytes until the set of disks eligible to accept
++     * the entry becomes stable, and, hence, accumulating more is not going to
++     * affect the cache_dir selection. A stable set is usually reached
++     * immediately (or soon) because most configurations either do not use
++     * cache_dirs with explicit min-size/max-size limits or use the same
++     * max-size limit for all cache_dirs (and low min-size limits).
++     */
++
++    // Can the set of min-size cache_dirs accepting this entry change?
++    if (accumulated < largestMinimumObjectSize)
++        return largestMinimumObjectSize - accumulated;
++
++    // Can the set of max-size cache_dirs accepting this entry change
++    // (other than when the entry exceeds the largest maximum; see below)?
++    if (accumulated <= secondLargestMaximumObjectSize)
++        return secondLargestMaximumObjectSize - accumulated + 1;
++
++    /* 
++     * Checking largestMaximumObjectSize instead eliminates the risk of starting
++     * to swap out an entry that later grows too big, but also implies huge
++     * accumulation in most environments. Accumulating huge entries not only
++     * consumes lots of RAM but also creates a burst of doPages() write requests
++     * that overwhelm the disk. To avoid these problems, we take the risk and
++     * allow swap out now. The disk will quit swapping out if the entry
++     * eventually grows too big for its selected cache_dir.
++     */
++    debugs(20, 3, "no: " << accumulated << '>' <<
++           secondLargestMaximumObjectSize << ',' << largestMinimumObjectSize);
++    return 0;
+ }
+ 
+ void
+ Store::Disks::getStats(StoreInfoStats &stats) const
+ {
+     // accumulate per-disk cache stats
+     for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+         StoreInfoStats dirStats;
+         store(i)->getStats(dirStats);
+         stats += dirStats;
+     }
+ 
+     // common to all disks
+     stats.swap.open_disk_fd = store_open_disk_fd;
+ 
+     // memory cache stats are collected in StoreController::getStats(), for now
+ }
+ 
+ void
+ Store::Disks::stat(StoreEntry & output) const
+
+=== modified file 'src/store/Disks.h'
+--- src/store/Disks.h	2016-02-29 22:32:41 +0000
++++ src/store/Disks.h	2016-04-27 00:45:09 +0000
+@@ -1,66 +1,79 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_STORE_DISKS_H
+ #define SQUID_STORE_DISKS_H
+ 
+ #include "store/Controlled.h"
+ #include "store/forward.h"
+ 
+ namespace Store {
+ 
+ /// summary view of all disk caches (cache_dirs) combined
+ class Disks: public Controlled
+ {
+ public:
++    Disks();
++
+     /* Storage API */
+     virtual void create() override;
+     virtual void init() override;
+     virtual StoreEntry *get(const cache_key *) override;
+     virtual uint64_t maxSize() const override;
+     virtual uint64_t minSize() const override;
+     virtual uint64_t currentSize() const override;
+     virtual uint64_t currentCount() const override;
+     virtual int64_t maxObjectSize() const override;
+     virtual void getStats(StoreInfoStats &stats) const override;
+     virtual void stat(StoreEntry &) const override;
+     virtual void sync() override;
+     virtual void reference(StoreEntry &) override;
+     virtual bool dereference(StoreEntry &e) override;
+     virtual void updateHeaders(StoreEntry *) override;
+     virtual void maintain() override;
+     virtual bool anchorCollapsed(StoreEntry &e, bool &inSync) override;
+     virtual bool updateCollapsed(StoreEntry &e) override;
+     virtual void markForUnlink(StoreEntry &) override;
+     virtual void unlink(StoreEntry &) override;
+     virtual int callback() override;
+ 
++    /// slowly calculate (and cache) hi/lo watermarks and similar limits
++    void updateLimits();
++
++    /// Additional unknown-size entry bytes required by disks in order to 
++    /// reduce the risk of selecting the wrong disk cache for the growing entry.
++    int64_t accumulateMore(const StoreEntry&) const;
++
+ private:
+     /* migration logic */
+     SwapDir *store(int const x) const;
+     SwapDir &dir(int const idx) const;
++
++    int64_t largestMinimumObjectSize; ///< maximum of all Disk::minObjectSize()s
++    int64_t largestMaximumObjectSize; ///< maximum of all Disk::maxObjectSize()s
++    int64_t secondLargestMaximumObjectSize; ///< the second-biggest Disk::maxObjectSize()
+ };
+ 
+ } // namespace Store
+ 
+ /* Store::Disks globals that should be converted to use RegisteredRunner */
+ void storeDirOpenSwapLogs(void);
+ int storeDirWriteCleanLogs(int reopen);
+ void storeDirCloseSwapLogs(void);
+ 
+ /* Globals that should be converted to static Store::Disks methods */
+ void allocate_new_swapdir(Store::DiskConfig *swap);
+ void free_cachedir(Store::DiskConfig *swap);
+ 
+ /* Globals that should be converted to Store::Disks private data members */
+ typedef int STDIRSELECT(const StoreEntry *e);
+ extern STDIRSELECT *storeDirSelectSwapDir;
+ 
+ /* Globals that should be moved to some Store::UFS-specific logging module */
+ void storeDirSwapLog(const StoreEntry *e, int op);
+ 
+
+=== modified file 'src/store_swapout.cc'
+--- src/store_swapout.cc	2016-01-01 00:12:18 +0000
++++ src/store_swapout.cc	2016-04-27 00:41:55 +0000
+@@ -410,41 +410,32 @@ StoreEntry::mayStartSwapOut()
+         const int64_t expectedEnd = mem_obj->expectedReplySize();
+         debugs(20, 7,  HERE << "expectedEnd = " << expectedEnd);
+         if (expectedEnd > store_maxobjsize) {
+             debugs(20, 3,  HERE << "will not fit: " << expectedEnd <<
+                    " > " << store_maxobjsize);
+             swapOutDecision(MemObject::SwapOut::swImpossible);
+             return false; // known to outgrow the limit eventually
+         }
+ 
+         // use current minimum (always known)
+         const int64_t currentEnd = mem_obj->endOffset();
+         if (currentEnd > store_maxobjsize) {
+             debugs(20, 3,  HERE << "does not fit: " << currentEnd <<
+                    " > " << store_maxobjsize);
+             swapOutDecision(MemObject::SwapOut::swImpossible);
+             return false; // already does not fit and may only get bigger
+         }
+ 
+         // prevent final default swPossible answer for yet unknown length
+         if (expectedEnd < 0 && store_status != STORE_OK) {
+-            const int64_t maxKnownSize = mem_obj->availableForSwapOut();
+-            debugs(20, 7, HERE << "maxKnownSize= " << maxKnownSize);
+-            /*
+-             * NOTE: the store_maxobjsize here is the global maximum
+-             * size of object cacheable in any of Squid cache stores
+-             * both disk and memory stores.
+-             *
+-             * However, I am worried that this
+-             * deferance may consume a lot of memory in some cases.
+-             * Should we add an option to limit this memory consumption?
+-             */
+-            debugs(20, 5,  HERE << "Deferring swapout start for " <<
+-                   (store_maxobjsize - maxKnownSize) << " bytes");
+-            return true; // may still fit, but no final decision yet
++            const int64_t more = Store::Root().accumulateMore(*this);
++            if (more > 0) {
++                debugs(20, 5, "got " << currentEnd << "; defer decision for " << more << " more bytes");
++                return true; // may still fit, but no final decision yet
++            }
+         }
+     }
+ 
+     swapOutDecision(MemObject::SwapOut::swPossible);
+     return true;
+ }
+ 
+
+=== modified file 'src/tests/stub_SwapDir.cc'
+--- src/tests/stub_SwapDir.cc	2016-01-01 00:12:18 +0000
++++ src/tests/stub_SwapDir.cc	2016-04-27 13:51:52 +0000
+@@ -5,40 +5,41 @@
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "store/Disk.h"
+ 
+ #define STUB_API "store/Disk.cc"
+ #include "tests/STUB.h"
+ 
+ // SwapDir::SwapDir(char const *) STUB
+ // SwapDir::~SwapDir() STUB
+ void SwapDir::create() STUB
+ void SwapDir::dump(StoreEntry &) const STUB
+ bool SwapDir::doubleCheck(StoreEntry &) STUB_RETVAL(false)
+ void SwapDir::getStats(StoreInfoStats &) const STUB
+ void SwapDir::stat(StoreEntry &) const STUB
+ void SwapDir::statfs(StoreEntry &)const STUB
+ void SwapDir::maintain() STUB
+ uint64_t SwapDir::minSize() const STUB_RETVAL(0)
++int64_t SwapDir::minObjectSize() const STUB_RETVAL(0)
+ int64_t SwapDir::maxObjectSize() const STUB_RETVAL(0)
+ void SwapDir::maxObjectSize(int64_t) STUB
+ void SwapDir::reference(StoreEntry &) STUB
+ bool SwapDir::dereference(StoreEntry &) STUB_RETVAL(false)
+ bool SwapDir::canStore(const StoreEntry &, int64_t, int &) const STUB_RETVAL(false)
+ bool SwapDir::canLog(StoreEntry const &)const STUB_RETVAL(false)
+ void SwapDir::openLog() STUB
+ void SwapDir::closeLog() STUB
+ int SwapDir::writeCleanStart() STUB_RETVAL(0)
+ void SwapDir::writeCleanDone() STUB
+ void SwapDir::logEntry(const StoreEntry &, int) const STUB
+ char const * SwapDir::type() const STUB_RETVAL("stub")
+ bool SwapDir::active() const STUB_RETVAL(false)
+ bool SwapDir::needsDiskStrand() const STUB_RETVAL(false)
+ ConfigOption * SwapDir::getOptionTree() const STUB_RETVAL(NULL)
+ void SwapDir::parseOptions(int) STUB
+ void SwapDir::dumpOptions(StoreEntry *) const STUB
+ bool SwapDir::optionReadOnlyParse(char const *, const char *, int) STUB_RETVAL(false)
+ void SwapDir::optionReadOnlyDump(StoreEntry *) const STUB
+ bool SwapDir::optionObjectSizeParse(char const *, const char *, int) STUB_RETVAL(false)
+

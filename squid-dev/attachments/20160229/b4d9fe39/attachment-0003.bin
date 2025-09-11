@@ -1,0 +1,827 @@
+Squid crashes on shutdown while cleaning up idle ICAP connections.
+
+The global Adaptation::Icap::TheConfig object is automatically
+destroyed when Squid exits. Its destructor destroys Icap::ServiceRep
+objects that, in turn, close all open connections in the idle
+connections pool. Since this happens after comm_exit has destroyed all
+Comm structures associated with those connections, Squid crashes.
+
+This patch closes all connections in existing connections pools before
+squid terminates comm subsystem using RegisteredRunners API.
+
+Also investigates the new class IndependedRunner to the RegistersRunner
+API, which can be used with objects can be destroyed outside the registry.
+Objects which inheritated from this class are deregister their self  from
+Runners registry when they are destroyed.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/base/RunnersRegistry.cc'
+--- src/base/RunnersRegistry.cc	2016-01-01 00:12:18 +0000
++++ src/base/RunnersRegistry.cc	2016-02-22 18:44:54 +0000
+@@ -1,62 +1,85 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "base/RunnersRegistry.h"
+ #include <set>
+ 
+ /// a collection of unique runners, in no particular order
+ typedef std::set<RegisteredRunner*> Runners;
+ /// all known runners
+ static Runners *TheRunners = NULL;
++/// used to avoid re-creating deleted TheRunners after shutdown finished.
++static bool RunnersGone = false;
++
++void
++IndependentRunner::finishShutdown()
++{
++    DeregisterRunner(this);
++}
++
++IndependentRunner::~IndependentRunner()
++{
++    DeregisterRunner(this);
++}
+ 
+ /// safely returns registered runners, initializing structures as needed
+-static Runners &
++static Runners *
+ GetRunners()
+ {
+-    if (!TheRunners)
++    if (!TheRunners && !RunnersGone)
+         TheRunners = new Runners;
+-    return *TheRunners;
++    return TheRunners;
+ }
+ 
+ int
+ RegisterRunner(RegisteredRunner *rr)
+ {
+-    Runners &runners = GetRunners();
+-    runners.insert(rr);
+-    return runners.size();
++    if (Runners *runners = GetRunners()) {
++        runners->insert(rr);
++        return runners->size();
++    }
++    return 0;
+ }
+ 
+ int
+ DeregisterRunner(RegisteredRunner *rr)
+ {
+-    Runners &runners = GetRunners();
+-    runners.erase(rr);
+-    return runners.size();
++    if (Runners *runners = GetRunners()) {
++        runners->erase(rr);
++        return runners->size();
++    }
++    return 0;
+ }
+ 
+ void
+ RunRegistered(const RegisteredRunner::Method &m)
+ {
+-    Runners &runners = GetRunners();
+-    typedef Runners::iterator RRI;
+-    for (RRI i = runners.begin(); i != runners.end(); ++i)
+-        ((*i)->*m)();
+-
+-    if (m == &RegisteredRunner::finishShutdown) {
+-        delete TheRunners;
+-        TheRunners = NULL;
++    if (Runners *runners = GetRunners()) {
++        typedef Runners::iterator RRI;
++        for (RRI i = runners->begin(); i != runners->end();) {
++            // copy to current, item may deleted inside method
++            RRI current = i;
++            ++i;
++            ((*current)->*m)();
++        }
++
++        if (m == &RegisteredRunner::finishShutdown) {
++            delete TheRunners;
++            TheRunners = NULL;
++            RunnersGone = true;
++        }
+     }
+ }
+ 
+ bool
+ UseThisStatic(const void *)
+ {
+     return true;
+ }
+ 
+
+=== modified file 'src/base/RunnersRegistry.h'
+--- src/base/RunnersRegistry.h	2016-01-01 00:12:18 +0000
++++ src/base/RunnersRegistry.h	2016-02-22 17:02:13 +0000
+@@ -60,46 +60,57 @@
+     /// Called after parsing squid.conf during reconfiguration.
+     /// Meant for adjusting the module state based on configuration changes.
+     virtual void syncConfig() {}
+ 
+     /* Shutdown events */
+ 
+     /// Called after receiving a shutdown request and before stopping the main
+     /// loop. At least one main loop iteration is guaranteed after this call.
+     /// Meant for cleanup and state saving that may require other modules.
+     virtual void startShutdown() {}
+ 
+     /// Called after shutdown_lifetime grace period ends and before stopping
+     /// the main loop. At least one main loop iteration is guaranteed after
+     /// this call.
+     /// Meant for cleanup and state saving that may require other modules.
+     virtual void endingShutdown() {}
+ 
+     /// Called after stopping the main loop and before releasing memory.
+     /// Meant for quick/basic cleanup that does not require any other modules.
+     virtual ~RegisteredRunner() {}
++
+     /// exists to simplify caller interface; override the destructor instead
+-    void finishShutdown() { delete this; }
++    virtual void finishShutdown() { delete this; }
+ 
+     /// a pointer to one of the above notification methods
+     typedef void (RegisteredRunner::*Method)();
++};
++
++/// A RegisteredRunner which lifetime is determined by forces outside the
++/// RR Registry
++class IndependentRunner: public RegisteredRunner
++{
++public:
++    /// Deregister self
++    virtual void finishShutdown();
+ 
++    virtual ~IndependentRunner();
+ };
+ 
+ /// registers a given runner with the given registry and returns registry count
+ int RegisterRunner(RegisteredRunner *rr);
+ 
+ /// de-registers a given runner with the given registry and returns registry count
+ int DeregisterRunner(RegisteredRunner *rr);
+ 
+ /// Calls a given method of all runners.
+ /// All runners are destroyed after the finishShutdown() call.
+ void RunRegistered(const RegisteredRunner::Method &m);
+ 
+ /// convenience macro to describe/debug the caller and the method being called
+ #define RunRegisteredHere(m) \
+     debugs(1, 2, "running " # m); \
+     RunRegistered(&m)
+ 
+ /// convenience function to "use" an otherwise unreferenced static variable
+ bool UseThisStatic(const void *);
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-02-13 07:51:20 +0000
++++ src/client_side.cc	2016-02-22 17:33:14 +0000
+@@ -567,41 +567,40 @@
+     if (aur != auth_) {
+         debugs(33, 2, "ERROR: Closing " << clientConnection << " due to change of connection-auth from " << by);
+         auth_->releaseAuthServer();
+         auth_ = NULL;
+         // this is a fatal type of problem.
+         // Close the connection immediately with TCP RST to abort all traffic flow
+         comm_reset_close(clientConnection);
+         return;
+     }
+ 
+     /* NOT REACHABLE */
+ }
+ #endif
+ 
+ // cleans up before destructor is called
+ void
+ ConnStateData::swanSong()
+ {
+     debugs(33, 2, HERE << clientConnection);
+     flags.readMore = false;
+-    DeregisterRunner(this);
+     clientdbEstablished(clientConnection->remote, -1);  /* decrement */
+     pipeline.terminateAll(0);
+ 
+     unpinConnection(true);
+ 
+     Server::swanSong(); // closes the client connection
+ 
+ #if USE_AUTH
+     // NP: do this bit after closing the connections to avoid side effects from unwanted TCP RST
+     setAuth(NULL, "ConnStateData::SwanSong cleanup");
+ #endif
+ 
+     flags.swanSang = true;
+ }
+ 
+ bool
+ ConnStateData::isOpen() const
+ {
+     return cbdataReferenceValid(this) && // XXX: checking "this" in a method
+            Comm::IsConnOpen(clientConnection) &&
+@@ -1023,44 +1022,40 @@
+ void
+ ConnStateData::startShutdown()
+ {
+     // RegisteredRunner API callback - Squid has been shut down
+ 
+     // if connection is idle terminate it now,
+     // otherwise wait for grace period to end
+     if (pipeline.empty())
+         endingShutdown();
+ }
+ 
+ void
+ ConnStateData::endingShutdown()
+ {
+     // RegisteredRunner API callback - Squid shutdown grace period is over
+ 
+     // force the client connection to close immediately
+     // swanSong() in the close handler will cleanup.
+     if (Comm::IsConnOpen(clientConnection))
+         clientConnection->close();
+-
+-    // deregister now to ensure finalShutdown() does not kill us prematurely.
+-    // fd_table purge will cleanup if close handler was not fast enough.
+-    DeregisterRunner(this);
+ }
+ 
+ char *
+ skipLeadingSpace(char *aString)
+ {
+     char *result = aString;
+ 
+     while (xisspace(*aString))
+         ++aString;
+ 
+     return result;
+ }
+ 
+ /**
+  * 'end' defaults to NULL for backwards compatibility
+  * remove default value if we ever get rid of NULL-terminated
+  * request buffers.
+  */
+ const char *
+ findTrailingHTTPVersion(const char *uriAndHTTPVersion, const char *end)
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2016-01-24 17:41:43 +0000
++++ src/client_side.h	2016-02-23 16:39:50 +0000
+@@ -44,41 +44,41 @@
+  *     So Must() is not safe to use.
+  *
+  * Multiple requests (up to pipeline_prefetch) can be pipelined.
+  * This object is responsible for managing which one is currently being
+  * fulfilled and what happens to the queue if the current one causes the client
+  * connection to be closed early.
+  *
+  * Act as a manager for the client connection and passes data in buffer to a
+  * Parser relevant to the state (message headers vs body) that is being
+  * processed.
+  *
+  * Performs HTTP message processing to kick off the actual HTTP request
+  * handling objects (Http::Stream, ClientHttpRequest, HttpRequest).
+  *
+  * Performs SSL-Bump processing for switching between HTTP and HTTPS protocols.
+  *
+  * To terminate a ConnStateData close() the client Comm::Connection it is
+  * managing, or for graceful half-close use the stopReceiving() or
+  * stopSending() methods.
+  */
+-class ConnStateData : public Server, public HttpControlMsgSink, public RegisteredRunner
++class ConnStateData : public Server, public HttpControlMsgSink, private IndependentRunner
+ {
+ 
+ public:
+     explicit ConnStateData(const MasterXaction::Pointer &xact);
+     virtual ~ConnStateData();
+ 
+     /* ::Server API */
+     virtual void receivedFirstByte();
+     virtual bool handleReadData();
+     virtual void afterClientRead();
+     virtual void afterClientWrite(size_t);
+ 
+     /* HttpControlMsgSink API */
+     virtual void sendControlMsg(HttpControlMsg);
+ 
+     /// Traffic parsing
+     bool clientParseRequests();
+     void readNextRequest();
+ 
+     /// try to make progress on a transaction or read more I/O
+
+=== modified file 'src/pconn.cc'
+--- src/pconn.cc	2016-01-01 00:12:18 +0000
++++ src/pconn.cc	2016-02-23 16:24:16 +0000
+@@ -14,105 +14,112 @@
+ #include "comm/Connection.h"
+ #include "comm/Read.h"
+ #include "fd.h"
+ #include "fde.h"
+ #include "globals.h"
+ #include "mgr/Registration.h"
+ #include "neighbors.h"
+ #include "pconn.h"
+ #include "PeerPoolMgr.h"
+ #include "SquidConfig.h"
+ #include "Store.h"
+ 
+ #define PCONN_FDS_SZ    8   /* pconn set size, increase for better memcache hit rate */
+ 
+ //TODO: re-attach to MemPools. WAS: static MemAllocator *pconn_fds_pool = NULL;
+ PconnModule * PconnModule::instance = NULL;
+ CBDATA_CLASS_INIT(IdleConnList);
+ 
+ /* ========== IdleConnList ============================================ */
+ 
+-IdleConnList::IdleConnList(const char *key, PconnPool *thePool) :
++IdleConnList::IdleConnList(const char *aKey, PconnPool *thePool) :
+     capacity_(PCONN_FDS_SZ),
+     size_(0),
+     parent_(thePool)
+ {
+-    hash.key = xstrdup(key);
+-    hash.next = NULL;
++    //Initialize hash_link members
++    key = xstrdup(aKey);
++    next = NULL;
++
+     theList_ = new Comm::ConnectionPointer[capacity_];
++
++    // Register to receive notice of Squid signal events
++    // and close open connections if required
++    RegisterRunner(this);
++
+ // TODO: re-attach to MemPools. WAS: theList = (?? *)pconn_fds_pool->alloc();
+ }
+ 
+ IdleConnList::~IdleConnList()
+ {
+     if (parent_)
+         parent_->unlinkList(this);
+ 
+     if (size_) {
+         parent_ = NULL; // prevent reentrant notifications and deletions
+         closeN(size_);
+     }
+ 
+     delete[] theList_;
+ 
+-    xfree(hash.key);
++    xfree(key);
+ }
+ 
+ /** Search the list. Matches by FD socket number.
+  * Performed from the end of list where newest entries are.
+  *
+  * \retval <0   The connection is not listed
+  * \retval >=0  The connection array index
+  */
+ int
+ IdleConnList::findIndexOf(const Comm::ConnectionPointer &conn) const
+ {
+     for (int index = size_ - 1; index >= 0; --index) {
+         if (conn->fd == theList_[index]->fd) {
+             debugs(48, 3, HERE << "found " << conn << " at index " << index);
+             return index;
+         }
+     }
+ 
+     debugs(48, 2, HERE << conn << " NOT FOUND!");
+     return -1;
+ }
+ 
+ /** Remove the entry at specified index.
+  * May perform a shuffle of list entries to fill the gap.
+  * \retval false The index is not an in-use entry.
+  */
+ bool
+ IdleConnList::removeAt(int index)
+ {
+     if (index < 0 || index >= size_)
+         return false;
+ 
+     // shuffle the remaining entries to fill the new gap.
+     for (; index < size_ - 1; ++index)
+         theList_[index] = theList_[index + 1];
+     theList_[--size_] = NULL;
+ 
+     if (parent_) {
+         parent_->noteConnectionRemoved();
+         if (size_ == 0) {
+-            debugs(48, 3, HERE << "deleting " << hashKeyStr(&hash));
++            debugs(48, 3, HERE << "deleting " << hashKeyStr(this));
+             delete this;
+         }
+     }
+ 
+     return true;
+ }
+ 
+ // almost a duplicate of removeFD. But drops multiple entries.
+ void
+ IdleConnList::closeN(size_t n)
+ {
+     if (n < 1) {
+         debugs(48, 2, HERE << "Nothing to do.");
+         return;
+     } else if (n >= (size_t)size_) {
+         debugs(48, 2, HERE << "Closing all entries.");
+         while (size_ > 0) {
+             const Comm::ConnectionPointer conn = theList_[--size_];
+             theList_[size_] = NULL;
+             clearHandlers(conn);
+@@ -129,41 +136,41 @@
+             const Comm::ConnectionPointer conn = theList_[index];
+             theList_[index] = NULL;
+             clearHandlers(conn);
+             conn->close();
+             if (parent_)
+                 parent_->noteConnectionRemoved();
+         }
+         // shuffle the list N down.
+         for (index = 0; index < (size_t)size_ - n; ++index) {
+             theList_[index] = theList_[index + n];
+         }
+         // ensure the last N entries are unset
+         while (index < ((size_t)size_)) {
+             theList_[index] = NULL;
+             ++index;
+         }
+         size_ -= n;
+     }
+ 
+     if (parent_ && size_ == 0) {
+-        debugs(48, 3, HERE << "deleting " << hashKeyStr(&hash));
++        debugs(48, 3, HERE << "deleting " << hashKeyStr(this));
+         delete this;
+     }
+ }
+ 
+ void
+ IdleConnList::clearHandlers(const Comm::ConnectionPointer &conn)
+ {
+     debugs(48, 3, HERE << "removing close handler for " << conn);
+     comm_read_cancel(conn->fd, IdleConnList::Read, this);
+     commUnsetConnTimeout(conn);
+ }
+ 
+ void
+ IdleConnList::push(const Comm::ConnectionPointer &conn)
+ {
+     if (size_ == capacity_) {
+         debugs(48, 3, HERE << "growing idle Connection array");
+         capacity_ <<= 1;
+         const Comm::ConnectionPointer *oldList = theList_;
+         theList_ = new Comm::ConnectionPointer[capacity_];
+@@ -220,59 +227,59 @@
+         // finally, a match. pop and return it.
+         Comm::ConnectionPointer result = theList_[i];
+         clearHandlers(result);
+         /* may delete this */
+         removeAt(i);
+         return result;
+     }
+ 
+     return Comm::ConnectionPointer();
+ }
+ 
+ /*
+  * XXX this routine isn't terribly efficient - if there's a pending
+  * read event (which signifies the fd will close in the next IO loop!)
+  * we ignore the FD and move onto the next one. This means, as an example,
+  * if we have a lot of FDs open to a very popular server and we get a bunch
+  * of requests JUST as they timeout (say, it shuts down) we'll be wasting
+  * quite a bit of CPU. Just keep it in mind.
+  */
+ Comm::ConnectionPointer
+-IdleConnList::findUseable(const Comm::ConnectionPointer &key)
++IdleConnList::findUseable(const Comm::ConnectionPointer &aKey)
+ {
+     assert(size_);
+ 
+     // small optimization: do the constant bool tests only once.
+-    const bool keyCheckAddr = !key->local.isAnyAddr();
+-    const bool keyCheckPort = key->local.port() > 0;
++    const bool keyCheckAddr = !aKey->local.isAnyAddr();
++    const bool keyCheckPort = aKey->local.port() > 0;
+ 
+     for (int i=size_-1; i>=0; --i) {
+ 
+         if (!isAvailable(i))
+             continue;
+ 
+         // local end port is required, but dont match.
+-        if (keyCheckPort && key->local.port() != theList_[i]->local.port())
++        if (keyCheckPort && aKey->local.port() != theList_[i]->local.port())
+             continue;
+ 
+         // local address is required, but does not match.
+-        if (keyCheckAddr && key->local.matchIPAddr(theList_[i]->local) != 0)
++        if (keyCheckAddr && aKey->local.matchIPAddr(theList_[i]->local) != 0)
+             continue;
+ 
+         // our connection timeout handler is scheduled to run already. unsafe for now.
+         // TODO: cancel the pending timeout callback and allow re-use of the conn.
+         if (fd_table[theList_[i]->fd].timeoutHandler == NULL)
+             continue;
+ 
+         // finally, a match. pop and return it.
+         Comm::ConnectionPointer result = theList_[i];
+         clearHandlers(result);
+         /* may delete this */
+         removeAt(i);
+         return result;
+     }
+ 
+     return Comm::ConnectionPointer();
+ }
+ 
+ /* might delete list */
+ void
+@@ -297,40 +304,46 @@
+     if (flag == Comm::ERR_CLOSING) {
+         debugs(48, 3, HERE << "Comm::ERR_CLOSING from " << conn);
+         /* Bail out on Comm::ERR_CLOSING - may happen when shutdown aborts our idle FD */
+         return;
+     }
+ 
+     IdleConnList *list = (IdleConnList *) data;
+     /* may delete list/data */
+     list->findAndClose(conn);
+ }
+ 
+ void
+ IdleConnList::Timeout(const CommTimeoutCbParams &io)
+ {
+     debugs(48, 3, HERE << io.conn);
+     IdleConnList *list = static_cast<IdleConnList *>(io.data);
+     /* may delete list/data */
+     list->findAndClose(io.conn);
+ }
+ 
++void
++IdleConnList::endingShutdown()
++{
++    closeN(size_);
++}
++
+ /* ========== PconnPool PRIVATE FUNCTIONS ============================================ */
+ 
+ const char *
+ PconnPool::key(const Comm::ConnectionPointer &destLink, const char *domain)
+ {
+     LOCAL_ARRAY(char, buf, SQUIDHOSTNAMELEN * 3 + 10);
+ 
+     destLink->remote.toUrl(buf, SQUIDHOSTNAMELEN * 3 + 10);
+     if (domain) {
+         const int used = strlen(buf);
+         snprintf(buf+used, SQUIDHOSTNAMELEN * 3 + 10-used, "/%s", domain);
+     }
+ 
+     debugs(48,6,"PconnPool::key(" << destLink << ", " << (domain?domain:"[no domain]") << ") is {" << buf << "}" );
+     return buf;
+ }
+ 
+ void
+ PconnPool::dumpHist(StoreEntry * e) const
+ {
+@@ -394,72 +407,72 @@
+ 
+ void
+ PconnPool::push(const Comm::ConnectionPointer &conn, const char *domain)
+ {
+     if (fdUsageHigh()) {
+         debugs(48, 3, HERE << "Not many unused FDs");
+         conn->close();
+         return;
+     } else if (shutting_down) {
+         conn->close();
+         debugs(48, 3, HERE << "Squid is shutting down. Refusing to do anything");
+         return;
+     }
+     // TODO: also close used pconns if we exceed peer max-conn limit
+ 
+     const char *aKey = key(conn, domain);
+     IdleConnList *list = (IdleConnList *) hash_lookup(table, aKey);
+ 
+     if (list == NULL) {
+         list = new IdleConnList(aKey, this);
+-        debugs(48, 3, HERE << "new IdleConnList for {" << hashKeyStr(&list->hash) << "}" );
+-        hash_join(table, &list->hash);
++        debugs(48, 3, HERE << "new IdleConnList for {" << hashKeyStr(list) << "}" );
++        hash_join(table, list);
+     } else {
+-        debugs(48, 3, HERE << "found IdleConnList for {" << hashKeyStr(&list->hash) << "}" );
++        debugs(48, 3, HERE << "found IdleConnList for {" << hashKeyStr(list) << "}" );
+     }
+ 
+     list->push(conn);
+     assert(!comm_has_incomplete_write(conn->fd));
+ 
+     LOCAL_ARRAY(char, desc, FD_DESC_SZ);
+     snprintf(desc, FD_DESC_SZ, "Idle server: %s", aKey);
+     fd_note(conn->fd, desc);
+     debugs(48, 3, HERE << "pushed " << conn << " for " << aKey);
+ 
+     // successful push notifications resume multi-connection opening sequence
+     notifyManager("push");
+ }
+ 
+ Comm::ConnectionPointer
+ PconnPool::pop(const Comm::ConnectionPointer &dest, const char *domain, bool keepOpen)
+ {
+ 
+     const char * aKey = key(dest, domain);
+ 
+     IdleConnList *list = (IdleConnList *)hash_lookup(table, aKey);
+     if (list == NULL) {
+         debugs(48, 3, HERE << "lookup for key {" << aKey << "} failed.");
+         // failure notifications resume standby conn creation after fdUsageHigh
+         notifyManager("pop failure");
+         return Comm::ConnectionPointer();
+     } else {
+-        debugs(48, 3, HERE << "found " << hashKeyStr(&list->hash) <<
++        debugs(48, 3, HERE << "found " << hashKeyStr(list) <<
+                (keepOpen ? " to use" : " to kill"));
+     }
+ 
+     /* may delete list */
+     Comm::ConnectionPointer popped = list->findUseable(dest);
+     if (!keepOpen && Comm::IsConnOpen(popped))
+         popped->close();
+ 
+     // successful pop notifications replenish standby connections pool
+     notifyManager("pop");
+     return popped;
+ }
+ 
+ void
+ PconnPool::notifyManager(const char *reason)
+ {
+     if (mgr.valid())
+         PeerPoolMgr::Checkpoint(mgr, reason);
+ }
+ 
+@@ -472,41 +485,41 @@
+     // close N connections, one per list, to treat all lists "fairly"
+     for (int i = 0; i < n && count(); ++i) {
+ 
+         hash_link *current = hash_next(hid);
+         if (!current) {
+             hash_first(hid);
+             current = hash_next(hid);
+             Must(current); // must have one because the count() was positive
+         }
+ 
+         // may delete current
+         reinterpret_cast<IdleConnList*>(current)->closeN(1);
+     }
+ }
+ 
+ void
+ PconnPool::unlinkList(IdleConnList *list)
+ {
+     theCount -= list->count();
+     assert(theCount >= 0);
+-    hash_remove_link(table, &list->hash);
++    hash_remove_link(table, list);
+ }
+ 
+ void
+ PconnPool::noteUses(int uses)
+ {
+     if (uses >= PCONN_HIST_SZ)
+         uses = PCONN_HIST_SZ - 1;
+ 
+     ++hist[uses];
+ }
+ 
+ /* ========== PconnModule ============================================ */
+ 
+ /*
+  * This simple class exists only for the cache manager
+  */
+ 
+ PconnModule::PconnModule(): pools()
+ {
+     registerWithCacheManager();
+
+=== modified file 'src/pconn.h'
+--- src/pconn.h	2016-01-01 00:12:18 +0000
++++ src/pconn.h	2016-02-23 16:15:58 +0000
+@@ -1,95 +1,95 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_PCONN_H
+ #define SQUID_PCONN_H
+ 
+ #include "base/CbcPointer.h"
++#include "base/RunnersRegistry.h"
+ #include "mgr/forward.h"
+ 
+ #include <set>
+ 
+ /**
+  \defgroup PConnAPI Persistent Connection API
+  \ingroup Component
+  *
+  \todo CLEANUP: Break multiple classes out of the generic pconn.h header
+  */
+ 
+ class PconnPool;
+ class PeerPoolMgr;
+ 
+ #include "cbdata.h"
+ #include "hash.h"
+ /* for IOCB */
+ #include "comm.h"
+ 
+ /// \ingroup PConnAPI
+ #define PCONN_HIST_SZ (1<<16)
+ 
+ /** \ingroup PConnAPI
+  * A list of connections currently open to a particular destination end-point.
+  */
+-class IdleConnList
++class IdleConnList: public hash_link, private IndependentRunner
+ {
+     CBDATA_CLASS(IdleConnList);
+ 
+ public:
+     IdleConnList(const char *key, PconnPool *parent);
+     ~IdleConnList();
+ 
+     /// Pass control of the connection to the idle list.
+     void push(const Comm::ConnectionPointer &conn);
+ 
+     /// get first conn which is not pending read fd.
+     Comm::ConnectionPointer pop();
+ 
+     /** Search the list for a connection which matches the 'key' details
+      * and pop it off the list.
+      * The list is created based on remote IP:port hash. This further filters
+      * the choices based on specific local-end details requested.
+      * If nothing usable is found the a nil pointer is returned.
+      */
+     Comm::ConnectionPointer findUseable(const Comm::ConnectionPointer &key);
+ 
+     void clearHandlers(const Comm::ConnectionPointer &conn);
+ 
+     int count() const { return size_; }
+     void closeN(size_t count);
+ 
++    // Registered Runner API
++    virtual void endingShutdown();
+ private:
+     bool isAvailable(int i) const;
+     bool removeAt(int index);
+     int findIndexOf(const Comm::ConnectionPointer &conn) const;
+     void findAndClose(const Comm::ConnectionPointer &conn);
+     static IOCB Read;
+     static CTCB Timeout;
+ 
+-public:
+-    hash_link hash;             /** must be first */
+-
+ private:
+     /** List of connections we are holding.
+      * Sorted as FIFO list for most efficient speeds on pop() and findUsable()
+      * The worst-case pop() and scans occur on timeout and link closure events
+      * where timing is less critical. Occasional slow additions are okay.
+      */
+     Comm::ConnectionPointer *theList_;
+ 
+     /// Number of entries theList can currently hold without re-allocating (capacity).
+     int capacity_;
+     ///< Number of in-use entries in theList
+     int size_;
+ 
+     /** The pool containing this sub-list.
+      * The parent performs all stats accounting, and
+      * will delete us when it dies. It persists for the
+      * full duration of our existence.
+      */
+     PconnPool *parent_;
+ 
+

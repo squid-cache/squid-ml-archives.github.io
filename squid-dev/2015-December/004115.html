@@ -1,0 +1,185 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [RFC] Fix shared memory initialization, cleanup. Ensure its usability.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BRFC%5D%20Fix%20shared%20memory%20initialization%2C%0A%20cleanup.%20Ensure%20its%20usability.&In-Reply-To=%3C56689AF6.9090102%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="004112.html">
+   <LINK REL="Next"  HREF="004117.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [RFC] Fix shared memory initialization, cleanup. Ensure its usability.</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BRFC%5D%20Fix%20shared%20memory%20initialization%2C%0A%20cleanup.%20Ensure%20its%20usability.&In-Reply-To=%3C56689AF6.9090102%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [RFC] Fix shared memory initialization, cleanup. Ensure its usability.">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Wed Dec  9 21:19:50 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004112.html">[squid-dev] [RFC] Fix shared memory initialization, cleanup. Ensure its usability.
+</A></li>
+        <LI>Next message: <A HREF="004117.html">[squid-dev] [RFC] Fix shared memory initialization, cleanup. Ensure its usability.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4115">[ date ]</a>
+              <a href="thread.html#4115">[ thread ]</a>
+              <a href="subject.html#4115">[ subject ]</a>
+              <a href="author.html#4115">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 10/12/2015 7:42 a.m., Alex Rousskov wrote:
+&gt;<i> Hello,
+</I>&gt;<i> 
+</I>&gt;<i>     The attached patch does four things:
+</I>&gt;<i> 
+</I>&gt;<i> 1. Fixes shared memory initialization. The OS X portability fix (Bug
+</I>&gt;<i> 3805) is a gift that keeps on giving: After we fixed OS X compilation,
+</I>&gt;<i> we stopped initializing previously used shared memory after crashes!
+</I>&gt;<i> Search the patch for &quot;truncate&quot;.
+</I>&gt;<i> 
+</I>&gt;<i> 2. Fixes shared memory cleanup. One segment was not deleted when running
+</I>&gt;<i> Squid in non-daemon mode (-N). Search the patch for &quot;UsingSmp&quot;.
+</I>&gt;<i> 
+</I>&gt;<i> 3. Makes sure using shared memory does not lead to SIGBUS crashes.
+</I>&gt;<i> Search the patch for &quot;mlock&quot;.
+</I>&gt;<i> 
+</I>&gt;<i> 4. Adds tests to check whether shared memory is usable. Search the patch
+</I>&gt;<i> for &quot;memory checks&quot; and &quot;shouldTest&quot;.
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> My plan is:
+</I>&gt;<i> 
+</I>&gt;<i> * Commit #1 and #2 fixes to trunk without review unless somebody
+</I>&gt;<i> requests one now: IMO, they are simple and non-controversial.
+</I>&gt;<i> 
+</I>
++1 for #1 bits. ... without the new &quot;HERE&quot; macros.
+
+
+
+&gt;<i> * Remove/forget #4. These paranoid checks should not be needed after #3,
+</I>&gt;<i> which they have helped to test. We can always add them later if I am wrong.
+</I>&gt;<i> 
+</I>
+Maybe make these optional. Or #if 0 them out for now.
+
+At the very least the checks are broken on 32-bit machinery:
+
+* Segment theSize is a off_t (64-bit unsigned).
+- fillTest() at least is storing its value into an 'int' (32-bit signed)
+for the page count math.
+ - maybe causeing 32-bit systems with large-file support to have wrap
+issues with 2GB+ signed/unsigned values.
+- the math needs to be done directly in off_t or with explicit uint64_t.
+- where conversion to int is required (for memset/memcpy?) it also needs
+to do limit checking that the 64-bit value is (n &lt; 2^31) before assignment.
+
+If you choose to drop the *Test() code entirely this is not an issue. If
+you #if 0 the above should probably be fixed or mentioned as a XXX fix.
+
+
+
+&gt;<i> * Discuss mlock() changes in #3 (below). Post the corresponding change
+</I>&gt;<i> for the proper review. The code adding the mlock(2) call itself is
+</I>&gt;<i> simple, but the side effects of this change are serious enough to
+</I>&gt;<i> warrant proper review IMO.
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> Questions: Should we add a configuration directive to control whether
+</I>&gt;<i> mlock(2) is called? If yes, should mlock(2) be called by default?
+</I>&gt;<i> Should mlock(2) failures be fatal?
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> My answers are three YESes: I propose to call mlock(2) by default (if
+</I>&gt;<i> available) to guarantee that mmapped memory is usable. I also propose to
+</I>&gt;<i> make mlock(2) failures fatal. I hesitate offering a configuration option
+</I>&gt;<i> to control this behavior, but I think we should offer it because mlock()
+</I>&gt;<i> causes startup delays. I will discuss the problem and explain my
+</I>&gt;<i> rationale below.
+</I>
+
+&gt;<i> AFAICT, this large delay is the only valid argument for making mlock()
+</I>&gt;<i> calls optional -- if I am sure that Squid has enough RAM, then I might
+</I>&gt;<i> want to trade one large startup delay for numerous tiny delays as the
+</I>&gt;<i> mmapped memory gets allocated and used.
+</I>&gt;<i> 
+</I>&gt;<i> Needless to say, if we make mlock() calls optional, then some admins
+</I>&gt;<i> will disable them without giving Squid enough RAM and will then complain
+</I>&gt;<i> about mysterious crashes. On the other hand, all other factors being
+</I>&gt;<i> equal, we should provide tools for knowledgeable admins even if those
+</I>&gt;<i> tools may be misused by others.
+</I>&gt;<i> 
+</I>&gt;<i> How would you answer the three questions above?
+</I>
+
+My answers are no, yes, yes. Since this is a startup thing squid.conf
+post-processing is probably too late.
+
+In general if a setting is not something that can have a reasonable
+temporary default for a while, then be switched around in realtime. Then
+squid.conf is not a good place for it.
+
+I would make it mandatory on &quot;-k check&quot; (but not -k parse). Optional
+through a command line parameter on all other runs. (Remember we have
+long-args possible now so no need to squeeze it into a gap.)
+
+
+Amos
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004112.html">[squid-dev] [RFC] Fix shared memory initialization, cleanup. Ensure its usability.
+</A></li>
+	<LI>Next message: <A HREF="004117.html">[squid-dev] [RFC] Fix shared memory initialization, cleanup. Ensure its usability.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4115">[ date ]</a>
+              <a href="thread.html#4115">[ thread ]</a>
+              <a href="subject.html#4115">[ subject ]</a>
+              <a href="author.html#4115">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

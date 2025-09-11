@@ -1,0 +1,272 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Collapse internal revalidation requests	(SMP-unaware caches)
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Collapse%20internal%20revalidation%20requests%0A%09%28SMP-unaware%20caches%29&In-Reply-To=%3C57895A8F.7090808%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006466.html">
+   <LINK REL="Next"  HREF="006342.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Collapse internal revalidation requests	(SMP-unaware caches)</H1>
+    <B>Eduard Bagdasaryan</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Collapse%20internal%20revalidation%20requests%0A%09%28SMP-unaware%20caches%29&In-Reply-To=%3C57895A8F.7090808%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] Collapse internal revalidation requests	(SMP-unaware caches)">eduard.bagdasaryan at measurement-factory.com
+       </A><BR>
+    <I>Fri Jul 15 21:50:07 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006466.html">[squid-dev] [PATCH] Deletors for std::unique_ptr WAS: Re: Broken trunk after r14735
+</A></li>
+        <LI>Next message: <A HREF="006342.html">[squid-dev] [PATCH] Collapse internal revalidation requests (SMP-unaware caches)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6307">[ date ]</a>
+              <a href="thread.html#6307">[ thread ]</a>
+              <a href="subject.html#6307">[ subject ]</a>
+              <a href="author.html#6307">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+This patch extends collapsed_forwarding functionality to internal 
+revalidation
+requests. The implementation does not support Vary-controlled cache
+objects and is limited to SMP-unaware caching environments, where each
+Squid worker knows nothing about requests and caches handled by other
+workers. However, it also lays critical groundwork for future SMP-aware
+collapsed revalidation support.
+
+Prior to these changes, multiple concurrent HTTP requests for the same
+stale cached object always resulted in multiple internal revalidation
+requests sent by Squid to the origin server. Those internal requests
+were likely to result in multiple competing Squid cache updates, causing
+cache misses and/or more internal revalidation requests, negating
+collapsed forwarding savings.
+
+Internal cache revalidation requests are collapsed if and only if
+collapsed_forwarding is enabled. There is no option to control just
+revalidation collapsing because there is no known use case for it.
+
+* Public revalidation keys
+
+Each Store entry has a unique key. Keys are used to find entries in the
+Store (both already cached/swapped_out entries and not). Public keys are
+normally tied to the request method and target URI. Same request
+properties normally lead to the same public key, making cache hits
+possible. If we were to calculate a public key for an internal
+revalidation request, it would have been the same as the public key of
+the stale cache entry being revalidated. Adding a revalidation response
+to Store would have purged that being-revalidated cached entry, even if
+the revalidation response itself was not cachable.
+
+To avoid purging being-revalidated cached entries, the old code used
+private keys for internal revalidation requests. Private keys are always
+unique and cannot accidentally purge a public entry. On the other hand,
+for concurrent [revalidation] requests to find the store entry to
+collapse on, that store entry has to have a public key!
+
+We resolved this conflict by adding &quot;scope&quot; to public keys:
+
+* Regular/old public keys have default empty scope (that does not affect
+   key generation). The code not dealing with collapsed revalidation
+   continues to work as before. All entries stored in caches continue to
+   have the same keys (with an empty scope).
+
+* When collapsed forwarding is enabled, collapsable internal
+   revalidation requests get public keys with a &quot;revalidation&quot; scope
+   (that is fed to the MD5 hash when the key is generated). Such a
+   revalidation request can find a matching store entry created by
+   another revalidation request (and collapse on it), but cannot clash
+   with the entry being revalidated (because that entry key is using a
+   different [empty] scope).
+
+This change not only enables collapsing of internal revalidation
+requests within one worker, but opens the way for SMP-aware workers to
+share information about collapsed revalidation requests, similar to how
+those workers already share information about being-swapped-out cache
+entries.
+
+
+After receiving the revalidation response, each collapsed revalidation
+request may call updateOnNotModified() to update the stale entry [with
+the same revalidation response!]. Concurrent entry updates would have
+wasted many resources, especially for disk-cached entries that support
+header updates, and may have purged being-revalidated entries due to
+locking conflicts among updating transactions. To minimize these
+problems, we adjusted header and entry metadata updating logic to skip
+the update if nothing have changed since the last update.
+
+Also fixed Bug 4311: Collapsed forwarding deadlocks for SMP Squids using
+SMP-unaware caches. Collapsed transactions stalled without getting a
+response because they were waiting for the shared &quot;transients&quot; table
+updates. The table was created by Store::Controller but then abandoned (not
+updated) by SMP-unaware caches. Now, the transients table is not created
+at all unless SMP-aware caches are present. This fix should also address
+complaints about shared memory being used for Squid instances without
+SMP-aware caches.
+
+Also partially addressed Bug 2833.
+
+A combination of SMP-aware and SMP-unaware caches is still not supported
+and is likely to stall collapsed transactions if they are enabled. Note
+that, by default, the memory cache is SMP-aware in SMP environments.
+
+The attachment contains trunk patch version(for r14742) and v3.5 port 
+(for r14066).
+
+
+Regards,
+Eduard.
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: SQUID-197-collapse-revalidation-requests-t10.patch
+Type: text/x-patch
+Size: 103931 bytes
+Desc: not available
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/attachments/20160716/0c033d50/attachment-0002.bin">http://lists.squid-cache.org/pipermail/squid-dev/attachments/20160716/0c033d50/attachment-0002.bin</A>&gt;
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: SQUID-197-collapse-revalidation-requests-3.5-t3.patch
+Type: text/x-patch
+Size: 121471 bytes
+Desc: not available
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/attachments/20160716/0c033d50/attachment-0003.bin">http://lists.squid-cache.org/pipermail/squid-dev/attachments/20160716/0c033d50/attachment-0003.bin</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006466.html">[squid-dev] [PATCH] Deletors for std::unique_ptr WAS: Re: Broken trunk after r14735
+</A></li>
+	<LI>Next message: <A HREF="006342.html">[squid-dev] [PATCH] Collapse internal revalidation requests (SMP-unaware caches)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6307">[ date ]</a>
+              <a href="thread.html#6307">[ thread ]</a>
+              <a href="subject.html#6307">[ subject ]</a>
+              <a href="author.html#6307">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

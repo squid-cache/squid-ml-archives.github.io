@@ -1,0 +1,395 @@
+Connection stats, including %<lp, missing for persistent connections.
+
+The code reusing a pconn was missing a hier.note() call, resulting in 0
+values logged for %<lp (local port number of the last server or peer
+connection) and probably other missing stats.
+
+Also refactored poorly copied statistics collection code to remove
+duplication and always update to-server connection stats when the actual
+connection becomes available.
+
+Positive side effect: Upon setsockopt(2) failures, the tos and nfmark
+fields of a pinned connection were set to the desired (but not actually
+applied) values, while persistent connection fields were left intact
+(and, hence, stale). Both fields are now reset to zero on failures, for
+both types of connections.
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2015-07-03 18:12:11 +0000
++++ src/FwdState.cc	2015-10-21 02:56:29 +0000
+@@ -763,146 +763,139 @@ FwdState::timeLeft() const
+     /* connection timeout */
+     int ctimeout;
+     if (serverDestinations[0]->getPeer()) {
+         ctimeout = serverDestinations[0]->getPeer()->connect_timeout > 0 ?
+                    serverDestinations[0]->getPeer()->connect_timeout : Config.Timeout.peer_connect;
+     } else {
+         ctimeout = Config.Timeout.connect;
+     }
+ 
+     /* calculate total forwarding timeout ??? */
+     int ftimeout = Config.Timeout.forward - (squid_curtime - start_t);
+     if (ftimeout < 0)
+         ftimeout = 5;
+ 
+     if (ftimeout < ctimeout)
+         return (time_t)ftimeout;
+     else
+         return (time_t)ctimeout;
+ }
+ 
++/// called when serverConn is set to an _open_ to-peer connection
++void
++FwdState::syncWithServerConn(const char *host)
++{
++    if (Ip::Qos::TheConfig.isAclTosActive())
++        Ip::Qos::setSockTos(serverConn, GetTosToServer(request));
++
++#if SO_MARK
++    if (Ip::Qos::TheConfig.isAclNfmarkActive())
++        Ip::Qos::setSockNfmark(serverConn, GetNfmarkToServer(request));
++#endif
++
++    request->hier.note(serverConn, host);
++}
++
+ /**
+  * Called after forwarding path selection (via peer select) has taken place
+  * and whenever forwarding needs to attempt a new connection (routing failover).
+  * We have a vector of possible localIP->remoteIP paths now ready to start being connected.
+  */
+ void
+ FwdState::connectStart()
+ {
+     assert(serverDestinations.size() > 0);
+ 
+     debugs(17, 3, "fwdConnectStart: " << entry->url());
+ 
+     request->hier.startPeerClock();
+ 
+     // Do not fowrward bumped connections to parent proxy unless it is an
+     // origin server
+     if (serverDestinations[0]->getPeer() && !serverDestinations[0]->getPeer()->options.originserver && request->flags.sslBumped) {
+         debugs(50, 4, "fwdConnectStart: Ssl bumped connections through parent proxy are not allowed");
+         ErrorState *anErr = new ErrorState(ERR_CANNOT_FORWARD, Http::scServiceUnavailable, request);
+         fail(anErr);
+         self = NULL; // refcounted
+         return;
+     }
+ 
+     request->flags.pinned = false; // XXX: what if the ConnStateData set this to flag existing credentials?
+     // XXX: answer: the peer selection *should* catch it and give us only the pinned peer. so we reverse the =0 step below.
+     // XXX: also, logs will now lie if pinning is broken and leads to an error message.
+     if (serverDestinations[0]->peerType == PINNED) {
+         ConnStateData *pinned_connection = request->pinnedConnection();
+         debugs(17,7, "pinned peer connection: " << pinned_connection);
+         // pinned_connection may become nil after a pconn race
+         if (pinned_connection)
+             serverConn = pinned_connection->borrowPinnedConnection(request, serverDestinations[0]->getPeer());
+         else
+             serverConn = NULL;
+         if (Comm::IsConnOpen(serverConn)) {
+             pinned_connection->stopPinnedConnectionMonitoring();
+             flags.connected_okay = true;
+             ++n_tries;
+             request->flags.pinned = true;
+-            request->hier.note(serverConn, pinned_connection->pinning.host);
+             if (pinned_connection->pinnedAuth())
+                 request->flags.auth = true;
+             comm_add_close_handler(serverConn->fd, fwdServerClosedWrapper, this);
+ 
+-            /* Update server side TOS and Netfilter mark on the connection. */
+-            if (Ip::Qos::TheConfig.isAclTosActive()) {
+-                debugs(17, 3, HERE << "setting tos for pinned connection to " << (int)serverConn->tos );
+-                serverConn->tos = GetTosToServer(request);
+-                Ip::Qos::setSockTos(serverConn, serverConn->tos);
+-            }
+-#if SO_MARK
+-            if (Ip::Qos::TheConfig.isAclNfmarkActive()) {
+-                serverConn->nfmark = GetNfmarkToServer(request);
+-                Ip::Qos::setSockNfmark(serverConn, serverConn->nfmark);
+-            }
+-#endif
++            syncWithServerConn(pinned_connection->pinning.host);
+ 
+             // the server may close the pinned connection before this request
+             pconnRace = racePossible;
+             dispatch();
+             return;
+         }
+         // Pinned connection failure.
+         debugs(17,2,HERE << "Pinned connection failed: " << pinned_connection);
+         ErrorState *anErr = new ErrorState(ERR_ZERO_SIZE_OBJECT, Http::scServiceUnavailable, request);
+         fail(anErr);
+         self = NULL; // refcounted
+         return;
+     }
+ 
+     // Use pconn to avoid opening a new connection.
+     const char *host = NULL;
+     if (!serverDestinations[0]->getPeer())
+         host = request->url.host();
+ 
+     Comm::ConnectionPointer temp;
+     // Avoid pconns after races so that the same client does not suffer twice.
+     // This does not increase the total number of connections because we just
+     // closed the connection that failed the race. And re-pinning assumes this.
+     if (pconnRace != raceHappened)
+         temp = pconnPop(serverDestinations[0], host);
+ 
+     const bool openedPconn = Comm::IsConnOpen(temp);
+     pconnRace = openedPconn ? racePossible : raceImpossible;
+ 
+     // if we found an open persistent connection to use. use it.
+     if (openedPconn) {
+         serverConn = temp;
+         flags.connected_okay = true;
+         debugs(17, 3, HERE << "reusing pconn " << serverConnection());
+         ++n_tries;
+ 
+         comm_add_close_handler(serverConnection()->fd, fwdServerClosedWrapper, this);
+ 
+-        /* Update server side TOS and Netfilter mark on the connection. */
+-        if (Ip::Qos::TheConfig.isAclTosActive()) {
+-            const tos_t tos = GetTosToServer(request);
+-            Ip::Qos::setSockTos(temp, tos);
+-        }
+-#if SO_MARK
+-        if (Ip::Qos::TheConfig.isAclNfmarkActive()) {
+-            const nfmark_t nfmark = GetNfmarkToServer(request);
+-            Ip::Qos::setSockNfmark(temp, nfmark);
+-        }
+-#endif
++        syncWithServerConn(request->url.host());
+ 
+         dispatch();
+         return;
+     }
+ 
+     // We will try to open a new connection, possibly to the same destination.
+     // We reset serverDestinations[0] in case we are using it again because
+     // ConnOpener modifies its destination argument.
+     serverDestinations[0]->local.port(0);
+     serverConn = NULL;
+ 
+ #if URL_CHECKSUM_DEBUG
+     entry->mem_obj->checkUrlChecksum();
+ #endif
+ 
+     GetMarkingsToServer(request, *serverDestinations[0]);
+ 
+     calls.connector = commCbCall(17,3, "fwdConnectDoneWrapper", CommConnectCbPtrFun(fwdConnectDoneWrapper, this));
+     Comm::ConnOpener *cs = new Comm::ConnOpener(serverDestinations[0], calls.connector, timeLeft());
+     if (host)
+
+=== modified file 'src/FwdState.h'
+--- src/FwdState.h	2015-03-20 15:10:07 +0000
++++ src/FwdState.h	2015-10-21 02:55:42 +0000
+@@ -103,40 +103,42 @@ public:
+ 
+ private:
+     // hidden for safer management of self; use static fwdStart
+     FwdState(const Comm::ConnectionPointer &client, StoreEntry *, HttpRequest *, const AccessLogEntryPointer &alp);
+     void start(Pointer aSelf);
+ 
+ #if STRICT_ORIGINAL_DST
+     void selectPeerForIntercepted();
+ #endif
+     static void logReplyStatus(int tries, const Http::StatusCode status);
+     void doneWithRetries();
+     void completed();
+     void retryOrBail();
+     ErrorState *makeConnectingError(const err_type type) const;
+     void connectedToPeer(Security::EncryptorAnswer &answer);
+     static void RegisterWithCacheManager(void);
+ 
+     /// stops monitoring server connection for closure and updates pconn stats
+     void closeServerConnection(const char *reason);
+ 
++    void syncWithServerConn(const char *host);
++
+ public:
+     StoreEntry *entry;
+     HttpRequest *request;
+     AccessLogEntryPointer al; ///< info for the future access.log entry
+ 
+     static void abort(void*);
+ 
+ private:
+     Pointer self;
+     ErrorState *err;
+     Comm::ConnectionPointer clientConn;        ///< a possibly open connection to the client.
+     time_t start_t;
+     int n_tries;
+ 
+     // AsyncCalls which we set and may need cancelling.
+     struct {
+         AsyncCall::Pointer connector;  ///< a call linking us to the ConnOpener producing serverConn.
+     } calls;
+ 
+     struct {
+
+=== modified file 'src/comm/TcpAcceptor.cc'
+--- src/comm/TcpAcceptor.cc	2015-10-02 04:54:28 +0000
++++ src/comm/TcpAcceptor.cc	2015-10-21 02:45:35 +0000
+@@ -164,47 +164,45 @@ Comm::TcpAcceptor::setListen()
+         debugs(5, DBG_IMPORTANT, "Installing accept filter '" << Config.accept_filter << "' on " << conn);
+         xstrncpy(afa.af_name, Config.accept_filter, sizeof(afa.af_name));
+         if (setsockopt(conn->fd, SOL_SOCKET, SO_ACCEPTFILTER, &afa, sizeof(afa)) < 0)
+             debugs(5, DBG_CRITICAL, "WARNING: SO_ACCEPTFILTER '" << Config.accept_filter << "': '" << xstrerror());
+ #elif defined(TCP_DEFER_ACCEPT)
+         int seconds = 30;
+         if (strncmp(Config.accept_filter, "data=", 5) == 0)
+             seconds = atoi(Config.accept_filter + 5);
+         if (setsockopt(conn->fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &seconds, sizeof(seconds)) < 0)
+             debugs(5, DBG_CRITICAL, "WARNING: TCP_DEFER_ACCEPT '" << Config.accept_filter << "': '" << xstrerror());
+ #else
+         debugs(5, DBG_CRITICAL, "WARNING: accept_filter not supported on your OS");
+ #endif
+     }
+ 
+ #if 0
+     // Untested code.
+     // Set TOS if needed.
+     // To correctly implement TOS values on listening sockets, probably requires
+     // more work to inherit TOS values to created connection objects.
+-    if (conn->tos &&
+-            Ip::Qos::setSockTos(conn->fd, conn->tos, conn->remote.isIPv4() ? AF_INET : AF_INET6) < 0)
+-        conn->tos = 0;
++    if (conn->tos)
++            Ip::Qos::setSockTos(conn, conn->tos)
+ #if SO_MARK
+-    if (conn->nfmark &&
+-            Ip::Qos::setSockNfmark(conn->fd, conn->nfmark) < 0)
+-        conn->nfmark = 0;
++    if (conn->nfmark)
++            Ip::Qos::setSockNfmark(conn, conn->nfmark);
+ #endif
+ #endif
+ 
+     typedef CommCbMemFunT<Comm::TcpAcceptor, CommCloseCbParams> Dialer;
+     closer_ = JobCallback(5, 4, Dialer, this, Comm::TcpAcceptor::handleClosure);
+     comm_add_close_handler(conn->fd, closer_);
+ }
+ 
+ /// called when listening descriptor is closed by an external force
+ /// such as clientHttpConnectionsClose()
+ void
+ Comm::TcpAcceptor::handleClosure(const CommCloseCbParams &)
+ {
+     closer_ = NULL;
+     conn = NULL;
+     Must(done());
+ }
+ 
+ /**
+  * This private callback is called whenever a filedescriptor is ready
+
+=== modified file 'src/ip/Qos.cci'
+--- src/ip/Qos.cci	2015-01-13 07:25:36 +0000
++++ src/ip/Qos.cci	2015-10-21 03:00:51 +0000
+@@ -2,98 +2,98 @@
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* Inline QOS functions */
+ #include "comm/Connection.h"
+ #include "Debug.h"
+ 
+ int
+ Ip::Qos::setSockTos(const int fd, tos_t tos, int type)
+ {
+     // Bug 3731: FreeBSD produces 'invalid option'
+     // unless we pass it a 32-bit variable storing 8-bits of data.
+     // NP: it is documented as 'int' for all systems, even those like Linux which accept 8-bit char
+     //     so we convert to a int before setting.
+     int bTos = tos;
+ 
++    debugs(50, 3, "for FD " << fd << " to " << bTos);
++
+     if (type == AF_INET) {
+ #if defined(IP_TOS)
+         const int x = setsockopt(fd, IPPROTO_IP, IP_TOS, &bTos, sizeof(bTos));
+         if (x < 0)
+             debugs(50, 2, "Ip::Qos::setSockTos: setsockopt(IP_TOS) on " << fd << ": " << xstrerror());
+         return x;
+ #else
+         debugs(50, DBG_IMPORTANT, "WARNING: setsockopt(IP_TOS) not supported on this platform");
+         return -1;
+ #endif
+     } else { // type == AF_INET6
+ #if defined(IPV6_TCLASS)
+         const int x = setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &bTos, sizeof(bTos));
+         if (x < 0)
+             debugs(50, 2, "Ip::Qos::setSockTos: setsockopt(IPV6_TCLASS) on " << fd << ": " << xstrerror());
+         return x;
+ #else
+         debugs(50, DBG_IMPORTANT, "WARNING: setsockopt(IPV6_TCLASS) not supported on this platform");
+         return -1;
+ #endif
+     }
+ 
+     /* CANNOT REACH HERE */
+ }
+ 
+ int
+ Ip::Qos::setSockTos(const Comm::ConnectionPointer &conn, tos_t tos)
+ {
+     const int x = Ip::Qos::setSockTos(conn->fd, tos, conn->remote.isIPv4() ? AF_INET : AF_INET6);
+-    if (x >= 0)
+-        conn->tos = tos;
+-
++    conn->tos = (x >= 0) ? tos : 0;
+     return x;
+ }
+ 
+ int
+ Ip::Qos::setSockNfmark(const int fd, nfmark_t mark)
+ {
+ #if SO_MARK && USE_LIBCAP
++    debugs(50, 3, "for FD " << fd << " to " << mark);
+     const int x = setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(nfmark_t));
+     if (x < 0)
+         debugs(50, 2, "setSockNfmark: setsockopt(SO_MARK) on " << fd << ": " << xstrerror());
+     return x;
+ #elif USE_LIBCAP
+     debugs(50, DBG_IMPORTANT, "WARNING: setsockopt(SO_MARK) not supported on this platform");
+     return -1;
+ #else
+     debugs(50, DBG_IMPORTANT, "WARNING: Netfilter marking disabled (netfilter marking requires build with LIBCAP)");
+     return -1;
+ #endif
+ }
+ 
+ int
+ Ip::Qos::setSockNfmark(const Comm::ConnectionPointer &conn, nfmark_t mark)
+ {
+     const int x = Ip::Qos::setSockNfmark(conn->fd, mark);
+-    if (x >= 0)
+-        conn->nfmark = mark;
++    conn->nfmark = (x >= 0) ? mark : 0;
+     return x;
+ }
+ 
+ bool
+ Ip::Qos::Config::isHitTosActive() const
+ {
+     return (tosLocalHit || tosSiblingHit || tosParentHit || tosMiss || preserveMissTos);
+ }
+ 
+ bool
+ Ip::Qos::Config::isHitNfmarkActive() const
+ {
+     return (markLocalHit || markSiblingHit || markParentHit || markMiss || preserveMissMark);
+ }
+ 
+ bool
+ Ip::Qos::Config::isAclNfmarkActive() const
+ {
+     acl_nfmark * nfmarkAcls [] = { nfmarkToServer, nfmarkToClient };
+ 
+

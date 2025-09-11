@@ -1,0 +1,1727 @@
+=== modified file 'src/HttpHeader.cc'
+--- src/HttpHeader.cc	2017-03-23 12:55:36 +0000
++++ src/HttpHeader.cc	2017-04-23 19:40:31 +0000
+@@ -1,31 +1,32 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 55    HTTP Header */
+ 
+ #include "squid.h"
++#include "base/CharacterSet.h"
+ #include "base/EnumIterator.h"
+ #include "base64.h"
+ #include "globals.h"
+ #include "http/ContentLengthInterpreter.h"
+ #include "HttpHdrCc.h"
+ #include "HttpHdrContRange.h"
+ #include "HttpHdrScTarget.h" // also includes HttpHdrSc.h
+ #include "HttpHeader.h"
+ #include "HttpHeaderFieldInfo.h"
+ #include "HttpHeaderStat.h"
+ #include "HttpHeaderTools.h"
+ #include "MemBuf.h"
+ #include "mgr/Registration.h"
+ #include "mime_header.h"
+ #include "profiler/Profiler.h"
+ #include "rfc1123.h"
+ #include "sbuf/StringConvert.h"
+ #include "SquidConfig.h"
+ #include "StatHist.h"
+ #include "Store.h"
+@@ -231,43 +232,42 @@
+ HttpHeader::append(const HttpHeader * src)
+ {
+     assert(src);
+     assert(src != this);
+     debugs(55, 7, "appending hdr: " << this << " += " << src);
+ 
+     for (auto e : src->entries) {
+         if (e)
+             addEntry(e->clone());
+     }
+ }
+ 
+ /// check whether the fresh header has any new/changed updatable fields
+ bool
+ HttpHeader::needUpdate(HttpHeader const *fresh) const
+ {
+     for (const auto e: fresh->entries) {
+         if (!e || skipUpdateHeader(e->id))
+             continue;
+         String value;
+-        const char *name = e->name.termedBuf();
+-        if (!hasNamed(name, strlen(name), &value) ||
+-                (value != fresh->getByName(name)))
++        if (!hasNamed(e->name, &value) ||
++                (value != fresh->getByName(e->name)))
+             return true;
+     }
+     return false;
+ }
+ 
+ void
+ HttpHeader::updateWarnings()
+ {
+     int count = 0;
+     HttpHeaderPos pos = HttpHeaderInitPos;
+ 
+     // RFC 7234, section 4.3.4: delete 1xx warnings and retain 2xx warnings
+     while (HttpHeaderEntry *e = getEntry(&pos)) {
+         if (e->id == Http::HdrType::WARNING && (e->getInt()/100 == 1) )
+             delAt(pos, count);
+     }
+ }
+ 
+ bool
+ HttpHeader::skipUpdateHeader(const Http::HdrType id) const
+@@ -284,41 +284,41 @@
+ 
+     // Optimization: Finding whether a header field changed is expensive
+     // and probably not worth it except for collapsed revalidation needs.
+     if (Config.onoff.collapsed_forwarding && !needUpdate(fresh))
+         return false;
+ 
+     updateWarnings();
+ 
+     const HttpHeaderEntry *e;
+     HttpHeaderPos pos = HttpHeaderInitPos;
+ 
+     while ((e = fresh->getEntry(&pos))) {
+         /* deny bad guys (ok to check for Http::HdrType::OTHER) here */
+ 
+         if (skipUpdateHeader(e->id))
+             continue;
+ 
+         if (e->id != Http::HdrType::OTHER)
+             delById(e->id);
+         else
+-            delByName(e->name.termedBuf());
++            delByName(e->name);
+     }
+ 
+     pos = HttpHeaderInitPos;
+     while ((e = fresh->getEntry(&pos))) {
+         /* deny bad guys (ok to check for Http::HdrType::OTHER) here */
+ 
+         if (skipUpdateHeader(e->id))
+             continue;
+ 
+         debugs(55, 7, "Updating header '" << Http::HeaderLookupTable.lookup(e->id).name << "' in cached entry");
+ 
+         addEntry(e->clone());
+     }
+     return true;
+ }
+ 
+ bool
+ HttpHeader::Isolate(const char **parse_start, size_t l, const char **blk_start, const char **blk_end)
+ {
+     /*
+@@ -475,41 +475,43 @@
+ 
+             if (Config.onoff.relaxed_header_parser)
+                 continue;
+ 
+             PROF_stop(HttpHeaderParse);
+             clean();
+             return 0;
+         }
+ 
+         if (e->id == Http::HdrType::CONTENT_LENGTH && !clen.checkField(e->value)) {
+             delete e;
+ 
+             if (Config.onoff.relaxed_header_parser)
+                 continue; // clen has printed any necessary warnings
+ 
+             PROF_stop(HttpHeaderParse);
+             clean();
+             return 0;
+         }
+ 
+-        if (e->id == Http::HdrType::OTHER && stringHasWhitespace(e->name.termedBuf())) {
++        // TODO: this is probably incorrect, for now it should match w_space
++        static CharacterSet wsp = (CharacterSet::WSP + CharacterSet::CR + CharacterSet::LF);
++        if (e->id == Http::HdrType::OTHER && e->name.findFirstOf(wsp) != SBuf::npos) {
+             debugs(55, warnOnError, "WARNING: found whitespace in HTTP header name {" <<
+                    getStringPrefix(field_start, field_end-field_start) << "}");
+ 
+             if (!Config.onoff.relaxed_header_parser) {
+                 delete e;
+                 PROF_stop(HttpHeaderParse);
+                 clean();
+                 return 0;
+             }
+         }
+ 
+         addEntry(e);
+     }
+ 
+     if (clen.headerWideProblem) {
+         debugs(55, warnOnError, "WARNING: " << clen.headerWideProblem <<
+                " Content-Length field values in" <<
+                Raw("header", header_start, hdrLen));
+     }
+ 
+@@ -551,41 +553,41 @@
+             e->packInto(p);
+             continue;
+         }
+ 
+         bool maskThisEntry = false;
+         switch (e->id) {
+         case Http::HdrType::AUTHORIZATION:
+         case Http::HdrType::PROXY_AUTHORIZATION:
+             maskThisEntry = true;
+             break;
+ 
+         case Http::HdrType::FTP_ARGUMENTS:
+             if (const HttpHeaderEntry *cmd = findEntry(Http::HdrType::FTP_COMMAND))
+                 maskThisEntry = (cmd->value == "PASS");
+             break;
+ 
+         default:
+             break;
+         }
+         if (maskThisEntry) {
+-            p->append(e->name.rawBuf(), e->name.size());
++            p->append(e->name.rawContent(), e->name.length());
+             p->append(": ** NOT DISPLAYED **\r\n", 23);
+         } else {
+             e->packInto(p);
+         }
+ 
+     }
+     /* Pack in the "special" entries */
+ 
+     /* Cache-Control */
+ }
+ 
+ /* returns next valid entry */
+ HttpHeaderEntry *
+ HttpHeader::getEntry(HttpHeaderPos * pos) const
+ {
+     assert(pos);
+     assert(*pos >= HttpHeaderInitPos && *pos < static_cast<ssize_t>(entries.size()));
+ 
+     for (++(*pos); *pos < static_cast<ssize_t>(entries.size()); ++(*pos)) {
+         if (entries[*pos])
+@@ -628,53 +630,49 @@
+ HttpHeaderEntry *
+ HttpHeader::findLastEntry(Http::HdrType id) const
+ {
+     assert(any_registered_header(id));
+     assert(!Http::HeaderLookupTable.lookup(id).list);
+ 
+     /* check mask first */
+     if (!CBIT_TEST(mask, id))
+         return NULL;
+ 
+     for (auto e = entries.rbegin(); e != entries.rend(); ++e) {
+         if (*e && (*e)->id == id)
+             return *e;
+     }
+ 
+     /* hm.. we thought it was there, but it was not found */
+     assert(false);
+     return nullptr; /* not reached */
+ }
+ 
+-/*
+- * deletes all fields with a given name if any, returns #fields deleted;
+- */
+ int
+-HttpHeader::delByName(const char *name)
++HttpHeader::delByName(const SBuf &name)
+ {
+     int count = 0;
+     HttpHeaderPos pos = HttpHeaderInitPos;
+-    HttpHeaderEntry *e;
+     httpHeaderMaskInit(&mask, 0);   /* temporal inconsistency */
+     debugs(55, 9, "deleting '" << name << "' fields in hdr " << this);
+ 
+-    while ((e = getEntry(&pos))) {
++    while (const HttpHeaderEntry *e = getEntry(&pos)) {
+         if (!e->name.caseCmp(name))
+             delAt(pos, count);
+         else
+             CBIT_SET(mask, e->id);
+     }
+ 
+     return count;
+ }
+ 
+ /* deletes all entries with a given id, returns the #entries deleted */
+ int
+ HttpHeader::delById(Http::HdrType id)
+ {
+     debugs(55, 8, this << " del-by-id " << id);
+     assert(any_registered_header(id));
+ 
+     if (!CBIT_TEST(mask, id))
+         return 0;
+ 
+     int count = 0;
+@@ -687,119 +685,119 @@
+ 
+     CBIT_CLR(mask, id);
+     assert(count);
+     return count;
+ }
+ 
+ /*
+  * deletes an entry at pos and leaves a gap; leaving a gap makes it
+  * possible to iterate(search) and delete fields at the same time
+  * NOTE: Does not update the header mask. Caller must follow up with
+  * a call to refreshMask() if headers_deleted was incremented.
+  */
+ void
+ HttpHeader::delAt(HttpHeaderPos pos, int &headers_deleted)
+ {
+     HttpHeaderEntry *e;
+     assert(pos >= HttpHeaderInitPos && pos < static_cast<ssize_t>(entries.size()));
+     e = static_cast<HttpHeaderEntry*>(entries[pos]);
+     entries[pos] = NULL;
+     /* decrement header length, allow for ": " and crlf */
+-    len -= e->name.size() + 2 + e->value.size() + 2;
++    len -= e->name.length() + 2 + e->value.size() + 2;
+     assert(len >= 0);
+     delete e;
+     ++headers_deleted;
+ }
+ 
+ /*
+  * Compacts the header storage
+  */
+ void
+ HttpHeader::compact()
+ {
+     // TODO: optimize removal, or possibly make it so that's not needed.
+     entries.erase( std::remove(entries.begin(), entries.end(), nullptr),
+                    entries.end());
+ }
+ 
+ /*
+  * Refreshes the header mask. Required after delAt() calls.
+  */
+ void
+ HttpHeader::refreshMask()
+ {
+     httpHeaderMaskInit(&mask, 0);
+     debugs(55, 7, "refreshing the mask in hdr " << this);
+     for (auto e : entries) {
+         if (e)
+             CBIT_SET(mask, e->id);
+     }
+ }
+ 
+ /* appends an entry;
+  * does not call e->clone() so one should not reuse "*e"
+  */
+ void
+ HttpHeader::addEntry(HttpHeaderEntry * e)
+ {
+     assert(e);
+     assert(any_HdrType_enum_value(e->id));
+-    assert(e->name.size());
++    assert(e->name.length());
+ 
+     debugs(55, 7, this << " adding entry: " << e->id << " at " << entries.size());
+ 
+     if (e->id != Http::HdrType::BAD_HDR) {
+         if (CBIT_TEST(mask, e->id)) {
+             ++ headerStatsTable[e->id].repCount;
+         } else {
+             CBIT_SET(mask, e->id);
+         }
+     }
+ 
+     entries.push_back(e);
+ 
+     /* increment header length, allow for ": " and crlf */
+-    len += e->name.size() + 2 + e->value.size() + 2;
++    len += e->name.length() + 2 + e->value.size() + 2;
+ }
+ 
+ /* inserts an entry;
+  * does not call e->clone() so one should not reuse "*e"
+  */
+ void
+ HttpHeader::insertEntry(HttpHeaderEntry * e)
+ {
+     assert(e);
+     assert(any_valid_header(e->id));
+ 
+     debugs(55, 7, this << " adding entry: " << e->id << " at " << entries.size());
+ 
+     // Http::HdrType::BAD_HDR is filtered out by assert_any_valid_header
+     if (CBIT_TEST(mask, e->id)) {
+         ++ headerStatsTable[e->id].repCount;
+     } else {
+         CBIT_SET(mask, e->id);
+     }
+ 
+     entries.insert(entries.begin(),e);
+ 
+     /* increment header length, allow for ": " and crlf */
+-    len += e->name.size() + 2 + e->value.size() + 2;
++    len += e->name.length() + 2 + e->value.size() + 2;
+ }
+ 
+ bool
+ HttpHeader::getList(Http::HdrType id, String *s) const
+ {
+     debugs(55, 9, this << " joining for id " << id);
+     /* only fields from ListHeaders array can be "listed" */
+     assert(Http::HeaderLookupTable.lookup(id).list);
+ 
+     if (!CBIT_TEST(mask, id))
+         return false;
+ 
+     for (auto e: entries) {
+         if (e && e->id == id)
+             strListAdd(s, e->value.termedBuf(), ',');
+     }
+ 
+     /*
+      * note: we might get an empty (size==0) string if there was an "empty"
+      * header. This results in an empty length String, which may have a NULL
+@@ -894,60 +892,60 @@
+ 
+ bool
+ HttpHeader::hasNamed(const SBuf &s, String *result) const
+ {
+     return hasNamed(s.rawContent(), s.length(), result);
+ }
+ 
+ bool
+ HttpHeader::getByIdIfPresent(Http::HdrType id, String *result) const
+ {
+     if (id == Http::HdrType::BAD_HDR)
+         return false;
+     if (!has(id))
+         return false;
+     if (result)
+         *result = getStrOrList(id);
+     return true;
+ }
+ 
+ bool
+-HttpHeader::hasNamed(const char *name, int namelen, String *result) const
++HttpHeader::hasNamed(const char *name, unsigned int namelen, String *result) const
+ {
+     Http::HdrType id;
+     HttpHeaderPos pos = HttpHeaderInitPos;
+     HttpHeaderEntry *e;
+ 
+     assert(name);
+ 
+     /* First try the quick path */
+     id = Http::HeaderLookupTable.lookup(name,namelen).id;
+ 
+     if (id != Http::HdrType::BAD_HDR) {
+         if (getByIdIfPresent(id, result))
+             return true;
+     }
+ 
+     /* Sorry, an unknown header name. Do linear search */
+     bool found = false;
+     while ((e = getEntry(&pos))) {
+-        if (e->id == Http::HdrType::OTHER && e->name.size() == static_cast<String::size_type>(namelen) && e->name.caseCmp(name, namelen) == 0) {
++        if (e->id == Http::HdrType::OTHER && e->name.length() == namelen && e->name.caseCmp(name, namelen) == 0) {
+             found = true;
+             if (!result)
+                 break;
+             strListAdd(result, e->value.termedBuf(), ',');
+         }
+     }
+ 
+     return found;
+ }
+ 
+ /*
+  * Returns a the value of the specified list member, if any.
+  */
+ String
+ HttpHeader::getByNameListMember(const char *name, const char *member, const char separator) const
+ {
+     String header;
+     const char *pos = NULL;
+     const char *item;
+     int ilen;
+@@ -1021,156 +1019,156 @@
+             buf.appendf("%s/", AnyP::ProtocolType_str[ver.protocol]);
+         buf.appendf("%d.%d %s", ver.major, ver.minor, ThisCache);
+         const HttpHeader *hdr = from ? from : this;
+         SBuf strVia = StringToSBuf(hdr->getList(Http::HdrType::VIA));
+         if (!strVia.isEmpty())
+             strVia.append(", ", 2);
+         strVia.append(buf);
+         // XXX: putStr() still suffers from String size limits
+         Must(strVia.length() < String::SizeMaxXXX());
+         delById(Http::HdrType::VIA);
+         putStr(Http::HdrType::VIA, strVia.c_str());
+     }
+ }
+ 
+ void
+ HttpHeader::putInt(Http::HdrType id, int number)
+ {
+     assert(any_registered_header(id));
+     assert(Http::HeaderLookupTable.lookup(id).type == Http::HdrFieldType::ftInt);  /* must be of an appropriate type */
+     assert(number >= 0);
+-    addEntry(new HttpHeaderEntry(id, NULL, xitoa(number)));
++    addEntry(new HttpHeaderEntry(id, SBuf(), xitoa(number)));
+ }
+ 
+ void
+ HttpHeader::putInt64(Http::HdrType id, int64_t number)
+ {
+     assert(any_registered_header(id));
+     assert(Http::HeaderLookupTable.lookup(id).type == Http::HdrFieldType::ftInt64);    /* must be of an appropriate type */
+     assert(number >= 0);
+-    addEntry(new HttpHeaderEntry(id, NULL, xint64toa(number)));
++    addEntry(new HttpHeaderEntry(id, SBuf(), xint64toa(number)));
+ }
+ 
+ void
+ HttpHeader::putTime(Http::HdrType id, time_t htime)
+ {
+     assert(any_registered_header(id));
+     assert(Http::HeaderLookupTable.lookup(id).type == Http::HdrFieldType::ftDate_1123);    /* must be of an appropriate type */
+     assert(htime >= 0);
+-    addEntry(new HttpHeaderEntry(id, NULL, mkrfc1123(htime)));
++    addEntry(new HttpHeaderEntry(id, SBuf(), mkrfc1123(htime)));
+ }
+ 
+ void
+ HttpHeader::putStr(Http::HdrType id, const char *str)
+ {
+     assert(any_registered_header(id));
+     assert(Http::HeaderLookupTable.lookup(id).type == Http::HdrFieldType::ftStr);  /* must be of an appropriate type */
+     assert(str);
+-    addEntry(new HttpHeaderEntry(id, NULL, str));
++    addEntry(new HttpHeaderEntry(id, SBuf(), str));
+ }
+ 
+ void
+ HttpHeader::putAuth(const char *auth_scheme, const char *realm)
+ {
+     assert(auth_scheme && realm);
+     httpHeaderPutStrf(this, Http::HdrType::WWW_AUTHENTICATE, "%s realm=\"%s\"", auth_scheme, realm);
+ }
+ 
+ void
+ HttpHeader::putCc(const HttpHdrCc * cc)
+ {
+     assert(cc);
+     /* remove old directives if any */
+     delById(Http::HdrType::CACHE_CONTROL);
+     /* pack into mb */
+     MemBuf mb;
+     mb.init();
+     cc->packInto(&mb);
+     /* put */
+-    addEntry(new HttpHeaderEntry(Http::HdrType::CACHE_CONTROL, NULL, mb.buf));
++    addEntry(new HttpHeaderEntry(Http::HdrType::CACHE_CONTROL, SBuf(), mb.buf));
+     /* cleanup */
+     mb.clean();
+ }
+ 
+ void
+ HttpHeader::putContRange(const HttpHdrContRange * cr)
+ {
+     assert(cr);
+     /* remove old directives if any */
+     delById(Http::HdrType::CONTENT_RANGE);
+     /* pack into mb */
+     MemBuf mb;
+     mb.init();
+     httpHdrContRangePackInto(cr, &mb);
+     /* put */
+-    addEntry(new HttpHeaderEntry(Http::HdrType::CONTENT_RANGE, NULL, mb.buf));
++    addEntry(new HttpHeaderEntry(Http::HdrType::CONTENT_RANGE, SBuf(), mb.buf));
+     /* cleanup */
+     mb.clean();
+ }
+ 
+ void
+ HttpHeader::putRange(const HttpHdrRange * range)
+ {
+     assert(range);
+     /* remove old directives if any */
+     delById(Http::HdrType::RANGE);
+     /* pack into mb */
+     MemBuf mb;
+     mb.init();
+     range->packInto(&mb);
+     /* put */
+-    addEntry(new HttpHeaderEntry(Http::HdrType::RANGE, NULL, mb.buf));
++    addEntry(new HttpHeaderEntry(Http::HdrType::RANGE, SBuf(), mb.buf));
+     /* cleanup */
+     mb.clean();
+ }
+ 
+ void
+ HttpHeader::putSc(HttpHdrSc *sc)
+ {
+     assert(sc);
+     /* remove old directives if any */
+     delById(Http::HdrType::SURROGATE_CONTROL);
+     /* pack into mb */
+     MemBuf mb;
+     mb.init();
+     sc->packInto(&mb);
+     /* put */
+-    addEntry(new HttpHeaderEntry(Http::HdrType::SURROGATE_CONTROL, NULL, mb.buf));
++    addEntry(new HttpHeaderEntry(Http::HdrType::SURROGATE_CONTROL, SBuf(), mb.buf));
+     /* cleanup */
+     mb.clean();
+ }
+ 
+ void
+ HttpHeader::putWarning(const int code, const char *const text)
+ {
+     char buf[512];
+     snprintf(buf, sizeof(buf), "%i %s \"%s\"", code, visible_appname_string, text);
+     putStr(Http::HdrType::WARNING, buf);
+ }
+ 
+ /* add extension header (these fields are not parsed/analyzed/joined, etc.) */
+ void
+ HttpHeader::putExt(const char *name, const char *value)
+ {
+     assert(name && value);
+     debugs(55, 8, this << " adds ext entry " << name << " : " << value);
+-    addEntry(new HttpHeaderEntry(Http::HdrType::OTHER, name, value));
++    addEntry(new HttpHeaderEntry(Http::HdrType::OTHER, SBuf(name), value));
+ }
+ 
+ int
+ HttpHeader::getInt(Http::HdrType id) const
+ {
+     assert(any_registered_header(id));
+     assert(Http::HeaderLookupTable.lookup(id).type == Http::HdrFieldType::ftInt);  /* must be of an appropriate type */
+     HttpHeaderEntry *e;
+ 
+     if ((e = findEntry(id)))
+         return e->getInt();
+ 
+     return -1;
+ }
+ 
+ int64_t
+ HttpHeader::getInt64(Http::HdrType id) const
+ {
+     assert(any_registered_header(id));
+     assert(Http::HeaderLookupTable.lookup(id).type == Http::HdrFieldType::ftInt64);    /* must be of an appropriate type */
+@@ -1380,41 +1378,41 @@
+ 
+         if (etagParseInit(&tot.tag, str)) {
+             tot.valid = tot.tag.str != NULL;
+             tot.time = -1;
+         } else {
+             /* or maybe it is time? */
+             tot.time = parse_rfc1123(str);
+             tot.valid = tot.time >= 0;
+             tot.tag.str = NULL;
+         }
+     }
+ 
+     assert(tot.time < 0 || !tot.tag.str);   /* paranoid */
+     return tot;
+ }
+ 
+ /*
+  * HttpHeaderEntry
+  */
+ 
+-HttpHeaderEntry::HttpHeaderEntry(Http::HdrType anId, const char *aName, const char *aValue)
++HttpHeaderEntry::HttpHeaderEntry(Http::HdrType anId, const SBuf &aName, const char *aValue)
+ {
+     assert(any_HdrType_enum_value(anId));
+     id = anId;
+ 
+     if (id != Http::HdrType::OTHER)
+         name = Http::HeaderLookupTable.lookup(id).name;
+     else
+         name = aName;
+ 
+     value = aValue;
+ 
+     if (id != Http::HdrType::BAD_HDR)
+         ++ headerStatsTable[id].aliveCount;
+ 
+     debugs(55, 9, "created HttpHeaderEntry " << this << ": '" << name << " : " << value );
+ }
+ 
+ HttpHeaderEntry::~HttpHeaderEntry()
+ {
+     debugs(55, 9, "destroying entry " << this << ": '" << name << ": " << value << "'");
+@@ -1452,92 +1450,88 @@
+ 
+     if (Config.onoff.relaxed_header_parser && xisspace(field_start[name_len - 1])) {
+         debugs(55, Config.onoff.relaxed_header_parser <= 0 ? 1 : 2,
+                "NOTICE: Whitespace after header name in '" << getStringPrefix(field_start, field_end-field_start) << "'");
+ 
+         while (name_len > 0 && xisspace(field_start[name_len - 1]))
+             --name_len;
+ 
+         if (!name_len)
+             return NULL;
+     }
+ 
+     /* now we know we can parse it */
+ 
+     debugs(55, 9, "parsing HttpHeaderEntry: near '" <<  getStringPrefix(field_start, field_end-field_start) << "'");
+ 
+     /* is it a "known" field? */
+     Http::HdrType id = Http::HeaderLookupTable.lookup(field_start,name_len).id;
+     debugs(55, 9, "got hdr-id=" << id);
+ 
+-    String name;
++    SBuf theName;
+ 
+     String value;
+ 
+     if (id == Http::HdrType::BAD_HDR)
+         id = Http::HdrType::OTHER;
+ 
+     /* set field name */
+     if (id == Http::HdrType::OTHER)
+-        name.limitInit(field_start, name_len);
++        theName.append(field_start, name_len);
+     else
+-        name = Http::HeaderLookupTable.lookup(id).name;
++        theName = Http::HeaderLookupTable.lookup(id).name;
+ 
+     /* trim field value */
+     while (value_start < field_end && xisspace(*value_start))
+         ++value_start;
+ 
+     while (value_start < field_end && xisspace(field_end[-1]))
+         --field_end;
+ 
+     if (field_end - value_start > 65534) {
+         /* String must be LESS THAN 64K and it adds a terminating NULL */
+-        debugs(55, DBG_IMPORTANT, "WARNING: ignoring '" << name << "' header of " << (field_end - value_start) << " bytes");
+-
+-        if (id == Http::HdrType::OTHER)
+-            name.clean();
+-
++        debugs(55, DBG_IMPORTANT, "WARNING: ignoring '" << theName << "' header of " << (field_end - value_start) << " bytes");
+         return NULL;
+     }
+ 
+     /* set field value */
+     value.limitInit(value_start, field_end - value_start);
+ 
+     if (id != Http::HdrType::BAD_HDR)
+         ++ headerStatsTable[id].seenCount;
+ 
+-    debugs(55, 9, "parsed HttpHeaderEntry: '" << name << ": " << value << "'");
++    debugs(55, 9, "parsed HttpHeaderEntry: '" << theName << ": " << value << "'");
+ 
+-    return new HttpHeaderEntry(id, name.termedBuf(), value.termedBuf());
++    return new HttpHeaderEntry(id, theName, value.termedBuf());
+ }
+ 
+ HttpHeaderEntry *
+ HttpHeaderEntry::clone() const
+ {
+-    return new HttpHeaderEntry(id, name.termedBuf(), value.termedBuf());
++    return new HttpHeaderEntry(id, name, value.termedBuf());
+ }
+ 
+ void
+ HttpHeaderEntry::packInto(Packable * p) const
+ {
+     assert(p);
+-    p->append(name.rawBuf(), name.size());
++    p->append(name.rawContent(), name.length());
+     p->append(": ", 2);
+     p->append(value.rawBuf(), value.size());
+     p->append("\r\n", 2);
+ }
+ 
+ int
+ HttpHeaderEntry::getInt() const
+ {
+     int val = -1;
+     int ok = httpHeaderParseInt(value.termedBuf(), &val);
+     httpHeaderNoteParsedEntry(id, value, ok == 0);
+     /* XXX: Should we check ok - ie
+      * return ok ? -1 : value;
+      */
+     return val;
+ }
+ 
+ int64_t
+ HttpHeaderEntry::getInt64() const
+ {
+@@ -1734,28 +1728,28 @@
+ HttpHeader::removeConnectionHeaderEntries()
+ {
+     if (has(Http::HdrType::CONNECTION)) {
+         /* anything that matches Connection list member will be deleted */
+         String strConnection;
+ 
+         (void) getList(Http::HdrType::CONNECTION, &strConnection);
+         const HttpHeaderEntry *e;
+         HttpHeaderPos pos = HttpHeaderInitPos;
+         /*
+          * think: on-average-best nesting of the two loops (hdrEntry
+          * and strListItem) @?@
+          */
+         /*
+          * maybe we should delete standard stuff ("keep-alive","close")
+          * from strConnection first?
+          */
+ 
+         int headers_deleted = 0;
+         while ((e = getEntry(&pos))) {
+-            if (strListIsMember(&strConnection, e->name.termedBuf(), ','))
++            if (strListIsMember(&strConnection, e->name, ','))
+                 delAt(pos, headers_deleted);
+         }
+         if (headers_deleted)
+             refreshMask();
+     }
+ }
+ 
+
+=== modified file 'src/HttpHeader.h'
+--- src/HttpHeader.h	2017-03-23 12:55:36 +0000
++++ src/HttpHeader.h	2017-04-22 18:28:11 +0000
+@@ -35,101 +35,106 @@
+ #endif
+     hoRequest,
+     hoReply,
+ #if USE_OPENSSL
+     hoErrorDetail,
+ #endif
+     hoEnd
+ } http_hdr_owner_type;
+ 
+ /** Iteration for headers; use HttpHeaderPos as opaque type, do not interpret */
+ typedef ssize_t HttpHeaderPos;
+ 
+ /* use this and only this to initialize HttpHeaderPos */
+ #define HttpHeaderInitPos (-1)
+ 
+ class HttpHeaderEntry
+ {
+     MEMPROXY_CLASS(HttpHeaderEntry);
+ 
+ public:
+-    HttpHeaderEntry(Http::HdrType id, const char *name, const char *value);
++    HttpHeaderEntry(Http::HdrType id, const SBuf &name, const char *value);
+     ~HttpHeaderEntry();
+     static HttpHeaderEntry *parse(const char *field_start, const char *field_end);
+     HttpHeaderEntry *clone() const;
+     void packInto(Packable *p) const;
+     int getInt() const;
+     int64_t getInt64() const;
+ 
+     Http::HdrType id;
+-    String name;
++    SBuf name;
+     String value;
+ };
+ 
+ class ETag;
+ class TimeOrTag;
+ 
+ class HttpHeader
+ {
+ 
+ public:
+     HttpHeader();
+     explicit HttpHeader(const http_hdr_owner_type owner);
+     HttpHeader(const HttpHeader &other);
+     ~HttpHeader();
+ 
+     HttpHeader &operator =(const HttpHeader &other);
+ 
+     /* Interface functions */
+     void clean();
+     void append(const HttpHeader * src);
+     bool update(HttpHeader const *fresh);
+     void compact();
+     int parse(const char *header_start, size_t len);
+     /// Parses headers stored in a buffer.
+     /// \returns 1 and sets hdr_sz on success
+     /// \returns 0 when needs more data
+     /// \returns -1 on error
+     int parse(const char *buf, size_t buf_len, bool atEnd, size_t &hdr_sz);
+     void packInto(Packable * p, bool mask_sensitive_info=false) const;
+     HttpHeaderEntry *getEntry(HttpHeaderPos * pos) const;
+     HttpHeaderEntry *findEntry(Http::HdrType id) const;
+-    int delByName(const char *name);
++    /// deletes all fields with a given name, if any.
++    /// \return #fields deleted
++    int delByName(const SBuf &name);
++    /// \deprecated use SBuf method instead. performance regression: reallocates
++    int delByName(const char *name) { return delByName(SBuf(name)); }
+     int delById(Http::HdrType id);
+     void delAt(HttpHeaderPos pos, int &headers_deleted);
+     void refreshMask();
+     void addEntry(HttpHeaderEntry * e);
+     void insertEntry(HttpHeaderEntry * e);
+     String getList(Http::HdrType id) const;
+     bool getList(Http::HdrType id, String *s) const;
+     bool conflictingContentLength() const { return conflictingContentLength_; }
+     String getStrOrList(Http::HdrType id) const;
+     String getByName(const SBuf &name) const;
+     String getByName(const char *name) const;
+     String getById(Http::HdrType id) const;
+     /// returns true iff a [possibly empty] field identified by id is there
+     /// when returning true, also sets the `result` parameter (if it is not nil)
+     bool getByIdIfPresent(Http::HdrType id, String *result) const;
+     /// returns true iff a [possibly empty] named field is there
+     /// when returning true, also sets the `value` parameter (if it is not nil)
+     bool hasNamed(const SBuf &s, String *value = 0) const;
+-    bool hasNamed(const char *name, int namelen, String *value = 0) const;
++    /// \deprecated use SBuf method instead.
++    bool hasNamed(const char *name, unsigned int namelen, String *value = 0) const;
+     String getByNameListMember(const char *name, const char *member, const char separator) const;
+     String getListMember(Http::HdrType id, const char *member, const char separator) const;
+     int has(Http::HdrType id) const;
+     /// Appends "this cache" information to VIA header field.
+     /// Takes the initial VIA value from "from" parameter, if provided.
+     void addVia(const AnyP::ProtocolVersion &ver, const HttpHeader *from = 0);
+     void putInt(Http::HdrType id, int number);
+     void putInt64(Http::HdrType id, int64_t number);
+     void putTime(Http::HdrType id, time_t htime);
+     void putStr(Http::HdrType id, const char *str);
+     void putAuth(const char *auth_scheme, const char *realm);
+     void putCc(const HttpHdrCc * cc);
+     void putContRange(const HttpHdrContRange * cr);
+     void putRange(const HttpHdrRange * range);
+     void putSc(HttpHdrSc *sc);
+     void putWarning(const int code, const char *const text); ///< add a Warning header
+     void putExt(const char *name, const char *value);
+     int getInt(Http::HdrType id) const;
+     int64_t getInt64(Http::HdrType id) const;
+     time_t getTime(Http::HdrType id) const;
+
+=== modified file 'src/HttpHeaderTools.cc'
+--- src/HttpHeaderTools.cc	2017-01-01 00:12:22 +0000
++++ src/HttpHeaderTools.cc	2017-04-22 19:30:24 +0000
+@@ -70,41 +70,41 @@
+     mb.clean();
+ }
+ 
+ /** wrapper arrounf PutContRange */
+ void
+ httpHeaderAddContRange(HttpHeader * hdr, HttpHdrRangeSpec spec, int64_t ent_len)
+ {
+     HttpHdrContRange *cr = httpHdrContRangeCreate();
+     assert(hdr && ent_len >= 0);
+     httpHdrContRangeSet(cr, spec, ent_len);
+     hdr->putContRange(cr);
+     delete cr;
+ }
+ 
+ /**
+  * \return true if a given directive is found in the Connection header field-value.
+  *
+  * \note if no Connection header exists we may check the Proxy-Connection header
+  */
+ bool
+-httpHeaderHasConnDir(const HttpHeader * hdr, const char *directive)
++httpHeaderHasConnDir(const HttpHeader * hdr, const SBuf &directive)
+ {
+     String list;
+ 
+     /* what type of header do we have? */
+     if (hdr->getList(Http::HdrType::CONNECTION, &list))
+         return strListIsMember(&list, directive, ',') != 0;
+ 
+ #if USE_HTTP_VIOLATIONS
+     if (hdr->getList(Http::HdrType::PROXY_CONNECTION, &list))
+         return strListIsMember(&list, directive, ',') != 0;
+ #endif
+ 
+     // else, no connection header for it to exist in
+     return false;
+ }
+ 
+ /** handy to printf prefixes of potentially very long buffers */
+ const char *
+ getStringPrefix(const char *str, size_t sz)
+ {
+@@ -439,65 +439,65 @@
+     // for backword compatibility, we allow replacements to be configured
+     // for headers w/o access rules, but such replacements are ignored
+     headerMangler *m = track(name);
+ 
+     safe_free(m->replacement); // overwrite old value if any
+     m->replacement = xstrdup(value);
+ }
+ 
+ const headerMangler *
+ HeaderManglers::find(const HttpHeaderEntry &e) const
+ {
+     // a known header with a configured ACL list
+     if (e.id != Http::HdrType::OTHER && Http::any_HdrType_enum_value(e.id) &&
+             known[e.id].access_list)
+         return &known[e.id];
+ 
+     // a custom header
+     if (e.id == Http::HdrType::OTHER) {
+         // does it have an ACL list configured?
+         // Optimize: use a name type that we do not need to convert to here
+-        const ManglersByName::const_iterator i = custom.find(e.name.termedBuf());
++        SBuf tmp(e.name); // XXX: performance regression. c_str() reallocates
++        const ManglersByName::const_iterator i = custom.find(tmp.c_str());
+         if (i != custom.end())
+             return &i->second;
+     }
+ 
+     // Next-to-last resort: "Other" rules match any custom header
+     if (e.id == Http::HdrType::OTHER && known[Http::HdrType::OTHER].access_list)
+         return &known[Http::HdrType::OTHER];
+ 
+     // Last resort: "All" rules match any header
+     if (all.access_list)
+         return &all;
+ 
+     return NULL;
+ }
+ 
+ void
+ httpHdrAdd(HttpHeader *heads, HttpRequest *request, const AccessLogEntryPointer &al, HeaderWithAclList &headersAdd)
+ {
+     ACLFilledChecklist checklist(NULL, request, NULL);
+ 
+     for (HeaderWithAclList::const_iterator hwa = headersAdd.begin(); hwa != headersAdd.end(); ++hwa) {
+         if (!hwa->aclList || checklist.fastCheck(hwa->aclList) == ACCESS_ALLOWED) {
+             const char *fieldValue = NULL;
+             MemBuf mb;
+             if (hwa->quoted) {
+                 if (al != NULL) {
+                     mb.init();
+                     hwa->valueFormat->assemble(mb, al, 0);
+                     fieldValue = mb.content();
+                 }
+             } else {
+                 fieldValue = hwa->fieldValue.c_str();
+             }
+ 
+             if (!fieldValue || fieldValue[0] == '\0')
+                 fieldValue = "-";
+ 
+-            HttpHeaderEntry *e = new HttpHeaderEntry(hwa->fieldId, hwa->fieldName.c_str(),
+-                    fieldValue);
++            HttpHeaderEntry *e = new HttpHeaderEntry(hwa->fieldId, SBuf(hwa->fieldName), fieldValue);
+             heads->addEntry(e);
+         }
+     }
+ }
+ 
+
+=== modified file 'src/HttpHeaderTools.h'
+--- src/HttpHeaderTools.h	2017-01-01 00:12:22 +0000
++++ src/HttpHeaderTools.h	2017-04-22 18:03:08 +0000
+@@ -1,48 +1,48 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_HTTPHEADERTOOLS_H
+ #define SQUID_HTTPHEADERTOOLS_H
+ 
+ #include "acl/forward.h"
+ #include "format/Format.h"
+ #include "HttpHeader.h"
++#include "sbuf/forward.h"
+ 
+ #include <functional>
+ #include <list>
+ #include <map>
+ #include <string>
+ #if HAVE_STRINGS_H
+ #include <strings.h>
+ #endif
+ 
+ class HeaderWithAcl;
+ class HttpHeader;
+ class HttpRequest;
+ class StoreEntry;
+-class String;
+ 
+ typedef std::list<HeaderWithAcl> HeaderWithAclList;
+ 
+ /* Distinguish between Request and Reply (for header mangling) */
+ typedef enum {
+     ROR_REQUEST,
+     ROR_REPLY
+ } req_or_rep_t;
+ 
+ // Currently a POD
+ class headerMangler
+ {
+ public:
+     acl_access *access_list;
+     char *replacement;
+ };
+ 
+ /// A collection of headerMangler objects for a given message kind.
+ class HeaderManglers
+ {
+@@ -108,30 +108,30 @@
+     ACLList *aclList;
+ 
+     /// compiled HTTP header field value (no macros)
+     Format::Format *valueFormat;
+ 
+     /// internal ID for "known" headers or HDR_OTHER
+     Http::HdrType fieldId;
+ 
+     /// whether fieldValue may contain macros
+     bool quoted;
+ };
+ 
+ /// A strtoll(10) wrapper that checks for strtoll() failures and other problems.
+ /// XXX: This function is not fully compatible with some HTTP syntax rules.
+ /// Just like strtoll(), allows whitespace prefix, a sign, and _any_ suffix.
+ /// Requires at least one digit to be present.
+ /// Sets "off" and "end" arguments if and only if no problems were found.
+ /// \return true if and only if no problems were found.
+ bool httpHeaderParseOffset(const char *start, int64_t *offPtr, char **endPtr = nullptr);
+ 
+-bool httpHeaderHasConnDir(const HttpHeader * hdr, const char *directive);
++bool httpHeaderHasConnDir(const HttpHeader * hdr, const SBuf &directive);
+ int httpHeaderParseInt(const char *start, int *val);
+ void httpHeaderPutStrf(HttpHeader * hdr, Http::HdrType id, const char *fmt,...) PRINTF_FORMAT_ARG3;
+ 
+ const char *getStringPrefix(const char *str, size_t len);
+ 
+ void httpHdrMangleList(HttpHeader *, HttpRequest *, const AccessLogEntryPointer &al, req_or_rep_t req_or_rep);
+ 
+ #endif
+ 
+
+=== modified file 'src/HttpReply.cc'
+--- src/HttpReply.cc	2017-02-20 04:56:00 +0000
++++ src/HttpReply.cc	2017-04-22 18:27:42 +0000
+@@ -557,41 +557,41 @@
+ HttpReply::inheritProperties(const Http::Message *aMsg)
+ {
+     const HttpReply *aRep = dynamic_cast<const HttpReply*>(aMsg);
+     if (!aRep)
+         return false;
+     keep_alive = aRep->keep_alive;
+     sources = aRep->sources;
+     return true;
+ }
+ 
+ void HttpReply::removeStaleWarnings()
+ {
+     String warning;
+     if (header.getList(Http::HdrType::WARNING, &warning)) {
+         const String newWarning = removeStaleWarningValues(warning);
+         if (warning.size() && warning.size() == newWarning.size())
+             return; // some warnings are there and none changed
+         header.delById(Http::HdrType::WARNING);
+         if (newWarning.size()) { // some warnings left
+             HttpHeaderEntry *const e =
+-                new HttpHeaderEntry(Http::HdrType::WARNING, NULL, newWarning.termedBuf());
++                new HttpHeaderEntry(Http::HdrType::WARNING, SBuf(), newWarning.termedBuf());
+             header.addEntry(e);
+         }
+     }
+ }
+ 
+ /**
+  * Remove warning-values with warn-date different from Date value from
+  * a single header entry. Returns a string with all valid warning-values.
+  */
+ String HttpReply::removeStaleWarningValues(const String &value)
+ {
+     String newValue;
+     const char *item = 0;
+     int len = 0;
+     const char *pos = 0;
+     while (strListGetItem(&value, ',', &item, &len, &pos)) {
+         bool keep = true;
+         // Does warning-value have warn-date (which contains quoted date)?
+         // We scan backwards, looking for two quoted strings.
+         // warning-value = warn-code SP warn-agent SP warn-text [SP warn-date]
+
+=== modified file 'src/StrList.cc'
+--- src/StrList.cc	2017-01-01 00:12:22 +0000
++++ src/StrList.cc	2017-04-22 19:33:11 +0000
+@@ -1,66 +1,66 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 66    HTTP Header Tools */
+ 
+ #include "squid.h"
+ #include "base/TextException.h"
++#include "sbuf/SBuf.h"
+ #include "SquidString.h"
+ #include "StrList.h"
+ 
+ /** appends an item to the list */
+ void
+ strListAdd(String * str, const char *item, char del)
+ {
+     assert(str && item);
+     const auto itemSize = strlen(item);
+     if (str->size()) {
+         char buf[3];
+         buf[0] = del;
+         buf[1] = ' ';
+         buf[2] = '\0';
+         Must(str->canGrowBy(2));
+         str->append(buf, 2);
+     }
+     Must(str->canGrowBy(itemSize));
+     str->append(item, itemSize);
+ }
+ 
+ /** returns true iff "m" is a member of the list */
+ int
+-strListIsMember(const String * list, const char *m, char del)
++strListIsMember(const String * list, const SBuf &m, char del)
+ {
+     const char *pos = NULL;
+     const char *item;
+     int ilen = 0;
+-    int mlen;
+ 
+-    assert(list && m);
+-    mlen = strlen(m);
++    assert(list);
++    int mlen = m.plength();
+     while (strListGetItem(list, del, &item, &ilen, &pos)) {
+-        if (mlen == ilen && !strncasecmp(item, m, ilen))
++        if (mlen == ilen && m.caseCmp(item, ilen) == 0)
+             return 1;
+     }
+     return 0;
+ }
+ 
+ /** returns true iff "s" is a substring of a member of the list */
+ int
+ strListIsSubstr(const String * list, const char *s, char del)
+ {
+     assert(list && del);
+     return (list->find(s) != String::npos);
+ 
+     /** \note
+      * Note: the original code with a loop is broken because it uses strstr()
+      * instead of strnstr(). If 's' contains a 'del', strListIsSubstr() may
+      * return true when it should not. If 's' does not contain a 'del', the
+      * implementaion is equavalent to strstr()! Thus, we replace the loop with
+      * strstr() above until strnstr() is available.
+      */
+ }
+
+=== modified file 'src/StrList.h'
+--- src/StrList.h	2017-01-01 00:12:22 +0000
++++ src/StrList.h	2017-04-22 18:10:21 +0000
+@@ -1,22 +1,24 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 66    HTTP Header Tools */
+ 
+ #ifndef SQUID_STRLIST_H_
+ #define SQUID_STRLIST_H_
+ 
++#include "sbuf/forward.h"
++
+ class String;
+ 
+ void strListAdd(String * str, const char *item, char del);
+-int strListIsMember(const String * str, const char *item, char del);
++int strListIsMember(const String * str, const SBuf &item, char del);
+ int strListIsSubstr(const String * list, const char *s, char del);
+ int strListGetItem(const String * str, char del, const char **item, int *ilen, const char **pos);
+ 
+ #endif /* SQUID_STRLIST_H_ */
+ 
+
+=== modified file 'src/adaptation/ecap/MessageRep.cc'
+--- src/adaptation/ecap/MessageRep.cc	2017-02-16 11:51:56 +0000
++++ src/adaptation/ecap/MessageRep.cc	2017-04-22 18:27:27 +0000
+@@ -36,41 +36,41 @@
+     return squidId == Http::HdrType::OTHER ?
+            theHeader.hasNamed(name.image().c_str(), name.image().size()) :
+            static_cast<bool>(theHeader.has(squidId));
+ }
+ 
+ Adaptation::Ecap::HeaderRep::Value
+ Adaptation::Ecap::HeaderRep::value(const Name &name) const
+ {
+     const Http::HdrType squidId = TranslateHeaderId(name);
+     const String value = squidId == Http::HdrType::OTHER ?
+                          theHeader.getByName(name.image().c_str()) :
+                          theHeader.getStrOrList(squidId);
+     return value.size() > 0 ?
+            Value::FromTempString(value.termedBuf()) : Value();
+ }
+ 
+ void
+ Adaptation::Ecap::HeaderRep::add(const Name &name, const Value &value)
+ {
+     const Http::HdrType squidId = TranslateHeaderId(name); // Http::HdrType::OTHER OK
+-    HttpHeaderEntry *e = new HttpHeaderEntry(squidId, name.image().c_str(),
++    HttpHeaderEntry *e = new HttpHeaderEntry(squidId, name.image(),
+             value.toString().c_str());
+     theHeader.addEntry(e);
+ 
+     if (squidId == Http::HdrType::CONTENT_LENGTH)
+         theMessage.content_length = theHeader.getInt64(Http::HdrType::CONTENT_LENGTH);
+ }
+ 
+ void
+ Adaptation::Ecap::HeaderRep::removeAny(const Name &name)
+ {
+     const Http::HdrType squidId = TranslateHeaderId(name);
+     if (squidId == Http::HdrType::OTHER)
+         theHeader.delByName(name.image().c_str());
+     else
+         theHeader.delById(squidId);
+ 
+     if (squidId == Http::HdrType::CONTENT_LENGTH)
+         theMessage.content_length = theHeader.getInt64(Http::HdrType::CONTENT_LENGTH);
+ }
+ 
+
+=== modified file 'src/adaptation/icap/ModXact.cc'
+--- src/adaptation/icap/ModXact.cc	2017-02-23 10:02:10 +0000
++++ src/adaptation/icap/ModXact.cc	2017-04-22 18:04:19 +0000
+@@ -780,41 +780,42 @@
+         // of 206 responses too, where we do not want to update Http::Message::sources
+         // flag. However even for 206 responses the state.sending is
+         // not set yet to sendingVirgin. This is done in later step
+         // after the parseBody method called.
+         updateSources();
+     }
+ }
+ 
+ void Adaptation::Icap::ModXact::parseIcapHead()
+ {
+     Must(state.sending == State::sendingUndecided);
+ 
+     if (!parseHead(icapReply.getRaw()))
+         return;
+ 
+     if (expectIcapTrailers()) {
+         Must(!trailerParser);
+         trailerParser = new TrailerParser;
+     }
+ 
+-    if (httpHeaderHasConnDir(&icapReply->header, "close")) {
++    static SBuf close("close", 5);
++    if (httpHeaderHasConnDir(&icapReply->header, close)) {
+         debugs(93, 5, HERE << "found connection close");
+         reuseConnection = false;
+     }
+ 
+     switch (icapReply->sline.status()) {
+ 
+     case Http::scContinue:
+         handle100Continue();
+         break;
+ 
+     case Http::scOkay:
+     case Http::scCreated: // Symantec Scan Engine 5.0 and later when modifying HTTP msg
+ 
+         if (!validate200Ok()) {
+             throw TexcHere("Invalid ICAP Response");
+         } else {
+             handle200Ok();
+         }
+ 
+         break;
+
+=== modified file 'src/adaptation/icap/OptXact.cc'
+--- src/adaptation/icap/OptXact.cc	2017-02-16 11:51:56 +0000
++++ src/adaptation/icap/OptXact.cc	2017-04-22 18:35:46 +0000
+@@ -94,41 +94,42 @@
+         setOutcome(xoOpt);
+         sendAnswer(Answer::Forward(icapReply.getRaw()));
+         Must(done()); // there should be nothing else to do
+         return;
+     }
+ 
+     scheduleRead();
+ }
+ 
+ bool Adaptation::Icap::OptXact::parseResponse()
+ {
+     debugs(93, 5, "have " << readBuf.length() << " bytes to parse" << status());
+     debugs(93, DBG_DATA, "\n" << readBuf);
+ 
+     HttpReply::Pointer r(new HttpReply);
+     r->protoPrefix = "ICAP/"; // TODO: make an IcapReply class?
+ 
+     if (!parseHttpMsg(r.getRaw())) // throws on errors
+         return false;
+ 
+-    if (httpHeaderHasConnDir(&r->header, "close"))
++    static SBuf close("close", 5);
++    if (httpHeaderHasConnDir(&r->header, close))
+         reuseConnection = false;
+ 
+     icapReply = r;
+     return true;
+ }
+ 
+ void Adaptation::Icap::OptXact::swanSong()
+ {
+     Adaptation::Icap::Xaction::swanSong();
+ }
+ 
+ void Adaptation::Icap::OptXact::finalizeLogInfo()
+ {
+     //    al.cache.caddr = 0;
+     al.icap.reqMethod = Adaptation::methodOptions;
+ 
+     if (icapReply != NULL && al.icap.bytesRead > icapReply->hdr_sz)
+         al.icap.bodyBytesRead = al.icap.bytesRead - icapReply->hdr_sz;
+ 
+     Adaptation::Icap::Xaction::finalizeLogInfo();
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2017-03-03 12:12:01 +0000
++++ src/format/Format.cc	2017-04-22 14:23:10 +0000
+@@ -730,71 +730,71 @@
+         case LFT_ICAP_REQ_HEADER:
+             if (al->icap.request) {
+                 sb = StringToSBuf(al->icap.request->header.getByName(fmt->data.header.header));
+                 out = sb.c_str();
+                 quote = 1;
+             }
+             break;
+ 
+         case LFT_ICAP_REQ_HEADER_ELEM:
+             if (al->icap.request) {
+                 sb = StringToSBuf(al->icap.request->header.getByNameListMember(fmt->data.header.header, fmt->data.header.element, fmt->data.header.separator));
+                 out = sb.c_str();
+                 quote = 1;
+             }
+             break;
+ 
+         case LFT_ICAP_REQ_ALL_HEADERS:
+             if (al->icap.request) {
+                 HttpHeaderPos pos = HttpHeaderInitPos;
+                 while (const HttpHeaderEntry *e = al->icap.request->header.getEntry(&pos)) {
+-                    sb.append(StringToSBuf(e->name));
++                    sb.append(e->name);
+                     sb.append(": ");
+                     sb.append(StringToSBuf(e->value));
+                     sb.append("\r\n");
+                 }
+                 out = sb.c_str();
+                 quote = 1;
+             }
+             break;
+ 
+         case LFT_ICAP_REP_HEADER:
+             if (al->icap.reply) {
+                 sb = StringToSBuf(al->icap.reply->header.getByName(fmt->data.header.header));
+                 out = sb.c_str();
+                 quote = 1;
+             }
+             break;
+ 
+         case LFT_ICAP_REP_HEADER_ELEM:
+             if (al->icap.reply) {
+                 sb = StringToSBuf(al->icap.reply->header.getByNameListMember(fmt->data.header.header, fmt->data.header.element, fmt->data.header.separator));
+                 out = sb.c_str();
+                 quote = 1;
+             }
+             break;
+ 
+         case LFT_ICAP_REP_ALL_HEADERS:
+             if (al->icap.reply) {
+                 HttpHeaderPos pos = HttpHeaderInitPos;
+                 while (const HttpHeaderEntry *e = al->icap.reply->header.getEntry(&pos)) {
+-                    sb.append(StringToSBuf(e->name));
++                    sb.append(e->name);
+                     sb.append(": ");
+                     sb.append(StringToSBuf(e->value));
+                     sb.append("\r\n");
+                 }
+                 out = sb.c_str();
+                 quote = 1;
+             }
+             break;
+ 
+         case LFT_ICAP_TR_RESPONSE_TIME:
+             outtv = al->icap.trTime;
+             doMsec = 1;
+             break;
+ 
+         case LFT_ICAP_IO_TIME:
+             outtv = al->icap.ioTime;
+             doMsec = 1;
+             break;
+ 
+         case LFT_ICAP_STATUS_CODE:
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2017-04-02 12:06:21 +0000
++++ src/http.cc	2017-04-22 18:27:20 +0000
+@@ -1024,41 +1024,42 @@
+                 EBIT_SET(entry->flags, ENTRY_REVALIDATE_ALWAYS);
+         }
+ #endif
+     }
+ 
+ #if HEADERS_LOG
+     headersLog(1, 0, request->method, rep);
+ 
+ #endif
+ 
+     ctx_exit(ctx);
+ }
+ 
+ HttpStateData::ConnectionStatus
+ HttpStateData::statusIfComplete() const
+ {
+     const HttpReply *rep = virginReply();
+     /** \par
+      * If the reply wants to close the connection, it takes precedence */
+ 
+-    if (httpHeaderHasConnDir(&rep->header, "close"))
++    static SBuf close("close", 5);
++    if (httpHeaderHasConnDir(&rep->header, close))
+         return COMPLETE_NONPERSISTENT_MSG;
+ 
+     /** \par
+      * If we didn't send a keep-alive request header, then this
+      * can not be a persistent connection.
+      */
+     if (!flags.keepalive)
+         return COMPLETE_NONPERSISTENT_MSG;
+ 
+     /** \par
+      * If we haven't sent the whole request then this can not be a persistent
+      * connection.
+      */
+     if (!flags.request_sent) {
+         debugs(11, 2, "Request not yet fully sent " << request->method << ' ' << entry->url());
+         return COMPLETE_NONPERSISTENT_MSG;
+     }
+ 
+     /** \par
+      * What does the reply have to say about keep-alive?
+@@ -1756,41 +1757,41 @@
+                                       const AccessLogEntryPointer &al,
+                                       HttpHeader * hdr_out,
+                                       const Http::StateFlags &flags)
+ {
+     /* building buffer for complex strings */
+ #define BBUF_SZ (MAX_URL+32)
+     LOCAL_ARRAY(char, bbuf, BBUF_SZ);
+     LOCAL_ARRAY(char, ntoabuf, MAX_IPSTRLEN);
+     const HttpHeader *hdr_in = &request->header;
+     const HttpHeaderEntry *e = NULL;
+     HttpHeaderPos pos = HttpHeaderInitPos;
+     assert (hdr_out->owner == hoRequest);
+ 
+     /* use our IMS header if the cached entry has Last-Modified time */
+     if (request->lastmod > -1)
+         hdr_out->putTime(Http::HdrType::IF_MODIFIED_SINCE, request->lastmod);
+ 
+     // Add our own If-None-Match field if the cached entry has a strong ETag.
+     // copyOneHeaderFromClientsideRequestToUpstreamRequest() adds client ones.
+     if (request->etag.size() > 0) {
+-        hdr_out->addEntry(new HttpHeaderEntry(Http::HdrType::IF_NONE_MATCH, NULL,
++        hdr_out->addEntry(new HttpHeaderEntry(Http::HdrType::IF_NONE_MATCH, SBuf(),
+                                               request->etag.termedBuf()));
+     }
+ 
+     bool we_do_ranges = decideIfWeDoRanges (request);
+ 
+     String strConnection (hdr_in->getList(Http::HdrType::CONNECTION));
+ 
+     while ((e = hdr_in->getEntry(&pos)))
+         copyOneHeaderFromClientsideRequestToUpstreamRequest(e, strConnection, request, hdr_out, we_do_ranges, flags);
+ 
+     /* Abstraction break: We should interpret multipart/byterange responses
+      * into offset-length data, and this works around our inability to do so.
+      */
+     if (!we_do_ranges && request->multipartRangeRequest()) {
+         /* don't cache the result */
+         request->flags.cachable = false;
+         /* pretend it's not a range request */
+         request->ignoreRange("want to request the whole object");
+         request->flags.isRanged = false;
+     }
+@@ -2082,42 +2083,41 @@
+     case Http::HdrType::X_FORWARDED_FOR:
+ 
+     case Http::HdrType::CACHE_CONTROL:
+         /** \par X-Forwarded-For:, Cache-Control:
+          * handled specially by Squid, so leave off for now.
+          * append these after the loop if needed */
+         break;
+ 
+     case Http::HdrType::FRONT_END_HTTPS:
+         /** \par Front-End-Https:
+          * Pass thru only if peer is configured with front-end-https */
+         if (!flags.front_end_https)
+             hdr_out->addEntry(e->clone());
+ 
+         break;
+ 
+     default:
+         /** \par default.
+          * pass on all other header fields
+          * which are NOT listed by the special Connection: header. */
+-
+-        if (strConnection.size()>0 && strListIsMember(&strConnection, e->name.termedBuf(), ',')) {
++        if (strConnection.size()>0 && strListIsMember(&strConnection, e->name, ',')) {
+             debugs(11, 2, "'" << e->name << "' header cropped by Connection: definition");
+             return;
+         }
+ 
+         hdr_out->addEntry(e->clone());
+     }
+ }
+ 
+ bool
+ HttpStateData::decideIfWeDoRanges (HttpRequest * request)
+ {
+     bool result = true;
+     /* decide if we want to do Ranges ourselves
+      * and fetch the whole object now)
+      * We want to handle Ranges ourselves iff
+      *    - we can actually parse client Range specs
+      *    - the specs are expected to be simple enough (e.g. no out-of-order ranges)
+      *    - reply will be cachable
+      * (If the reply will be uncachable we have to throw it away after
+      *  serving this request, so it is better to forward ranges to
+
+=== modified file 'src/http/Message.cc'
+--- src/http/Message.cc	2017-02-20 04:56:00 +0000
++++ src/http/Message.cc	2017-04-22 18:05:16 +0000
+@@ -244,44 +244,46 @@
+     reset();
+     return -1;
+ }
+ 
+ void
+ Http::Message::setContentLength(int64_t clen)
+ {
+     header.delById(Http::HdrType::CONTENT_LENGTH); // if any
+     header.putInt64(Http::HdrType::CONTENT_LENGTH, clen);
+     content_length = clen;
+ }
+ 
+ bool
+ Http::Message::persistent() const
+ {
+     if (http_ver > Http::ProtocolVersion(1,0)) {
+         /*
+          * for modern versions of HTTP: persistent unless there is
+          * a "Connection: close" header.
+          */
+-        return !httpHeaderHasConnDir(&header, "close");
++        static SBuf close("close", 5);
++        return !httpHeaderHasConnDir(&header, close);
+     } else {
+         /* for old versions of HTTP: persistent if has "keep-alive" */
+-        return httpHeaderHasConnDir(&header, "keep-alive");
++        static SBuf keepAlive("keep-alive", 10);
++        return httpHeaderHasConnDir(&header, keepAlive);
+     }
+ }
+ 
+ void
+ Http::Message::packInto(Packable *p, bool full_uri) const
+ {
+     packFirstLineInto(p, full_uri);
+     header.packInto(p);
+     p->append("\r\n", 2);
+ }
+ 
+ void
+ Http::Message::hdrCacheInit()
+ {
+     content_length = header.getInt64(Http::HdrType::CONTENT_LENGTH);
+     assert(NULL == cache_control);
+     cache_control = header.getCc();
+ }
+ 
+ /// useful for debugging
+
+=== modified file 'src/store.cc'
+--- src/store.cc	2017-03-03 22:15:10 +0000
++++ src/store.cc	2017-04-22 19:35:07 +0000
+@@ -1987,42 +1987,44 @@
+ {
+     const String reqETags = request.header.getList(Http::HdrType::IF_MATCH);
+     return hasOneOfEtags(reqETags, false);
+ }
+ 
+ bool
+ StoreEntry::hasIfNoneMatchEtag(const HttpRequest &request) const
+ {
+     const String reqETags = request.header.getList(Http::HdrType::IF_NONE_MATCH);
+     // weak comparison is allowed only for HEAD or full-body GET requests
+     const bool allowWeakMatch = !request.flags.isRanged &&
+                                 (request.method == Http::METHOD_GET || request.method == Http::METHOD_HEAD);
+     return hasOneOfEtags(reqETags, allowWeakMatch);
+ }
+ 
+ /// whether at least one of the request ETags matches entity ETag
+ bool
+ StoreEntry::hasOneOfEtags(const String &reqETags, const bool allowWeakMatch) const
+ {
+     const ETag repETag = getReply()->header.getETag(Http::HdrType::ETAG);
+-    if (!repETag.str)
+-        return strListIsMember(&reqETags, "*", ',');
++    if (!repETag.str) {
++        static SBuf asterisk("*", 1);
++        return strListIsMember(&reqETags, asterisk, ',');
++    }
+ 
+     bool matched = false;
+     const char *pos = NULL;
+     const char *item;
+     int ilen;
+     while (!matched && strListGetItem(&reqETags, ',', &item, &ilen, &pos)) {
+         if (!strncmp(item, "*", ilen))
+             matched = true;
+         else {
+             String str;
+             str.append(item, ilen);
+             ETag reqETag;
+             if (etagParseInit(&reqETag, str.termedBuf())) {
+                 matched = allowWeakMatch ? etagIsWeakEqual(repETag, reqETag) :
+                           etagIsStrongEqual(repETag, reqETag);
+             }
+         }
+     }
+     return matched;
+ }
+

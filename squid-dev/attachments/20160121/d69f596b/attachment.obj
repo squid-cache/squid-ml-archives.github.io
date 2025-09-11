@@ -1,0 +1,126 @@
+From b4a48fac30990cf5a0bfbbf050a4a594369e0a30 Mon Sep 17 00:00:00 2001
+From: Markus Mayer <code@mmayer.net>
+Date: Thu, 21 Jan 2016 18:56:10 -0800
+Subject: [PATCH] Fix Ipc::Mem::Segment::create() for OS X
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+OS X does not allow ftruncate() to be called on an existing shared
+memory segment. ftruncate() only succeeds on a newly created segment
+and cannot be called a second time. Repeated calls to ftruncate() will
+purposefully return EINVAL. Unfortunately, ftruncate() will also return
+EINVAL for several other errors, so applications can't really tell what
+caused the error or react specifically to this condition.
+
+Here is a brief explanation of what is happening: ftruncate() calls
+pshm_truncate() in the Darwin kernel. There, it checks if the
+PSHM_ALLOCATED flag is already set on the region. (It checks for other
+flags, too, but PSHM_ALLOCATED is what matters here.) If the flag is
+set, it returns EINVAL, and the call fails.
+
+pshm_truncate() is also the only place in the kernel that sets
+PSHM_ALLOCATED. It is the last step of a successfull call to
+pshm_truncate().
+
+Combined, these two steps ensure that pshm_truncate() -- and by
+extension ftruncate() -- will succeed no more than once for a shared
+memory region.
+
+From
+http://www.opensource.apple.com/source/xnu/xnu-3248.20.55/bsd/kern/posix_shm.c
+
+int
+pshm_truncate(__unused proc_t p, struct fileproc *fp, __unused int fd,
+              off_t length, __unused int32_t *retval)
+{
+[...]
+
+    if ((pinfo->pshm_flags & (PSHM_DEFINED|PSHM_ALLOCATING|PSHM_ALLOCATED)) 
+                    != PSHM_DEFINED) {
+            PSHM_SUBSYS_UNLOCK();
+            return(EINVAL);
+    }
+
+[...]
+
+    pinfo->pshm_flags |= PSHM_ALLOCATED;
+    pinfo->pshm_flags &= ~(PSHM_ALLOCATING);
+    pinfo->pshm_length = total_size;
+    PSHM_SUBSYS_UNLOCK();
+    return(0);
+
+[...]
+
+The workaround for Squid was discussed on the mailing. See list
+archives at
+http://lists.squid-cache.org/pipermail/squid-dev/2016-January/004833.html
+
+Using a new helper method named createExclusive(), Squid now calls
+shm_create() with the O_EXCL flag. This will cause the creation of the
+shared memory region to fail if it already exists. The code then checks
+specifically for the EEXIST error. If detected, it will remove the
+shared memory region before retrying to create it. Thus ensuring that
+the shared memory region is always newly created, calling ftruncate()
+will succeed even on OS X.
+
+Signed-off-by: Markus Mayer <code@mmayer.net>
+---
+ src/ipc/mem/Segment.cc | 22 +++++++++++++++++++---
+ src/ipc/mem/Segment.h  |  1 +
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/src/ipc/mem/Segment.cc b/src/ipc/mem/Segment.cc
+index 524cec1..11f6da1 100644
+--- a/src/ipc/mem/Segment.cc
++++ b/src/ipc/mem/Segment.cc
+@@ -82,15 +82,31 @@ Ipc::Mem::Segment::Enabled()
+     return true;
+ }
+ 
++bool
++Ipc::Mem::Segment::createExclusive()
++{
++    theFD = shm_open(theName.termedBuf(),
++                     O_EXCL | O_CREAT | O_RDWR,
++                     S_IRUSR | S_IWUSR);
++    return theFD >= 0;
++}
++
+ void
+ Ipc::Mem::Segment::create(const off_t aSize)
+ {
+     assert(aSize > 0);
+     assert(theFD < 0);
+ 
+-    // OS X does not allow using O_TRUNC here.
+-    theFD = shm_open(theName.termedBuf(), O_CREAT | O_RDWR,
+-                     S_IRUSR | S_IWUSR);
++    // OS X does not allow using O_TRUNC with shm_open. Also, OS X permits
++    // ftruncate() to be called only once on a shared memory area. The call
++    // will fail if the shared memory area was previously truncated. To
++    // prevent this error, we delete and re-create the area if it existed
++    // previously (i.e. from an unclean shutdown) and wasn't newly created.
++    if (!createExclusive() && errno == EEXIST) {
++        unlink();
++        createExclusive();
++    }
++
+     if (theFD < 0) {
+         debugs(54, 5, HERE << "shm_open " << theName << ": " << xstrerror());
+         fatalf("Ipc::Mem::Segment::create failed to shm_open(%s): %s\n",
+diff --git a/src/ipc/mem/Segment.h b/src/ipc/mem/Segment.h
+index 14e0cd5..57256cb 100644
+--- a/src/ipc/mem/Segment.h
++++ b/src/ipc/mem/Segment.h
+@@ -54,6 +54,7 @@ private:
+ 
+ #if HAVE_SHM
+ 
++    bool createExclusive();
+     void attach();
+     void detach();
+     void unlink(); ///< unlink the segment
+-- 
+2.6.3
+

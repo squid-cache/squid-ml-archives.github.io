@@ -1,0 +1,616 @@
+#!/usr/bin/perl
+
+use strict;
+use IO::Socket::INET;
+use POSIX qw(EAGAIN);
+use Event;
+use HTTP::Request;
+use HTTP::Response;
+use Data::Dumper;
+use HTML::Entities;
+use Template;
+use URI::QueryParam;
+
+my @request_filters;
+my @response_filters;
+my $denied = {};
+my $grey_id = 0;
+
+my $docroot = '/home/jleu/personal/icap-filter/html';
+my $request_root = '/home/jleu/personal/icap-filter/request-filters';
+my $content_root = '/home/jleu/personal/icap-filter/content-filters';
+
+opendir(LIST, $request_root) || die "$!\n";
+while (my $file = readdir(LIST)) {
+    my $count = 0;
+    next if ($file =~ m/^\./);
+    open(DATA, "<$request_root/$file") || die "$!\n";
+
+    my $current;
+    while (my $line = <DATA>) {
+	if ($line =~ m/\s*#/) {
+	    #comment
+	} elsif ($line =~ m/^\s*$/) {
+	    #blank
+	} elsif ($line =~ m/^PATTERN=(.*)/) {
+	    $count++;
+	    $current = {
+		pattern => $1,
+		name => "$file-$count",
+	    };
+	} elsif ($line =~ m/ACTION=(.*)/) {
+	    $current->{action} = $1;
+	    push(@request_filters, $current);
+	    $current = undef;
+	} else {
+	}
+    }
+}
+
+my $total = $#request_filters;
+$total++;
+print "Loaded $total Filters\n";
+
+my $debug = 0;
+my $port = 1344;
+my $address = '0.0.0.0';
+my $client_count = 0;
+my $current_client = {};
+
+my $icap = IO::Socket::INET->new(
+    LocalAddr => $address,
+    LocalPort => $port,
+    Proto => 'tcp',
+    Listen => 100,
+    ReuseAddr => 1,
+    Blocking => 0,
+);
+
+my $icap_io = Event->io(
+    fd => $icap,
+    cb => \&icap_accept,
+    poll => 'r',
+);
+
+my $http = IO::Socket::INET->new(
+    LocalAddr => $address,
+    LocalPort => 8080,
+    Proto => 'tcp',
+    Listen => 100,
+    ReuseAddr => 1,
+    Blocking => 0,
+);
+
+my $http_io = Event->io(
+    fd => $http,
+    cb => \&http_accept,
+    poll => 'r',
+);
+
+Event::loop();
+
+sub icap_accept {
+    my $e = shift;
+    my $w = $e->w();
+    my $fd = $w->fd();
+
+    while (my $client = $fd->accept()) {
+        $client->blocking(0);
+        my $n = $client_count++;
+        my $client_data = {
+            type => 'icap_read',
+            conn => $n,
+            client => $client,
+            bytes => 0,
+            buffer => '',
+            offset => 0,
+	    filter => '^\s*(OPTIONS|REQMOD|RESPMOD)',
+	    handler => \&icap_handler,
+        };
+        $current_client->{$n} = $client_data;
+        my $io = Event->io(
+            fd => $client,
+            cb => \&message_read,
+            data => $client_data,
+            poll => 'r',
+        );
+        #printf "icap_accept(%d)\n", $n;
+    }
+
+    $w->again();
+}
+
+sub http_accept {
+    my $e = shift;
+    my $w = $e->w();
+    my $fd = $w->fd();
+
+    while (my $client = $fd->accept()) {
+        $client->blocking(0);
+        my $n = $client_count++;
+        my $client_data = {
+            type => 'http_read',
+            conn => $n,
+            client => $client,
+            bytes => 0,
+            buffer => '',
+            offset => 0,
+	    filter => '^\s*(GET|POST)',
+	    handler => \&http_handler,
+        };
+        $current_client->{$n} = $client_data;
+        my $io = Event->io(
+            fd => $client,
+            cb => \&message_read,
+            data => $client_data,
+            poll => 'r',
+        );
+        #printf "http_accept(%d)\n", $n;
+    }
+
+    $w->again();
+}
+
+sub message_read {
+    my $e = shift;
+    my $w = $e->w();
+    my $client_data = $w->data();
+    my $handler = $client_data->{handler};
+    my $filter = $client_data->{filter};
+
+    #printf("message_read(%d) enter\n", $client_data->{conn});
+
+    my ($buffer, $eof) = _read($client_data->{client});
+    $client_data->{bytes} += length($buffer);
+
+    $client_data->{buffer} .= $buffer;
+    $client_data->{offset} += length($buffer);
+    if ($eof) {
+        $w->cancel();
+        $client_data->{client}->close();
+        #printf("message_read(%d) close\n", $client_data->{conn});
+        delete($current_client->{$client_data->{conn}});
+    } else {
+        $w->again();
+    }
+
+    my $done = 0;
+    while (!$done) {
+        if ($client_data->{buffer} =~ m/^(.*?\015?\012\015?\012)(.*)/s) {
+            my $str = $1;
+            $client_data->{buffer} = $2;
+            $client_data->{offset} = length($client_data->{buffer});
+	    next if ($str !~ m/$filter/i);
+
+	    my $r = HTTP::Request->parse($str);
+	    my $break = &{$handler}($client_data, $r);
+	    if ($break) {
+		print "message_read break\n";
+		return;
+	    }
+        } else {
+            $done = 1;
+        }
+	$w->cancel();
+	$client_data->{client}->close();
+    }
+
+    #printf("message_read(%d):%d exit\n", $client_data->{conn}, $client_data->{bytes});
+}
+
+sub icap_handler {
+    my $client_data = shift;
+    my $r = shift;
+    my $request;
+    my $subject;
+    my $result = 100;
+    # 403 filters have denied access
+    # 202 filters have allowed access
+    # 100 no filters have affected access
+
+    my $method = $r->method();
+    if ($r->method() eq 'OPTIONS') {
+	print "ICAP REQUEST: ".$r->as_string()."\n";
+	my $response = HTTP::Response->new(200);
+	$response->protocol('ICAP/1.0');
+	$response->header( Connect => "close" );
+	$response->header( Server => "jleu::icap/0.1" );
+	$response->header( ISTag => '5BDEEEA9-12E4-2' );
+	if ($r->uri->as_string =~ m/request/) {
+	    $response->header( Methods => 'REQMOD');
+	} elsif ($r->uri->as_string =~ m/response/) {
+	    $response->header( Methods => 'RESPMOD');
+	} else {
+	    $response = HTTP::Response->new(501);
+	}
+	print "ICAP RESPONSE ".$response->as_string."\n";
+	$client_data->{client}->syswrite($response->as_string);
+    } elsif ($method eq 'REQMOD') {
+	print "ICAP REQUEST: ".$r->as_string()."\n";
+	my $foo = decap($r, $client_data->{buffer});
+	my $changed = 0;
+	my $tmp;
+	my @chkList;
+	my $client_ip = $r->header('X-Client-IP');
+	$client_data->{buffer} = $foo->{remain};
+	$client_data->{offset} = length($foo->{remain});
+	if (defined($foo->{'req-hdr'})) {
+	    $request = HTTP::Request->parse($foo->{'req-hdr'});
+	    my $uri = $request->uri;
+	    my $str = $uri->as_string();
+	    if (defined($str) && length($str)) {
+		push(@chkList, { value => $str, src => 'uri'});
+		print "URI: $str\n";
+	    } else {
+		if (defined($request->header('Host'))) {
+		    my $str = $request->header('Host');
+		    push(@chkList, { value => $str, src => 'host'});
+		    #print "HOST: $str\n";
+		} else {
+		    $result = 403;
+		    print "BLACK:invalid request\n";
+		    goto DONE;
+		}
+	    }
+goto DONE;
+	    if (defined($request->header('Referer'))) {
+		my $str = $request->header('Referer');
+		push(@chkList, { value => $str, src => 'referer'});
+		#print "REFERER: $str\n";
+	    }
+
+	    foreach my $href (@chkList) {
+		foreach my $filter (@request_filters) {
+		    my $re = $filter->{pattern};
+		    if ($href->{value} =~ m/$re/i) {
+			if ($filter->{action} eq 'BLACK') {
+			    $result = 403;
+			    print "BLACK|$href->{value}|\n";
+			    goto DONE;
+			} elsif ($filter->{action} eq 'WHITE') {
+			    $result = 202;
+			    print "WHITE|$href->{value}|\n";
+			    if ($href->{src} eq 'uri') {
+				goto DONE;
+			    }
+			}
+		    }
+		}
+	    }
+	} else {
+	    print Dumper($foo->{order});
+	}
+
+DONE:
+	if ($result == 403) {
+	    # BLOCKED
+	    $changed = 1;
+	    $foo = build_redirect($request, $foo);
+	} elsif ($result == 202) {
+	    # EXPLICIT ALLOW
+	    if ($r->header('Allow') ne '204') {
+		$changed = 1;
+	    }
+	} else {
+	    # GREY
+#	    $request->header('X-grey-id' => $grey_id++);
+#	    $changed = 1;
+	}
+	send_ack($changed, $client_data->{client}, $foo);
+    } elsif ($method eq 'RESPMOD') {
+	my $response;
+	my $foo = decap($r,  $client_data->{buffer});
+	if (defined($foo->{'resp-hdr'})) {
+	    $response = HTTP::Request->parse($foo->{'resp-hdr'});
+	    if (defined($response->header('X-grey-id'))) {
+		print "RESPONSE GREY-ID: ".$response->header('X-grey-id')."\n";
+	    }
+	}
+	my $changed = 0;
+	$client_data->{buffer} = '';
+	$client_data->{offset} = 0;
+	if (defined($foo->{'res-body'})) {
+	}
+	if ($r->header('Allow') ne '206') {
+	    $changed = 1;
+	}
+	send_ack($changed, $client_data->{client}, $foo);
+    } else {
+	print "UNKNOWN method: $method\n";
+    }
+    return undef;
+}
+
+sub send_ack {
+    my $rebuild = shift;
+    my $fh = shift;
+    my $foo = shift;
+
+    if ($rebuild == 0) {
+        ack_nochange($fh);
+    } else {
+	print "send_ack: CHANGE\n";
+        ack_withchange($fh, $foo);
+    }
+}
+
+sub http_handler {
+    my $client_data = shift;
+    my $r = shift;
+
+    print "HTTP REQUEST: ".$r->as_string()."\n";
+    my $method = $r->method();
+    my $response = HTTP::Response->new(200);
+    $response->protocol('HTTP/1.1');
+
+    if ($method eq 'GET') {
+	my $query = $r->uri->query_form_hash();
+	if (defined($query)) {
+	    if (defined($query->{id})) {
+		my $id = $query->{id};
+		if (defined($denied->{$id})) {
+		    $query->{url} = $denied->{$id};
+		}
+	    }
+	    print "GET with QUERY ".Dumper($query);
+	}
+
+	my $rpath = $r->uri->path();
+	my $fpath = $docroot.$rpath;
+	if ($fpath =~ m/\/$/) {
+	    $fpath .= 'index.html';
+	}
+
+	if (-r $fpath) {
+	    $rpath =~ s/^\///;
+	    my $data = {
+	    };
+            my $tt = Template->new({
+                INCLUDE_PATH => $docroot,
+                INTERPOLATE  => 1,
+                EVAL_PERL    => 1,
+            });
+            my $output = '';
+            if (!$tt->process($rpath, $query, \$output)) {
+                die "Template error:".$tt->error()."\n";
+            }
+            my ($safe) = ($output =~ m/^(.*)$/s);
+	    print  "SAFE: $safe\n";
+	    $response->content($safe);
+	    $response->header( 'Connection' => 'close');
+	    $response->header( 'Content-Type' => 'text/html');
+	    $response->header( 'Content-Length' => length($safe));
+	} else {
+	    $response->code(404);
+	    $response->content("Unable to open file: $rpath");
+	    $response->header( 'Connection' => 'close');
+	}
+	print "HTTP GET RESPONSE:".$response->as_string,"\n";
+	$client_data->{client}->syswrite($response->as_string);
+    } elsif ($method eq 'POST') {
+	print "HTTP POST REQUEST:".$r->as_string,"\n";
+	my $length = $r->header('Content-Length');
+	my $rpath = $r->uri->path();
+	my $fpath = $docroot.$rpath;
+	print "PATH $fpath\n";
+	if (length($client_data->{buffer}) < $length) {
+	    print "Waiting for data: $length\n";
+	    return 1;
+	} else {
+	    if ($rpath eq '/submit') {
+		my $content = $client_data->{buffer};
+		$client_data->{buffer} = '';
+		$client_data->{offset} = 0;
+		$content =~ s/%([A-Fa-f\d]{2})/chr hex $1/eg;
+		if ($content =~ m/url=(.*?)$/) {
+		    my $url = $1;
+		    my $uri = URI->new($url);
+		    if (defined($uri)) {
+		    push(@request_filters, {
+			pattern => $uri->host(),
+			action => 'WHITE',
+		    });
+		        $response->code(302);
+		        $response->header('Location' => $url);
+		        $response->header('Refresh' => "0; url=$url");
+		    } else {
+		        $response->code(404);
+		    }
+		} else {
+		    $response->code(404);
+		}
+	    } else {
+		$response->code(404);
+	    }
+	}
+	$response->header('Connection' => "close");
+	print "HTTP POST RESPONSE:".$response->as_string,"\n";
+	$client_data->{client}->syswrite($response->as_string);
+    } else {
+	print "UNKNOWN method: $method\n";
+    }
+    return undef;
+}
+
+sub build_redirect {
+    my $r = shift;
+    my $foo = shift;
+    my $id = time();
+    my $content = "id=$id";
+
+    my $url = "http://localhost:8080/denied.html?$content";
+    $denied->{$id} = $r->uri->as_string();
+    my $response = HTTP::Response->new(302);
+    $response->protocol('HTTP/1.1');
+    $response->header('Location' => $url);
+    $response->header('Refresh' => "0; url=$url");
+
+    $foo->{'res-hdr'} = $response->as_string();
+    $foo->{order} = ['res-hdr', 'null-body'];
+
+    #my $request = HTTP::Request->new('POST', 'http://localhost:8080/denied');
+    #my $request = HTTP::Request->new('GET', $url);
+    #$request->protocol('HTTP/1.1');
+    #$request->header('Connection' => 'close');
+    #$request->header('Content-Type' => 'application/x-www-form-urlencoded');
+    #$request->header('Content-Length' => length($content));
+    #$foo->{'req-hdr'} = $request->as_string();
+    #$foo->{'req-body'} = $content;
+    #$foo->{order} = ['req-hdr', 'null-body'];
+
+    return $foo;
+}
+
+sub ack_withchange {
+    my $fh = shift;
+    my $foo = shift;
+    my $response = HTTP::Response->new(200);
+    $response->protocol('ICAP/1.0');
+    $response->header( 'Service' => "jleu::icap/0.1" );
+    $response->header( 'ISTag' => '5BDEEEA9-12E4-2' );
+    $response->header( 'Connection' => 'close' );
+
+    encap($response, $foo);
+    print "*ICAP RESPONSE:".$response->as_string,"\n";
+    $fh->syswrite($response->as_string);
+}
+
+sub ack_nochange {
+    my $fh = shift;
+    my $response = HTTP::Response->new(204);
+    $response->protocol('ICAP/1.0');
+    $response->header( Server => "jleu::icap/0.1" );
+    $response->header( ISTag => '5BDEEEA9-12E4-2' );
+    $response->header( Connection => 'close' );
+    print "ICAP RESPONSE:".$response->as_string,"\n";
+    $fh->syswrite($response->as_string);
+}
+
+sub encap {
+   my $r = shift;
+   my $foo = shift;
+    my @list;
+   my $length = 0;
+   my $content = '';
+   foreach my $part (@{$foo->{order}}) {
+	push(@list, "$part=$length");
+	my $str = $foo->{$part};
+	$length += length($str);
+	$content .= $str;
+   }
+
+   my $str = join(', ', @list);
+   $r->header('encapsulated' => $str);
+   $r->content($content);
+}
+
+sub decap {
+    my $r = shift;
+    my $content = shift;
+    my $retval = { order => [] };
+
+    my $size = $r->header('encapsulated');
+    my @list = split(/[ ,]+/, $size);
+    #print "encaplist: ".join('|', @list)."\n";
+    push(@list, 'end='.length($content));
+    my $pnum;
+    my $pname;
+    foreach my $offset (@list) {
+	my ($name, $num) = ($offset =~ m/(\S+).*?=.*?(\d+)/);
+	push(@{$retval->{order}}, $name);
+	if (defined($pnum)) {
+	    my $len = ($num - $pnum);
+	    my $data = substr($content, $pnum, $len);
+	    $retval->{$pname} = $data;
+	}
+	$pnum = $num;
+	$pname = $name;
+    }
+    return $retval;
+}
+
+sub _read {
+    my $socket = shift;
+    my $done = 0;
+    my $eof = 0;
+    my $buffer = '';
+    my $offset = 0;
+    while (!$done) {
+        my $count = $socket->sysread($buffer, 1024, $offset);
+        if (!defined($count) && $! == EAGAIN) {
+            $eof = 0;
+            $done = 1;
+        }  elsif ($count > 0) {
+            $offset += $count;
+            $eof = 0;
+        } elsif ($count == 0) {
+            $eof = 1;
+            $done = 1;
+        };
+    }
+    return ($buffer, $eof);
+}
+
+
+#    100 - Continue after ICAP Preview (Section 4.5).
+#    204 - No modifications needed (Section 4.6).
+#    400 - Bad request.
+#    404 - ICAP Service not found.
+#    405 - Method not allowed for service (e.g., RESPMOD requested for
+#          service that supports only REQMOD).
+#    408 - Request timeout.  ICAP server gave up waiting for a request
+#          from an ICAP client.
+#    500 - Server error.  Error on the ICAP server, such as "out of disk space".
+#    501 - Method not implemented.  This response is illegal for an
+#          OPTIONS request since implementation of OPTIONS is mandatory.
+#
+#    502 - Bad Gateway.  This is an ICAP proxy and proxying produced an error.
+#    503 - Service overloaded.  The ICAP server has exceeded a maximum
+#          connection limit associated with this service; the ICAP client
+#          should not exceed this limit in the future.
+#    505 - ICAP version not supported by server.
+
+# add processing for following request headers
+#       Encapsulated: req-hdr=0, res-hdr=45, res-body=100, null-body 
+#The syntax of an Encapsulated header is:
+#
+#   encapsulated_header: "Encapsulated: " encapsulated_list
+#   encapsulated_list: encapsulated_entity |
+#                      encapsulated_entity ", " encapsulated_list
+#   encapsulated_entity: reqhdr | reshdr | reqbody | resbody | optbody
+#   reqhdr  = "req-hdr" "=" (decimal integer)
+#   reshdr  = "res-hdr" "=" (decimal integer)
+#   reqbody = { "req-body" | "null-body" } "=" (decimal integer)
+#   resbody = { "res-body" | "null-body" } "=" (decimal integer)
+#   optbody = { "opt-body" | "null-body" } "=" (decimal integer)	    
+#
+#   REQMOD  request  encapsulated_list: [reqhdr] reqbody
+#   REQMOD  response encapsulated_list: {[reqhdr] reqbody} | {[reshdr] resbody}
+#   RESPMOD request  encapsulated_list: [reqhdr] [reshdr] resbody
+#   RESPMOD response encapsulated_list: [reshdr] resbody
+#   OPTIONS response encapsulated_list: optbody
+	    #       Cache-Control
+	    #       Connection
+	    #       Date
+	    #       Expires
+	    #       Pragma
+	    #       Trailer
+	    #       Upgrade
+	    #
+	    #       Encapsulated
+	    #
+	    #       Authorization
+	    #       Allow (see Section 4.6)
+	    #              Allow: 204
+	    #       From  (see Section 14.22 of [4])
+	    #       Host (REQUIRED in ICAP as it is in HTTP/1.1)
+	    #       Referer (see Section 14.36 of [4])
+	    #       User-Agent
+	    #
+	    #       Preview
+	    #
+	    #
+	    # include the following response headers?
+	    # Server
+	    # ISTag (see Section 4.7)
+	    #

@@ -1,0 +1,176 @@
+Second adaptation missing for CONNECTs
+
+Squid does not send CONNECT request to adaptation services
+if the "ssl_bump splice" rule matched at step 2. This adaptation
+is important because the CONNECT request gains SNI information during
+the second SslBump step. This is a regression bug, possibly caused by
+the Squid bug 4529 fix (trunk commits r14913 and r14914).
+
+This is a Measurement Factory project.
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2017-03-02 01:26:30 +0000
++++ src/client_side.cc	2017-03-31 09:40:41 +0000
+@@ -3129,42 +3129,43 @@
+ 
+     assert(!inBuf.isEmpty());
+     receivedFirstByte();
+     fd_note(clientConnection->fd, "Parsing TLS handshake");
+ 
+     bool unsupportedProtocol = false;
+     try {
+         if (!tlsParser.parseHello(inBuf)) {
+             // need more data to finish parsing
+             readSomeData();
+             return;
+         }
+     }
+     catch (const std::exception &ex) {
+         debugs(83, 2, "error on FD " << clientConnection->fd << ": " << ex.what());
+         unsupportedProtocol = true;
+     }
+ 
+     parsingTlsHandshake = false;
+ 
+-    if (mayTunnelUnsupportedProto())
+-        preservedClientData = inBuf;
++    // client data may be needed for splicing and for
++    // tunneling unsupportedProtocol after an error
++    preservedClientData = inBuf;
+ 
+     // Even if the parser failed, each TLS detail should either be set
+     // correctly or still be "unknown"; copying unknown detail is a no-op.
+     Security::TlsDetails::Pointer const &details = tlsParser.details;
+     clientConnection->tlsNegotiations()->retrieveParsedInfo(details);
+     if (details && !details->serverName.isEmpty()) {
+         resetSslCommonName(details->serverName.c_str());
+         if (sslServerBump)
+             sslServerBump->clientSni = details->serverName;
+     }
+ 
+     // We should disable read/write handlers
+     Comm::SetSelect(clientConnection->fd, COMM_SELECT_READ, NULL, NULL, 0);
+     Comm::SetSelect(clientConnection->fd, COMM_SELECT_WRITE, NULL, NULL, 0);
+ 
+     if (unsupportedProtocol) {
+         Http::StreamPointer context = pipeline.front();
+         Must(context && context->http);
+         HttpRequest::Pointer request = context->http->request;
+         debugs(83, 5, "Got something other than TLS Client Hello. Cannot SslBump.");
+@@ -3212,43 +3213,57 @@
+     } else if (!connState->splice())
+         connState->clientConnection->close();
+ }
+ 
+ bool
+ ConnStateData::splice()
+ {
+     // normally we can splice here, because we just got client hello message
+ 
+     if (fd_table[clientConnection->fd].ssl.get()) {
+         // Restore default read methods
+         fd_table[clientConnection->fd].read_method = &default_read_method;
+         fd_table[clientConnection->fd].write_method = &default_write_method;
+     }
+ 
+     // XXX: assuming that there was an HTTP/1.1 CONNECT to begin with...
+     // reset the current protocol to HTTP/1.1 (was "HTTPS" for the bumping process)
+     transferProtocol = Http::ProtocolVersion();
+     assert(!pipeline.empty());
+     Http::StreamPointer context = pipeline.front();
++    Must(context);
++    Must(context->http);
+     ClientHttpRequest *http = context->http;
+-    tunnelStart(http);
+-    return true;
++    HttpRequest::Pointer request = http->request;
++    context->finished();
++    if (transparent()) {
++        // For transparent connections, make a new fake CONNECT request, now
++        // with SNI as target. doCallout() checks, adaptations may need that.
++        return fakeAConnectRequest("splice", preservedClientData);
++    } else {
++        // For non transparent connections  make a new tunneled CONNECT, which
++        // also sets the HttpRequest::flags::forceTunnel flag to avoid
++        // respond with "Connection Established" to the client.
++        // This fake CONNECT request required to allow use of SNI in
++        // doCallout() checks and adaptations.
++        return initiateTunneledRequest(request, Http::METHOD_CONNECT, "splice", preservedClientData);
++    }
+ }
+ 
+ void
+ ConnStateData::startPeekAndSplice()
+ {
+     // This is the Step2 of the SSL bumping
+     assert(sslServerBump);
+     Http::StreamPointer context = pipeline.front();
+     ClientHttpRequest *http = context ? context->http : nullptr;
+ 
+     if (sslServerBump->step == Ssl::bumpStep1) {
+         sslServerBump->step = Ssl::bumpStep2;
+         // Run a accessList check to check if want to splice or continue bumping
+ 
+         ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(Config.accessList.ssl_bump, sslServerBump->request.getRaw(), nullptr);
+         acl_checklist->al = http ? http->al : nullptr;
+         //acl_checklist->src_addr = params.conn->remote;
+         //acl_checklist->my_addr = s->s;
+         acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpNone));
+         acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpClientFirst));
+
+=== modified file 'src/client_side_request.cc'
+--- src/client_side_request.cc	2017-02-16 11:51:56 +0000
++++ src/client_side_request.cc	2017-03-31 09:29:59 +0000
+@@ -1398,47 +1398,49 @@
+ void
+ ClientRequestContext::checkNoCacheDone(const allow_t &answer)
+ {
+     acl_checklist = NULL;
+     if (answer == ACCESS_DENIED) {
+         http->request->flags.noCache = true; // dont read reply from cache
+         http->request->flags.cachable = false; // dont store reply into cache
+     }
+     http->doCallouts();
+ }
+ 
+ #if USE_OPENSSL
+ bool
+ ClientRequestContext::sslBumpAccessCheck()
+ {
+     if (!http->getConn()) {
+         http->al->ssl.bumpMode = Ssl::bumpEnd; // SslBump does not apply; log -
+         return false;
+     }
+ 
++    const Ssl::BumpMode bumpMode = http->getConn()->sslBumpMode;
+     if (http->request->flags.forceTunnel) {
+         debugs(85, 5, "not needed; already decided to tunnel " << http->getConn());
++        if (bumpMode != Ssl::bumpEnd)
++            http->al->ssl.bumpMode = bumpMode; // inherited from bumped connection
+         return false;
+     }
+ 
+     // If SSL connection tunneling or bumping decision has been made, obey it.
+-    const Ssl::BumpMode bumpMode = http->getConn()->sslBumpMode;
+     if (bumpMode != Ssl::bumpEnd) {
+         debugs(85, 5, HERE << "SslBump already decided (" << bumpMode <<
+                "), " << "ignoring ssl_bump for " << http->getConn());
+         if (!http->getConn()->serverBump())
+             http->sslBumpNeed(bumpMode); // for processRequest() to bump if needed and not already bumped
+         http->al->ssl.bumpMode = bumpMode; // inherited from bumped connection
+         return false;
+     }
+ 
+     // If we have not decided yet, decide whether to bump now.
+ 
+     // Bumping here can only start with a CONNECT request on a bumping port
+     // (bumping of intercepted SSL conns is decided before we get 1st request).
+     // We also do not bump redirected CONNECT requests.
+     if (http->request->method != Http::METHOD_CONNECT || http->redirect.status ||
+             !Config.accessList.ssl_bump ||
+             !http->getConn()->port->flags.tunnelSslBumping) {
+         http->al->ssl.bumpMode = Ssl::bumpEnd; // SslBump does not apply; log -
+         debugs(85, 5, HERE << "cannot SslBump this request");
+         return false;
+
+

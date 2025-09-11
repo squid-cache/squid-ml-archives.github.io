@@ -1,0 +1,210 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-users] very poor performance of rock cache ipc
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20very%20poor%20performance%20of%20rock%20cache%20ipc&In-Reply-To=%3C0e161590-206f-4d51-9fd0-1a767f0a1793%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026200.html">
+   <LINK REL="Next"  HREF="026202.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-users] very poor performance of rock cache ipc</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20very%20poor%20performance%20of%20rock%20cache%20ipc&In-Reply-To=%3C0e161590-206f-4d51-9fd0-1a767f0a1793%40measurement-factory.com%3E"
+       TITLE="[squid-users] very poor performance of rock cache ipc">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Sat Oct 14 15:40:51 UTC 2023</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="026200.html">[squid-users] very poor performance of rock cache ipc
+</A></li>
+        <LI>Next message (by thread): <A HREF="026202.html">[squid-users] very poor performance of rock cache ipc
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26201">[ date ]</a>
+              <a href="thread.html#26201">[ thread ]</a>
+              <a href="subject.html#26201">[ subject ]</a>
+              <a href="author.html#26201">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 2023-10-13 16:01, Julian Taylor wrote:
+
+&gt;<i> When using squid for caching using the rock cache_dir setting the 
+</I>&gt;<i> performance is pretty poor with multiple workers.
+</I>&gt;<i> The reason for this is due to the very high number of systemcalls 
+</I>&gt;<i> involved in the IPC between the disker and workers.
+</I>
+Please allow me to rephrase your conclusion to better match (expected) 
+reality and avoid misunderstanding:
+
+By design, a mostly idle SMP Squid should use a lot more system calls 
+per disk cache hit than a busy SMP Squid would:
+
+* Mostly idle Squid: Every disk I/O may require a few IPC messages.
+* Busy Squid: Bugs notwithstanding, disk I/Os require no IPC messages.
+
+
+In your single-request test, you are observing the expected effects 
+described in the first bullet. That does not imply those effects are 
+&quot;good&quot; or &quot;desirable&quot; in your use case, of course. It only means that 
+SMP Squid was no optimized for that use case; SMP rock design was 
+explicitly targeting the opposite use case (i.e. a busy Squid).
+
+Roughly speaking, here, &quot;busy&quot; means &quot;there are always some messages in 
+the disk I/O queue [maintained by Squid in shared memory]&quot;.
+
+
+You may wonder how it is possible that an increase in I/O work results 
+in decrease (and, hopefully, elimination) of related IPC messages. 
+Roughly speaking, a worker must send an IPC &quot;you have a new I/O request&quot; 
+message only when its worker-&gt;disker queue is empty. If the queue is not 
+empty, then there is no reason to send an IPC message to wake up disker 
+because disker will see the new message when dequeuing the previous one. 
+Same for the opposite direction: disker-&gt;worker...
+
+
+ &gt; Is it necessary to have these read chunks so small
+
+It is not. Disk I/O size should be at least the system I/O page size, 
+but it can be larger. The optimal I/O size is probably very dependent on 
+traffic patterns. IIRC, Squid I/O size is at most one Squid page 
+(SM_PAGE_SIZE or 4KB).
+
+FWIW, I suspect there are significant inefficiencies in disk I/O related 
+request alignment: The code does not attempt to read from and write to 
+disk page boundaries, probably resulting in multiple low-level disk I/Os 
+per one Squid 4KB I/O in some (many?) cases. With modern non-rotational 
+storage these effects are probably less pronounced, but they probably 
+still exist.
+
+BTW, please note that, IIRC, workers and diskers do not send HTTP bytes 
+using IPC messages. Those IPC messages only carry small metainformation 
+about I/O. HTTP bytes are stored in shared memory pages. I do not recall 
+why the corresponding disk I/O IPC messages are so big, but it is 
+probably just a code simplification (because larger IPC messages are 
+needed for cache manager queries).
+
+
+HTH,
+
+Alex.
+
+
+&gt;<i> You can reproduce this very easily with a simple setup with following 
+</I>&gt;<i> configuration in the current git HEAD and older versions:
+</I>&gt;<i> 
+</I>&gt;<i> maximum_object_size 8 GB
+</I>&gt;<i> cache_dir rock /cachedir/cache 1024
+</I>&gt;<i> cache_peer some.host parent 80 3130 default no-query no-digest
+</I>&gt;<i> http_port 3128
+</I>&gt;<i> 
+</I>&gt;<i> Now download a larger file from some.host through the cache so it cached 
+</I>&gt;<i> and repeat.
+</I>&gt;<i> 
+</I>&gt;<i> curl --proxy localhost:3128&#160; <A HREF="http://some.host/file">http://some.host/file</A> &gt;&#160; /dev/null
+</I>&gt;<i> 
+</I>&gt;<i> The download of the cached file from the local machine will be performed 
+</I>&gt;<i> with a very low rate, on my not ancient machine 35mb/s with everything 
+</I>&gt;<i> is being cached in memory.
+</I>&gt;<i> 
+</I>&gt;<i> If you check what is happening in the disker you see that it reads a 
+</I>&gt;<i> 4112 byte ipc message from the worker, performs a read of 4KiB size then 
+</I>&gt;<i> opens a new socket to notifies the worker, does 4 fcntl calls on the 
+</I>&gt;<i> socket and then sends a 4112 byte (2 x86 pages) size ipc message and 
+</I>&gt;<i> then closes the socket, this repeats for every 4KiB read and you have 
+</I>&gt;<i> the same thing in the receiving worker side.
+</I>&gt;<i> 
+</I>&gt;<i> Here an strace of one chunk of the request in the disker:
+</I>&gt;<i> 
+</I>&gt;<i> 21:49:28 epoll_wait(7, [{events=EPOLLIN, data={u32=26, u64=26}}], 65536, 
+</I>&gt;<i> 827) = 1 &lt;0.000013&gt;
+</I>&gt;<i> 21:49:28 recvmsg(26, {msg_name=0x557d7c4f06b8, msg_namelen=110 =&gt; 0, 
+</I>&gt;<i> msg_iov=[{iov_base=&quot;\7\0\0\0\0\0\0\0\4\0\0\0\0\0\0\0\2\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0&quot;..., iov_len=4112}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, MSG_DONTWAIT) = 4112 &lt;0.000027&gt;
+</I>&gt;<i> 21:49:28 pread64(19, 
+</I>&gt;<i> &quot;\266E\337\37\374\201b\215\240\310`\216\366\242\350\210\215\22\377zu\302\244Tb\317\255K\10\&quot;p\327&quot;..., 4096, 10747944) = 4096 &lt;0.000015&gt;
+</I>&gt;<i> 21:49:28 socket(AF_UNIX, SOCK_DGRAM, 0) = 11 &lt;0.000021&gt;
+</I>&gt;<i> 21:49:28 fcntl(11, F_GETFD)&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160; = 0 &lt;0.000011&gt;
+</I>&gt;<i> 21:49:28 fcntl(11, F_SETFD, FD_CLOEXEC) = 0 &lt;0.000011&gt;
+</I>&gt;<i> 21:49:28 fcntl(11, F_GETFL)&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160; = 0x2 (flags O_RDWR) &lt;0.000011&gt;
+</I>&gt;<i> 21:49:28 fcntl(11, F_SETFL, O_RDWR|O_NONBLOCK) = 0 &lt;0.000012&gt;
+</I>&gt;<i> 21:49:28 epoll_ctl(7, EPOLL_CTL_ADD, 11, 
+</I>&gt;<i> {events=EPOLLOUT|EPOLLERR|EPOLLHUP, data={u32=11, u64=11}}) = 0 &lt;0.000023&gt;
+</I>&gt;<i> 21:49:28 epoll_wait(7, [{events=EPOLLOUT, data={u32=11, u64=11}}], 
+</I>&gt;<i> 65536, 826) = 1 &lt;0.000015&gt;
+</I>&gt;<i> 21:49:28 sendmsg(11, {msg_name={sa_family=AF_UNIX, 
+</I>&gt;<i> sun_path=&quot;/tmp/local/var/run/squid/squid-kid-2.ipc&quot;}, msg_namelen=42, 
+</I>&gt;<i> msg_iov=[{iov_base=&quot;\7\0\0\0\0\0\0\0\4\0\0\0\0\0\0\0\3\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0&quot;..., iov_len=4112}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, MSG_NOSIGNAL) = 4112 &lt;0.000022&gt;
+</I>&gt;<i> 21:49:28 epoll_ctl(7, EPOLL_CTL_DEL, 11, 0x7ffef63da174) = 0 &lt;0.000014&gt;
+</I>&gt;<i> 21:49:28 close(11)&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160; = 0 &lt;0.000018&gt;
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> Pocking around a bit in the code I have found that by increasing the 
+</I>&gt;<i> HTTP_REQBUF_SZ in src/http/forward.h to 32KiB also affects the read size 
+</I>&gt;<i> on the disker making it 8 times more efficient which is ok (but not great).
+</I>&gt;<i> (This does not work the same anymore with 
+</I>&gt;<i> <A HREF="https://github.com/squid-cache/squid/pull/1335">https://github.com/squid-cache/squid/pull/1335</A> recently added to 6.x 
+</I>&gt;<i> backports, but the 4KiB issue remains in current master)
+</I>&gt;<i> 
+</I>&gt;<i> This problem is very noticeable on large objects but the extrem overhead 
+</I>&gt;<i> per disk cache request should affect most disk cached objects.
+</I>&gt;<i> 
+</I>&gt;<i> Is it necessary to have these read chunks so small and the processes 
+</I>&gt;<i> opening and closing sockets for every single request instead of reusing 
+</I>&gt;<i> an open socket?
+</I>&gt;<i> At least the 4 fcntl calls could be removed/reduced to 1 though that 
+</I>&gt;<i> only gains 10-30% compared to 800% of increasing the read size.
+</I>&gt;<i> Reducing the 4112 byte ipc message with only has 4 bytes of data to 
+</I>&gt;<i> lower values also results in measurable improvements (though dangerous 
+</I>&gt;<i> as squid crashes if its too low and receives cachemanager requests which 
+</I>&gt;<i> seem to be around 600 bytes in length).
+</I>&gt;<i> 
+</I>&gt;<i> If the small chunk sizes are needed for certain use cases I would love a 
+</I>&gt;<i> configuration flag to set it to higher values (higher even that the 
+</I>&gt;<i> current maximum of mem::pagessize 32KiB) if that fits the use case. In 
+</I>&gt;<i> the case I noticed this the average object size in the cache was in the 
+</I>&gt;<i> megabyte range.
+</I>&gt;<i> 
+</I>&gt;<i> Currently without recompiling squid using the rock cache (the only one 
+</I>&gt;<i> supported for SMP) utilizing modern hardware with 10G or more network 
+</I>&gt;<i> and SSD disks does not seem feasible unless I missed some configuration 
+</I>&gt;<i> option which may help here.
+</I>&gt;<i> 
+</I>&gt;<i> Cheers,
+</I>&gt;<i> Julian
+</I>&gt;<i> _______________________________________________
+</I>&gt;<i> squid-users mailing list
+</I>&gt;<i> <A HREF="https://lists.squid-cache.org/listinfo/squid-users">squid-users at lists.squid-cache.org</A>
+</I>&gt;<i> <A HREF="https://lists.squid-cache.org/listinfo/squid-users">https://lists.squid-cache.org/listinfo/squid-users</A>
+</I>
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="026200.html">[squid-users] very poor performance of rock cache ipc
+</A></li>
+	<LI>Next message (by thread): <A HREF="026202.html">[squid-users] very poor performance of rock cache ipc
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26201">[ date ]</a>
+              <a href="thread.html#26201">[ thread ]</a>
+              <a href="subject.html#26201">[ subject ]</a>
+              <a href="author.html#26201">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.squid-cache.org/listinfo/squid-users">More information about the squid-users
+mailing list</a><br>
+</body></html>

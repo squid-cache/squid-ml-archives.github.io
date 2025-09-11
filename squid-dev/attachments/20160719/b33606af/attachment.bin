@@ -1,0 +1,743 @@
+Some failed transactions are not logged.
+
+There are situations when Squid logs nothing to access.log after an
+[abnormal] transaction termination. Such "stealthy" transactions may be
+a security risk and an accounting problem.
+
+ClientHttpRequest is responsible for logging most transactions but that
+object is created only after the HTTP request headers are successfully
+parsed. Request header parsing errors may be detected and logged
+appropriately, but the job handling the incoming transaction may
+terminate for reasons outside the parsing code control (e.g., a job-
+killing exception thrown when there are no request headers to start
+parsing yet or when the job waits for more request headers to finishing
+parsing).
+
+This change adds access logging for three cases:
+
+1. accept(2) system call errors (before ConnStateData job is created).
+
+2. Unexpected ConnStateData job termination, when there is no
+   ClientHttpRequest to log the failure.
+
+3. Connections which send no bytes: these connections drain Squid
+   resources and, hence, should be logged.
+   TODO: make this behavior configurable because some browsers are known to
+   routinely create such connections(and, hence, logging them by default may
+   create too much noise).
+
+=== modified file 'doc/release-notes/release-4.sgml'
+--- doc/release-notes/release-4.sgml	2016-07-01 11:30:00 +0000
++++ doc/release-notes/release-4.sgml	2016-07-19 10:29:44 +0000
+@@ -199,60 +199,66 @@
+ 
+ 	<tag>request_start_timeout</tag>
+ 	<p>New directive controlling how long Squid waits for the first request
+ 	   bytes to arrive after initial connection establishment by a client.
+ 
+ 	<tag>server_pconn_for_nonretriable</tag>
+ 	<p>New directive to provide fine-grained control over persistent connection
+ 	   reuse when forwarding HTTP requests that Squid cannot retry. It is useful
+ 	   in environments where opening new connections is very expensive
+ 	   and race conditions associated with persistent connections are very rare
+ 	   and/or only cause minor problems.
+ 
+ 	<tag>shared_memory_locking</tag>
+ 	<p>New directive to ensure shared memory is all available immediately
+ 	   on startup. Protects against SIGBUS errors, but delays startup.
+ 
+ 	<tag>tls_outgoing_options</tag>
+ 	<p>New directive to define TLS security context options for outgoing
+ 	   connections. For example to HTTPS servers.
+ 
+ 	<tag>url_rewrite_timeout</tag>
+ 	<p>Squid times active requests to redirector. This option sets
+ 	   the timeout value and the Squid reaction to a timed out
+ 	   request.
+ 
+ </descrip>
+ 
+ <sect1>Changes to existing tags<label id="modifiedtags">
+ <p>
+ <descrip>
++	<tag>access_log</tag>
++	<p>TCP accept(2) errors logged with URI <em>error:accept-user-connection</em>
++	<p>Unused connections received in <em>http_port</em> or <em>https_port</em>
++	   or transactions terminated before reading[parsing] request headers
++	   logged with URI <em>error:transaction-end-before-headers</em>
++
+ 	<tag>acl</tag>
+ 	<p>New <em>-m</em> flag for <em>note</em> ACL to match substrings.
+ 
+ 	<tag>auth_param</tag>
+ 	<p>New parameter <em>queue-size=</em> to set the maximum number
+ 	   of queued requests.
+ 
+ 	<tag>cache_peer</tag>
+ 	<p>New option <em>auth-no-keytab</em> to let GSSAPI implementation determine
+ 	   which Kerberos credentials to use, instead of specifying a keytab.
+ 	<p>New option <em>tls-min-version=1.N</em> to set minimum TLS version allowed.
+ 	<p>New option <em>tls-default-ca</em> replaces <em>sslflags=NO_DEFAULT_CA</em>
+ 	<p>New option <em>tls-no-npn</em> to disable sending TLS NPN extension.
+ 	<p>All <em>ssloptions=</em> values for SSLv2 configuration or disabling
+ 	   have been removed.
+ 	<p>Removed <em>sslversion=</em> option. Use <em>tls-options=</em> instead.
+ 	<p>Manual squid.conf update may be required on upgrade.
+ 	<p>Replaced <em>sslcafile=</em> with <em>tls-cafile=</em> which takes multiple entries.
+ 
+ 	<tag>external_acl_type</tag>
+ 	<p>New parameter <em>queue-size=</em> to set the maximum number
+ 	   of queued requests.
+ 	<p>Format field updated to accept any logformat %macro code.
+ 
+ 	<tag>http_port</tag>
+ 	<p>New option <em>tls-min-version=1.N</em> to set minimum TLS version allowed.
+ 	<p>New option <em>tls-default-ca</em> replaces <em>sslflags=NO_DEFAULT_CA</em>
+ 	<p>New option <em>tls-no-npn</em> to disable sending TLS NPN extension.
+ 	<p>All <em>option=</em> values for SSLv2 configuration or disabling
+ 	   have been removed.
+
+=== modified file 'src/Pipeline.cc'
+--- src/Pipeline.cc	2016-01-24 17:41:43 +0000
++++ src/Pipeline.cc	2016-07-19 07:51:03 +0000
+@@ -9,55 +9,67 @@
+ /*
+  * DEBUG: section 33    Client Request Pipeline
+  */
+ #include "squid.h"
+ #include "anyp/PortCfg.h"
+ #include "client_side.h"
+ #include "Debug.h"
+ #include "http/Stream.h"
+ #include "Pipeline.h"
+ 
+ void
+ Pipeline::add(const Http::StreamPointer &c)
+ {
+     requests.push_back(c);
+     ++nrequests;
+     debugs(33, 3, "Pipeline " << (void*)this << " add request " << nrequests << ' ' << c);
+ }
+ 
+ Http::StreamPointer
+ Pipeline::front() const
+ {
+     if (requests.empty()) {
+         debugs(33, 3, "Pipeline " << (void*)this << " empty");
+         return Http::StreamPointer();
+     }
+ 
+     debugs(33, 3, "Pipeline " << (void*)this << " front " << requests.front());
+     return requests.front();
+ }
+ 
++Http::StreamPointer
++Pipeline::back() const
++{
++    if (requests.empty()) {
++        debugs(33, 3, "Pipeline " << (void*)this << " empty");
++        return Http::StreamPointer();
++    }
++
++    debugs(33, 3, "Pipeline " << (void*)this << " back " << requests.back());
++    return requests.back();
++}
++
+ void
+ Pipeline::terminateAll(int xerrno)
+ {
+     while (!requests.empty()) {
+         Http::StreamPointer context = requests.front();
+         debugs(33, 3, "Pipeline " << (void*)this << " notify(" << xerrno << ") " << context);
+         context->noteIoError(xerrno);
+         context->finished();  // cleanup and self-deregister
+         assert(context != requests.front());
+     }
+ }
+ 
+ void
+ Pipeline::popMe(const Http::StreamPointer &which)
+ {
+     if (requests.empty())
+         return;
+ 
+     debugs(33, 3, "Pipeline " << (void*)this << " drop " << requests.front());
+     // in reality there may be multiple contexts doing processing in parallel.
+     // XXX: pipeline still assumes HTTP/1 FIFO semantics are obeyed.
+     assert(which == requests.front());
+     requests.pop_front();
+ }
+ 
+
+=== modified file 'src/Pipeline.h'
+--- src/Pipeline.h	2016-01-24 17:41:43 +0000
++++ src/Pipeline.h	2016-07-19 07:51:03 +0000
+@@ -19,53 +19,56 @@
+  *
+  * Transactions in the queue may be fully processed, but not yet delivered,
+  * or only partially processed.
+  *
+  * - HTTP/1 pipelined requests can be processed out of order but
+  *   responses MUST be written to the client in-order.
+  *   The front() context is for the response writing transaction.
+  *   The back context may still be reading a request payload/body.
+  *   Other contexts are in deferred I/O state, but may be accumulating
+  *   payload/body data to be written later.
+  *
+  * - HTTP/2 multiplexed streams can be processed and delivered in any order.
+  *
+  * For consistency we treat the pipeline as a FIFO queue in both cases.
+  */
+ class Pipeline
+ {
+     Pipeline(const Pipeline &) = delete;
+     Pipeline & operator =(const Pipeline &) = delete;
+ 
+ public:
+     Pipeline() : nrequests(0) {}
+     ~Pipeline() = default;
+ 
+     /// register a new request context to the pipeline
+     void add(const Http::StreamPointer &);
+ 
+     /// get the first request context in the pipeline
+     Http::StreamPointer front() const;
+ 
++    /// get the last request context in the pipeline
++    Http::StreamPointer back() const;
++
+     /// how many requests are currently pipelined
+     size_t count() const {return requests.size();}
+ 
+     /// whether there are none or any requests currently pipelined
+     bool empty() const {return requests.empty();}
+ 
+     /// tell everybody about the err, and abort all waiting requests
+     void terminateAll(const int xerrno);
+ 
+     /// deregister the front request from the pipeline
+     void popMe(const Http::StreamPointer &);
+ 
+     /// Number of requests seen in this pipeline (so far).
+     /// Includes incomplete transactions.
+     uint32_t nrequests;
+ 
+ private:
+     /// requests parsed from the connection but not yet completed.
+     std::list<Http::StreamPointer> requests;
+ };
+ 
+ #endif /* SQUID_SRC_PIPELINE_H */
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-07-18 12:36:38 +0000
++++ src/client_side.cc	2016-07-19 09:48:15 +0000
+@@ -557,60 +557,62 @@
+         debugs(33, 2, "WARNING: Graceful closure on " << clientConnection << " due to connection-auth erase from " << by);
+         auth_->releaseAuthServer();
+         auth_ = NULL;
+         // XXX: need to test whether the connection re-auth challenge is sent. If not, how to trigger it from here.
+         // NP: the current situation seems to fix challenge loops in Safari without visible issues in others.
+         // we stop receiving more traffic but can leave the Job running to terminate after the error or challenge is delivered.
+         stopReceiving("connection-auth removed");
+         return;
+     }
+ 
+     // clobbered with alternative credentials
+     if (aur != auth_) {
+         debugs(33, 2, "ERROR: Closing " << clientConnection << " due to change of connection-auth from " << by);
+         auth_->releaseAuthServer();
+         auth_ = NULL;
+         // this is a fatal type of problem.
+         // Close the connection immediately with TCP RST to abort all traffic flow
+         comm_reset_close(clientConnection);
+         return;
+     }
+ 
+     /* NOT REACHABLE */
+ }
+ #endif
+ 
+ // cleans up before destructor is called
+ void
+ ConnStateData::swanSong()
+ {
+     debugs(33, 2, HERE << clientConnection);
++    checkLogging();
++
+     flags.readMore = false;
+     DeregisterRunner(this);
+     clientdbEstablished(clientConnection->remote, -1);  /* decrement */
+     pipeline.terminateAll(0);
+ 
+     unpinConnection(true);
+ 
+     Server::swanSong(); // closes the client connection
+ 
+ #if USE_AUTH
+     // NP: do this bit after closing the connections to avoid side effects from unwanted TCP RST
+     setAuth(NULL, "ConnStateData::SwanSong cleanup");
+ #endif
+ 
+     flags.swanSang = true;
+ }
+ 
+ bool
+ ConnStateData::isOpen() const
+ {
+     return cbdataReferenceValid(this) && // XXX: checking "this" in a method
+            Comm::IsConnOpen(clientConnection) &&
+            !fd_table[clientConnection->fd].closing();
+ }
+ 
+ ConnStateData::~ConnStateData()
+ {
+     debugs(33, 3, HERE << clientConnection);
+ 
+     if (isOpen())
+@@ -3999,30 +4001,61 @@
+ void
+ ConnStateData::unpinConnection(const bool andClose)
+ {
+     debugs(33, 3, HERE << pinning.serverConnection);
+ 
+     if (pinning.peer)
+         cbdataReferenceDone(pinning.peer);
+ 
+     if (Comm::IsConnOpen(pinning.serverConnection)) {
+         if (pinning.closeHandler != NULL) {
+             comm_remove_close_handler(pinning.serverConnection->fd, pinning.closeHandler);
+             pinning.closeHandler = NULL;
+         }
+ 
+         stopPinnedConnectionMonitoring();
+ 
+         // close the server side socket if requested
+         if (andClose)
+             pinning.serverConnection->close();
+         pinning.serverConnection = NULL;
+     }
+ 
+     safe_free(pinning.host);
+ 
+     pinning.zeroReply = false;
+ 
+     /* NOTE: pinning.pinned should be kept. This combined with fd == -1 at the end of a request indicates that the host
+      * connection has gone away */
+ }
+ 
++void
++ConnStateData::checkLogging()
++{
++    // if we are parsing request body, its request is responsible for logging
++    if (bodyPipe)
++        return;
++
++    // a request currently using this connection is responsible for logging
++    if (!pipeline.empty() && pipeline.back()->mayUseConnection())
++        return;
++
++    /* Either we are waiting for the very first transaction, or
++     * we are done with the Nth transaction and are waiting for N+1st.
++     * XXX: We assume that if anything was added to inBuf, then it could
++     * only be consumed by actions already covered by the above checks.
++     */
++
++    // do not log connections that closed after a transaction (it is normal)
++    // TODO: configurable logging for connections that sent us no bytes
++    // XXX: TLS bytes are consumed without going through inBuf
++    // XXX: PROXY protocol bytes are consumed without going through inBuf
++    if (receivedFirstByte_ && inBuf.isEmpty())
++        return;
++
++    /* Create a temporary ClientHttpRequest object. Its destructor will log. */
++    ClientHttpRequest http(this);
++    http.req_sz = inBuf.length();
++    char const *uri = "error:transaction-end-before-headers";
++    http.uri = xstrdup(uri);
++    setLogUri(&http, uri);
++}
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2016-05-18 16:26:16 +0000
++++ src/client_side.h	2016-07-19 07:51:03 +0000
+@@ -302,60 +302,61 @@
+     err_type handleChunkedRequestBody();
+ 
+     void startPinnedConnectionMonitoring();
+     void clientPinnedConnectionRead(const CommIoCbParams &io);
+ #if USE_OPENSSL
+     /// Handles a ready-for-reading TLS squid-to-server connection that
+     /// we thought was idle.
+     /// \return false if and only if the connection should be closed.
+     bool handleIdleClientPinnedTlsRead();
+ #endif
+ 
+     /// parse input buffer prefix into a single transfer protocol request
+     /// return NULL to request more header bytes (after checking any limits)
+     /// use abortRequestParsing() to handle parsing errors w/o creating request
+     virtual Http::Stream *parseOneRequest() = 0;
+ 
+     /// start processing a freshly parsed request
+     virtual void processParsedRequest(Http::Stream *) = 0;
+ 
+     /// returning N allows a pipeline of 1+N requests (see pipeline_prefetch)
+     virtual int pipelinePrefetchMax() const;
+ 
+     /// timeout to use when waiting for the next request
+     virtual time_t idleTimeout() const = 0;
+ 
+     BodyPipe::Pointer bodyPipe; ///< set when we are reading request body
+ 
+ private:
+     /* ::Server API */
+     virtual bool connFinishedWithConn(int size);
++    virtual void checkLogging();
+ 
+     void clientAfterReadingRequests();
+     bool concurrentRequestQueueFilled() const;
+ 
+     void pinNewConnection(const Comm::ConnectionPointer &pinServer, HttpRequest *request, CachePeer *aPeer, bool auth);
+ 
+     /* PROXY protocol functionality */
+     bool proxyProtocolValidateClient();
+     bool parseProxyProtocolHeader();
+     bool parseProxy1p0();
+     bool parseProxy2p0();
+     bool proxyProtocolError(const char *reason);
+ 
+     /// whether PROXY protocol header is still expected
+     bool needProxyProtocolHeader_;
+ 
+ #if USE_AUTH
+     /// some user details that can be used to perform authentication on this connection
+     Auth::UserRequest::Pointer auth_;
+ #endif
+ 
+     /// the parser state for current HTTP/1.x input buffer processing
+     Http1::RequestParserPointer parser_;
+ 
+ #if USE_OPENSSL
+     bool switchedToHttps_;
+     bool parsingTlsHandshake; ///< whether we are getting/parsing TLS Hello bytes
+ 
+     /// The SSL server host name appears in CONNECT request or the server ip address for the intercepted requests
+     String sslConnectHostOrIp; ///< The SSL server host name as passed in the CONNECT request
+
+=== modified file 'src/comm/TcpAcceptor.cc'
+--- src/comm/TcpAcceptor.cc	2016-04-03 23:41:58 +0000
++++ src/comm/TcpAcceptor.cc	2016-07-19 09:38:03 +0000
+@@ -1,56 +1,58 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 05    Listener Socket Handler */
+ 
+ #include "squid.h"
++#include "acl/FilledChecklist.h"
+ #include "anyp/PortCfg.h"
+ #include "base/TextException.h"
+ #include "client_db.h"
+ #include "comm/AcceptLimiter.h"
+ #include "comm/comm_internal.h"
+ #include "comm/Connection.h"
+ #include "comm/Loops.h"
+ #include "comm/TcpAcceptor.h"
+ #include "CommCalls.h"
+ #include "eui/Config.h"
+ #include "fd.h"
+ #include "fde.h"
+ #include "globals.h"
+ #include "ip/Intercept.h"
+ #include "ip/QosConfig.h"
++#include "log/access_log.h"
+ #include "MasterXaction.h"
+ #include "profiler/Profiler.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "StatCounters.h"
+ 
+ #include <cerrno>
+ #ifdef HAVE_NETINET_TCP_H
+ // required for accept_filter to build.
+ #include <netinet/tcp.h>
+ #endif
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Comm, TcpAcceptor);
+ 
+ Comm::TcpAcceptor::TcpAcceptor(const Comm::ConnectionPointer &newConn, const char *, const Subscription::Pointer &aSub) :
+     AsyncJob("Comm::TcpAcceptor"),
+     errcode(0),
+     isLimited(0),
+     theCallSub(aSub),
+     conn(newConn),
+     listenPort_()
+ {}
+ 
+ Comm::TcpAcceptor::TcpAcceptor(const AnyP::PortCfgPointer &p, const char *, const Subscription::Pointer &aSub) :
+     AsyncJob("Comm::TcpAcceptor"),
+     errcode(0),
+     isLimited(0),
+     theCallSub(aSub),
+     conn(p->listenConn),
+     listenPort_(p)
+@@ -229,85 +231,99 @@
+         if (!okToAccept()) {
+             AcceptLimiter::Instance().defer(afd);
+         } else {
+             afd->acceptNext();
+         }
+         SetSelect(fd, COMM_SELECT_READ, Comm::TcpAcceptor::doAccept, afd, 0);
+ 
+     } catch (const std::exception &e) {
+         fatalf("FATAL: error while accepting new client connection: %s\n", e.what());
+     } catch (...) {
+         fatal("FATAL: error while accepting new client connection: [unknown]\n");
+     }
+ }
+ 
+ bool
+ Comm::TcpAcceptor::okToAccept()
+ {
+     static time_t last_warn = 0;
+ 
+     if (fdNFree() >= RESERVED_FD)
+         return true;
+ 
+     if (last_warn + 15 < squid_curtime) {
+         debugs(5, DBG_CRITICAL, "WARNING! Your cache is running out of filedescriptors");
+         last_warn = squid_curtime;
+     }
+ 
+     return false;
+ }
+ 
++static void
++logAcceptError(const Comm::ConnectionPointer &conn)
++{
++    AccessLogEntry::Pointer al = new AccessLogEntry;
++    al->tcpClient = conn;
++    al->url = "error:accept-user-connection";
++    ACLFilledChecklist ch(NULL, NULL, NULL);
++    ch.src_addr = conn->remote;
++    ch.my_addr = conn->local;
++    accessLogLog(al, &ch);
++}
++
+ void
+ Comm::TcpAcceptor::acceptOne()
+ {
+     /*
+      * We don't worry about running low on FDs here.  Instead,
+      * doAccept() will use AcceptLimiter if we reach the limit
+      * there.
+      */
+ 
+     /* Accept a new connection */
+     ConnectionPointer newConnDetails = new Connection();
+     const Comm::Flag flag = oldAccept(newConnDetails);
+ 
+     /* Check for errors */
+     if (!newConnDetails->isOpen()) {
+ 
+         if (flag == Comm::NOMESSAGE) {
+             /* register interest again */
+             debugs(5, 5, HERE << "try later: " << conn << " handler Subscription: " << theCallSub);
+             SetSelect(conn->fd, COMM_SELECT_READ, doAccept, this, 0);
+             return;
+         }
+ 
+         // A non-recoverable error; notify the caller */
+         debugs(5, 5, HERE << "non-recoverable error:" << status() << " handler Subscription: " << theCallSub);
++        if (intendedForUserConnections())
++            logAcceptError(newConnDetails);
+         notify(flag, newConnDetails);
+         mustStop("Listener socket closed");
+         return;
+     }
+ 
+     debugs(5, 5, HERE << "Listener: " << conn <<
+            " accepted new connection " << newConnDetails <<
+            " handler Subscription: " << theCallSub);
+     notify(flag, newConnDetails);
+ }
+ 
+ void
+ Comm::TcpAcceptor::acceptNext()
+ {
+     Must(IsConnOpen(conn));
+     debugs(5, 2, HERE << "connection on " << conn);
+     acceptOne();
+ }
+ 
+ void
+ Comm::TcpAcceptor::notify(const Comm::Flag flag, const Comm::ConnectionPointer &newConnDetails) const
+ {
+     // listener socket handlers just abandon the port with Comm::ERR_CLOSING
+     // it should only happen when this object is deleted...
+     if (flag == Comm::ERR_CLOSING) {
+         return;
+     }
+ 
+     if (theCallSub != NULL) {
+         AsyncCall::Pointer call = theCallSub->callback();
+
+=== modified file 'src/comm/TcpAcceptor.h'
+--- src/comm/TcpAcceptor.h	2016-01-01 00:12:18 +0000
++++ src/comm/TcpAcceptor.h	2016-07-19 07:51:03 +0000
+@@ -77,36 +77,38 @@
+     int errcode;
+ 
+ protected:
+     friend class AcceptLimiter;
+     int32_t isLimited;                   ///< whether this socket is delayed and on the AcceptLimiter queue.
+ 
+ private:
+     Subscription::Pointer theCallSub;    ///< used to generate AsyncCalls handling our events.
+ 
+     /// conn being listened on for new connections
+     /// Reserved for read-only use.
+     ConnectionPointer conn;
+ 
+     /// configuration details of the listening port (if provided)
+     AnyP::PortCfgPointer listenPort_;
+ 
+     /// listen socket closure handler
+     AsyncCall::Pointer closer_;
+ 
+     /// Method to test if there are enough file descriptors to open a new client connection
+     /// if not the accept() will be postponed
+     static bool okToAccept();
+ 
+     /// Method callback for whenever an FD is ready to accept a client connection.
+     static void doAccept(int fd, void *data);
+ 
+     void acceptOne();
+     Comm::Flag oldAccept(Comm::ConnectionPointer &details);
+     void setListen();
+     void handleClosure(const CommCloseCbParams &io);
++    /// whether we are listening on one of the squid.conf *ports
++    bool intendedForUserConnections() const { return bool(listenPort_); }
+ };
+ 
+ } // namespace Comm
+ 
+ #endif /* SQUID_COMM_TCPACCEPTOR_H */
+ 
+
+=== modified file 'src/servers/Server.cc'
+--- src/servers/Server.cc	2016-06-14 16:54:23 +0000
++++ src/servers/Server.cc	2016-07-19 07:51:03 +0000
+@@ -140,60 +140,61 @@
+         if (!handleReadData())
+             return;
+ 
+         /* Continue to process previously read data */
+         break;
+ 
+     case Comm::ENDFILE: // close detected by 0-byte read
+         debugs(33, 5, io.conn << " closed?");
+ 
+         if (connFinishedWithConn(rd.size)) {
+             clientConnection->close();
+             return;
+         }
+ 
+         /* It might be half-closed, we can't tell */
+         fd_table[io.conn->fd].flags.socket_eof = true;
+         commMarkHalfClosed(io.conn->fd);
+         fd_note(io.conn->fd, "half-closed");
+ 
+         /* There is one more close check at the end, to detect aborted
+          * (partial) requests. At this point we can't tell if the request
+          * is partial.
+          */
+ 
+         /* Continue to process previously read data */
+         break;
+ 
+     // case Comm::COMM_ERROR:
+     default: // no other flags should ever occur
+         debugs(33, 2, io.conn << ": got flag " << rd.flag << "; " << xstrerr(rd.xerrno));
++        checkLogging();
+         pipeline.terminateAll(rd.xerrno);
+         io.conn->close();
+         return;
+     }
+ 
+     afterClientRead();
+ }
+ 
+ /** callback handling the Comm::Write completion
+  *
+  * Will call afterClientWrite(size_t) to sync the I/O state.
+  * Then writeSomeData() to initiate any followup writes that
+  * could be immediately done.
+  */
+ void
+ Server::clientWriteDone(const CommIoCbParams &io)
+ {
+     debugs(33,5, io.conn);
+     Must(writer != nullptr);
+     writer = nullptr;
+ 
+     /* Bail out quickly on Comm::ERR_CLOSING - close handlers will tidy up */
+     if (io.flag == Comm::ERR_CLOSING || !Comm::IsConnOpen(clientConnection)) {
+         debugs(33,5, io.conn << " closing Bailout.");
+         return;
+     }
+ 
+     Must(io.conn->fd == clientConnection->fd);
+ 
+     if (io.flag && pipeline.front())
+
+=== modified file 'src/servers/Server.h'
+--- src/servers/Server.h	2016-06-14 16:54:23 +0000
++++ src/servers/Server.h	2016-07-19 07:51:03 +0000
+@@ -90,36 +90,39 @@
+ public:
+ 
+     /// grows the available read buffer space (if possible)
+     void maybeMakeSpaceAvailable();
+ 
+     // Client TCP connection details from comm layer.
+     Comm::ConnectionPointer clientConnection;
+ 
+     /**
+      * The transfer protocol currently being spoken on this connection.
+      * HTTP/1.x CONNECT, HTTP/1.1 Upgrade and HTTP/2 SETTINGS offer the
+      * ability to change protocols on the fly.
+      */
+     AnyP::ProtocolVersion transferProtocol;
+ 
+     /// Squid listening port details where this connection arrived.
+     AnyP::PortCfgPointer port;
+ 
+     /// read I/O buffer for the client connection
+     SBuf inBuf;
+ 
+     bool receivedFirstByte_; ///< true if at least one byte received on this connection
+ 
+     /// set of requests waiting to be serviced
+     Pipeline pipeline;
+ 
+ protected:
+     void doClientRead(const CommIoCbParams &io);
+     void clientWriteDone(const CommIoCbParams &io);
+ 
++    /// Log the current [attempt at] transaction if nobody else will.
++    virtual void checkLogging() = 0;
++
+     AsyncCall::Pointer reader; ///< set when we are reading
+     AsyncCall::Pointer writer; ///< set when we are writing
+ };
+ 
+ #endif /* SQUID_SERVERS_SERVER_H */
+ 
+

@@ -1,0 +1,142 @@
+Do not die silently when dying via std::terminate().
+
+Report exception failures that call std::terminate(). Exceptions unwind
+stack towards main() and sooner or later get handled/reported by Squid.
+However, exception failures just call std::terminate(), which aborts
+Squid without the stack unwinding. By default, a std::terminate() call
+usually results in a silent Squid process death because some default
+std::terminate_handler implementations do not say anything at all while
+others write to stderr which Squid redirects to /dev/null by default.
+
+Many different problems trigger std::terminate() calls. Most of them are
+rare, but, after the C++11 migration, one category became likely in
+Squid: A throwing destructor. Destructors in C++11 are implicitly
+"noexcept" by default, and many old Squid destructors might throw.
+
+These reporting changes do not bypass or eliminate any failures.
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2017-03-03 23:18:25 +0000
++++ src/main.cc	2017-05-17 23:34:59 +0000
+@@ -1319,81 +1319,115 @@ mainInitialize(void)
+ 
+         if (Config.onoff.announce)
+             eventAdd("start_announce", start_announce, NULL, 3600.0, 1);
+ 
+         eventAdd("ipcache_purgelru", ipcache_purgelru, NULL, 10.0, 1);
+ 
+         eventAdd("fqdncache_purgelru", fqdncache_purgelru, NULL, 15.0, 1);
+ 
+ #if USE_XPROF_STATS
+ 
+         eventAdd("cpuProfiling", xprof_event, NULL, 1.0, 1);
+ 
+ #endif
+ 
+         eventAdd("memPoolCleanIdlePools", Mem::CleanIdlePools, NULL, 15.0, 1);
+     }
+ 
+     configured_once = 1;
+ }
+ 
++/// describes active (i.e., thrown but not yet handled) exception
++static std::ostream &
++CurrentException(std::ostream &os)
++{
++    if (std::current_exception()) { 
++        try {
++            throw; // re-throw to recognize the exception type
++        }
++        catch (const std::exception &ex) {
++            os << ex.what();
++        }
++        catch (...) {
++            os << "[unknown exception type]";
++        }
++    } else {
++        os << "[no active exception]";
++    }
++    return os;
++}
++
++static void
++OnTerminate()
++{
++    // ignore recursive calls to avoid termination loops
++    static bool terminating = false;
++    if (terminating)
++        return;
++    terminating = true;
++
++    debugs(1, DBG_CRITICAL, "FATAL: Dying from an exception handling failure; exception: " << CurrentException);
++    abort();
++}
++
+ /// unsafe main routine -- may throw
+ int SquidMain(int argc, char **argv);
+ /// unsafe main routine wrapper to catch exceptions
+ static int SquidMainSafe(int argc, char **argv);
+ 
+ #if USE_WIN32_SERVICE
+ /* Entry point for Windows services */
+ extern "C" void WINAPI
+ SquidWinSvcMain(int argc, char **argv)
+ {
+     SquidMainSafe(argc, argv);
+ }
+ #endif
+ 
+ int
+ main(int argc, char **argv)
+ {
+ #if USE_WIN32_SERVICE
+     SetErrorMode(SEM_NOGPFAULTERRORBOX);
+     if ((argc == 2) && strstr(argv[1], _WIN_SQUID_SERVICE_OPTION))
+         return WIN32_StartService(argc, argv);
+     else {
+         WIN32_run_mode = _WIN_SQUID_RUN_MODE_INTERACTIVE;
+         opt_no_daemon = 1;
+     }
+ #endif
+ 
+     return SquidMainSafe(argc, argv);
+ }
+ 
+ static int
+ SquidMainSafe(int argc, char **argv)
+ {
++    (void)std::set_terminate(&OnTerminate);
++    // XXX: This top-level catch works great for startup, but, during runtime,
++    // it erases valuable stack info. TODO: Let stack-preserving OnTerminate()
++    // handle FATAL runtime errors by splitting main code into protected
++    // startup, unprotected runtime, and protected termination sections!
+     try {
+         return SquidMain(argc, argv);
+-    } catch (const std::exception &e) {
+-        debugs(1, DBG_CRITICAL, "FATAL: dying from an unhandled exception: " <<
+-               e.what());
+-        throw;
+     } catch (...) {
+-        debugs(1, DBG_CRITICAL, "FATAL: dying from an unhandled exception.");
++        debugs(1, DBG_CRITICAL, "FATAL: dying from an unhandled exception: " << CurrentException);
+         throw;
+     }
+     return -1; // not reached
+ }
+ 
+ /// computes name and ID for the current kid process
+ static void
+ ConfigureCurrentKid(const char *processName)
+ {
+     // kids are marked with parenthesis around their process names
+     if (processName && processName[0] == '(') {
+         if (const char *idStart = strrchr(processName, '-')) {
+             KidIdentifier = atoi(idStart + 1);
+             const size_t nameLen = idStart - (processName + 1);
+             assert(nameLen < sizeof(TheKidName));
+             xstrncpy(TheKidName, processName + 1, nameLen + 1);
+             if (!strcmp(TheKidName, "squid-coord"))
+                 TheProcessKind = pkCoordinator;
+             else if (!strcmp(TheKidName, "squid"))
+                 TheProcessKind = pkWorker;
+

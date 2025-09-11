@@ -1,0 +1,324 @@
+Support http_access denials of SslBump "peeked" connections.
+
+If an SSL connection is "peeked", it is currently not possible to deny it
+with http_access. For example, the following configuration denies all plain
+HTTP requests as expected but allows all CONNECTs (and all subsequent 
+encrypted/spliced HTTPS requests inside the allowed CONNECT tunnels):
+
+  http_access deny all
+  ssl_bump peek all
+  ssl_bump splice all
+
+The bug results in insecure bumping configurations and/or forces admins to
+abuse ssl_bump directive (during step1 of bumping) for access control (as a
+partial workaround).
+
+This change sends all SSL tunnels (CONNECT and transparent) through http_access
+(and adaptation, etc.) checks during bumping step1. If (real or fake) CONNECT is
+denied during step1, then Squid does not connect to the SSL server, but bumps
+the client connection, and then delivers an error page (in response to the
+first decrypted GET). The behavior is similar to what Squid has already been
+doing for server certificate validation errors.
+
+Technical notes
+----------------
+
+Before these changes:
+
+  * When a transparent SSL connection is being bumped, if we decide to splice
+    during step1, then we splice the connections without any http_access
+    checks. The (spliced) connection is always established.
+
+  * When a CONNECT tunnel is being bumped at step1, if peek/stare/server-first
+    mode is selected, and our http_access check fails, then:
+     1) We create an error page and proceeding with SSL bump, expecting
+        to serve the error after the client SSL connection is negotiated.
+     2) We start forwarding SSL Hello to the server, to peek/stare at (or
+        server-first bump) the server connection.
+     3) If we then decide to splice the connection during step2 or step3, then
+        we splice, and the error page never gets served to the client!
+
+After these changes:
+
+  * During transparent SSL bumping, if we decide to splice at step1, do not 
+    splice the connection immediately, but create a fake CONNECT request first
+    and send it through the callout code (http_access check, ICAP/ECAP, etc.).
+    If that fake CONNECT is denied, the code path described below kicks in.
+
+  * When an error page is generated during CONNECT or transparent bumping
+    (e.g. because an http_access check has failed), we switch to the
+    "client-first" bumping mode and then serve the error page to the client
+    (upon receiving the first regular request on the bumped connection).
+
+This is a Measurement Factory project.
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2014-11-20 08:57:14 +0000
++++ src/client_side.cc	2014-12-09 16:20:21 +0000
+@@ -3655,60 +3655,59 @@
+ 
+ /**
+  * A callback function to use with the ACLFilledChecklist callback.
+  * In the case of ACCESS_ALLOWED answer initializes a bumped SSL connection,
+  * else reverts the connection to tunnel mode.
+  */
+ static void
+ httpsSslBumpAccessCheckDone(allow_t answer, void *data)
+ {
+     ConnStateData *connState = (ConnStateData *) data;
+ 
+     // if the connection is closed or closing, just return.
+     if (!connState->isOpen())
+         return;
+ 
+     // Require both a match and a positive bump mode to work around exceptional
+     // cases where ACL code may return ACCESS_ALLOWED with zero answer.kind.
+     if (answer == ACCESS_ALLOWED && (answer.kind != Ssl::bumpNone && answer.kind != Ssl::bumpSplice)) {
+         debugs(33, 2, "sslBump needed for " << connState->clientConnection << " method " << answer.kind);
+         connState->sslBumpMode = static_cast<Ssl::BumpMode>(answer.kind);
+-        httpsEstablish(connState, NULL, (Ssl::BumpMode)answer.kind);
+     } else {
+         debugs(33, 2, HERE << "sslBump not needed for " << connState->clientConnection);
+         connState->sslBumpMode = Ssl::bumpNone;
++    }
+ 
+-        // fake a CONNECT request to force connState to tunnel
+-        static char ip[MAX_IPSTRLEN];
+-        connState->clientConnection->local.toUrl(ip, sizeof(ip));
+-        // Pre-pend this fake request to the TLS bits already in the buffer
+-        SBuf retStr;
+-        retStr.append("CONNECT ").append(ip).append(" HTTP/1.1\r\nHost: ").append(ip).append("\r\n\r\n");
+-        connState->in.buf = retStr.append(connState->in.buf);
+-        bool ret = connState->handleReadData();
+-        if (ret)
+-            ret = connState->clientParseRequests();
+-
+-        if (!ret) {
+-            debugs(33, 2, HERE << "Failed to start fake CONNECT request for ssl bumped connection: " << connState->clientConnection);
+-            connState->clientConnection->close();
+-        }
++    // fake a CONNECT request to force connState to tunnel
++    static char ip[MAX_IPSTRLEN];
++    connState->clientConnection->local.toUrl(ip, sizeof(ip));
++    // Pre-pend this fake request to the TLS bits already in the buffer
++    SBuf retStr;
++    retStr.append("CONNECT ").append(ip).append(" HTTP/1.1\r\nHost: ").append(ip).append("\r\n\r\n");
++    connState->in.buf = retStr.append(connState->in.buf);
++    bool ret = connState->handleReadData();
++    if (ret)
++        ret = connState->clientParseRequests();
++
++    if (!ret) {
++        debugs(33, 2, "Failed to start fake CONNECT request for SSL bumped connection: " << connState->clientConnection);
++        connState->clientConnection->close();
+     }
+ }
+ 
+ /** handle a new HTTPS connection */
+ static void
+ httpsAccept(const CommAcceptCbParams &params)
+ {
+     MasterXaction::Pointer xact = params.xaction;
+     const AnyP::PortCfgPointer s = xact->squidPort;
+ 
+     // NP: it is possible the port was reconfigured when the call or accept() was queued.
+ 
+     if (params.flag != Comm::OK) {
+         // Its possible the call was still queued when the client disconnected
+         debugs(33, 2, "httpsAccept: " << s->listenConn << ": accept failure: " << xstrerr(params.xerrno));
+         return;
+     }
+ 
+     debugs(33, 4, HERE << params.conn << " accepted, starting SSL negotiation.");
+     fd_note(params.conn->fd, "client https connect");
+
+=== modified file 'src/client_side_request.cc'
+--- src/client_side_request.cc	2014-11-04 08:47:03 +0000
++++ src/client_side_request.cc	2014-12-09 16:24:41 +0000
+@@ -3,40 +3,41 @@
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 85    Client-side Request Routines */
+ 
+ /*
+  * General logic of request processing:
+  *
+  * We run a series of tests to determine if access will be permitted, and to do
+  * any redirection. Then we call into the result clientStream to retrieve data.
+  * From that point on it's up to reply management.
+  */
+ 
+ #include "squid.h"
+ #include "acl/FilledChecklist.h"
+ #include "acl/Gadgets.h"
+ #include "anyp/PortCfg.h"
++#include "base/AsyncJobCalls.h"
+ #include "client_side.h"
+ #include "client_side_reply.h"
+ #include "client_side_request.h"
+ #include "ClientRequestContext.h"
+ #include "clientStream.h"
+ #include "comm/Connection.h"
+ #include "comm/Write.h"
+ #include "compat/inet_pton.h"
+ #include "err_detail_type.h"
+ #include "errorpage.h"
+ #include "fd.h"
+ #include "fde.h"
+ #include "format/Token.h"
+ #include "gopher.h"
+ #include "helper.h"
+ #include "helper/Reply.h"
+ #include "http.h"
+ #include "HttpHdrCc.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+@@ -1400,40 +1401,41 @@
+     calloutContext->checkNoCacheDone(answer);
+ }
+ 
+ void
+ ClientRequestContext::checkNoCacheDone(const allow_t &answer)
+ {
+     acl_checklist = NULL;
+     http->request->flags.cachable = (answer == ACCESS_ALLOWED);
+     http->doCallouts();
+ }
+ 
+ #if USE_OPENSSL
+ bool
+ ClientRequestContext::sslBumpAccessCheck()
+ {
+     // If SSL connection tunneling or bumping decision has been made, obey it.
+     const Ssl::BumpMode bumpMode = http->getConn()->sslBumpMode;
+     if (bumpMode != Ssl::bumpEnd) {
+         debugs(85, 5, HERE << "SslBump already decided (" << bumpMode <<
+                "), " << "ignoring ssl_bump for " << http->getConn());
++        http->sslBumpNeed(bumpMode); // for processRequest() to bump if needed
+         http->al->ssl.bumpMode = bumpMode; // inherited from bumped connection
+         return false;
+     }
+ 
+     // If we have not decided yet, decide whether to bump now.
+ 
+     // Bumping here can only start with a CONNECT request on a bumping port
+     // (bumping of intercepted SSL conns is decided before we get 1st request).
+     // We also do not bump redirected CONNECT requests.
+     if (http->request->method != Http::METHOD_CONNECT || http->redirect.status ||
+             !Config.accessList.ssl_bump ||
+             !http->getConn()->port->flags.tunnelSslBumping) {
+         http->al->ssl.bumpMode = Ssl::bumpEnd; // SslBump does not apply; log -
+         debugs(85, 5, HERE << "cannot SslBump this request");
+         return false;
+     }
+ 
+     // Do not bump during authentication: clients would not proxy-authenticate
+     // if we delay a 407 response and respond with 200 OK to CONNECT.
+     if (error && error->httpStatus == Http::scProxyAuthenticationRequired) {
+@@ -1555,46 +1557,55 @@
+     // TODO: Use HttpReply instead of the "200 Connection established" string.
+     al->http.code = 200;
+ 
+ #if USE_AUTH
+     // Preserve authentication info for the ssl-bumped request
+     if (request->auth_user_request != NULL)
+         getConn()->setAuth(request->auth_user_request, "SSL-bumped CONNECT");
+ #endif
+ 
+     assert(sslBumpNeeded());
+     getConn()->switchToHttps(request, sslBumpNeed_);
+ }
+ 
+ void
+ ClientHttpRequest::sslBumpStart()
+ {
+     debugs(85, 5, HERE << "Confirming " << Ssl::bumpMode(sslBumpNeed_) <<
+            "-bumped CONNECT tunnel on FD " << getConn()->clientConnection);
+     getConn()->sslBumpMode = sslBumpNeed_;
+ 
++    AsyncCall::Pointer bumpCall = commCbCall(85, 5, "ClientSocketContext::sslBumpEstablish",
++                                         CommIoCbPtrFun(&SslBumpEstablish, this));
++
++    if (request->flags.interceptTproxy || request->flags.intercepted) {
++        CommIoCbParams &params = GetCommParams<CommIoCbParams>(bumpCall);
++        params.flag = Comm::OK;
++        params.conn = getConn()->clientConnection;
++        ScheduleCallHere(bumpCall);
++        return;
++    }
++
+     // send an HTTP 200 response to kick client SSL negotiation
+     // TODO: Unify with tunnel.cc and add a Server(?) header
+     static const char *const conn_established = "HTTP/1.1 200 Connection established\r\n\r\n";
+-    AsyncCall::Pointer call = commCbCall(85, 5, "ClientSocketContext::sslBumpEstablish",
+-                                         CommIoCbPtrFun(&SslBumpEstablish, this));
+-    Comm::Write(getConn()->clientConnection, conn_established, strlen(conn_established), call, NULL);
++    Comm::Write(getConn()->clientConnection, conn_established, strlen(conn_established), bumpCall, NULL);
+ }
+ 
+ #endif
+ 
+ bool
+ ClientHttpRequest::gotEnough() const
+ {
+     /** TODO: should be querying the stream. */
+     int64_t contentLength =
+         memObject()->getReply()->bodySize(request->method);
+     assert(contentLength >= 0);
+ 
+     if (out.offset < contentLength)
+         return false;
+ 
+     return true;
+ }
+ 
+ void
+ ClientHttpRequest::storeEntry(StoreEntry *newEntry)
+@@ -1764,40 +1775,42 @@
+                 Ip::Qos::setSockNfmark(getConn()->clientConnection, mark);
+         }
+     }
+ 
+ #if USE_OPENSSL
+     // We need to check for SslBump even if the calloutContext->error is set
+     // because bumping may require delaying the error until after CONNECT.
+     if (!calloutContext->sslBumpCheckDone) {
+         calloutContext->sslBumpCheckDone = true;
+         if (calloutContext->sslBumpAccessCheck())
+             return;
+         /* else no ssl bump required*/
+     }
+ #endif
+ 
+     if (calloutContext->error) {
+         const char *storeUri = request->storeId();
+         StoreEntry *e= storeCreateEntry(storeUri, storeUri, request->flags, request->method);
+ #if USE_OPENSSL
+         if (sslBumpNeeded()) {
++            // We have to serve an error, so bump the client first.
++            sslBumpNeed(Ssl::bumpClientFirst);
+             // set final error but delay sending until we bump
+             Ssl::ServerBump *srvBump = new Ssl::ServerBump(request, e);
+             errorAppendEntry(e, calloutContext->error);
+             calloutContext->error = NULL;
+             getConn()->setServerBump(srvBump);
+             e->unlock("ClientHttpRequest::doCallouts+sslBumpNeeded");
+         } else
+ #endif
+         {
+             // send the error to the client now
+             clientStreamNode *node = (clientStreamNode *)client_stream.tail->prev->data;
+             clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+             assert (repContext);
+             repContext->setReplyToStoreEntry(e, "immediate SslBump error");
+             errorAppendEntry(e, calloutContext->error);
+             calloutContext->error = NULL;
+             if (calloutContext->readNextRequest)
+                 getConn()->flags.readMore = true; // resume any pipeline reads.
+             node = (clientStreamNode *)client_stream.tail->data;
+             clientStreamRead(node, this, node->readBuffer);
+

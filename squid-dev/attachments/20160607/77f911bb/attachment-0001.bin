@@ -1,0 +1,346 @@
+TLS Authority Key Identifier certificate extension
+
+This patch add support for mimicking TLS Authority Key Identifier certificate
+extension in Squid generated TLS certificates: If the origin server certificate
+has that extension, the generated certificate (via the ssl_crtd daemon or
+internally) should have the same extension, with the same set of fields if
+possible.
+
+This is a Measurement Factory project
+
+=== modified file 'src/ssl/gadgets.cc'
+--- src/ssl/gadgets.cc	2016-02-13 16:10:26 +0000
++++ src/ssl/gadgets.cc	2016-06-07 14:21:42 +0000
+@@ -247,47 +247,129 @@
+         certKey.append("+SetValidBefore=on", 18);
+ 
+     if (setCommonName) {
+         certKey.append("+SetCommonName=", 15);
+         certKey.append(commonName);
+     }
+ 
+     if (signAlgorithm != Ssl::algSignEnd) {
+         certKey.append("+Sign=", 6);
+         certKey.append(certSignAlgorithm(signAlgorithm));
+     }
+ 
+     if (signHash != NULL) {
+         certKey.append("+SignHash=", 10);
+         certKey.append(EVP_MD_name(signHash));
+     }
+ 
+     return certKey;
+ }
+ 
++/// Check if mimicCert certificate has the Authority Key Identifier extension
++/// and if yes add the extrension to cert certificate with the same fields if
++/// possible. If the issuerCert certificate  does not have the Subject Key 
++/// Identifier extension (required to build the keyIdentifier field of
++/// AuthorityKeyIdentifier) then the authorityCertIssuer and
++/// authorityCertSerialNumber fields added.
++static bool
++mimicAuthorityKeyId(Security::CertPointer &cert, Security::CertPointer const &mimicCert, Security::CertPointer const &issuerCert)
++{
++    if (!mimicCert.get() || !issuerCert.get())
++        return false;
++
++    Ssl::AUTHORITY_KEYID_Pointer akid((AUTHORITY_KEYID *)X509_get_ext_d2i(mimicCert.get(), NID_authority_key_identifier, nullptr, nullptr));
++
++    bool addKeyId = false, addIssuer = false;
++    if (akid.get()) {
++        addKeyId = (akid.get()->keyid != nullptr);
++        addIssuer = (akid.get()->issuer && akid.get()->serial);
++    }
++
++    if (!addKeyId && !addIssuer)
++        return false; // No need to add AuthorityKeyIdentifier
++
++    Ssl::ASN1_OCTET_STRING_Pointer issuerKeyId;
++    if (addKeyId) {
++        X509_EXTENSION *ext;
++        // Check if the issuer has the Subject Key Identifier extension
++        const int indx = X509_get_ext_by_NID(issuerCert.get(), NID_subject_key_identifier, -1);
++        if (indx >= 0 && (ext = X509_get_ext(issuerCert.get(), indx))) {
++            issuerKeyId.reset((ASN1_OCTET_STRING *)X509V3_EXT_d2i(ext));
++        }
++    }
++
++    Ssl::X509_NAME_Pointer issuerName;
++    Ssl::ASN1_INT_Pointer issuerSerial;
++    if (issuerKeyId.get() == nullptr || addIssuer) {
++        issuerName.reset(X509_NAME_dup(X509_get_issuer_name(issuerCert.get())));
++        issuerSerial.reset(M_ASN1_INTEGER_dup(X509_get_serialNumber(issuerCert.get())));
++    }
++
++    Ssl::AUTHORITY_KEYID_Pointer theAuthKeyId(AUTHORITY_KEYID_new());
++    if (!theAuthKeyId.get())
++        return false;
++    theAuthKeyId.get()->keyid = issuerKeyId.release();
++    if (issuerName && issuerSerial) {
++        Ssl::GENERAL_NAME_STACK_Pointer genNames(sk_GENERAL_NAME_new_null());
++        if (genNames.get()) {
++            if (GENERAL_NAME *aname = GENERAL_NAME_new()) {
++                sk_GENERAL_NAME_push(genNames.get(), aname);
++                aname->type = GEN_DIRNAME;
++                aname->d.dirn = issuerName.release();
++                theAuthKeyId.get()->issuer = genNames.release();
++                theAuthKeyId.get()->serial = issuerSerial.release();
++            }
++        }
++    }
++
++    // The Authority Key Identifier extension should include KeyId or/and both
++    /// issuer name and issuer serial
++    if (!theAuthKeyId.get()->keyid && (!theAuthKeyId.get()->issuer || !theAuthKeyId.get()->serial))
++        return false;
++
++    const X509V3_EXT_METHOD *method = X509V3_EXT_get_nid(NID_authority_key_identifier);
++    if (!method)
++        return false;
++
++    unsigned char *ext_der = NULL;
++    int ext_len = ASN1_item_i2d((ASN1_VALUE *)theAuthKeyId.get(), &ext_der, ASN1_ITEM_ptr(method->it));
++    Ssl::ASN1_OCTET_STRING_Pointer extOct(M_ASN1_OCTET_STRING_new());
++    extOct.get()->data = ext_der;
++    extOct.get()->length = ext_len;
++    Ssl::X509_EXTENSION_Pointer extAuthKeyId(X509_EXTENSION_create_by_NID(NULL, NID_authority_key_identifier, 0, extOct.get()));
++    if (!extAuthKeyId.get())
++        return false;
++
++    extOct.release();
++    if (!X509_add_ext(cert.get(), extAuthKeyId.get(), -1))
++        return false;
++
++    return true;
++}
++
+ /// Copy certificate extensions from cert to mimicCert.
+ /// Returns the number of extensions copied.
+ // Currently only extensions which are reported by the users that required are
+ // mimicked. More safe to mimic extensions would be added here if users request
+ // them.
+ static int
+-mimicExtensions(Security::CertPointer & cert, Security::CertPointer const & mimicCert)
++mimicExtensions(Security::CertPointer & cert, Security::CertPointer const &mimicCert, Security::CertPointer const &issuerCert)
+ {
+     static int extensions[]= {
+         NID_key_usage,
+         NID_ext_key_usage,
+         NID_basic_constraints,
+         0
+     };
+ 
+     // key usage bit names
+     enum {
+         DigitalSignature,
+         NonRepudiation,
+         KeyEncipherment, // NSS requires for RSA but not EC
+         DataEncipherment,
+         KeyAgreement,
+         KeyCertificateSign,
+         CRLSign,
+         EncipherOnly,
+         DecipherOnly
+     };
+@@ -316,40 +398,43 @@
+                     //Build the ASN1_OCTET_STRING
+                     const X509V3_EXT_METHOD *method = X509V3_EXT_get(ext);
+                     assert(method && method->it);
+                     unsigned char *ext_der = NULL;
+                     int ext_len = ASN1_item_i2d((ASN1_VALUE *)keyusage,
+                                                 &ext_der,
+                                                 (const ASN1_ITEM *)ASN1_ITEM_ptr(method->it));
+ 
+                     ASN1_OCTET_STRING *ext_oct = M_ASN1_OCTET_STRING_new();
+                     ext_oct->data = ext_der;
+                     ext_oct->length = ext_len;
+                     X509_EXTENSION_set_data(ext, ext_oct);
+ 
+                     M_ASN1_OCTET_STRING_free(ext_oct);
+                     ASN1_BIT_STRING_free(keyusage);
+                 }
+             }
+         }
+     }
+ 
++    if (mimicAuthorityKeyId(cert, mimicCert, issuerCert))
++        added++;
++
+     // We could also restrict mimicking of the CA extension to CA:FALSE
+     // because Squid does not generate valid fake CA certificates.
+ 
+     return added;
+ }
+ 
+ static bool buildCertificate(Security::CertPointer & cert, Ssl::CertificateProperties const &properties)
+ {
+     // not an Ssl::X509_NAME_Pointer because X509_REQ_get_subject_name()
+     // returns a pointer to the existing subject name. Nothing to clean here.
+     if (properties.mimicCert.get()) {
+         // Leave subject empty if we cannot extract it from true cert.
+         if (X509_NAME *name = X509_get_subject_name(properties.mimicCert.get())) {
+             // X509_set_subject_name will call X509_dup for name
+             X509_set_subject_name(cert.get(), name);
+         }
+     }
+ 
+     if (properties.setCommonName || !properties.mimicCert.get()) {
+         // In this case the CN of the certificate given by the user
+@@ -392,41 +477,41 @@
+         unsigned char *alStr;
+         int alLen;
+         alStr = X509_alias_get0(properties.mimicCert.get(), &alLen);
+         if (alStr) {
+             X509_alias_set1(cert.get(), alStr, alLen);
+         }
+ 
+         int addedExtensions = 0;
+ 
+         // Mimic subjectAltName unless we used a configured CN: browsers reject
+         // certificates with CN unrelated to subjectAltNames.
+         if (!properties.setCommonName) {
+             int pos=X509_get_ext_by_NID (properties.mimicCert.get(), OBJ_sn2nid("subjectAltName"), -1);
+             X509_EXTENSION *ext=X509_get_ext(properties.mimicCert.get(), pos);
+             if (ext) {
+                 if (X509_add_ext(cert.get(), ext, -1))
+                     ++addedExtensions;
+             }
+         }
+ 
+-        addedExtensions += mimicExtensions(cert, properties.mimicCert);
++        addedExtensions += mimicExtensions(cert, properties.mimicCert, properties.signWithX509);
+ 
+         // According to RFC 5280, using extensions requires v3 certificate.
+         if (addedExtensions)
+             X509_set_version(cert.get(), 2); // value 2 means v3
+     }
+ 
+     return true;
+ }
+ 
+ static bool generateFakeSslCertificate(Security::CertPointer & certToStore, Ssl::EVP_PKEY_Pointer & pkeyToStore, Ssl::CertificateProperties const &properties,  Ssl::BIGNUM_Pointer const &serial)
+ {
+     Ssl::EVP_PKEY_Pointer pkey;
+     // Use signing certificates private key as generated certificate private key
+     if (properties.signWithPkey.get())
+         pkey.resetAndLock(properties.signWithPkey.get());
+     else // if not exist generate one
+         pkey.reset(Ssl::createSslPrivateKey());
+ 
+     if (!pkey)
+         return false;
+
+=== modified file 'src/ssl/gadgets.h'
+--- src/ssl/gadgets.h	2016-02-13 16:10:26 +0000
++++ src/ssl/gadgets.h	2016-06-07 10:05:17 +0000
+@@ -1,91 +1,109 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SSL_GADGETS_H
+ #define SQUID_SSL_GADGETS_H
+ 
+ #include "security/forward.h"
+ #include "ssl/crtd_message.h"
+ 
+ #if HAVE_OPENSSL_TXT_DB_H
+ #include <openssl/txt_db.h>
+ #endif
++#if HAVE_OPENSSL_X509V3_H
++#include <openssl/x509v3.h>
++#endif
+ #include <string>
+ 
+ namespace Ssl
+ {
+ /**
+  \defgroup SslCrtdSslAPI SSL certificate generator API
+  These functions must not depend on Squid runtime code such as debug()
+  because they are used by security_file_certgen helper.
+  */
+ 
+ #if SQUID_USE_CONST_SSL_METHOD
+ typedef const SSL_METHOD * ContextMethod;
+ #else
+ typedef SSL_METHOD * ContextMethod;
+ #endif
+ 
+ #if !defined(SQUID_SSL_SIGN_HASH_IF_NONE)
+ #define SQUID_SSL_SIGN_HASH_IF_NONE "sha256"
+ #endif
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+  * TidyPointer typedefs for  common SSL objects
+  */
+ sk_free_wrapper(sk_X509, STACK_OF(X509) *, X509_free)
+ typedef TidyPointer<STACK_OF(X509), sk_X509_free_wrapper> X509_STACK_Pointer;
+ 
+ CtoCpp1(EVP_PKEY_free, EVP_PKEY *)
+ typedef Security::LockingPointer<EVP_PKEY, EVP_PKEY_free_cpp, CRYPTO_LOCK_EVP_PKEY> EVP_PKEY_Pointer;
+ 
+ CtoCpp1(BN_free, BIGNUM *)
+ typedef TidyPointer<BIGNUM, BN_free_cpp> BIGNUM_Pointer;
+ 
+ CtoCpp1(BIO_free, BIO *)
+ typedef TidyPointer<BIO, BIO_free_cpp> BIO_Pointer;
+ 
+ CtoCpp1(ASN1_INTEGER_free, ASN1_INTEGER *)
+ typedef TidyPointer<ASN1_INTEGER, ASN1_INTEGER_free_cpp> ASN1_INT_Pointer;
+ 
++CtoCpp1(ASN1_OCTET_STRING_free, ASN1_OCTET_STRING *)
++typedef TidyPointer<ASN1_OCTET_STRING, ASN1_OCTET_STRING_free_cpp> ASN1_OCTET_STRING_Pointer;
++
+ CtoCpp1(TXT_DB_free, TXT_DB *)
+ typedef TidyPointer<TXT_DB, TXT_DB_free_cpp> TXT_DB_Pointer;
+ 
+ CtoCpp1(X509_NAME_free, X509_NAME *)
+ typedef TidyPointer<X509_NAME, X509_NAME_free_cpp> X509_NAME_Pointer;
+ 
+ CtoCpp1(RSA_free, RSA *)
+ typedef TidyPointer<RSA, RSA_free_cpp> RSA_Pointer;
+ 
+ CtoCpp1(X509_REQ_free, X509_REQ *)
+ typedef TidyPointer<X509_REQ, X509_REQ_free_cpp> X509_REQ_Pointer;
+ 
+ sk_free_wrapper(sk_X509_NAME, STACK_OF(X509_NAME) *, X509_NAME_free)
+ typedef TidyPointer<STACK_OF(X509_NAME), sk_X509_NAME_free_wrapper> X509_NAME_STACK_Pointer;
+ 
++CtoCpp1(AUTHORITY_KEYID_free, AUTHORITY_KEYID *)
++typedef TidyPointer<AUTHORITY_KEYID, AUTHORITY_KEYID_free_cpp> AUTHORITY_KEYID_Pointer;
++
++sk_free_wrapper(sk_GENERAL_NAME, STACK_OF(GENERAL_NAME) *, GENERAL_NAME_free)
++typedef TidyPointer<STACK_OF(GENERAL_NAME), sk_GENERAL_NAME_free_wrapper> GENERAL_NAME_STACK_Pointer;
++
++CtoCpp1(GENERAL_NAME_free, GENERAL_NAME *)
++typedef TidyPointer<GENERAL_NAME, GENERAL_NAME_free_cpp> GENERAL_NAME_Pointer;
++
++CtoCpp1(X509_EXTENSION_free, X509_EXTENSION *)
++typedef TidyPointer<X509_EXTENSION, X509_EXTENSION_free_cpp> X509_EXTENSION_Pointer;
++
+ /**
+  \ingroup SslCrtdSslAPI
+  * Create 1024 bits rsa key.
+  */
+ EVP_PKEY * createSslPrivateKey();
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+  * Write private key and SSL certificate to memory.
+  */
+ bool writeCertAndPrivateKeyToMemory(Security::CertPointer const & cert, EVP_PKEY_Pointer const & pkey, std::string & bufferToWrite);
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+  * Append SSL certificate to bufferToWrite.
+  */
+ bool appendCertToMemory(Security::CertPointer const & cert, std::string & bufferToWrite);
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+

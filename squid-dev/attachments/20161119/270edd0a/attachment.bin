@@ -1,0 +1,1823 @@
+Added auth_schemes to control schemes presence and order in 401s/407s.
+
+The new squid.conf directive may be used to customize authentication
+schemes presence and order in Squid's HTTP 401 (Unauthorized) and 407
+(Proxy Authentication Required) responses. The defaults remain the same.
+
+Also refactored configuration code for options with custom
+ACL-controlled actions:
+
+* Reduced parsing code duplication by adding ParseAclWithAction().
+
+* Used functors for generic action-to-string conversions. It is possible
+  now to perform such conversions providing lambda expressions.
+
+* Used vectors of strings instead of C-style arrays for storing
+  conversion tables and check against bounds with vector::at().
+
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2016-11-07 05:24:26 +0000
++++ src/SquidConfig.h	2016-11-18 15:03:18 +0000
+@@ -1,42 +1,45 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SQUIDCONFIG_H_
+ #define SQUID_SQUIDCONFIG_H_
+ 
+ #include "acl/forward.h"
++#if USE_AUTH
++#include "auth/SchemesConfig.h"
++#endif
+ #include "base/RefCount.h"
+ #include "base/YesNoNone.h"
+ #include "ClientDelayConfig.h"
+ #include "DelayConfig.h"
+ #include "helper/ChildConfig.h"
+ #include "HttpHeaderTools.h"
+ #include "ip/Address.h"
+ #include "Notes.h"
+ #include "security/forward.h"
+ #include "SquidTime.h"
+ #if USE_OPENSSL
+ #include "ssl/support.h"
+ #endif
+ #include "store/forward.h"
+ 
+ #if USE_OPENSSL
+ class sslproxy_cert_sign;
+ class sslproxy_cert_adapt;
+ #endif
+ 
+ namespace Mgr
+ {
+ class ActionPasswordList;
+ } // namespace Mgr
+ class CachePeer;
+ class CustomLog;
+ class CpuAffinityMap;
+ class external_acl;
+ class HeaderManglers;
+ class RefreshPattern;
+@@ -370,60 +373,63 @@
+ #endif
+         acl_access *redirector;
+         acl_access *store_id;
+         acl_access *reply;
+         Acl::Address *outgoing_address;
+ #if USE_HTCP
+ 
+         acl_access *htcp;
+         acl_access *htcp_clr;
+ #endif
+ 
+ #if USE_OPENSSL
+         acl_access *ssl_bump;
+ #endif
+ #if FOLLOW_X_FORWARDED_FOR
+         acl_access *followXFF;
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+ 
+         /// acceptible PROXY protocol clients
+         acl_access *proxyProtocol;
+ 
+         /// spoof_client_ip squid.conf acl.
+         /// nil unless configured
+         acl_access* spoof_client_ip;
+         acl_access *on_unsupported_protocol;
+ 
+         acl_access *ftp_epsv;
+ 
+         acl_access *forceRequestBodyContinuation;
+         acl_access *serverPconnForNonretriable;
++#if USE_AUTH
++        acl_access *authSchemes;
++#endif
+     } accessList;
+     AclDenyInfoList *denyInfoList;
+ 
+     struct {
+         size_t list_width;
+         int list_wrap;
+         char *anon_user;
+         int passive;
+         int epsv_all;
+         int epsv;
+         int eprt;
+         int sanitycheck;
+         int telnet;
+     } Ftp;
+     RefreshPattern *Refresh;
+ 
+     Store::DiskConfig cacheSwap;
+ 
+     struct {
+         char *directory;
+         int use_short_names;
+     } icons;
+     char *errorDirectory;
+ #if USE_ERR_LOCALES
+     char *errorDefaultLanguage;
+     int errorLogMissingLanguages;
+ #endif
+     char *errorStylesheet;
+ 
+     struct {
+@@ -511,52 +517,55 @@
+         sslproxy_cert_adapt *cert_adapt;
+ #endif
+     } ssl_client;
+ 
+     char *accept_filter;
+     int umask;
+     int max_filedescriptors;
+     int workers;
+     CpuAffinityMap *cpuAffinityMap;
+ 
+ #if USE_LOADABLE_MODULES
+     wordlist *loadable_module_names;
+ #endif
+ 
+     int client_ip_max_connections;
+ 
+     char *redirector_extras;
+ 
+     struct UrlHelperTimeout {
+         int action;
+         char *response;
+     } onUrlRewriteTimeout;
+ 
+     char *storeId_extras;
+ 
+     struct {
+         int v4_first;       ///< Place IPv4 first in the order of DNS results.
+         ssize_t packet_max; ///< maximum size EDNS advertised for DNS replies.
+     } dns;
+ 
++#if USE_AUTH
++    Auth::SchemesConfigs authSchemesConfigs;
++#endif
+ };
+ 
+ extern SquidConfig Config;
+ 
+ class SquidConfig2
+ {
+ public:
+     void clear() {
+         *this = SquidConfig2();
+     }
+ 
+     struct {
+         int enable_purge = 0;
+     } onoff;
+     uid_t effectiveUserID = 0;
+     gid_t effectiveGroupID = 0;
+ };
+ 
+ extern SquidConfig2 Config2;
+ 
+ #endif /* SQUID_SQUIDCONFIG_H_ */
+ 
+
+=== modified file 'src/acl/Tree.cc'
+--- src/acl/Tree.cc	2016-01-01 00:12:18 +0000
++++ src/acl/Tree.cc	2016-11-18 15:03:18 +0000
+@@ -30,70 +30,41 @@
+ /// computes action that corresponds to the position of the matched rule
+ allow_t
+ Acl::Tree::actionAt(const Nodes::size_type pos) const
+ {
+     assert(pos < nodes.size());
+     if (actions.size()) {
+         assert(actions.size() == nodes.size());
+         return actions[pos];
+     }
+     // default for matched rules in trees without actions
+     return ACCESS_ALLOWED;
+ }
+ 
+ void
+ Acl::Tree::add(ACL *rule, const allow_t &action)
+ {
+     // either all rules have actions or none
+     assert(nodes.size() == actions.size());
+     InnerNode::add(rule);
+     actions.push_back(action);
+ }
+ 
+ void
+ Acl::Tree::add(ACL *rule)
+ {
+     // either all rules have actions or none
+     assert(actions.empty());
+     InnerNode::add(rule);
+ }
+ 
+-SBufList
+-Acl::Tree::treeDump(const char *prefix, const ActionToString &convert) const
+-{
+-    SBufList text;
+-    Actions::const_iterator action = actions.begin();
+-    typedef Nodes::const_iterator NCI;
+-    for (NCI node = nodes.begin(); node != nodes.end(); ++node) {
+-
+-        text.push_back(SBuf(prefix));
+-
+-        if (action != actions.end()) {
+-            const char *act = convert ? convert[action->kind] :
+-                              (*action == ACCESS_ALLOWED ? "allow" : "deny");
+-            text.push_back(act?SBuf(act):SBuf("???"));
+-            ++action;
+-        }
+-
+-#if __cplusplus >= 201103L
+-        text.splice(text.end(), (*node)->dump());
+-#else
+-        // temp is needed until c++11 move constructor
+-        SBufList temp = (*node)->dump();
+-        text.splice(text.end(), temp);
+-#endif
+-        text.push_back(SBuf("\n"));
+-    }
+-    return text;
+-}
+-
+ bool
+ Acl::Tree::bannedAction(ACLChecklist *checklist, Nodes::const_iterator node) const
+ {
+     if (actions.size()) {
+         assert(actions.size() == nodes.size());
+         const Nodes::size_type pos = node - nodes.begin();
+         return checklist->bannedAction(actions.at(pos));
+     }
+     return false;
+ }
+ 
+
+=== modified file 'src/acl/Tree.h'
+--- src/acl/Tree.h	2016-03-01 09:58:44 +0000
++++ src/acl/Tree.h	2016-11-18 15:03:18 +0000
+@@ -1,55 +1,91 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ACL_TREE_H
+ #define SQUID_ACL_TREE_H
+ 
+ #include "acl/BoolOps.h"
+ #include "sbuf/List.h"
+ 
+ namespace Acl
+ {
+ 
+ /// An ORed set of rules at the top of the ACL expression tree, providing two
+ /// unique properties: cbdata protection and optional rule actions.
+ class Tree: public OrNode
+ {
+     // XXX: We should use refcounting instead, but it requires making ACLs
+     // refcounted as well. Otherwise, async lookups will reach deleted ACLs.
+     CBDATA_CLASS(Tree);
+ 
+ public:
+     /// dumps <name, action, rule, new line> tuples
+-    /// action.kind is mapped to a string using the supplied conversion table
+-    typedef const char **ActionToString;
+-    SBufList treeDump(const char *name, const ActionToString &convert) const;
++    /// the supplied converter maps action.kind to a string
++    template <class ActionToStringConverter>
++    SBufList treeDump(const char *name, ActionToStringConverter converter) const;
+ 
+     /// Returns the corresponding action after a successful tree match.
+     allow_t winningAction() const;
+ 
+     /// what action to use if no nodes matched
+     allow_t lastAction() const;
+ 
+     /// appends and takes control over the rule with a given action
+     void add(ACL *rule, const allow_t &action);
+     void add(ACL *rule); ///< same as InnerNode::add()
+ 
+ protected:
+     /// Acl::OrNode API
+     virtual bool bannedAction(ACLChecklist *, Nodes::const_iterator) const override;
+     allow_t actionAt(const Nodes::size_type pos) const;
+ 
+     /// if not empty, contains actions corresponding to InnerNode::nodes
+     typedef std::vector<allow_t> Actions;
+     Actions actions;
+ };
+ 
++inline const char *
++AllowOrDeny(const allow_t &action)
++{
++    return action == ACCESS_ALLOWED ? "allow" : "deny";
++}
++
++template <class ActionToStringConverter>
++inline SBufList
++Tree::treeDump(const char *prefix, ActionToStringConverter converter) const
++{
++    SBufList text;
++    Actions::const_iterator action = actions.begin();
++    typedef Nodes::const_iterator NCI;
++    for (NCI node = nodes.begin(); node != nodes.end(); ++node) {
++
++        text.push_back(SBuf(prefix));
++
++        if (action != actions.end()) {
++            static const SBuf DefaultActString("???");
++            const char *act = converter(*action);
++            text.push_back(act ? SBuf(act) : DefaultActString);
++            ++action;
++        }
++
++#if __cplusplus >= 201103L
++        text.splice(text.end(), (*node)->dump());
++#else
++        // temp is needed until c++11 move constructor
++        SBufList temp = (*node)->dump();
++        text.splice(text.end(), temp);
++#endif
++        text.push_back(SBuf("\n"));
++    }
++    return text;
++}
++
+ } // namespace Acl
+ 
+ #endif /* SQUID_ACL_TREE_H */
+ 
+
+=== modified file 'src/auth/Config.cc'
+--- src/auth/Config.cc	2016-01-01 00:12:18 +0000
++++ src/auth/Config.cc	2016-11-18 15:03:18 +0000
+@@ -38,60 +38,69 @@
+     Auth::Config *config = Find(proxy_auth);
+ 
+     if (config == NULL || !config->active()) {
+         debugs(29, (shutting_down?3:DBG_IMPORTANT), (shutting_down?"":"WARNING: ") <<
+                "Unsupported or unconfigured/inactive proxy-auth scheme, '" << proxy_auth << "'");
+         return NULL;
+     }
+     static MemBuf rmb;
+     rmb.reset();
+     if (config->keyExtras) {
+         // %credentials and %username, which normally included in
+         // request_format, are - at this time, but that is OK
+         // because user name is added to key explicitly, and we do
+         // not want to store authenticated credentials at all.
+         config->keyExtras->assemble(rmb, al, 0);
+     }
+ 
+     return config->decode(proxy_auth, rmb.hasContent() ? rmb.content() : NULL);
+ }
+ 
+ Auth::Config *
+ Auth::Config::Find(const char *proxy_auth)
+ {
+     for (Auth::ConfigVector::iterator  i = Auth::TheConfig.begin(); i != Auth::TheConfig.end(); ++i)
+         if (strncasecmp(proxy_auth, (*i)->type(), strlen((*i)->type())) == 0)
+             return *i;
+ 
+     return NULL;
+ }
+ 
++Auth::Config *
++Auth::Config::GetParsed(const char *proxy_auth)
++{
++    if (auto *cfg = Find(proxy_auth))
++        return cfg;
++    fatalf("auth_schemes: required authentication method '%s' is not configured", proxy_auth);
++    return nullptr;
++}
++
+ /** Default behaviour is to expose nothing */
+ void
+ Auth::Config::registerWithCacheManager(void)
+ {}
+ 
+ void
+ Auth::Config::parse(Auth::Config * scheme, int, char *param_str)
+ {
+     if (strcmp(param_str, "program") == 0) {
+         if (authenticateProgram)
+             wordlistDestroy(&authenticateProgram);
+ 
+         parse_wordlist(&authenticateProgram);
+ 
+         requirePathnameExists("Authentication helper program", authenticateProgram->key);
+ 
+     } else if (strcmp(param_str, "realm") == 0) {
+         realm.clear();
+ 
+         char *token = ConfigParser::NextQuotedOrToEol();
+ 
+         while (token && *token && xisspace(*token))
+             ++token;
+ 
+         if (!token || !*token) {
+             debugs(29, DBG_PARSE_NOTE(DBG_IMPORTANT), "ERROR: Missing auth_param " << scheme->type() << " realm");
+             self_destruct();
+             return;
+         }
+ 
+
+=== modified file 'src/auth/Config.h'
+--- src/auth/Config.h	2016-01-01 00:12:18 +0000
++++ src/auth/Config.h	2016-11-18 15:03:18 +0000
+@@ -22,60 +22,63 @@
+ 
+ /* for Http::HdrType parameters-by-value */
+ #include "HttpHeader.h"
+ 
+ namespace Format
+ {
+ class Format;
+ }
+ 
+ namespace Auth
+ {
+ 
+ /**
+  * \ingroup AuthAPI
+  * \par
+  * I am the configuration for an auth scheme.
+  * Currently each scheme has only one instance of me,
+  * but this may change.
+  * \par
+  * This class is treated like a ref counted class.
+  * If the children ever stop being singletons, implement the
+  * ref counting...
+  */
+ class Config
+ {
+ 
+ public:
+     static UserRequest::Pointer CreateAuthUser(const char *proxy_auth, AccessLogEntry::Pointer &al);
+ 
+     static Config *Find(const char *proxy_auth);
++    /// Call this method if you need a guarantee that all auth schemes has been
++    /// already configured.
++    static Config *GetParsed(const char *proxy_auth);
+     Config() : authenticateChildren(20), authenticateProgram(NULL), keyExtras(NULL) {}
+ 
+     virtual ~Config() {}
+ 
+     /**
+      * Used by squid to determine whether the auth module has successfully initialised itself with the current configuration.
+      *
+      \retval true   Authentication Module loaded and running.
+      \retval false  No Authentication Module loaded.
+      */
+     virtual bool active() const = 0;
+ 
+     /**
+      * new decode API: virtual factory pattern
+      \par
+      * Responsible for decoding the passed authentication header, creating or
+      * linking to a AuthUser object and for storing any needed details to complete
+      * authentication in Auth::UserRequest::authenticate().
+      *
+      \param proxy_auth  Login Pattern to parse.
+      \retval *      Details needed to authenticate.
+      */
+     virtual UserRequest::Pointer decode(char const *proxy_auth, const char *requestRealm) = 0;
+ 
+     /**
+      * squid is finished with this config, release any unneeded resources.
+      * If a singleton, delete will not occur. if not a singleton (future),
+      * delete will occur when no references are held.
+      *
+      \todo we need a 'done for reconfigure' and a 'done permanently' concept.
+
+=== modified file 'src/auth/Makefile.am'
+--- src/auth/Makefile.am	2016-01-01 00:12:18 +0000
++++ src/auth/Makefile.am	2016-11-18 15:03:18 +0000
+@@ -3,58 +3,60 @@
+ ## Squid software is distributed under GPLv2+ license and includes
+ ## contributions from numerous individuals and organizations.
+ ## Please see the COPYING and CONTRIBUTORS files for details.
+ ##
+ 
+ include $(top_srcdir)/src/Common.am
+ include $(top_srcdir)/src/TestHeaders.am
+ 
+ SUBDIRS = $(AUTH_MODULES)
+ DIST_SUBDIRS = basic digest negotiate ntlm
+ 
+ noinst_LTLIBRARIES = libauth.la libacls.la
+ ## not needed? $(AUTH_LIBS_TO_BUILD)
+ ## EXTRA_LTLIBRARIES = libdigest.la libntlm.la libnegotiate.la
+ 
+ ## authentication framework; this library is always built
+ libauth_la_SOURCES = \
+ 	Type.h \
+ 	Type.cc \
+ 	Config.cc \
+ 	Config.h \
+ 	CredentialsCache.h \
+ 	CredentialsCache.cc \
+ 	CredentialState.cc \
+ 	CredentialState.h \
+ 	Gadgets.cc \
+ 	Gadgets.h \
+ 	QueueNode.h \
+ 	Scheme.cc \
+ 	Scheme.h \
++	SchemesConfig.h \
++	SchemesConfig.cc \
+ 	State.h \
+ 	State.cc \
+ 	User.h \
+ 	User.cc \
+ 	UserRequest.h \
+ 	UserRequest.cc
+ 
+ libauth_la_LIBADD = $(AUTH_LIBS_TO_BUILD)
+ libauth_la_DEPENDENCIES = $(AUTH_LIBS_TO_BUILD)
+ 
+ ## authentication-dependent ACLs and authentication code they share
+ libacls_la_SOURCES = \
+ 	Acl.cc \
+ 	Acl.h \
+ 	\
+ 	AclMaxUserIp.cc \
+ 	AclMaxUserIp.h \
+ 	AclProxyAuth.cc \
+ 	AclProxyAuth.h \
+ 	AuthAclState.h
+ 
+ CredentialState.cc: CredentialState.h $(top_srcdir)/src/mk-string-arrays.awk
+ 	$(AWK) -f $(top_srcdir)/src/mk-string-arrays.awk < $(srcdir)/CredentialState.h > $@ || (rm -f $@ ; exit 1)
+ 
+ Type.cc: Type.h $(top_srcdir)/src/mk-string-arrays.awk
+ 	$(AWK) -f $(top_srcdir)/src/mk-string-arrays.awk < $(srcdir)/Type.h > $@ || (rm -f $@ ; exit 1)
+ 
+ CLEANFILES += CredentialState.cc Type.cc
+
+=== added file 'src/auth/SchemesConfig.cc'
+--- src/auth/SchemesConfig.cc	1970-01-01 00:00:00 +0000
++++ src/auth/SchemesConfig.cc	2016-11-18 15:03:18 +0000
+@@ -0,0 +1,47 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "auth/Config.h"
++#include "auth/SchemesConfig.h"
++#include "fatal.h"
++#include "parser/Tokenizer.h"
++
++static void
++addUnique(const SBuf &scheme, std::vector<SBuf> &vec)
++{
++    static const SBuf all("ALL");
++    if (scheme == all) {
++        for (const auto config: Auth::TheConfig)
++            addUnique(SBuf(config->type()), vec);
++    } else if (std::find(vec.begin(), vec.end(), scheme) == vec.end())
++        vec.push_back(scheme);
++}
++
++void
++Auth::SchemesConfig::expand()
++{
++    static const CharacterSet delimiters("delimiters", ",");
++    static const CharacterSet quotedDelimiters("quotedDelimiters", ", ");
++    const CharacterSet *resultDelimiters = quoted ? &quotedDelimiters : &delimiters;
++    std::vector<SBuf> expanded;
++    Parser::Tokenizer t(schemes);
++    SBuf scheme;
++    while (t.token(scheme, *resultDelimiters))
++        addUnique(scheme, expanded);
++    t.skipAllTrailing(CharacterSet::SP + CharacterSet::HTAB);
++    if (!t.remaining().isEmpty())
++        addUnique(t.remaining(), expanded);
++
++    authConfigs.clear();
++    transform(expanded.begin(), expanded.end(),
++    back_inserter(authConfigs), [](SBuf &s) {
++        return Auth::Config::GetParsed(s.c_str());
++    });
++}
++
+
+=== added file 'src/auth/SchemesConfig.h'
+--- src/auth/SchemesConfig.h	1970-01-01 00:00:00 +0000
++++ src/auth/SchemesConfig.h	2016-11-18 15:03:18 +0000
+@@ -0,0 +1,52 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SCHEMES_CONFIG_H
++#define SQUID_SCHEMES_CONFIG_H
++
++#if USE_AUTH
++
++#include "auth/Config.h"
++
++namespace Auth
++{
++
++/**
++ * \ingroup AuthAPI
++ * Stores authentication schemes list, configured by auth_schemes
++ * directive.
++ */
++class SchemesConfig
++{
++public:
++    SchemesConfig(const char *s, const bool q) : schemes(s), quoted(q), rawSchemes(schemes.c_str()) {}
++    /// Expands special "ALL" scheme name (if provided), removes
++    /// duplicates and fills authConfigs vector.
++    void expand();
++
++public:
++    /// corresponding vector of Auth::Config objects
++    ConfigVector authConfigs;
++
++private:
++    /// raw auth schemes list (may have duplicates)
++    SBuf schemes;
++    const bool quoted;
++
++public:
++    /// optimization for storing schemes.c_str()
++    const char *rawSchemes;
++};
++
++typedef std::vector<SchemesConfig> SchemesConfigs;
++
++} // namespace Auth
++
++#endif /* USE_AUTH */
++#endif /* SQUID_SCHEMES_CONFIG_H */
++
+
+=== modified file 'src/auth/UserRequest.cc'
+--- src/auth/UserRequest.cc	2016-01-24 17:41:43 +0000
++++ src/auth/UserRequest.cc	2016-11-18 15:03:18 +0000
+@@ -1,57 +1,60 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 29    Authenticator */
+ 
+ /* The functions in this file handle authentication.
+  * They DO NOT perform access control or auditing.
+  * See acl.c for access control and client_side.c for auditing */
+ 
+ #include "squid.h"
++#include "acl/FilledChecklist.h"
+ #include "auth/Config.h"
+ #include "auth/Scheme.h"
++#include "auth/SchemesConfig.h"
+ #include "auth/User.h"
+ #include "auth/UserRequest.h"
+ #include "client_side.h"
+ #include "comm/Connection.h"
+ #include "fatal.h"
+ #include "format/Format.h"
+ #include "http/Stream.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+ #include "MemBuf.h"
++#include "SquidConfig.h"
+ 
+ /* Generic Functions */
+ 
+ char const *
+ Auth::UserRequest::username() const
+ {
+     if (user() != NULL)
+         return user()->username();
+     else
+         return NULL;
+ }
+ 
+ /**** PUBLIC FUNCTIONS (ALL GENERIC!)  ****/
+ 
+ /* send the initial data to an authenticator module */
+ void
+ Auth::UserRequest::start(HttpRequest *request, AccessLogEntry::Pointer &al, AUTHCB * handler, void *data)
+ {
+     assert(handler);
+     assert(data);
+     debugs(29, 9, this);
+     startHelperLookup(request, al, handler, data);
+ }
+ 
+ bool
+ Auth::UserRequest::valid() const
+ {
+     debugs(29, 9, HERE << "Validating Auth::UserRequest '" << this << "'.");
+ 
+     if (user() == NULL) {
+@@ -434,99 +437,113 @@
+ }
+ 
+ AuthAclState
+ Auth::UserRequest::tryToAuthenticateAndSetAuthUser(Auth::UserRequest::Pointer * aUR, Http::HdrType headertype, HttpRequest * request, ConnStateData * conn, Ip::Address &src_addr, AccessLogEntry::Pointer &al)
+ {
+     // If we have already been called, return the cached value
+     Auth::UserRequest::Pointer t = authTryGetUser(*aUR, conn, request);
+ 
+     if (t != NULL && t->lastReply != AUTH_ACL_CANNOT_AUTHENTICATE && t->lastReply != AUTH_ACL_HELPER) {
+         if (*aUR == NULL)
+             *aUR = t;
+ 
+         if (request->auth_user_request == NULL && t->lastReply == AUTH_AUTHENTICATED) {
+             request->auth_user_request = t;
+         }
+         return t->lastReply;
+     }
+ 
+     // ok, call the actual authenticator routine.
+     AuthAclState result = authenticate(aUR, headertype, request, conn, src_addr, al);
+ 
+     // auth process may have changed the UserRequest we are dealing with
+     t = authTryGetUser(*aUR, conn, request);
+ 
+     if (t != NULL && result != AUTH_ACL_CANNOT_AUTHENTICATE && result != AUTH_ACL_HELPER)
+         t->lastReply = result;
+ 
+     return result;
+ }
+ 
++static Auth::ConfigVector &
++schemesConfig(HttpRequest *request, HttpReply *rep)
++{
++    if (::Config.accessList.authSchemes) {
++        ACLFilledChecklist ch(NULL, request, NULL);
++        ch.reply = rep;
++        HTTPMSGLOCK(ch.reply);
++        const allow_t answer = ch.fastCheck(::Config.accessList.authSchemes);
++        if (answer == ACCESS_ALLOWED)
++            return ::Config.authSchemesConfigs.at(answer.kind).authConfigs;
++    }
++    return Auth::TheConfig;
++}
++
+ void
+ Auth::UserRequest::addReplyAuthHeader(HttpReply * rep, Auth::UserRequest::Pointer auth_user_request, HttpRequest * request, int accelerated, int internal)
+ /* send the auth types we are configured to support (and have compiled in!) */
+ {
+     Http::HdrType type;
+ 
+     switch (rep->sline.status()) {
+ 
+     case Http::scProxyAuthenticationRequired:
+         /* Proxy authorisation needed */
+         type = Http::HdrType::PROXY_AUTHENTICATE;
+         break;
+ 
+     case Http::scUnauthorized:
+         /* WWW Authorisation needed */
+         type = Http::HdrType::WWW_AUTHENTICATE;
+         break;
+ 
+     default:
+         /* Keep GCC happy */
+         /* some other HTTP status */
+         type = Http::HdrType::BAD_HDR;
+         break;
+     }
+ 
+     debugs(29, 9, "headertype:" << type << " authuser:" << auth_user_request);
+ 
+     if (((rep->sline.status() == Http::scProxyAuthenticationRequired)
+             || (rep->sline.status() == Http::scUnauthorized)) && internal)
+         /* this is a authenticate-needed response */
+     {
+ 
+         if (auth_user_request != NULL && auth_user_request->direction() == Auth::CRED_CHALLENGE)
+             /* add the scheme specific challenge header to the response */
+             auth_user_request->user()->config->fixHeader(auth_user_request, rep, type, request);
+         else {
+             /* call each configured & running authscheme */
+-
+-            for (Auth::ConfigVector::iterator  i = Auth::TheConfig.begin(); i != Auth::TheConfig.end(); ++i) {
++            Auth::ConfigVector &configs = schemesConfig(request, rep);
++            for (Auth::ConfigVector::iterator i = configs.begin(); i != configs.end(); ++i) {
+                 Auth::Config *scheme = *i;
+ 
+                 if (scheme->active()) {
+                     if (auth_user_request != NULL && auth_user_request->scheme()->type() == scheme->type())
+                         scheme->fixHeader(auth_user_request, rep, type, request);
+                     else
+                         scheme->fixHeader(NULL, rep, type, request);
+                 } else
+                     debugs(29, 4, HERE << "Configured scheme " << scheme->type() << " not Active");
+             }
+         }
+ 
+     }
+ 
+     /*
+      * allow protocol specific headers to be _added_ to the existing
+      * response - currently Digest or Negotiate auth
+      */
+     if (auth_user_request != NULL) {
+         auth_user_request->addAuthenticationInfoHeader(rep, accelerated);
+         if (auth_user_request->lastReply != AUTH_AUTHENTICATED)
+             auth_user_request->lastReply = AUTH_ACL_CANNOT_AUTHENTICATE;
+     }
+ }
+ 
+ // TODO remove wrapper.
+ void
+ authenticateFixHeader(HttpReply * rep, Auth::UserRequest::Pointer auth_user_request, HttpRequest * request, int accelerated, int internal)
+ {
+     Auth::UserRequest::addReplyAuthHeader(rep, auth_user_request, request, accelerated, internal);
+
+=== modified file 'src/cache_cf.cc'
+--- src/cache_cf.cc	2016-11-01 01:41:39 +0000
++++ src/cache_cf.cc	2016-11-18 15:27:35 +0000
+@@ -53,60 +53,61 @@
+ #include "rfc1738.h"
+ #include "sbuf/List.h"
+ #include "SquidConfig.h"
+ #include "SquidString.h"
+ #include "ssl/ProxyCerts.h"
+ #include "Store.h"
+ #include "store/Disk.h"
+ #include "store/Disks.h"
+ #include "StoreFileSystem.h"
+ #include "tools.h"
+ #include "util.h"
+ #include "wordlist.h"
+ /* wccp2 has its own conditional definitions */
+ #include "wccp2.h"
+ #if USE_ADAPTATION
+ #include "adaptation/Config.h"
+ #endif
+ #if ICAP_CLIENT
+ #include "adaptation/icap/Config.h"
+ #endif
+ #if USE_ECAP
+ #include "adaptation/ecap/Config.h"
+ #endif
+ #if USE_OPENSSL
+ #include "ssl/Config.h"
+ #include "ssl/support.h"
+ #endif
+ #if USE_AUTH
+ #include "auth/Config.h"
+ #include "auth/Scheme.h"
++#include "auth/SchemesConfig.h"
+ #endif
+ #if USE_SQUID_ESI
+ #include "esi/Parser.h"
+ #endif
+ #if SQUID_SNMP
+ #include "snmp.h"
+ #endif
+ 
+ #if HAVE_GLOB_H
+ #include <glob.h>
+ #endif
+ #include <limits>
+ #include <list>
+ #if HAVE_PWD_H
+ #include <pwd.h>
+ #endif
+ #if HAVE_GRP_H
+ #include <grp.h>
+ #endif
+ #if HAVE_SYS_STAT_H
+ #include <sys/stat.h>
+ #endif
+ 
+ #if USE_OPENSSL
+ #include "ssl/gadgets.h"
+ #endif
+ 
+ #if USE_ADAPTATION
+ static void parse_adaptation_service_set_type();
+ static void parse_adaptation_service_chain_type();
+@@ -916,60 +917,68 @@
+                " Change client_request_buffer_max or request_header_max_size limits.",
+                (uint32_t)Config.maxRequestBufferSize, (uint32_t)Config.maxRequestHeaderSize);
+     }
+ 
+     /*
+      * Disable client side request pipelining if client_persistent_connections OFF.
+      * Waste of resources queueing any pipelined requests when the first will close the connection.
+      */
+     if (Config.pipeline_max_prefetch > 0 && !Config.onoff.client_pconns) {
+         debugs(3, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: pipeline_prefetch " << Config.pipeline_max_prefetch <<
+                " requires client_persistent_connections ON. Forced pipeline_prefetch 0.");
+         Config.pipeline_max_prefetch = 0;
+     }
+ 
+ #if USE_AUTH
+     /*
+      * disable client side request pipelining. There is a race with
+      * Negotiate and NTLM when the client sends a second request on an
+      * connection before the authenticate challenge is sent. With
+      * pipelining OFF, the client may fail to authenticate, but squid's
+      * state will be preserved.
+      */
+     if (Config.pipeline_max_prefetch > 0) {
+         Auth::Config *nego = Auth::Config::Find("Negotiate");
+         Auth::Config *ntlm = Auth::Config::Find("NTLM");
+         if ((nego && nego->active()) || (ntlm && ntlm->active())) {
+             debugs(3, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: pipeline_prefetch breaks NTLM and Negotiate authentication. Forced pipeline_prefetch 0.");
+             Config.pipeline_max_prefetch = 0;
+         }
+     }
++
++    for (auto &authSchemes: Config.authSchemesConfigs) {
++        authSchemes.expand();
++        if (authSchemes.authConfigs.empty()) {
++            debugs(3, DBG_CRITICAL, "auth_schemes: at least one scheme name is required; got: " << authSchemes.rawSchemes);
++            self_destruct();
++        }
++    }
+ #endif
+ }
+ 
+ /** Parse a line containing an obsolete directive.
+  * To upgrade it where possible instead of just "Bungled config" for
+  * directives which cannot be marked as simply aliases of the some name.
+  * For example if the parameter order and content has changed.
+  * Or if the directive has been completely removed.
+  */
+ void
+ parse_obsolete(const char *name)
+ {
+     // Directives which have been radically changed rather than removed
+     if (!strcmp(name, "url_rewrite_concurrency")) {
+         int cval;
+         parse_int(&cval);
+         debugs(3, DBG_CRITICAL, "WARNING: url_rewrite_concurrency upgrade overriding url_rewrite_children settings.");
+         Config.redirectChildren.concurrency = cval;
+     }
+ 
+     if (!strcmp(name, "log_access")) {
+         self_destruct();
+         return;
+     }
+ 
+     if (!strcmp(name, "log_icap")) {
+         self_destruct();
+         return;
+     }
+ 
+@@ -1313,61 +1322,61 @@
+                           ae->name,
+                           ae->typeString(),
+                           ae->flags.flagsStr());
+         dump_SBufList(entry, ae->dump());
+         ae = ae->next;
+     }
+ }
+ 
+ static void
+ parse_acl(ACL ** ae)
+ {
+     ACL::ParseAclLine(LegacyParser, ae);
+ }
+ 
+ static void
+ free_acl(ACL ** ae)
+ {
+     aclDestroyAcls(ae);
+ }
+ 
+ void
+ dump_acl_list(StoreEntry * entry, ACLList * head)
+ {
+     dump_SBufList(entry, head->dump());
+ }
+ 
+ void
+ dump_acl_access(StoreEntry * entry, const char *name, acl_access * head)
+ {
+     if (head)
+-        dump_SBufList(entry, head->treeDump(name,NULL));
++        dump_SBufList(entry, head->treeDump(name, &Acl::AllowOrDeny));
+ }
+ 
+ static void
+ parse_acl_access(acl_access ** head)
+ {
+     aclParseAccessLine(cfg_directive, LegacyParser, head);
+ }
+ 
+ static void
+ free_acl_access(acl_access ** head)
+ {
+     aclDestroyAccessList(head);
+ }
+ 
+ static void
+ dump_address(StoreEntry * entry, const char *name, Ip::Address &addr)
+ {
+     char buf[MAX_IPSTRLEN];
+     storeAppendPrintf(entry, "%s %s\n", name, addr.toStr(buf,MAX_IPSTRLEN) );
+ }
+ 
+ static void
+ parse_address(Ip::Address *addr)
+ {
+     char *token = ConfigParser::NextToken();
+ 
+     if (!token) {
+         self_destruct();
+         return;
+     }
+@@ -1797,60 +1806,108 @@
+         config->push_back(theScheme->createConfig());
+         schemeCfg = Auth::Config::Find(type_str);
+         if (schemeCfg == NULL) {
+             debugs(3, DBG_CRITICAL, "Parsing Config File: Corruption configuring authentication scheme '" << type_str << "'.");
+             self_destruct();
+             return;
+         }
+     }
+ 
+     schemeCfg->parse(schemeCfg, config->size(), param_str);
+ }
+ 
+ static void
+ free_authparam(Auth::ConfigVector * cfg)
+ {
+     /* Wipe the Auth globals and Detach/Destruct component config + state. */
+     cfg->clear();
+ 
+     /* on reconfigure initialize new auth schemes for the new config. */
+     if (reconfiguring) {
+         Auth::Init();
+     }
+ }
+ 
+ static void
+ dump_authparam(StoreEntry * entry, const char *name, Auth::ConfigVector cfg)
+ {
+     for (Auth::ConfigVector::iterator  i = cfg.begin(); i != cfg.end(); ++i)
+         (*i)->dump(entry, name, (*i));
+ }
++
++static void
++ParseAclWithAction(acl_access **access, const allow_t &action, const char *desc, ACL *acl = nullptr)
++{
++    assert(access);
++    SBuf name;
++    if (!*access) {
++        *access = new Acl::Tree;
++        name.Printf("(%s rules)", desc);
++        (*access)->context(name.c_str(), config_input_line);
++    }
++    Acl::AndNode *rule = new Acl::AndNode;
++    name.Printf("(%s rule)", desc);
++    rule->context(name.c_str(), config_input_line);
++    acl ? rule->add(acl) : rule->lineParse();
++    (*access)->add(rule, action);
++}
++
++static void
++parse_AuthSchemes(acl_access **authSchemes)
++{
++    const char *tok = ConfigParser::NextQuotedToken();
++    if (!tok) {
++        debugs(29, DBG_CRITICAL, "FATAL: auth_schemes missing the parameter");
++        self_destruct();
++        return;
++    }
++    Config.authSchemesConfigs.push_back(Auth::SchemesConfig(tok, ConfigParser::LastTokenWasQuoted));
++    const allow_t action = allow_t(ACCESS_ALLOWED, Config.authSchemesConfigs.size() - 1);
++    ParseAclWithAction(authSchemes, action, "auth_schemes");
++}
++
++static void
++free_AuthSchemes(acl_access **authSchemes)
++{
++    Config.authSchemesConfigs.clear();
++    free_acl_access(authSchemes);
++}
++
++static void
++dump_AuthSchemes(StoreEntry *entry, const char *name, acl_access *authSchemes)
++{
++    if (authSchemes)
++        dump_SBufList(entry, authSchemes->treeDump(name, [](const allow_t &action) {
++                    return Config.authSchemesConfigs.at(action.kind).rawSchemes;
++        }));
++}
++
+ #endif /* USE_AUTH */
+ 
+ /* TODO: just return the object, the # is irrelevant */
+ static int
+ find_fstype(char *type)
+ {
+     for (size_t i = 0; i < StoreFileSystem::FileSystems().size(); ++i)
+         if (strcasecmp(type, StoreFileSystem::FileSystems().at(i)->type()) == 0)
+             return (int)i;
+ 
+     return (-1);
+ }
+ 
+ static void
+ parse_cachedir(Store::DiskConfig *swap)
+ {
+     char *type_str = ConfigParser::NextToken();
+     if (!type_str) {
+         self_destruct();
+         return;
+     }
+ 
+     char *path_str = ConfigParser::NextToken();
+     if (!path_str) {
+         self_destruct();
+         return;
+     }
+ 
+     int fs = find_fstype(type_str);
+     if (fs < 0) {
+@@ -4599,78 +4656,70 @@
+     } else if (strcmp(bm, "allow") == 0) {
+         debugs(3, DBG_CRITICAL, "SECURITY NOTICE: auto-converting deprecated "
+                "\"ssl_bump allow <acl>\" to \"ssl_bump client-first <acl>\" which "
+                "is usually inferior to the newer server-first "
+                "bumping mode. Update your ssl_bump rules.");
+         action.kind = Ssl::bumpClientFirst;
+         bumpCfgStyleNow = bcsOld;
+         sslBumpCfgRr::lastDeprecatedRule = Ssl::bumpClientFirst;
+     } else if (strcmp(bm, "deny") == 0) {
+         debugs(3, DBG_CRITICAL, "WARNING: auto-converting deprecated "
+                "\"ssl_bump deny <acl>\" to \"ssl_bump none <acl>\". Update "
+                "your ssl_bump rules.");
+         action.kind = Ssl::bumpNone;
+         bumpCfgStyleNow = bcsOld;
+         sslBumpCfgRr::lastDeprecatedRule = Ssl::bumpNone;
+     } else {
+         debugs(3, DBG_CRITICAL, "FATAL: unknown ssl_bump mode: " << bm);
+         self_destruct();
+         return;
+     }
+ 
+     if (bumpCfgStyleLast != bcsNone && bumpCfgStyleNow != bumpCfgStyleLast) {
+         debugs(3, DBG_CRITICAL, "FATAL: do not mix " << bumpCfgStyleNow << " actions with " <<
+                bumpCfgStyleLast << " actions. Update your ssl_bump rules.");
+         self_destruct();
+         return;
+     }
+ 
+     bumpCfgStyleLast = bumpCfgStyleNow;
+ 
+-    Acl::AndNode *rule = new Acl::AndNode;
+-    rule->context("(ssl_bump rule)", config_input_line);
+-    rule->lineParse();
+     // empty rule OK
+-
+-    assert(ssl_bump);
+-    if (!*ssl_bump) {
+-        *ssl_bump = new Acl::Tree;
+-        (*ssl_bump)->context("(ssl_bump rules)", config_input_line);
+-    }
+-
+-    (*ssl_bump)->add(rule, action);
++    ParseAclWithAction(ssl_bump, action, "ssl_bump");
+ }
+ 
+ static void dump_sslproxy_ssl_bump(StoreEntry *entry, const char *name, acl_access *ssl_bump)
+ {
+     if (ssl_bump)
+-        dump_SBufList(entry, ssl_bump->treeDump(name, Ssl::BumpModeStr));
++        dump_SBufList(entry, ssl_bump->treeDump(name, [](const allow_t &action) {
++                    return Ssl::BumpModeStr.at(action.kind);
++        }));
+ }
+ 
+ static void free_sslproxy_ssl_bump(acl_access **ssl_bump)
+ {
+     free_acl_access(ssl_bump);
+ }
+ 
+ #endif
+ 
+ static void dump_HeaderWithAclList(StoreEntry * entry, const char *name, HeaderWithAclList *headers)
+ {
+     if (!headers)
+         return;
+ 
+     for (HeaderWithAclList::iterator hwa = headers->begin(); hwa != headers->end(); ++hwa) {
+         storeAppendPrintf(entry, "%s %s %s", name, hwa->fieldName.c_str(), hwa->fieldValue.c_str());
+         if (hwa->aclList)
+             dump_acl_list(entry, hwa->aclList);
+         storeAppendPrintf(entry, "\n");
+     }
+ }
+ 
+ static void parse_HeaderWithAclList(HeaderWithAclList **headers)
+ {
+     char *fn;
+     if (!*headers) {
+         *headers = new HeaderWithAclList;
+     }
+     if ((fn = ConfigParser::NextToken()) == NULL) {
+         self_destruct();
+@@ -4743,85 +4792,80 @@
+     char *t = ConfigParser::PeekAtToken();
+     if (!t) {
+         self_destruct();
+         return;
+     }
+ 
+     if (!strcmp(t, "off")) {
+         (void)ConfigParser::NextToken();
+         ftpEpsvIsDeprecatedRule = true;
+         ftpEpsvDeprecatedAction = allow_t(ACCESS_DENIED);
+     } else if (!strcmp(t, "on")) {
+         (void)ConfigParser::NextToken();
+         ftpEpsvIsDeprecatedRule = true;
+         ftpEpsvDeprecatedAction = allow_t(ACCESS_ALLOWED);
+     }
+ 
+     // Check for mixing "ftp_epsv on|off" and "ftp_epsv allow|deny .." rules:
+     //   1) if this line is "ftp_epsv allow|deny ..." and already exist rules of "ftp_epsv on|off"
+     //   2) if this line is "ftp_epsv on|off" and already exist rules of "ftp_epsv allow|deny ..."
+     // then abort
+     if ((!ftpEpsvIsDeprecatedRule && FtpEspvDeprecated) ||
+             (ftpEpsvIsDeprecatedRule && !FtpEspvDeprecated && *ftp_epsv != NULL)) {
+         debugs(3, DBG_CRITICAL, "FATAL: do not mix \"ftp_epsv on|off\" cfg lines with \"ftp_epsv allow|deny ...\" cfg lines. Update your ftp_epsv rules.");
+         self_destruct();
+         return;
+     }
+ 
+     if (ftpEpsvIsDeprecatedRule) {
+         // overwrite previous ftp_epsv lines
+         delete *ftp_epsv;
++        *ftp_epsv = nullptr;
++
+         if (ftpEpsvDeprecatedAction == allow_t(ACCESS_DENIED)) {
+-            Acl::AndNode *ftpEpsvRule = new Acl::AndNode;
+-            ftpEpsvRule->context("(ftp_epsv rule)", config_input_line);
+-            ACL *a = ACL::FindByName("all");
+-            if (!a) {
+-                delete ftpEpsvRule;
++            if (ACL *a = ACL::FindByName("all"))
++                ParseAclWithAction(ftp_epsv, ftpEpsvDeprecatedAction, "ftp_epsv", a);
++            else {
+                 self_destruct();
+                 return;
+             }
+-            ftpEpsvRule->add(a);
+-            *ftp_epsv = new Acl::Tree;
+-            (*ftp_epsv)->context("(ftp_epsv rules)", config_input_line);
+-            (*ftp_epsv)->add(ftpEpsvRule, ftpEpsvDeprecatedAction);
+-        } else
+-            *ftp_epsv = NULL;
++        }
+         FtpEspvDeprecated = true;
+     } else {
+         aclParseAccessLine(cfg_directive, LegacyParser, ftp_epsv);
+     }
+ }
+ 
+ static void dump_ftp_epsv(StoreEntry *entry, const char *name, acl_access *ftp_epsv)
+ {
+     if (ftp_epsv)
+-        dump_SBufList(entry, ftp_epsv->treeDump(name, NULL));
++        dump_SBufList(entry, ftp_epsv->treeDump(name, Acl::AllowOrDeny));
+ }
+ 
+ static void free_ftp_epsv(acl_access **ftp_epsv)
+ {
+     free_acl_access(ftp_epsv);
+     FtpEspvDeprecated = false;
+ }
+ 
+ static void
+ parse_UrlHelperTimeout(SquidConfig::UrlHelperTimeout *config)
+ {
+     time_msec_t tval;
+     parseTimeLine(&tval, T_SECOND_STR, false, true);
+     Config.Timeout.urlRewrite = static_cast<time_t>(tval/1000);
+ 
+     char *key, *value;
+     while(ConfigParser::NextKvPair(key, value)) {
+         if (strcasecmp(key, "on_timeout") == 0) {
+             if (strcasecmp(value, "bypass") == 0)
+                 config->action = toutActBypass;
+             else if (strcasecmp(value, "fail") == 0)
+                 config->action = toutActFail;
+             else if (strcasecmp(value, "retry") == 0)
+                 config->action = toutActRetry;
+             else if (strcasecmp(value, "use_configured_response") == 0) {
+                 config->action = toutActUseConfiguredResponse;
+             } else {
+                 debugs(3, DBG_CRITICAL, "FATAL: unsuported \"on_timeout\"  action:" << value);
+                 self_destruct();
+                 return;
+@@ -4892,65 +4936,56 @@
+     dump_onoff(entry, name, val);
+ }
+ 
+ static void
+ free_configuration_includes_quoted_values(bool *)
+ {
+     ConfigParser::RecognizeQuotedValues = false;
+     ConfigParser::StrictMode = false;
+ }
+ 
+ static void
+ parse_on_unsupported_protocol(acl_access **access)
+ {
+     char *tm;
+     if ((tm = ConfigParser::NextToken()) == NULL) {
+         self_destruct();
+         return;
+     }
+ 
+     allow_t action = allow_t(ACCESS_ALLOWED);
+     if (strcmp(tm, "tunnel") == 0)
+         action.kind = 1;
+     else if (strcmp(tm, "respond") == 0)
+         action.kind = 2;
+     else {
+         debugs(3, DBG_CRITICAL, "FATAL: unknown on_unsupported_protocol mode: " << tm);
+         self_destruct();
+         return;
+     }
+ 
+-    Acl::AndNode *rule = new Acl::AndNode;
+-    rule->context("(on_unsupported_protocol rule)", config_input_line);
+-    rule->lineParse();
+     // empty rule OK
+-
+-    assert(access);
+-    if (!*access) {
+-        *access = new Acl::Tree;
+-        (*access)->context("(on_unsupported_protocol rules)", config_input_line);
+-    }
+-
+-    (*access)->add(rule, action);
++    ParseAclWithAction(access, action, "on_unsupported_protocol");
+ }
+ 
+ static void
+ dump_on_unsupported_protocol(StoreEntry *entry, const char *name, acl_access *access)
+ {
+-    const char *on_error_tunnel_mode_str[] = {
++    static const std::vector<const char *> onErrorTunnelMode = {
+         "none",
+         "tunnel",
+-        "respond",
+-        NULL
++        "respond"
+     };
+     if (access) {
+-        SBufList lines = access->treeDump(name, on_error_tunnel_mode_str);
++        SBufList lines = access->treeDump(name, [](const allow_t &action) {
++                return onErrorTunnelMode.at(action.kind);
++        });
+         dump_SBufList(entry, lines);
+     }
+ }
+ 
+ static void
+ free_on_unsupported_protocol(acl_access **access)
+ {
+     free_acl_access(access);
+ }
+ 
+
+=== modified file 'src/cf.data.depend'
+--- src/cf.data.depend	2016-03-30 11:55:02 +0000
++++ src/cf.data.depend	2016-11-18 15:03:18 +0000
+@@ -1,48 +1,49 @@
+ ## Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+ ##
+ ## Squid software is distributed under GPLv2+ license and includes
+ ## contributions from numerous individuals and organizations.
+ ## Please see the COPYING and CONTRIBUTORS files for details.
+ ##
+ #
+ # type			dependencies
+ #
+ access_log		acl	logformat
+ acl			external_acl_type auth_param
+ acl_access		acl
+ acl_address		acl
+ acl_b_size_t		acl
+ acl_tos			acl
+ acl_nfmark		acl
+ address
+ authparam
++AuthSchemes
+ b_int64_t
+ b_size_t
+ b_ssize_t
+ cachedir		cache_replacement_policy
+ cachemgrpasswd
+ ConfigAclTos
+ configuration_includes_quoted_values
+ CpuAffinityMap
+ debug
+ delay_pool_access	acl	delay_class
+ delay_pool_class	delay_pools
+ delay_pool_count
+ delay_pool_rates	delay_class
+ client_delay_pool_access	acl
+ client_delay_pool_count
+ client_delay_pool_rates
+ denyinfo		acl
+ eol
+ externalAclHelper	auth_param
+ HelperChildConfig
+ hostdomain		cache_peer
+ hostdomaintype		cache_peer
+ http_header_access	acl
+ http_header_replace
+ HeaderWithAclList	acl
+ adaptation_access_type	adaptation_service_set adaptation_service_chain acl icap_service icap_class
+ adaptation_service_set_type	icap_service ecap_service
+ adaptation_service_chain_type	icap_service ecap_service
+ icap_access_type	icap_class acl
+ icap_class_type		icap_service
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2016-10-28 08:31:53 +0000
++++ src/cf.data.pre	2016-11-18 15:03:18 +0000
+@@ -744,60 +744,105 @@
+ 	This is a trade-off between memory utilization (long intervals - say
+ 	2 days) and CPU (short intervals - say 1 minute). Only change if you
+ 	have good reason to.
+ DOC_END
+ 
+ NAME: authenticate_ttl
+ TYPE: time_t
+ DEFAULT: 1 hour
+ LOC: Config.authenticateTTL
+ DOC_START
+ 	The time a user & their credentials stay in the logged in
+ 	user cache since their last request. When the garbage
+ 	interval passes, all user credentials that have passed their
+ 	TTL are removed from memory.
+ DOC_END
+ 
+ NAME: authenticate_ip_ttl
+ TYPE: time_t
+ LOC: Config.authenticateIpTTL
+ DEFAULT: 1 second
+ DOC_START
+ 	If you use proxy authentication and the 'max_user_ip' ACL,
+ 	this directive controls how long Squid remembers the IP
+ 	addresses associated with each user.  Use a small value
+ 	(e.g., 60 seconds) if your users might change addresses
+ 	quickly, as is the case with dialup.   You might be safe
+ 	using a larger value (e.g., 2 hours) in a corporate LAN
+ 	environment with relatively static address assignments.
+ DOC_END
+ 
++NAME: auth_schemes
++TYPE: AuthSchemes
++IFDEF: USE_AUTH
++LOC: Config.accessList.authSchemes
++DEFAULT: none
++DEFAULT_DOC: use all auth_param schemes in their configuration order
++DOC_START
++	Use this directive to customize authentication schemes presence and
++	order in Squid's Unauthorized and Authentication Required responses.
++
++		auth_schemes scheme1,scheme2,... [!]aclname ...
++
++	where schemeN is the name of one of the authentication schemes
++	configured using auth_param directives. At least one scheme name is
++	required. Multiple scheme names are separated by commas. Either
++	avoid whitespace or quote the entire schemes list.
++
++	A special "ALL" scheme name expands to all auth_param-configured
++	schemes in their configuration order. This directive cannot be used
++	to configure Squid to offer no authentication schemes at all.
++
++	The first matching auth_schemes rule determines the schemes order
++	for the current Authentication Required transaction. Note that the
++	future response is not yet available during auth_schemes evaluation.
++
++	If this directive is not used or none of its rules match, then Squid
++	responds with all configured authentication schemes in the order of
++	auth_param directives in the configuration file.
++
++	This directive does not determine when authentication is used or
++	how each authentication scheme authenticates clients.
++
++	The following example sends basic and negotiate authentication
++	schemes, in that order, when requesting authentication of HTTP
++	requests matching the isIE ACL (not shown) while sending all
++	auth_param schemes in their configuration order to other clients:
++
++		auth_schemes basic,negotiate isIE
++		auth_schemes ALL all # explicit default
++
++	This directive supports fast ACLs only.
++
++	See also: auth_param.
++DOC_END
++
+ COMMENT_START
+  ACCESS CONTROLS
+  -----------------------------------------------------------------------------
+ COMMENT_END
+ 
+ NAME: external_acl_type
+ TYPE: externalAclHelper
+ LOC: Config.externalAclHelperList
+ DEFAULT: none
+ DOC_START
+ 	This option defines external acl classes using a helper program
+ 	to look up the status
+ 
+ 	  external_acl_type name [options] FORMAT /path/to/helper [helper arguments]
+ 
+ 	Options:
+ 
+ 	  ttl=n		TTL in seconds for cached results (defaults to 3600
+ 			for 1 hour)
+ 
+ 	  negative_ttl=n
+ 			TTL for cached negative lookups (default same
+ 			as ttl)
+ 
+ 	  grace=n	Percentage remaining of TTL where a refresh of a
+ 			cached entry should be initiated without needing to
+ 			wait for a new reply. (default is for no grace period)
+ 
+ 	  cache=n	The maximum number of entries in the result cache. The
+ 			default limit is 262144 entries.  Each cache entry usually
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2016-11-08 06:34:59 +0000
++++ src/ssl/support.cc	2016-11-18 15:03:18 +0000
+@@ -17,71 +17,70 @@
+ 
+ #include "acl/FilledChecklist.h"
+ #include "anyp/PortCfg.h"
+ #include "fatal.h"
+ #include "fd.h"
+ #include "fde.h"
+ #include "globals.h"
+ #include "ipc/MemMap.h"
+ #include "security/CertError.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "ssl/bio.h"
+ #include "ssl/Config.h"
+ #include "ssl/ErrorDetail.h"
+ #include "ssl/gadgets.h"
+ #include "ssl/support.h"
+ #include "URL.h"
+ 
+ #include <cerrno>
+ 
+ // TODO: Move ssl_ex_index_* global variables from global.cc here.
+ int ssl_ex_index_ssl_untrusted_chain = -1;
+ 
+ Ipc::MemMap *Ssl::SessionCache = NULL;
+ const char *Ssl::SessionCacheName = "ssl_session_cache";
+ 
+ static Ssl::CertsIndexedList SquidUntrustedCerts;
+ 
+ const EVP_MD *Ssl::DefaultSignHash = NULL;
+ 
+-const char *Ssl::BumpModeStr[] = {
++std::vector<const char *> Ssl::BumpModeStr = {
+     "none",
+     "client-first",
+     "server-first",
+     "peek",
+     "stare",
+     "bump",
+     "splice",
+-    "terminate",
+-    /*"err",*/
+-    NULL
++    "terminate"
++    /*,"err"*/
+ };
+ 
+ /**
+  \defgroup ServerProtocolSSLInternal Server-Side SSL Internals
+  \ingroup ServerProtocolSSLAPI
+  */
+ 
+ /// \ingroup ServerProtocolSSLInternal
+ static int
+ ssl_ask_password_cb(char *buf, int size, int rwflag, void *userdata)
+ {
+     FILE *in;
+     int len = 0;
+     char cmdline[1024];
+ 
+     snprintf(cmdline, sizeof(cmdline), "\"%s\" \"%s\"", Config.Program.ssl_password, (const char *)userdata);
+     in = popen(cmdline, "r");
+ 
+     if (fgets(buf, size, in))
+ 
+         len = strlen(buf);
+ 
+     while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+         --len;
+ 
+     buf[len] = '\0';
+ 
+     pclose(in);
+ 
+     return len;
+
+=== modified file 'src/ssl/support.h'
+--- src/ssl/support.h	2016-11-07 10:49:37 +0000
++++ src/ssl/support.h	2016-11-18 15:03:18 +0000
+@@ -124,69 +124,69 @@
+ const char *sslGetUserCertificateChainPEM(SSL *ssl);
+ 
+ namespace Ssl
+ {
+ /// \ingroup ServerProtocolSSLAPI
+ typedef char const *GETX509ATTRIBUTE(X509 *, const char *);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ GETX509ATTRIBUTE GetX509UserAttribute;
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ GETX509ATTRIBUTE GetX509CAAttribute;
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ GETX509ATTRIBUTE GetX509Fingerprint;
+ 
+ extern const EVP_MD *DefaultSignHash;
+ 
+ /**
+   \ingroup ServerProtocolSSLAPI
+  * Supported ssl-bump modes
+  */
+ enum BumpMode {bumpNone = 0, bumpClientFirst, bumpServerFirst, bumpPeek, bumpStare, bumpBump, bumpSplice, bumpTerminate, /*bumpErr,*/ bumpEnd};
+ 
+ enum BumpStep {bumpStep1, bumpStep2, bumpStep3};
+ 
+ /**
+  \ingroup  ServerProtocolSSLAPI
+  * Short names for ssl-bump modes
+  */
+-extern const char *BumpModeStr[];
++extern std::vector<const char *>BumpModeStr;
+ 
+ /**
+  \ingroup ServerProtocolSSLAPI
+  * Return the short name of the ssl-bump mode "bm"
+  */
+ inline const char *bumpMode(int bm)
+ {
+-    return (0 <= bm && bm < Ssl::bumpEnd) ? Ssl::BumpModeStr[bm] : NULL;
++    return (0 <= bm && bm < Ssl::bumpEnd) ? Ssl::BumpModeStr.at(bm) : NULL;
+ }
+ 
+ /// certificates indexed by issuer name
+ typedef std::multimap<SBuf, X509 *> CertsIndexedList;
+ 
+ /**
+  * Load PEM-encoded certificates from the given file.
+  */
+ bool loadCerts(const char *certsFile, Ssl::CertsIndexedList &list);
+ 
+ /**
+  * Load PEM-encoded certificates to the squid untrusteds certificates
+  * internal DB from the given file.
+  */
+ bool loadSquidUntrusted(const char *path);
+ 
+ /**
+  * Removes all certificates from squid untrusteds certificates
+  * internal DB and frees all memory
+  */
+ void unloadSquidUntrusted();
+ 
+ /**
+  * Add the certificate cert to ssl object untrusted certificates.
+  * Squid uses an attached to SSL object list of untrusted certificates,
+  * with certificates which can be used to complete incomplete chains sent
+  * by the SSL server.
+  */
+ void SSL_add_untrusted_cert(SSL *ssl, X509 *cert);
+ 
+
+=== modified file 'src/tests/stub_libauth.cc'
+--- src/tests/stub_libauth.cc	2016-01-01 00:12:18 +0000
++++ src/tests/stub_libauth.cc	2016-11-18 15:03:18 +0000
+@@ -47,32 +47,35 @@
+ #include "auth/UserRequest.h"
+ char const * Auth::UserRequest::username() const STUB_RETVAL("stub_username")
+ void Auth::UserRequest::start(HttpRequest *, AccessLogEntry::Pointer &, AUTHCB *, void *) STUB
+ bool Auth::UserRequest::valid() const STUB_RETVAL(false)
+ void * Auth::UserRequest::operator new (size_t) STUB_RETVAL((void *)1)
+ void Auth::UserRequest::operator delete (void *) STUB
+ Auth::UserRequest::UserRequest() STUB
+ Auth::UserRequest::~UserRequest() STUB
+ void Auth::UserRequest::setDenyMessage(char const *) STUB
+ char const * Auth::UserRequest::getDenyMessage() STUB_RETVAL("stub")
+ char const * Auth::UserRequest::denyMessage(char const * const) STUB_RETVAL("stub")
+ void authenticateAuthUserRequestRemoveIp(Auth::UserRequest::Pointer, Ip::Address const &) STUB
+ void authenticateAuthUserRequestClearIp(Auth::UserRequest::Pointer) STUB
+ int authenticateAuthUserRequestIPCount(Auth::UserRequest::Pointer) STUB_RETVAL(0)
+ int authenticateUserAuthenticated(Auth::UserRequest::Pointer) STUB_RETVAL(0)
+ Auth::Direction Auth::UserRequest::direction() STUB_RETVAL(Auth::CRED_ERROR)
+ void Auth::UserRequest::addAuthenticationInfoHeader(HttpReply *, int) STUB
+ void Auth::UserRequest::addAuthenticationInfoTrailer(HttpReply *, int) STUB
+ void Auth::UserRequest::releaseAuthServer() STUB
+ const char * Auth::UserRequest::connLastHeader() STUB_RETVAL("stub")
+ AuthAclState Auth::UserRequest::authenticate(Auth::UserRequest::Pointer *, Http::HdrType, HttpRequest *, ConnStateData *, Ip::Address &, AccessLogEntry::Pointer &) STUB_RETVAL(AUTH_AUTHENTICATED)
+ AuthAclState Auth::UserRequest::tryToAuthenticateAndSetAuthUser(Auth::UserRequest::Pointer *, Http::HdrType, HttpRequest *, ConnStateData *, Ip::Address &, AccessLogEntry::Pointer &) STUB_RETVAL(AUTH_AUTHENTICATED)
+ void Auth::UserRequest::addReplyAuthHeader(HttpReply *, Auth::UserRequest::Pointer, HttpRequest *, int, int) STUB
+ void authenticateFixHeader(HttpReply *, Auth::UserRequest::Pointer, HttpRequest *, int, int) STUB
+ void authenticateAddTrailer(HttpReply *, Auth::UserRequest::Pointer, HttpRequest *, int) STUB
+ Auth::Scheme::Pointer Auth::UserRequest::scheme() const STUB_RETVAL(NULL)
+ 
+ #include "AuthReg.h"
+ void Auth::Init() STUB_NOP
+ 
++#include "auth/SchemesConfig.h"
++void Auth::SchemesConfig::expand() STUB
++
+ #endif /* USE_AUTH */
+ 
+
+=== modified file 'src/tests/stub_libsslsquid.cc'
+--- src/tests/stub_libsslsquid.cc	2016-09-22 14:21:12 +0000
++++ src/tests/stub_libsslsquid.cc	2016-11-18 15:04:39 +0000
+@@ -39,45 +39,45 @@
+ { fatal(STUB_API " required"); static Ssl::LocalContextStorage v(0,0); return &v; }
+ void Ssl::GlobalContextStorage::reconfigureStart() STUB
+ //Ssl::GlobalContextStorage Ssl::TheGlobalContextStorage;
+ 
+ #include "ssl/ErrorDetail.h"
+ Security::ErrorCode parseErrorString(const char *name) STUB_RETVAL(0)
+ //const char *Ssl::getErrorName(Security::ErrorCode value) STUB_RETVAL(NULL)
+ Ssl::ErrorDetail::ErrorDetail(Security::ErrorCode, X509 *, X509 *, const char *) STUB
+ Ssl::ErrorDetail::ErrorDetail(ErrorDetail const &) STUB
+ const String & Ssl::ErrorDetail::toString() const STUB_RETSTATREF(String)
+ 
+ #include "ssl/support.h"
+ namespace Ssl
+ {
+ bool InitServerContext(Security::ContextPointer &, AnyP::PortCfg &) STUB_RETVAL(false)
+ bool InitClientContext(Security::ContextPointer &, Security::PeerOptions &, long, const char *) STUB_RETVAL(false)
+ } // namespace Ssl
+ int ssl_read_method(int, char *, int) STUB_RETVAL(0)
+ int ssl_write_method(int, const char *, int) STUB_RETVAL(0)
+ void ssl_shutdown_method(SSL *ssl) STUB
+ const char *sslGetUserEmail(SSL *ssl) STUB_RETVAL(NULL)
+ const char *sslGetUserAttribute(SSL *ssl, const char *attribute_name) STUB_RETVAL(NULL)
+ const char *sslGetCAAttribute(SSL *ssl, const char *attribute_name) STUB_RETVAL(NULL)
+ const char *sslGetUserCertificatePEM(SSL *ssl) STUB_RETVAL(NULL)
+ const char *sslGetUserCertificateChainPEM(SSL *ssl) STUB_RETVAL(NULL)
+ namespace Ssl
+ {
+ //GETX509ATTRIBUTE GetX509UserAttribute;
+ //GETX509ATTRIBUTE GetX509CAAttribute;
+ //GETX509ATTRIBUTE GetX509Fingerprint;
+-const char *BumpModeStr[] = {""};
++std::vector<const char *> BumpModeStr = {""};
+ bool generateUntrustedCert(Security::CertPointer & untrustedCert, EVP_PKEY_Pointer & untrustedPkey, Security::CertPointer const & cert, EVP_PKEY_Pointer const & pkey) STUB_RETVAL(false)
+ Security::ContextPointer generateSslContext(CertificateProperties const &, AnyP::PortCfg &) STUB_RETVAL(Security::ContextPointer())
+ bool verifySslCertificate(Security::ContextPointer &, CertificateProperties const &) STUB_RETVAL(false)
+ Security::ContextPointer generateSslContextUsingPkeyAndCertFromMemory(const char *, AnyP::PortCfg &) STUB_RETVAL(Security::ContextPointer())
+ void addChainToSslContext(Security::ContextPointer &, STACK_OF(X509) *) STUB
+ void readCertChainAndPrivateKeyFromFiles(Security::CertPointer & cert, EVP_PKEY_Pointer & pkey, X509_STACK_Pointer & chain, char const * certFilename, char const * keyFilename) STUB
+ int matchX509CommonNames(X509 *peer_cert, void *check_data, int (*check_func)(void *check_data,  ASN1_STRING *cn_data)) STUB_RETVAL(0)
+ bool checkX509ServerValidity(X509 *cert, const char *server) STUB_RETVAL(false)
+ int asn1timeToString(ASN1_TIME *tm, char *buf, int len) STUB_RETVAL(0)
+ bool setClientSNI(SSL *ssl, const char *fqdn) STUB_RETVAL(false)
+ } //namespace Ssl
+ 
+ #endif
+ 
+

@@ -1,0 +1,193 @@
+Delete cbdata-protected data when built --with-valgrind-debug.
+
+Valgrind was correctly reporting every cbdata allocation as leaking!
+AFAICT, these regressions were introduced by a combination of trunk
+r13977 (Bug 4215: double-free in CBDATA) and trunk r13909 (de-duplicate
+cbdata deallocate actions).
+
+Also fixed and polished cbdata debugging that was printing mismatching
+Allocating/Freeing pointer values and synced scripts/find-alive.pl.
+
+=== modified file 'scripts/find-alive.pl'
+--- scripts/find-alive.pl	2016-01-01 00:12:18 +0000
++++ scripts/find-alive.pl	2016-05-18 01:32:48 +0000
+@@ -38,42 +38,42 @@ my %Pairs = (
+ 		'\bClientSocketContext constructing, this=(\S+)',
+ 		'\bClientSocketContext destructed, this=(\S+)',
+ 	],
+ 	ICAP => [
+ 		'(?:ICAP|Icap).* constructed, this=(\S+)',
+ 		'(?:ICAP|Icap).* destruct.*, this=(\S+)',
+ 	],
+ 	IcapModXact => [
+ 		'Adaptation::Icap::ModXact.* constructed, this=(\S+)',
+ 		'Adaptation::Icap::ModXact.* destruct.*, this=(\S+)',
+ 	],
+ 	ICAPClientReqmodPrecache => [
+ 		'ICAPClientReqmodPrecache constructed, this=(\S+)',
+ 		'ICAPClientReqmodPrecache destruct.*, this=(\S+)',
+ 	],
+ 	HttpStateData => [
+ 		'HttpStateData (\S+) created',
+ 		'HttpStateData (\S+) destroyed',
+ 	],
+ 	cbdata => [
+-		'cbdataAlloc: (\S+)',
+-		'(?:cbdataFree|cbdataUnlock): Freeing (\S+)',
++		'cbdataInternalAlloc: Allocating (\S+)',
++		'cbdataRealFree: Freeing (\S+)',
+ 	],
+ 	FD => [
+ 		'fd_open.*\sFD (\d+)',
+ 		'fd_close\s+FD (\d+)',
+ 	],
+ 	IpcStoreMapEntry => [
+ 		'StoreMap.* opened .*entry (\d+) for \S+ (\S+)',
+ 		'StoreMap.* closed .*entry (\d+) for \S+ (\S+)',
+ 	],
+ 	sh_page => [
+ 		'PageStack.* pop: (sh_page\S+) at',
+ 		'PageStack.* push: (sh_page\S+) at',
+ 	],
+ );
+ 
+ if (!$Pairs{$Thing}) {
+     warn("guessing construction/destruction pattern for $Thing\n");
+     $Pairs{$Thing} = [
+ 		"\\b$Thing construct.*, this=(\\S+)",
+ 		"\\b$Thing destruct.*, this=(\\S+)",
+
+=== modified file 'src/cbdata.cc'
+--- src/cbdata.cc	2016-01-01 00:12:18 +0000
++++ src/cbdata.cc	2016-05-18 01:19:42 +0000
+@@ -145,40 +145,47 @@ struct CBDataIndex {
+     MemAllocator *pool;
+ }
+ *cbdata_index = NULL;
+ 
+ int cbdata_types = 0;
+ 
+ #if WITH_VALGRIND
+ static std::map<const void *, cbdata *> cbdata_htable;
+ #endif
+ 
+ cbdata::~cbdata()
+ {
+ #if USE_CBDATA_DEBUG
+ 
+     while (!calls.empty()) {
+         delete calls.back();
+         calls.pop_back();
+     }
+ 
+ #endif
++
++#if WITH_VALGRIND
++    void *p = data;
++#else
++    void *p = this;
++#endif
++    cbdata_index[type].pool->freeOne(p);
+ }
+ 
+ static void
+ cbdataInternalInitType(cbdata_type type, const char *name, int size)
+ {
+     char *label;
+     assert (type == cbdata_types + 1);
+ 
+     cbdata_index = (CBDataIndex *)xrealloc(cbdata_index, (type + 1) * sizeof(*cbdata_index));
+     memset(&cbdata_index[type], 0, sizeof(*cbdata_index));
+     cbdata_types = type;
+ 
+     label = (char *)xmalloc(strlen(name) + 20);
+ 
+     snprintf(label, strlen(name) + 20, "cbdata %s (%d)", name, (int) type);
+ 
+ #if !WITH_VALGRIND
+     assert((size_t)cbdata::Offset == (sizeof(cbdata) - ((cbdata *)NULL)->dataSize()));
+     size += cbdata::Offset;
+ #endif
+@@ -238,72 +245,69 @@ cbdataInternalAlloc(cbdata_type type, co
+     c->cookie = (long) c ^ cbdata::Cookie;
+     ++cbdataCount;
+ #if USE_CBDATA_DEBUG
+ 
+     c->file = file;
+     c->line = line;
+     c->calls = std::vector<CBDataCall *> ();
+     c->addHistory("Alloc", file, line);
+     dlinkAdd(c, &c->link, &cbdataEntries);
+     debugs(45, 3, "Allocating " << p << " " << file << ":" << line);
+ #else
+     debugs(45, 9, "Allocating " << p);
+ #endif
+ 
+     return p;
+ }
+ 
+ void
+ cbdataRealFree(cbdata *c, const char *file, const int line)
+ {
+-    void *p = c;
++#if WITH_VALGRIND
++    void *p = c->data;
++#else
++    void *p = (void *)&c->data;
++#endif
+ 
+     --cbdataCount;
+-    debugs(45, 9, "Freeing " << p);
+ #if USE_CBDATA_DEBUG
++    debugs(45, 3, "Freeing " << p << ' ' << file << ':' << line);
+     dlinkDelete(&c->link, &cbdataEntries);
++#else
++    debugs(45, 9, "Freeing " << p);
+ #endif
+ 
+ #if WITH_VALGRIND
+-    cbdata_htable.erase(c->data);
+-#if USE_CBDATA_DEBUG
+-    debugs(45, 3, "Call delete " << p << " " << file << ":" << line);
+-#endif
++    cbdata_htable.erase(p);
+     delete c;
+ #else
+-#if USE_CBDATA_DEBUG
+-    debugs(45, 3, "Call cbdata::~cbdata() " << p << " " << file << ":" << line);
+-#endif
+-
+     /* This is ugly. But: operator delete doesn't get
+      * the type parameter, so we can't use that
+      * to free the memory.
+      * So, we free it ourselves.
+      * Note that this means a non-placement
+      * new would be a seriously bad idea.
+      * Lastly, if we where a templated class,
+      * we could use the normal delete operator
+      * and it would Just Work. RBC 20030902
+      */
+-    cbdata_type theType = c->type;
+     c->cbdata::~cbdata();
+-    cbdata_index[theType].pool->freeOne(p);
+ #endif
+ }
+ 
+ void *
+ cbdataInternalFree(void *p, const char *file, int line)
+ {
+     cbdata *c;
+ #if WITH_VALGRIND
+     c = cbdata_htable.at(p);
+ #else
+     c = (cbdata *) (((char *) p) - cbdata::Offset);
+ #endif
+ #if USE_CBDATA_DEBUG
+     debugs(45, 3, p << " " << file << ":" << line);
+ #else
+     debugs(45, 9, p);
+ #endif
+ 
+     c->check(__LINE__);
+     assert(c->valid);
+

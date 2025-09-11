@@ -1,0 +1,448 @@
+%ssl::<cert_errors logformat code part2: provide depth information
+
+The first implementation of %ssl::<cert_errors formating code does not provide
+information about the certificate the errors belongs.
+This patch prints the chain depth information for error, if exist, using the
+following format for the printed certificate error:
+   ERROR@depth=X
+
+The patch also adds the "error_depth_" parameter to cert validator, used to 
+pass depth information from cert validator to squid.
+
+This is a Measurement Factory project
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2015-10-11 18:12:00 +0000
++++ src/format/Format.cc	2015-12-10 16:33:53 +0000
+@@ -1231,40 +1231,44 @@
+         case LFT_SSL_CLIENT_SNI:
+             if (al->request && al->request->clientConnectionManager.valid()) {
+                 if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
+                     if (!srvBump->clientSni.isEmpty())
+                         out = srvBump->clientSni.c_str();
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_SERVER_CERT_ERRORS:
+             if (al->request && al->request->clientConnectionManager.valid()) {
+                 if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
+                     const char *separator = fmt->data.string ? fmt->data.string : ":";
+                     for (Ssl::CertErrors *sslError = srvBump->sslErrors; sslError != NULL;  sslError = sslError->next) {
+                         if (sb.size())
+                             sb.append(separator);
+                         if (const char *errorName = Ssl::GetErrorName(sslError->element.code))
+                             sb.append(errorName);
+                         else
+                             sb.append(sslErrorName(sslError->element.code, tmp, sizeof(tmp)));
++                        if (sslError->element.depth >= 0) {
++                            snprintf(tmp, sizeof(tmp), "@depth=%d", sslError->element.depth);
++                            sb.append(tmp);
++                        }
+                     }
+                     if (sb.size())
+                         out = sb.termedBuf();
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_SERVER_CERT_ISSUER:
+         case LFT_SSL_SERVER_CERT_SUBJECT:
+             // Not implemented
+             break;
+ #endif
+ 
+         case LFT_REQUEST_URLGROUP_OLD_2X:
+             assert(LFT_REQUEST_URLGROUP_OLD_2X == 0); // should never happen.
+ 
+         case LFT_NOTE:
+             tmp[0] = fmt->data.header.separator;
+             tmp[1] = '\0';
+             if (fmt->data.header.header && *fmt->data.header.header) {
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2015-12-07 09:53:57 +0000
++++ src/ssl/PeerConnector.cc	2015-12-10 16:33:53 +0000
+@@ -364,66 +364,66 @@
+ /// The method returns all seen errors except SSL_ERROR_NONE as Ssl::CertErrors.
+ Ssl::CertErrors *
+ Ssl::PeerConnector::sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &resp, Ssl::ErrorDetail *& errDetails)
+ {
+     Ssl::CertErrors *errs = NULL;
+ 
+     ACLFilledChecklist *check = NULL;
+     if (acl_access *acl = ::Config.ssl_client.cert_error)
+         check = new ACLFilledChecklist(acl, request.getRaw(), dash_str);
+ 
+     SSL *ssl = fd_table[serverConnection()->fd].ssl;
+     typedef Ssl::CertValidationResponse::RecvdErrors::const_iterator SVCRECI;
+     for (SVCRECI i = resp.errors.begin(); i != resp.errors.end(); ++i) {
+         debugs(83, 7, "Error item: " << i->error_no << " " << i->error_reason);
+ 
+         assert(i->error_no != SSL_ERROR_NONE);
+ 
+         if (!errDetails) {
+             bool allowed = false;
+             if (check) {
+-                check->sslErrors = new Ssl::CertErrors(Ssl::CertError(i->error_no, i->cert.get()));
++                check->sslErrors = new Ssl::CertErrors(Ssl::CertError(i->error_no, i->cert.get(), i->error_depth));
+                 if (check->fastCheck() == ACCESS_ALLOWED)
+                     allowed = true;
+             }
+             // else the Config.ssl_client.cert_error access list is not defined
+             // and the first error will cause the error page
+ 
+             if (allowed) {
+                 debugs(83, 3, "bypassing SSL error " << i->error_no << " in " << "buffer");
+             } else {
+                 debugs(83, 5, "confirming SSL error " << i->error_no);
+                 X509 *brokenCert = i->cert.get();
+                 Security::CertPointer peerCert(SSL_get_peer_certificate(ssl));
+                 const char *aReason = i->error_reason.empty() ? NULL : i->error_reason.c_str();
+                 errDetails = new Ssl::ErrorDetail(i->error_no, peerCert.get(), brokenCert, aReason);
+             }
+             if (check) {
+                 delete check->sslErrors;
+                 check->sslErrors = NULL;
+             }
+         }
+ 
+         if (!errs)
+-            errs = new Ssl::CertErrors(Ssl::CertError(i->error_no, i->cert.get()));
++            errs = new Ssl::CertErrors(Ssl::CertError(i->error_no, i->cert.get(), i->error_depth));
+         else
+-            errs->push_back_unique(Ssl::CertError(i->error_no, i->cert.get()));
++            errs->push_back_unique(Ssl::CertError(i->error_no, i->cert.get(), i->error_depth));
+     }
+     if (check)
+         delete check;
+ 
+     return errs;
+ }
+ 
+ /// A wrapper for Comm::SetSelect() notifications.
+ void
+ Ssl::PeerConnector::NegotiateSsl(int, void *data)
+ {
+     PeerConnector *pc = static_cast<PeerConnector*>(data);
+     // Use job calls to add done() checks and other job logic/protections.
+     CallJobHere(83, 7, pc, Ssl::PeerConnector, negotiateSsl);
+ }
+ 
+ void
+ Ssl::PeerConnector::handleNegotiateError(const int ret)
+ {
+     const int fd = serverConnection()->fd;
+
+=== modified file 'src/ssl/cert_validate_message.cc'
+--- src/ssl/cert_validate_message.cc	2015-09-14 16:25:05 +0000
++++ src/ssl/cert_validate_message.cc	2015-12-10 16:33:53 +0000
+@@ -128,40 +128,44 @@
+             }
+         } else if (param_len > param_error_reason.length() &&
+                    strncmp(param, param_error_reason.c_str(), param_error_reason.length()) == 0) {
+             currentItem.error_reason = v;
+         } else if (param_len > param_error_cert.length() &&
+                    strncmp(param, param_error_cert.c_str(), param_error_cert.length()) == 0) {
+ 
+             if (X509 *cert = getCertByName(certs, v)) {
+                 debugs(83, 6, "The certificate with id \"" << v << "\" found.");
+                 currentItem.setCert(cert);
+             } else {
+                 //In this case we assume that the certID is one of the certificates sent
+                 // to cert validator. The certificates sent to cert validator have names in
+                 // form "cert_xx" where the "xx" is an integer represents the position of
+                 // the certificate inside peer certificates list.
+                 const int certId = get_error_id(v.c_str(), v.length());
+                 debugs(83, 6, "Cert index in peer certificates list:" << certId);
+                 //if certId is not correct sk_X509_value returns NULL
+                 currentItem.setCert(sk_X509_value(peerCerts, certId));
+             }
++        } else if (param_len > param_error_depth.length() &&
++                   strncmp(param, param_error_depth.c_str(), param_error_depth.length()) == 0 &&
++                   std::all_of(v.begin(), v.end(), isdigit)) {
++            currentItem.error_depth = std::stoi(v);
+         } else {
+             debugs(83, DBG_IMPORTANT, "WARNING: cert validator response parse error: Unknown parameter name " << std::string(param, param_len).c_str());
+             return false;
+         }
+ 
+         param = value + value_len +1;
+     }
+ 
+     /*Run through parsed errors to check for errors*/
+     typedef Ssl::CertValidationResponse::RecvdErrors::const_iterator SVCRECI;
+     for (SVCRECI i = resp.errors.begin(); i != resp.errors.end(); ++i) {
+         if (i->error_no == SSL_ERROR_NONE) {
+             debugs(83, DBG_IMPORTANT, "WARNING: cert validator incomplete response: Missing error name from error_id: " << i->id);
+             return false;
+         }
+     }
+ 
+     return true;
+ }
+ 
+@@ -221,23 +225,24 @@
+ 
+ Ssl::CertValidationMsg::CertItem & Ssl::CertValidationMsg::CertItem::operator = (const CertItem &old)
+ {
+     name = old.name;
+     setCert(old.cert.get());
+     return *this;
+ }
+ 
+ void
+ Ssl::CertValidationMsg::CertItem::setCert(X509 *aCert)
+ {
+     cert.resetAndLock(aCert);
+ }
+ 
+ const std::string Ssl::CertValidationMsg::code_cert_validate("cert_validate");
+ const std::string Ssl::CertValidationMsg::param_domain("domain");
+ const std::string Ssl::CertValidationMsg::param_cert("cert_");
+ const std::string Ssl::CertValidationMsg::param_error_name("error_name_");
+ const std::string Ssl::CertValidationMsg::param_error_reason("error_reason_");
+ const std::string Ssl::CertValidationMsg::param_error_cert("error_cert_");
++const std::string Ssl::CertValidationMsg::param_error_depth("error_depth_");
+ const std::string Ssl::CertValidationMsg::param_proto_version("proto_version");
+ const std::string Ssl::CertValidationMsg::param_cipher("cipher");
+ 
+
+=== modified file 'src/ssl/cert_validate_message.h'
+--- src/ssl/cert_validate_message.h	2015-09-14 16:25:05 +0000
++++ src/ssl/cert_validate_message.h	2015-12-10 16:46:40 +0000
+@@ -28,48 +28,49 @@
+     SSL *ssl;
+     CertErrors *errors; ///< The list of errors detected
+     std::string domainName; ///< The server name
+     CertValidationRequest() : ssl(NULL), errors(NULL) {}
+ };
+ 
+ /**
+  * This class is used to store informations found in certificate validation
+  * response messages read from certificate validator helper
+  */
+ class CertValidationResponse
+ {
+ public:
+     /**
+      * This class used to hold error informations returned from
+      * cert validator helper.
+      */
+     class  RecvdError
+     {
+     public:
+-        RecvdError(): id(0), error_no(SSL_ERROR_NONE), cert(NULL) {}
++        RecvdError(): id(0), error_no(SSL_ERROR_NONE), cert(NULL), error_depth(-1) {}
+         RecvdError(const RecvdError &);
+         RecvdError & operator =(const RecvdError &);
+         void setCert(X509 *);  ///< Sets cert to the given certificate
+         int id; ///<  The id of the error
+         ssl_error_t error_no; ///< The OpenSSL error code
+         std::string error_reason; ///< A string describing the error
+         Security::CertPointer cert; ///< The broken certificate
++        int error_depth; ///< The error depth
+     };
+ 
+     typedef std::vector<RecvdError> RecvdErrors;
+ 
+     /// Search in errors list for the error item with id=errorId.
+     /// If none found a new RecvdError item added with the given id;
+     RecvdError &getError(int errorId);
+     RecvdErrors errors; ///< The list of parsed errors
+     Helper::ResultCode resultCode; ///< The helper result code
+ };
+ 
+ /**
+  * This class is responsible for composing or parsing messages destined to
+  * or comming from a cert validator helper.
+  * The messages format is:
+  *   response/request-code SP body-length SP [key=value ...] \x01
+  */
+ class CertValidationMsg : public CrtdMessage
+ {
+ private:
+@@ -96,30 +97,32 @@
+     void composeRequest(CertValidationRequest const &vcert);
+ 
+     /// Parse a response message and fill the resp object with parsed informations
+     bool parseResponse(CertValidationResponse &resp, STACK_OF(X509) *peerCerts, std::string &error);
+ 
+     /// Search a CertItems list for the certificate with ID "name"
+     X509 *getCertByName(std::vector<CertItem> const &, std::string const & name);
+ 
+     /// String code for "cert_validate" messages
+     static const std::string code_cert_validate;
+     /// Parameter name for passing intended domain name
+     static const std::string param_domain;
+     /// Parameter name for passing SSL certificates
+     static const std::string param_cert;
+     /// Parameter name for passing the major SSL error
+     static const std::string param_error_name;
+     /// Parameter name for passing the error reason
+     static const std::string param_error_reason;
+     /// Parameter name for passing the error cert ID
+     static const std::string param_error_cert;
++    /// Parameter name for passing the error depth
++    static const std::string param_error_depth;
+     /// Parameter name for SSL version
+     static const std::string param_proto_version;
+     /// Parameter name for SSL cipher
+     static const std::string param_cipher;
+ };
+ 
+ }//namespace Ssl
+ 
+ #endif // SQUID_SSL_CERT_VALIDATE_MESSAGE_H
+ 
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2015-12-08 01:48:40 +0000
++++ src/ssl/support.cc	2015-12-10 16:41:46 +0000
+@@ -268,41 +268,42 @@
+             }
+         }
+     }
+ 
+     if (ok && peeked_cert) {
+         // Check whether the already peeked certificate matches the new one.
+         if (X509_cmp(peer_cert, peeked_cert) != 0) {
+             debugs(83, 2, "SQUID_X509_V_ERR_CERT_CHANGE: Certificate " << buffer << " does not match peeked certificate");
+             ok = 0;
+             error_no =  SQUID_X509_V_ERR_CERT_CHANGE;
+         }
+     }
+ 
+     if (!ok) {
+         X509 *broken_cert =  X509_STORE_CTX_get_current_cert(ctx);
+         if (!broken_cert)
+             broken_cert = peer_cert;
+ 
+         Ssl::CertErrors *errs = static_cast<Ssl::CertErrors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors));
+         if (!errs) {
+-            errs = new Ssl::CertErrors(Ssl::CertError(error_no, broken_cert));
++            const int depth = X509_STORE_CTX_get_error_depth(ctx);
++            errs = new Ssl::CertErrors(Ssl::CertError(error_no, broken_cert, depth));
+             if (!SSL_set_ex_data(ssl, ssl_ex_index_ssl_errors,  (void *)errs)) {
+                 debugs(83, 2, "Failed to set ssl error_no in ssl_verify_cb: Certificate " << buffer);
+                 delete errs;
+                 errs = NULL;
+             }
+         } else // remember another error number
+             errs->push_back_unique(Ssl::CertError(error_no, broken_cert));
+ 
+         if (const char *err_descr = Ssl::GetErrorDescr(error_no))
+             debugs(83, 5, err_descr << ": " << buffer);
+         else
+             debugs(83, DBG_IMPORTANT, "SSL unknown certificate error " << error_no << " in " << buffer);
+ 
+         // Check if the certificate error can be bypassed.
+         // Infinity validation loop errors can not bypassed.
+         if (error_no != SQUID_X509_V_ERR_INFINITE_VALIDATION) {
+             if (check) {
+                 ACLFilledChecklist *filledCheck = Filled(check);
+                 assert(!filledCheck->sslErrors);
+                 filledCheck->sslErrors = new Ssl::CertErrors(Ssl::CertError(error_no, broken_cert));
+@@ -1334,46 +1335,46 @@
+         errAction = "failed to allocate handle";
+     }
+ 
+     debugs(83, DBG_IMPORTANT, "ERROR: " << squidCtx << ' ' << errAction <<
+            ": " << ERR_error_string(errCode, NULL));
+     return NULL;
+ }
+ 
+ SSL *
+ Ssl::CreateClient(Security::ContextPtr sslContext, const int fd, const char *squidCtx)
+ {
+     return SslCreate(sslContext, fd, Ssl::Bio::BIO_TO_SERVER, squidCtx);
+ }
+ 
+ SSL *
+ Ssl::CreateServer(Security::ContextPtr sslContext, const int fd, const char *squidCtx)
+ {
+     return SslCreate(sslContext, fd, Ssl::Bio::BIO_TO_CLIENT, squidCtx);
+ }
+ 
+-Ssl::CertError::CertError(ssl_error_t anErr, X509 *aCert): code(anErr)
++Ssl::CertError::CertError(ssl_error_t anErr, X509 *aCert, int aDepth): code(anErr), depth(aDepth)
+ {
+     cert.resetAndLock(aCert);
+ }
+ 
+-Ssl::CertError::CertError(CertError const &err): code(err.code)
++Ssl::CertError::CertError(CertError const &err): code(err.code), depth(err.depth)
+ {
+     cert.resetAndLock(err.cert.get());
+ }
+ 
+ Ssl::CertError &
+ Ssl::CertError::operator = (const CertError &old)
+ {
+     code = old.code;
+     cert.resetAndLock(old.cert.get());
+     return *this;
+ }
+ 
+ bool
+ Ssl::CertError::operator == (const CertError &ce) const
+ {
+     return code == ce.code && cert.get() == ce.cert.get();
+ }
+ 
+ bool
+ Ssl::CertError::operator != (const CertError &ce) const
+
+=== modified file 'src/ssl/support.h'
+--- src/ssl/support.h	2015-12-08 01:48:40 +0000
++++ src/ssl/support.h	2015-12-10 16:41:22 +0000
+@@ -63,41 +63,47 @@
+ /// Squid defined error code (<0),  an error code returned by SSL X509 api, or SSL_ERROR_NONE
+ typedef int ssl_error_t;
+ 
+ typedef CbDataList<Ssl::ssl_error_t> Errors;
+ 
+ /// Creates SSL Client connection structure and initializes SSL I/O (Comm and BIO).
+ /// On errors, emits DBG_IMPORTANT with details and returns NULL.
+ SSL *CreateClient(Security::ContextPtr sslContext, const int fd, const char *squidCtx);
+ 
+ /// Creates SSL Server connection structure and initializes SSL I/O (Comm and BIO).
+ /// On errors, emits DBG_IMPORTANT with details and returns NULL.
+ SSL *CreateServer(Security::ContextPtr sslContext, const int fd, const char *squidCtx);
+ 
+ /// An SSL certificate-related error.
+ /// Pairs an error code with the certificate experiencing the error.
+ class CertError
+ {
+ public:
+     ssl_error_t code; ///< certificate error code
+     Security::CertPointer cert; ///< certificate with the above error code
+-    CertError(ssl_error_t anErr, X509 *aCert);
++    /**
++     * Absolute cert position in the final certificate chain that may include
++     * intermediate certificates. Chain positions start with zero and increase
++     * towards the root certificate. Negative if unknown.
++     */
++    int depth;
++    CertError(ssl_error_t anErr, X509 *aCert, int depth = -1);
+     CertError(CertError const &err);
+     CertError & operator = (const CertError &old);
+     bool operator == (const CertError &ce) const;
+     bool operator != (const CertError &ce) const;
+ };
+ 
+ /// Holds a list of certificate SSL errors
+ typedef CbDataList<Ssl::CertError> CertErrors;
+ 
+ } //namespace Ssl
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ Security::ContextPtr sslCreateServerContext(AnyP::PortCfg &port);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ Security::ContextPtr sslCreateClientContext(Security::PeerOptions &, long options, long flags);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ int ssl_read_method(int, char *, int);
+ 
+

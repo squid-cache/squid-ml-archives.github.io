@@ -1,0 +1,12 @@
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG/MacGPG2 v2.0.22 (Darwin)
+Comment: GPGTools - https://gpgtools.org
+
+iQEcBAEBAgAGBQJUTnU1AAoJEDoysnSpVGNHlWIH/0aDveQqfA10fb6qAuwPt9kB
++a11MWsvRFzGKDvKXmzx8PltXn/WiXbyinObks+KQGXElncI8U5J9ja/RiaJsiNg
+jy8Y+P4QQJ9Epma5colK2r8RPC2284O+qA/raZKDhCHHN29RU2MDCfjIlg8dfSMW
+tmBDQn6ZV9KD2uB0+IgWV4KweIHgfZFbOvawV5P/LGvhc3HaxB9/7aZJ8jBPOa80
+fjfTJpC211kq3zh5OTdnhxWWv5tMyMxuX3LOWT2KKlR9lzcpFPYijINn6/uU9mnh
+pQqCUxyPKFOxQ8PmaSXgTfvohVPE84borZVtvpm7cm4y1JgKyTL0jsSOtML6D6U=
+=7itz
+-----END PGP SIGNATURE-----

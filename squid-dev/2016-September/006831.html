@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [RFC] dns_wait_for_all
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BRFC%5D%20dns_wait_for_all&In-Reply-To=%3Cd50bbe30-6e48-c9a0-fb74-711b987d361d%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006838.html">
+   <LINK REL="Next"  HREF="006832.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [RFC] dns_wait_for_all</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BRFC%5D%20dns_wait_for_all&In-Reply-To=%3Cd50bbe30-6e48-c9a0-fb74-711b987d361d%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [RFC] dns_wait_for_all">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Wed Sep 14 20:15:17 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006838.html">[squid-dev] dlink question
+</A></li>
+        <LI>Next message: <A HREF="006832.html">[squid-dev] [RFC] dns_wait_for_all
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6831">[ date ]</a>
+              <a href="thread.html#6831">[ thread ]</a>
+              <a href="subject.html#6831">[ subject ]</a>
+              <a href="author.html#6831">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+    Currently, when connecting to an origin server, Squid sends
+concurrent DNS A and AAAA queries and waits for both answers before
+proceeding with the HTTP transaction. If the authoritative DNS server
+(or something on its path) breaks or significantly delays IPv6 (AAAA)
+transactions, then Squid waits until timeout, even if Squid already has
+a usable IPv4 address from a successful A query. This naturally leads to
+admins disabling IPv6, willingly or under external pressure.
+
+As Happy Eyeballs algorithms and related discussions/measurements have
+established, the best migration path to IPv6 requires making sure that
+enabling IPv6 does not create [user-visible] problems. Once that is
+accomplished, software can and should prefer IPv6 over IPv4 by default.
+I hope that we do not need to revisit those discussions to accept that
+principle.
+
+Currently, Squid violates that principle -- enabling IPv6 leads to
+user-visible problems, and those problems lead to IPv6 being disabled.
+
+
+This will not fix all IPv6 problems, but I propose to modify Squid so
+that it starts connecting after receiving the first usable DNS response:
+
+&gt;<i> dns_wait_for_all &lt;on|off&gt;
+</I>&gt;<i> 
+</I>&gt;<i> Determines whether Squid resolves domain names of all possible
+</I>&gt;<i> destinations in all supported address families before deciding which
+</I>&gt;<i> IP address to try first when contacting an origin server or cache_peer.
+</I>&gt;<i> 
+</I>&gt;<i> Before Squid can connect to a peer, it needs an IP address. Obtaining an
+</I>&gt;<i> IP address often requires a DNS lookup. Squid often makes two concurrent
+</I>&gt;<i> DNS lookups: An &quot;A&quot; query for an IPv4 address and an &quot;AAAA&quot; query for an
+</I>&gt;<i> IPv6 address. This directive does not affect the number of DNS queries
+</I>&gt;<i> sent or the side-effects of those queries (e.g., IP cache updates), but
+</I>&gt;<i> if two concurrent lookups are initiated, and this directive is off, then
+</I>&gt;<i> Squid proceeds immediately after receiving the first usable DNS answer.
+</I>&gt;<i> 
+</I>&gt;<i> This directive does not affect forwarding retries. For example, if
+</I>&gt;<i> dns_wait_for_all is off, and Squid gets an IPv4 address first, but the
+</I>&gt;<i> TCP connection to that IPv4 address fails, Squid will wait for the IPv6
+</I>&gt;<i> address resolution to complete (if it has not yet) and will then connect
+</I>&gt;<i> to an IPv6 address (if possible).
+</I>&gt;<i> 
+</I>&gt;<i> Furthermore, this directive does not affect the number of peer domain
+</I>&gt;<i> names that Squid will attempt to resolve or peer addresses that Squid
+</I>&gt;<i> may connect to. If Squid is allowed to forward a transaction to two
+</I>&gt;<i> peers, then Squid will resolve both peer names and, if failures make it
+</I>&gt;<i> necessary, will connect to all IP addresses of both peers (subject to
+</I>&gt;<i> other restrictions such as connect_retries).
+</I>&gt;<i> 
+</I>&gt;<i> See also: dns_v4_first
+</I>
+I suggest to enable this option by default because it will help with
+IPv6 adoption, but I certainly do not insist on that default.
+
+
+While we call both queries &quot;concurrent&quot;, Squid sends the AAAA query just
+before sending the A query. All other factors being equal, IPv6 will
+usually win the DNS race. However, even if AAAA loses, Squid will use
+IPv6 the next time it needs to connect to the same server.
+
+
+&gt;<i>From development point of view, support this feature properly means
+</I>creating an AsyncJob that will initiate DNS queries and update the
+destinations list as the answers come in while informing the caller (if
+it is still alive) of any new answers. Today, FwdState does
+approximately this:
+
+  1. Call peerSelect(&amp;serverDestinations, fwdPeerSelectionComplete)
+     and wait for the fwdPeerSelectionComplete callback.
+
+  2. When fwdPeerSelectionComplete is called,
+     start iterating over pre-filled serverDestinations.
+
+To support, dns_wait_for_all, FwdState will do _approximately_ this:
+
+  1. Call peerSelect(serverDestinations, fwdPeerSelected)
+     and wait for the first fwdPeerSelected subscription callback.
+
+  2. Every time fwdPeerSelected is called,
+     start or resume iterating still-unused serverDestinations
+     if we were actually waiting for the next destination to try.
+
+The DNS code dealing with concurrent A and AAAA queries will need to be
+adjusted to report the first answer while waiting for the second one.
+
+It is questionable whether the new AsyncJob should continue running
+(i.e., resolving more peer names) after FwdState is gone (or no more
+retries are needed). However, I do not want to complicate this
+discussion by introducing that side effect. We can decide to optimize
+that later, with or without another configuration option to control the
+behavior.
+
+Once this new infrastructure is in place, we can accommodate IPv6
+further by experimenting with limited semi-concurrent TCP connections
+and other Happy Eyeballs-inspired tricks (with proxy specifics in mind).
+
+
+Any better ideas or objections to adding dns_wait_for_all?
+
+
+Thank you,
+
+Alex.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006838.html">[squid-dev] dlink question
+</A></li>
+	<LI>Next message: <A HREF="006832.html">[squid-dev] [RFC] dns_wait_for_all
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6831">[ date ]</a>
+              <a href="thread.html#6831">[ thread ]</a>
+              <a href="subject.html#6831">[ subject ]</a>
+              <a href="author.html#6831">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

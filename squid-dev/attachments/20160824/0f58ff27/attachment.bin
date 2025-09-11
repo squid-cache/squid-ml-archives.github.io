@@ -1,0 +1,414 @@
+SSL CN wildcard must only match a single domain component [fragment].
+
+When comparing the requested domain name with a certificate Common Name,
+Squid expanded wildcard to cover more than one domain name label (a.k.a
+component), violating RFC 2818 requirement[1]. For example, Squid
+thought that wrong.host.example.com matched a *.example.com CN.
+
+    [1] "the wildcard character * ... is considered to match any single
+    domain name component or component fragment. E.g., *.a.com matches
+    foo.a.com but not bar.foo.a.com".
+
+In other contexts (e.g., ACLs), wildcards expand to all components.
+matchDomainName() now accepts a mdnRejectSubsubDomains flag that selects
+the right behavior for CN match validation.
+
+The old boolean honorWildcards parameter replaced with a flag, for clarity
+and consistency sake.
+
+This patch also handles the cases where the host name consists only from dots
+(eg malformed Host header or SNI info). The old code has undefined behaniour
+in these cases. Moreover it handles the cases a certificate contain zero length
+string as CN or alternate name.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/URL.h'
+--- src/URL.h	2016-08-17 00:38:25 +0000
++++ src/URL.h	2016-08-24 15:07:45 +0000
+@@ -157,57 +157,66 @@
+     if (url.getScheme() != AnyP::PROTO_URN)
+         os << "//" << url.authority();
+ 
+     // path is what it is - including absent
+     os << url.path();
+     return os;
+ }
+ 
+ class HttpRequest;
+ class HttpRequestMethod;
+ 
+ void urlInitialize(void);
+ HttpRequest *urlParse(const HttpRequestMethod&, char *, HttpRequest *request = NULL);
+ char *urlCanonicalClean(const HttpRequest *);
+ const char *urlCanonicalFakeHttps(const HttpRequest * request);
+ bool urlIsRelative(const char *);
+ char *urlMakeAbsolute(const HttpRequest *, const char *);
+ char *urlRInternal(const char *host, unsigned short port, const char *dir, const char *name);
+ char *urlInternal(const char *dir, const char *name);
+ 
++enum MatchDomainNameFlags {
++    mdnNone = 0,
++    mdnHonorWildcards = 1 << 0,
++    mdnRejectSubsubDomains = 1 << 1
++};
++
+ /**
+- * matchDomainName() compares a hostname (usually extracted from traffic)
+- * with a domainname (usually from an ACL) according to the following rules:
+- *
+- *    HOST      |   DOMAIN    |   MATCH?
+- * -------------|-------------|------
+- *    foo.com   |   foo.com   |     YES
+- *   .foo.com   |   foo.com   |     YES
+- *  x.foo.com   |   foo.com   |     NO
+- *    foo.com   |  .foo.com   |     YES
+- *   .foo.com   |  .foo.com   |     YES
+- *  x.foo.com   |  .foo.com   |     YES
++ * matchDomainName() matches a hostname (usually extracted from traffic)
++ * with a domainname when mdnNone or mdnRejectSubsubDomains flags are used
++ * according to the following rules:
+  *
+- *  We strip leading dots on hosts (but not domains!) so that
+- *  ".foo.com" is always the same as "foo.com".
++ *    HOST      |   DOMAIN    |   mdnNone | mdnRejectSubsubDomains
++ * -------------|-------------|-----------|-----------------------
++ *      foo.com |   foo.com   |     YES   |   YES
++ *     .foo.com |   foo.com   |     YES   |   YES
++ *    x.foo.com |   foo.com   |     NO    |   NO
++ *      foo.com |  .foo.com   |     YES   |   YES
++ *     .foo.com |  .foo.com   |     YES   |   YES
++ *    x.foo.com |  .foo.com   |     YES   |   YES
++ *   .x.foo.com |  .foo.com   |     YES   |   NO
++ *  y.x.foo.com |  .foo.com   |     YES   |   NO
+  *
+- * if honorWildcards is true then the matchDomainName() also accepts
++ * if mdnHonorWildcards flag is set then the matchDomainName() also accepts
+  * optional wildcards on hostname:
+  *
+  *    HOST      |    DOMAIN    |  MATCH?
+  * -------------|--------------|-------
+  *    *.foo.com |   x.foo.com  |   YES
+  *    *.foo.com |  .x.foo.com  |   YES
+  *    *.foo.com |    .foo.com  |   YES
+  *    *.foo.com |     foo.com  |   NO
+  *
++ * The combination of mdnHonorWildcards and mdnRejectSubsubDomains flags is
++ * supported.
++ *
+  * \retval 0 means the host matches the domain
+  * \retval 1 means the host is greater than the domain
+  * \retval -1 means the host is less than the domain
+  */
+-int matchDomainName(const char *host, const char *domain, bool honorWildcards = false);
++int matchDomainName(const char *host, const char *domain, uint flags = mdnNone);
+ int urlCheckRequest(const HttpRequest *);
+ char *urlHostname(const char *url);
+ void urlExtMethodConfigure(void);
+ 
+ #endif /* SQUID_SRC_URL_H_H */
+ 
+
+=== modified file 'src/acl/ServerName.cc'
+--- src/acl/ServerName.cc	2016-01-24 17:41:43 +0000
++++ src/acl/ServerName.cc	2016-06-07 14:50:56 +0000
+@@ -14,41 +14,41 @@
+ #include "acl/RegexData.h"
+ #include "acl/ServerName.h"
+ #include "client_side.h"
+ #include "fde.h"
+ #include "http/Stream.h"
+ #include "HttpRequest.h"
+ #include "ipcache.h"
+ #include "SquidString.h"
+ #include "ssl/bio.h"
+ #include "ssl/ServerBump.h"
+ #include "ssl/support.h"
+ #include "URL.h"
+ 
+ // Compare function for tree search algorithms
+ static int
+ aclHostDomainCompare( char *const &a, char * const &b)
+ {
+     const char *h = static_cast<const char *>(a);
+     const char *d = static_cast<const char *>(b);
+     debugs(28, 7, "Match:" << h << " <>  " << d);
+-    return matchDomainName(h, d, true);
++    return matchDomainName(h, d, mdnHonorWildcards);
+ }
+ 
+ bool
+ ACLServerNameData::match(const char *host)
+ {
+     if (host == NULL)
+         return 0;
+ 
+     debugs(28, 3, "checking '" << host << "'");
+ 
+     char *h = const_cast<char *>(host);
+     char const * const * result = domains->find(h, aclHostDomainCompare);
+ 
+     debugs(28, 3, "'" << host << "' " << (result ? "found" : "NOT found"));
+ 
+     return (result != NULL);
+ 
+ }
+ 
+ ACLData<char const *> *
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2016-08-01 12:12:15 +0000
++++ src/ssl/support.cc	2016-08-24 10:23:58 +0000
+@@ -185,53 +185,56 @@
+             if (check->type != GEN_DNS) {
+                 continue;
+             }
+             ASN1_STRING *cn_data = check->d.dNSName;
+ 
+             if ( (*check_func)(check_data, cn_data) == 0) {
+                 sk_GENERAL_NAME_pop_free(altnames, GENERAL_NAME_free);
+                 return 1;
+             }
+         }
+         sk_GENERAL_NAME_pop_free(altnames, GENERAL_NAME_free);
+     }
+     return 0;
+ }
+ 
+ static int check_domain( void *check_data, ASN1_STRING *cn_data)
+ {
+     char cn[1024];
+     const char *server = (const char *)check_data;
+ 
+-    if (cn_data->length > (int)sizeof(cn) - 1) {
++    if (cn_data->length == 0)
++        return 1; // zero length cn, ignore
++
++    if (cn_data->length > (int)sizeof(cn) - 1)
+         return 1; //if does not fit our buffer just ignore
+-    }
++
+     char *s = reinterpret_cast<char*>(cn_data->data);
+     char *d = cn;
+     for (int i = 0; i < cn_data->length; ++i, ++d, ++s) {
+         if (*s == '\0')
+             return 1; // always a domain mismatch. contains 0x00
+         *d = *s;
+     }
+     cn[cn_data->length] = '\0';
+     debugs(83, 4, "Verifying server domain " << server << " to certificate name/subjectAltName " << cn);
+-    return matchDomainName(server, cn[0] == '*' ? cn + 1 : cn);
++    return matchDomainName(server, (cn[0] == '*' ? cn + 1 : cn), mdnRejectSubsubDomains);
+ }
+ 
+ bool Ssl::checkX509ServerValidity(X509 *cert, const char *server)
+ {
+     return matchX509CommonNames(cert, (void *)server, check_domain);
+ }
+ 
+ /// \ingroup ServerProtocolSSLInternal
+ static int
+ ssl_verify_cb(int ok, X509_STORE_CTX * ctx)
+ {
+     // preserve original ctx->error before SSL_ calls can overwrite it
+     Ssl::ssl_error_t error_no = ok ? SSL_ERROR_NONE : ctx->error;
+ 
+     char buffer[256] = "";
+     SSL *ssl = (SSL *)X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
+     Security::ContextPtr sslctx = SSL_get_SSL_CTX(ssl);
+     SBuf *server = (SBuf *)SSL_get_ex_data(ssl, ssl_ex_index_server);
+     void *dont_verify_domain = SSL_CTX_get_ex_data(sslctx, ssl_ctx_ex_index_dont_verify_domain);
+     ACLChecklist *check = (ACLChecklist*)SSL_get_ex_data(ssl, ssl_ex_index_cert_error_check);
+
+=== modified file 'src/url.cc'
+--- src/url.cc	2016-08-17 14:24:07 +0000
++++ src/url.cc	2016-08-24 14:25:31 +0000
+@@ -80,52 +80,64 @@
+     return path_;
+ }
+ 
+ void
+ urlInitialize(void)
+ {
+     debugs(23, 5, "urlInitialize: Initializing...");
+     /* this ensures that the number of protocol strings is the same as
+      * the enum slots allocated because the last enum is always 'MAX'.
+      */
+     assert(strcmp(AnyP::ProtocolType_str[AnyP::PROTO_MAX], "MAX") == 0);
+     /*
+      * These test that our matchDomainName() function works the
+      * way we expect it to.
+      */
+     assert(0 == matchDomainName("foo.com", "foo.com"));
+     assert(0 == matchDomainName(".foo.com", "foo.com"));
+     assert(0 == matchDomainName("foo.com", ".foo.com"));
+     assert(0 == matchDomainName(".foo.com", ".foo.com"));
+     assert(0 == matchDomainName("x.foo.com", ".foo.com"));
++    assert(0 == matchDomainName("y.x.foo.com", ".foo.com"));
+     assert(0 != matchDomainName("x.foo.com", "foo.com"));
+     assert(0 != matchDomainName("foo.com", "x.foo.com"));
+     assert(0 != matchDomainName("bar.com", "foo.com"));
+     assert(0 != matchDomainName(".bar.com", "foo.com"));
+     assert(0 != matchDomainName(".bar.com", ".foo.com"));
+     assert(0 != matchDomainName("bar.com", ".foo.com"));
+     assert(0 < matchDomainName("zzz.com", "foo.com"));
+     assert(0 > matchDomainName("aaa.com", "foo.com"));
+     assert(0 == matchDomainName("FOO.com", "foo.COM"));
+     assert(0 < matchDomainName("bfoo.com", "afoo.com"));
+     assert(0 > matchDomainName("afoo.com", "bfoo.com"));
+     assert(0 < matchDomainName("x-foo.com", ".foo.com"));
++
++    assert(0 == matchDomainName(".foo.com", ".foo.com", mdnRejectSubsubDomains));
++    assert(0 == matchDomainName("x.foo.com", ".foo.com", mdnRejectSubsubDomains));
++    assert(0 != matchDomainName("y.x.foo.com", ".foo.com", mdnRejectSubsubDomains));
++    assert(0 != matchDomainName(".x.foo.com", ".foo.com", mdnRejectSubsubDomains));
++
++    assert(0 == matchDomainName("*.foo.com", "x.foo.com", mdnHonorWildcards));
++    assert(0 == matchDomainName("*.foo.com", ".x.foo.com", mdnHonorWildcards));
++    assert(0 == matchDomainName("*.foo.com", ".foo.com", mdnHonorWildcards));
++    assert(0 != matchDomainName("*.foo.com", "foo.com", mdnHonorWildcards));
++
+     /* more cases? */
+ }
+ 
+ /**
+  * Parse the scheme name from string b, into protocol type.
+  * The string must be 0-terminated.
+  */
+ AnyP::ProtocolType
+ urlParseProtocol(const char *b)
+ {
+     // make e point to the ':' character
+     const char *e = b + strcspn(b, ":");
+     int len = e - b;
+ 
+     /* test common stuff first */
+ 
+     if (strncasecmp(b, "http", len) == 0)
+         return AnyP::PROTO_HTTP;
+ 
+     if (strncasecmp(b, "ftp", len) == 0)
+@@ -650,102 +662,115 @@
+             xstrncpy(&urlbuf[urllen], relUrl, MAX_URL - urllen - 1);
+         } else {
+             // replace only the last (file?) segment with the given bit(s)
+             ++lastSlashPos;
+             if (lastSlashPos > MAX_URL - urllen - 1) {
+                 // XXX: crops bits in the middle of the combined URL.
+                 lastSlashPos = MAX_URL - urllen - 1;
+             }
+             SBufToCstring(&urlbuf[urllen], path.substr(0,lastSlashPos));
+             urllen += lastSlashPos;
+             if (urllen + 1 < MAX_URL) {
+                 xstrncpy(&urlbuf[urllen], relUrl, MAX_URL - urllen - 1);
+             }
+         }
+     }
+ 
+     return (urlbuf);
+ }
+ 
+ int
+-matchDomainName(const char *h, const char *d, bool honorWildcards)
++matchDomainName(const char *h, const char *d, uint flags)
+ {
+     int dl;
+     int hl;
+ 
++    const bool hostIncludesSubdomains = (*h == '.');
+     while ('.' == *h)
+         ++h;
+ 
+     hl = strlen(h);
+ 
++    if (hl == 0)
++        return -1;
++
+     dl = strlen(d);
+ 
+     /*
+      * Start at the ends of the two strings and work towards the
+      * beginning.
+      */
+     while (xtolower(h[--hl]) == xtolower(d[--dl])) {
+         if (hl == 0 && dl == 0) {
+             /*
+              * We made it all the way to the beginning of both
+              * strings without finding any difference.
+              */
+             return 0;
+         }
+ 
+         if (0 == hl) {
+             /*
+              * The host string is shorter than the domain string.
+              * There is only one case when this can be a match.
+              * If the domain is just one character longer, and if
+              * that character is a leading '.' then we call it a
+              * match.
+              */
+ 
+             if (1 == dl && '.' == d[0])
+                 return 0;
+             else
+                 return -1;
+         }
+ 
+         if (0 == dl) {
+             /*
+              * The domain string is shorter than the host string.
+-             * This is a match only if the first domain character
+-             * is a leading '.'.
+              */
+ 
+-            if ('.' == d[0])
+-                return 0;
+-            else
++            if ('.' == d[0]) {
++                if (flags & mdnRejectSubsubDomains) {
++                    // Check for sub-sub domain and reject
++                    while(--hl >= 0 && h[hl] != '.');
++                    if (hl < 0) {
++                        // No sub-sub domain found, but reject if there is a
++                        // leading dot in given host string (which is removed
++                        // before the check is started).
++                        return hostIncludesSubdomains ? 1 : 0;
++                    } else
++                        return 1; // sub-sub domain, reject
++                } else
++                    return 0;
++            } else
+                 return 1;
+         }
+     }
+ 
+     /*
+      * We found different characters in the same position (from the end).
+      */
+ 
+     // If the h has a form of "*.foo.com" and d has a form of "x.foo.com"
+     // then the h[hl] points to '*', h[hl+1] to '.' and d[dl] to 'x'
+     // The following checks are safe, the "h[hl + 1]" in the worst case is '\0'.
+-    if (honorWildcards && h[hl] == '*' && h[hl + 1] == '.')
++    if ((flags & mdnHonorWildcards) && h[hl] == '*' && h[hl + 1] == '.')
+         return 0;
+ 
+     /*
+      * If one of those character is '.' then its special.  In order
+      * for splay tree sorting to work properly, "x-foo.com" must
+      * be greater than ".foo.com" even though '-' is less than '.'.
+      */
+     if ('.' == d[dl])
+         return 1;
+ 
+     if ('.' == h[hl])
+         return -1;
+ 
+     return (xtolower(h[hl]) - xtolower(d[dl]));
+ }
+ 
+ /*
+  * return true if we can serve requests for this method.
+  */
+ int
+

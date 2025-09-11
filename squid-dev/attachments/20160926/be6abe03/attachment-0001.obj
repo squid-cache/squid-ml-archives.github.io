@@ -1,0 +1,121 @@
+The /dev/pf device on OSX does not publicly provide the redirection state
+by ioctl, therefore when using a transparent proxy a forwarding loop
+is generated. This patch uses the pfctl command line tool to retrieve
+the state information needed in the same manner as mitmproxy.
+
+=== modified file 'src/ip/Intercept.cc'
+--- src/ip/Intercept.cc	2016-04-07 12:03:53 +0000
++++ src/ip/Intercept.cc	2016-09-26 14:13:09 +0000
+@@ -300,6 +300,78 @@
+ #if PF_TRANSPARENT  /* --enable-pf-transparent */
+ 
+ #if !USE_NAT_DEVPF
++
++#if _SQUID_APPLE_ /* _SQUID_APPLE_ */
++
++    const char *cmdFormat = "/sbin/pfctl -s state | "
++        "/usr/bin/awk '$3 == \"%s\" && $7 == \"%s\" && $8 == \"%s\" "
++        "{print $5}'";
++    const char *established = "ESTABLISHED:ESTABLISHED";
++
++    char saddr[MAX_IPSTRLEN + 6];
++    char daddr[MAX_IPSTRLEN + 6];
++
++    newConn->remote.toUrl(saddr, sizeof(saddr));
++    newConn->local.toUrl(daddr, sizeof(daddr));
++
++    int cmdLen = strlen(cmdFormat) + strlen(saddr) + strlen(daddr)
++        + strlen(established);
++    char *cmd = (char *)malloc(sizeof(char) * cmdLen);
++    snprintf(cmd, cmdLen, cmdFormat, daddr, saddr, established);
++
++    int pipefd[2];
++    pipe(pipefd);
++    pid_t pid = fork();
++    if (pid == 0) {
++        close(pipefd[0]);
++        close(STDIN_FILENO);
++        close(STDERR_FILENO);
++        dup2(pipefd[1], STDOUT_FILENO);
++        enter_suid();
++        execl("/bin/sh", "/bin/sh", "-c", cmd, NULL);
++        leave_suid();
++    }
++    else if (pid == -1) {
++        int xerrno = errno;
++        debugs(89, DBG_IMPORTANT, HERE << "PFCTL fork failed: " << xstrerr(xerrno));
++        free(cmd);
++        return false;
++    }
++    free(cmd);
++    close(pipefd[1]);
++
++    char rdaddr[MAX_IPSTRLEN + 6];
++    FILE *fp = fdopen(pipefd[0], "r");
++    while (!feof(fp)) {
++        if (fgets(rdaddr, sizeof(rdaddr), fp) != NULL) {
++            char *portPtr = strchr(rdaddr, '\n');
++            if (portPtr) *portPtr = '\0';
++            portPtr = strrchr(rdaddr, ':');
++            if (portPtr) {
++                *portPtr = '\0';
++                portPtr += 1;
++            }
++            else {
++                debugs(89, DBG_IMPORTANT, HERE << "PFCTL failed to find state");
++                return false;
++            }
++            newConn->local = rdaddr;
++            newConn->local.port(atol(portPtr));
++            debugs(89, 5, HERE << "address NAT: " << newConn);
++
++            close(pipefd[0]);
++            return true;
++        }
++        if (errno == EINTR || errno == EAGAIN) {
++            continue;
++        }
++    }
++
++    close(pipefd[0]);
++    return false;
++
++#else /* _SQUID_APPLE_ */
++
+     /* On recent PF versions the getsockname() call performed already provided
+      * the required TCP packet details.
+      * There is no way to identify whether they came from NAT or not.
+@@ -309,6 +381,7 @@
+     debugs(89, 5, HERE << "address NAT divert-to: " << newConn);
+     return true;
+ 
++#endif /* _SQUID_APPLE_ */
+ #else /* USE_NAT_DEVPF / --with-nat-devpf */
+ 
+     struct pfioc_natlook nl;
+
+=== modified file 'test-suite/buildtest.sh'
+--- test-suite/buildtest.sh	2016-01-18 13:40:42 +0000
++++ test-suite/buildtest.sh	2016-09-26 15:20:20 +0000
+@@ -67,6 +67,7 @@
+ #
+ # eval is need to correctly handle quoted arguments
+ 	eval "$base/../configure ${DISTCHECK_CONFIGURE_FLAGS} ${configcache}" \
++		CPPFLAGS=\"-D_SQUID_APPLE -Wno-error=deprecated-declarations\" LDFLAGS=-lresolv \
+ 		2>&1 && \
+ 	${MAKE:-make} ${pjobs} ${MAKETEST} 2>&1
+ 
+
+=== modified file 'test-suite/buildtests/layer-00-default.opts'
+--- test-suite/buildtests/layer-00-default.opts	2016-01-01 00:12:18 +0000
++++ test-suite/buildtests/layer-00-default.opts	2016-09-26 15:28:54 +0000
+@@ -15,7 +15,7 @@
+ # NP: DISTCHECK_CONFIGURE_FLAGS is a magic automake macro for the
+ #     distcheck target recursive tests beteen scripted runs.
+ #     we use it to perform the same duty between our nested scripts.
+-DISTCHECK_CONFIGURE_FLAGS=""
++DISTCHECK_CONFIGURE_FLAGS="CPPFLAGS=\"-D_SQUID_APPLE -Wno-error=deprecated-declarations\" LDFLAGS=-lresolv"
+ 
+ # Fix the distclean testing.
+ export DISTCHECK_CONFIGURE_FLAGS
+

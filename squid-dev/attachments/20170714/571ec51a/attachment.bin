@@ -1,0 +1,2765 @@
+Fix SSL certificate cache refresh and collision handling.
+
+SslBump was ignoring origin server certificate changes and using the
+previously cached fake certificate (mimicking now-stale properties).
+Also, Squid was not detecting key collisions inside certificate caches.
+
+On-disk certificate cache fixes:
+
+  - Use the original certificate signature instead of the certificate
+    subject as part of the key. Using signatures reduces certificate key
+    collisions to deliberate attacks and woefully misconfigured origins,
+    and makes any mishandled attacks a lot less dangerous because the
+    attacking origin server certificate cannot by trusted by a properly
+    configured Squid and cannot be used for encryption by an attacker.
+
+    We have considered using certificate digests instead of signatures.
+    Digests would further reduce the attack surface to copies of public
+    certificates (as if the origin server was woefully misconfigured).
+    However, unlike the origin-supplied signatures, digests require
+    (expensive) computation in Squid, and implemented collision handling
+    should make any signature-based attacks unappealing. Signatures won
+    on performance grounds.
+
+    Other key components remain the same: NotValidAfter, NotValidBefore,
+    forced common name, non-default signing algorithm, and signing hash.
+
+  - Store the original server certificate in the cache (together with
+    the generated certificate) for reliable key collision detection.
+
+  - Upon detecting key collisions, ignore and replace the existing cache
+    entry with a freshly computed one. This change is required to
+    prevent an attacker from tricking Squid into hitting a cached
+    impersonating certificate when talking to a legitimate origin.
+
+In-memory SSL context cache fixes:
+
+  - Use the original server certificate (in ASN.1 form) as a part of the
+    cache key, to completely eliminate cache key collisions.
+
+Other related improvements:
+
+  - Make the LruMap keys template parameters.
+  - Polish Ssl::CertificateDb class member names to match Squid coding
+    style. Rename some functions parameters to better match their
+    meaning.
+  - Replace Ssl::CertificateProperties::dbKey() with:
+     * Ssl::TxtKeyForCertificateProperties() in ssl/gadgets.cc for
+       on-disk key generation by the ssl_crtd helper;
+     * Ssl::UniqueKeyForCertificateProperties() in ssl/support.cc for
+       in-memory binary keys generation by the SSL context memory cache.
+  - Optimization: Added Ssl::BIO_new_SBuf(SBuf*) for OpenSSL to write
+    directly into SBuf objects.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/base/LruMap.h'
+--- src/base/LruMap.h	2017-01-01 00:12:22 +0000
++++ src/base/LruMap.h	2017-07-14 08:19:51 +0000
+@@ -1,219 +1,220 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_LRUMAP_H
+ #define SQUID_LRUMAP_H
+ 
+ #include "SquidTime.h"
++#include "sbuf/SBuf.h"
+ 
+ #include <list>
+ #include <map>
+ 
+-template <class EntryValue, size_t EntryCost = sizeof(EntryValue)> class LruMap
++template <class Key, class EntryValue, size_t EntryCost = sizeof(EntryValue)> class LruMap
+ {
+ public:
+     class Entry
+     {
+     public:
+-        Entry(const char *aKey, EntryValue *t): key(aKey), value(t), date(squid_curtime) {}
++        Entry(const Key &aKey, EntryValue *t): key(aKey), value(t), date(squid_curtime) {}
+         ~Entry() {delete value;}
+     private:
+         Entry(Entry &);
+         Entry & operator = (Entry &);
+     public:
+-        std::string key; ///< the key of entry
++        Key key; ///< the key of entry
+         EntryValue *value; ///< A pointer to the stored value
+         time_t date; ///< The date the entry created
+     };
+     typedef std::list<Entry *> Queue;
+     typedef typename std::list<Entry *>::iterator QueueIterator;
+ 
+     /// key:queue_item mapping for fast lookups by key
+-    typedef std::map<std::string, QueueIterator> Map;
++    typedef std::map<Key, QueueIterator> Map;
+     typedef typename Map::iterator MapIterator;
+-    typedef std::pair<std::string, QueueIterator> MapPair;
++    typedef std::pair<Key, QueueIterator> MapPair;
+ 
+     LruMap(int ttl, size_t size);
+     ~LruMap();
+     /// Search for an entry, and return a pointer
+-    EntryValue *get(const char *key);
++    EntryValue *get(const Key &key);
+     /// Add an entry to the map
+-    bool add(const char *key, EntryValue *t);
++    bool add(const Key &key, EntryValue *t);
+     /// Delete an entry from the map
+-    bool del(const char *key);
++    bool del(const Key &key);
+     /// (Re-)set the maximum size for this map
+     void setMemLimit(size_t aSize);
+     /// The available size for the map
+     size_t memLimit() const {return memLimit_;}
+     /// The free space of the map
+     size_t freeMem() const { return (memLimit() > size() ? memLimit() - size() : 0);}
+     /// The current size of the map
+     size_t size() const {return (entries_ * EntryCost);}
+     /// The number of stored entries
+     int entries() const {return entries_;}
+ private:
+     LruMap(LruMap const &);
+     LruMap & operator = (LruMap const &);
+ 
+     bool expired(const Entry &e) const;
+     void trim();
+     void touch(const MapIterator &i);
+     bool del(const MapIterator &i);
+-    void findEntry(const char *key, LruMap::MapIterator &i);
++    void findEntry(const Key &key, LruMap::MapIterator &i);
+ 
+     Map storage; ///< The Key/value * pairs
+     Queue index; ///< LRU cache index
+     int ttl;///< >0 ttl for caching, == 0 cache is disabled, < 0 store for ever
+     size_t memLimit_; ///< The maximum memory to use
+     int entries_; ///< The stored entries
+ };
+ 
+-template <class EntryValue, size_t EntryCost>
+-LruMap<EntryValue, EntryCost>::LruMap(int aTtl, size_t aSize): entries_(0)
++template <class Key, class EntryValue, size_t EntryCost>
++    LruMap<Key, EntryValue, EntryCost>::LruMap(int aTtl, size_t aSize): entries_(0)
+ {
+     ttl = aTtl;
+ 
+     setMemLimit(aSize);
+ }
+ 
+-template <class EntryValue, size_t EntryCost>
+-LruMap<EntryValue, EntryCost>::~LruMap()
++template <class Key, class EntryValue, size_t EntryCost>
++LruMap<Key, EntryValue, EntryCost>::~LruMap()
+ {
+     for (QueueIterator i = index.begin(); i != index.end(); ++i) {
+         delete *i;
+     }
+ }
+ 
+-template <class EntryValue, size_t EntryCost>
++template <class Key, class EntryValue, size_t EntryCost>
+ void
+-LruMap<EntryValue, EntryCost>::setMemLimit(size_t aSize)
++LruMap<Key, EntryValue, EntryCost>::setMemLimit(size_t aSize)
+ {
+     if (aSize > 0)
+         memLimit_ = aSize;
+     else
+         memLimit_ = 0;
+ }
+ 
+-template <class EntryValue, size_t EntryCost>
++template <class Key, class EntryValue, size_t EntryCost>
+ void
+-LruMap<EntryValue, EntryCost>::findEntry(const char *key, LruMap::MapIterator &i)
++LruMap<Key, EntryValue, EntryCost>::findEntry(const Key &key, LruMap::MapIterator &i)
+ {
+     i = storage.find(key);
+     if (i == storage.end()) {
+         return;
+     }
+     index.push_front(*(i->second));
+     index.erase(i->second);
+     i->second = index.begin();
+ 
+     if (const Entry *e = *i->second) {
+         if (!expired(*e))
+             return;
+         // else fall through to cleanup
+     }
+ 
+     del(i);
+     i = storage.end();
+ }
+ 
+-template <class EntryValue, size_t EntryCost>
++template <class Key, class EntryValue, size_t EntryCost>
+ EntryValue *
+-LruMap<EntryValue, EntryCost>::get(const char *key)
++LruMap<Key, EntryValue, EntryCost>::get(const Key &key)
+ {
+     MapIterator i;
+     findEntry(key, i);
+     if (i != storage.end()) {
+         touch(i);
+         Entry *e = *i->second;
+         return e->value;
+     }
+     return NULL;
+ }
+ 
+-template <class EntryValue, size_t EntryCost>
++template <class Key, class EntryValue, size_t EntryCost>
+ bool
+-LruMap<EntryValue, EntryCost>::add(const char *key, EntryValue *t)
++LruMap<Key, EntryValue, EntryCost>::add(const Key &key, EntryValue *t)
+ {
+     if (ttl == 0)
+         return false;
+ 
+     del(key);
+     trim();
+ 
+     if (memLimit() == 0)
+         return false;
+ 
+     index.push_front(new Entry(key, t));
+     storage.insert(MapPair(key, index.begin()));
+ 
+     ++entries_;
+     return true;
+ }
+ 
+-template <class EntryValue, size_t EntryCost>
++template <class Key, class EntryValue, size_t EntryCost>
+ bool
+-LruMap<EntryValue, EntryCost>::expired(const LruMap::Entry &entry) const
++LruMap<Key, EntryValue, EntryCost>::expired(const LruMap::Entry &entry) const
+ {
+     if (ttl < 0)
+         return false;
+ 
+     return (entry.date + ttl < squid_curtime);
+ }
+ 
+-template <class EntryValue, size_t EntryCost>
++template <class Key, class EntryValue, size_t EntryCost>
+ bool
+-LruMap<EntryValue, EntryCost>::del(LruMap::MapIterator const &i)
++LruMap<Key, EntryValue, EntryCost>::del(LruMap::MapIterator const &i)
+ {
+     if (i != storage.end()) {
+         Entry *e = *i->second;
+         index.erase(i->second);
+         storage.erase(i);
+         delete e;
+         --entries_;
+         return true;
+     }
+     return false;
+ }
+ 
+-template <class EntryValue, size_t EntryCost>
++template <class Key, class EntryValue, size_t EntryCost>
+ bool
+-LruMap<EntryValue, EntryCost>::del(const char *key)
++LruMap<Key, EntryValue, EntryCost>::del(const Key &key)
+ {
+     MapIterator i;
+     findEntry(key, i);
+     return del(i);
+ }
+ 
+-template <class EntryValue, size_t EntryCost>
++template <class Key, class EntryValue, size_t EntryCost>
+ void
+-LruMap<EntryValue, EntryCost>::trim()
++LruMap<Key, EntryValue, EntryCost>::trim()
+ {
+     while (size() >= memLimit()) {
+         QueueIterator i = index.end();
+         --i;
+         if (i != index.end()) {
+-            del((*i)->key.c_str());
++            del((*i)->key);
+         }
+     }
+ }
+ 
+-template <class EntryValue, size_t EntryCost>
++template <class Key, class EntryValue, size_t EntryCost>
+ void
+-LruMap<EntryValue, EntryCost>::touch(LruMap::MapIterator const &i)
++LruMap<Key, EntryValue, EntryCost>::touch(LruMap::MapIterator const &i)
+ {
+     // this must not be done when nothing is being cached.
+     if (ttl == 0)
+         return;
+ 
+     index.push_front(*(i->second));
+     index.erase(i->second);
+     i->second = index.begin();
+ }
+ 
+ #endif
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2017-06-16 18:12:15 +0000
++++ src/client_side.cc	2017-07-14 14:04:46 +0000
+@@ -2813,58 +2813,59 @@
+         debugs(1, DBG_IMPORTANT, HERE << "\"ssl_crtd\" helper returned <NULL> reply.");
+     } else {
+         Ssl::CrtdMessage reply_message(Ssl::CrtdMessage::REPLY);
+         if (reply_message.parse(reply.other().content(), reply.other().contentSize()) != Ssl::CrtdMessage::OK) {
+             debugs(33, 5, HERE << "Reply from ssl_crtd for " << sslConnectHostOrIp << " is incorrect");
+         } else {
+             if (reply.result != Helper::Okay) {
+                 debugs(33, 5, HERE << "Certificate for " << sslConnectHostOrIp << " cannot be generated. ssl_crtd response: " << reply_message.getBody());
+             } else {
+                 debugs(33, 5, HERE << "Certificate for " << sslConnectHostOrIp << " was successfully recieved from ssl_crtd");
+                 if (sslServerBump && (sslServerBump->act.step1 == Ssl::bumpPeek || sslServerBump->act.step1 == Ssl::bumpStare)) {
+                     doPeekAndSpliceStep();
+                     auto ssl = fd_table[clientConnection->fd].ssl.get();
+                     bool ret = Ssl::configureSSLUsingPkeyAndCertFromMemory(ssl, reply_message.getBody().c_str(), *port);
+                     if (!ret)
+                         debugs(33, 5, "Failed to set certificates to ssl object for PeekAndSplice mode");
+ 
+                     Security::ContextPointer ctx(Security::GetFrom(fd_table[clientConnection->fd].ssl));
+                     Ssl::configureUnconfiguredSslContext(ctx, signAlgorithm, *port);
+                 } else {
+-                    Security::ContextPointer ctx(Ssl::generateSslContextUsingPkeyAndCertFromMemory(reply_message.getBody().c_str(), *port));
+-                    getSslContextDone(ctx, true);
++                    Security::ContextPointer ctx(Ssl::GenerateSslContextUsingPkeyAndCertFromMemory(reply_message.getBody().c_str(), *port, (signAlgorithm == Ssl::algSignTrusted)));
++                    if (ctx && !sslBumpCertKey.isEmpty())
++                        storeTlsContextToCache(sslBumpCertKey, ctx);
++                    getSslContextDone(ctx);
+                 }
+                 return;
+             }
+         }
+     }
+     Security::ContextPointer nil;
+     getSslContextDone(nil);
+ }
+ 
+ void ConnStateData::buildSslCertGenerationParams(Ssl::CertificateProperties &certProperties)
+ {
+     certProperties.commonName =  sslCommonName_.isEmpty() ? sslConnectHostOrIp.termedBuf() : sslCommonName_.c_str();
+ 
+-    const bool triedToConnect = sslServerBump && sslServerBump->entry;
+-    const bool connectedOK = triedToConnect && sslServerBump->entry->isEmpty();
+-    if (connectedOK) {
++    const bool connectedOk = sslServerBump && sslServerBump->connectedOk();
++    if (connectedOk) {
+         if (X509 *mimicCert = sslServerBump->serverCert.get())
+             certProperties.mimicCert.resetAndLock(mimicCert);
+ 
+         ACLFilledChecklist checklist(NULL, sslServerBump->request.getRaw(),
+                                      clientConnection != NULL ? clientConnection->rfc931 : dash_str);
+         checklist.sslErrors = cbdataReference(sslServerBump->sslErrors());
+ 
+         for (sslproxy_cert_adapt *ca = Config.ssl_client.cert_adapt; ca != NULL; ca = ca->next) {
+             // If the algorithm already set, then ignore it.
+             if ((ca->alg == Ssl::algSetCommonName && certProperties.setCommonName) ||
+                     (ca->alg == Ssl::algSetValidAfter && certProperties.setValidAfter) ||
+                     (ca->alg == Ssl::algSetValidBefore && certProperties.setValidBefore) )
+                 continue;
+ 
+             if (ca->aclList && checklist.fastCheck(ca->aclList) == ACCESS_ALLOWED) {
+                 const char *alg = Ssl::CertAdaptAlgorithmStr[ca->alg];
+                 const char *param = ca->param;
+ 
+                 // For parameterless CN adaptation, use hostname from the
+                 // CONNECT request.
+@@ -2901,140 +2902,142 @@
+     }
+ 
+     assert(certProperties.signAlgorithm != Ssl::algSignEnd);
+ 
+     if (certProperties.signAlgorithm == Ssl::algSignUntrusted) {
+         assert(port->untrustedSigningCert.get());
+         certProperties.signWithX509.resetAndLock(port->untrustedSigningCert.get());
+         certProperties.signWithPkey.resetAndLock(port->untrustedSignPkey.get());
+     } else {
+         assert(port->signingCert.get());
+         certProperties.signWithX509.resetAndLock(port->signingCert.get());
+ 
+         if (port->signPkey.get())
+             certProperties.signWithPkey.resetAndLock(port->signPkey.get());
+     }
+     signAlgorithm = certProperties.signAlgorithm;
+ 
+     certProperties.signHash = Ssl::DefaultSignHash;
+ }
+ 
++Security::ContextPointer
++ConnStateData::getTlsContextFromCache(const SBuf &cacheKey, const Ssl::CertificateProperties &certProperties)
++{
++    debugs(33, 5, "Finding SSL certificate for " << cacheKey << " in cache");
++    Ssl::LocalContextStorage * ssl_ctx_cache = Ssl::TheGlobalContextStorage.getLocalStorage(port->s);
++    if (Security::ContextPointer *ctx = ssl_ctx_cache ? ssl_ctx_cache->get(cacheKey) : nullptr) {
++        if (Ssl::verifySslCertificate(*ctx, certProperties)) {
++            debugs(33, 5, "Cached SSL certificate for " << certProperties.commonName << " is valid");
++            return *ctx;
++        } else {
++            debugs(33, 5, "Cached SSL certificate for " << certProperties.commonName << " is out of date. Delete this certificate from cache");
++            if (ssl_ctx_cache)
++                ssl_ctx_cache->del(cacheKey);
++        }
++    }
++    return Security::ContextPointer(nullptr);
++}
++
++void
++ConnStateData::storeTlsContextToCache(const SBuf &cacheKey, Security::ContextPointer &ctx)
++{
++    Ssl::LocalContextStorage *ssl_ctx_cache = Ssl::TheGlobalContextStorage.getLocalStorage(port->s);
++    if (!ssl_ctx_cache || !ssl_ctx_cache->add(cacheKey, new Security::ContextPointer(ctx))) {
++        // If it is not in storage delete after using. Else storage deleted it.
++        fd_table[clientConnection->fd].dynamicTlsContext = ctx;
++    }
++}
++
+ void
+ ConnStateData::getSslContextStart()
+ {
+     // If we are called, then CONNECT has succeeded. Finalize it.
+     if (auto xact = pipeline.front()) {
+         if (xact->http && xact->http->request && xact->http->request->method == Http::METHOD_CONNECT)
+             xact->finished();
+         // cannot proceed with encryption if requests wait for plain responses
+         Must(pipeline.empty());
+     }
+     /* careful: finished() above frees request, host, etc. */
+ 
+     if (port->generateHostCertificates) {
+         Ssl::CertificateProperties certProperties;
+         buildSslCertGenerationParams(certProperties);
+-        sslBumpCertKey = certProperties.dbKey().c_str();
+-        assert(sslBumpCertKey.size() > 0 && sslBumpCertKey[0] != '\0');
+ 
+         // Disable caching for bumpPeekAndSplice mode
+         if (!(sslServerBump && (sslServerBump->act.step1 == Ssl::bumpPeek || sslServerBump->act.step1 == Ssl::bumpStare))) {
+-            debugs(33, 5, "Finding SSL certificate for " << sslBumpCertKey << " in cache");
+-            Ssl::LocalContextStorage * ssl_ctx_cache = Ssl::TheGlobalContextStorage.getLocalStorage(port->s);
+-            Security::ContextPointer *cachedCtx = ssl_ctx_cache ? ssl_ctx_cache->get(sslBumpCertKey.termedBuf()) : nullptr;
+-            if (cachedCtx) {
+-                debugs(33, 5, "SSL certificate for " << sslBumpCertKey << " found in cache");
+-                if (Ssl::verifySslCertificate(*cachedCtx, certProperties)) {
+-                    debugs(33, 5, "Cached SSL certificate for " << sslBumpCertKey << " is valid");
+-                    getSslContextDone(*cachedCtx);
+-                    return;
+-                } else {
+-                    debugs(33, 5, "Cached SSL certificate for " << sslBumpCertKey << " is out of date. Delete this certificate from cache");
+-                    if (ssl_ctx_cache)
+-                        ssl_ctx_cache->del(sslBumpCertKey.termedBuf());
+-                }
+-            } else {
+-                debugs(33, 5, "SSL certificate for " << sslBumpCertKey << " haven't found in cache");
++            sslBumpCertKey.clear();
++            UniqueKeyForCertificateProperties(certProperties, sslBumpCertKey);
++            assert(!sslBumpCertKey.isEmpty());
++
++            Security::ContextPointer ctx(getTlsContextFromCache(sslBumpCertKey, certProperties));
++            if (ctx) {
++                getSslContextDone(ctx);
++                return;
+             }
+         }
+ 
+ #if USE_SSL_CRTD
+         try {
+             debugs(33, 5, HERE << "Generating SSL certificate for " << certProperties.commonName << " using ssl_crtd.");
+             Ssl::CrtdMessage request_message(Ssl::CrtdMessage::REQUEST);
+             request_message.setCode(Ssl::CrtdMessage::code_new_certificate);
+             request_message.composeRequest(certProperties);
+             debugs(33, 5, HERE << "SSL crtd request: " << request_message.compose().c_str());
+             Ssl::Helper::GetInstance()->sslSubmit(request_message, sslCrtdHandleReplyWrapper, this);
+             return;
+         } catch (const std::exception &e) {
+             debugs(33, DBG_IMPORTANT, "ERROR: Failed to compose ssl_crtd " <<
+                    "request for " << certProperties.commonName <<
+                    " certificate: " << e.what() << "; will now block to " <<
+                    "generate that certificate.");
+             // fall through to do blocking in-process generation.
+         }
+ #endif // USE_SSL_CRTD
+ 
+         debugs(33, 5, HERE << "Generating SSL certificate for " << certProperties.commonName);
+         if (sslServerBump && (sslServerBump->act.step1 == Ssl::bumpPeek || sslServerBump->act.step1 == Ssl::bumpStare)) {
+             doPeekAndSpliceStep();
+             auto ssl = fd_table[clientConnection->fd].ssl.get();
+             if (!Ssl::configureSSL(ssl, certProperties, *port))
+                 debugs(33, 5, "Failed to set certificates to ssl object for PeekAndSplice mode");
+ 
+             Security::ContextPointer ctx(Security::GetFrom(fd_table[clientConnection->fd].ssl));
+             Ssl::configureUnconfiguredSslContext(ctx, certProperties.signAlgorithm, *port);
+         } else {
+-            Security::ContextPointer dynCtx(Ssl::generateSslContext(certProperties, *port));
+-            getSslContextDone(dynCtx, true);
++            Security::ContextPointer dynCtx(Ssl::GenerateSslContext(certProperties, *port, (signAlgorithm == Ssl::algSignTrusted)));
++            if (dynCtx && !sslBumpCertKey.isEmpty())
++                storeTlsContextToCache(sslBumpCertKey, dynCtx);
++            getSslContextDone(dynCtx);
+         }
+         return;
+     }
+ 
+     Security::ContextPointer nil;
+     getSslContextDone(nil);
+ }
+ 
+ void
+-ConnStateData::getSslContextDone(Security::ContextPointer &ctx, bool isNew)
++ConnStateData::getSslContextDone(Security::ContextPointer &ctx)
+ {
+-    // Try to add generated ssl context to storage.
+-    if (port->generateHostCertificates && isNew) {
+-
+-        if (ctx && (signAlgorithm == Ssl::algSignTrusted)) {
+-            Ssl::chainCertificatesToSSLContext(ctx, *port);
+-        } else if (signAlgorithm == Ssl::algSignTrusted) {
+-            debugs(33, DBG_IMPORTANT, "WARNING: can not add signing certificate to SSL context chain because SSL context chain is invalid!");
+-        }
+-        //else it is self-signed or untrusted do not attrach any certificate
+-
+-        Ssl::LocalContextStorage *ssl_ctx_cache = Ssl::TheGlobalContextStorage.getLocalStorage(port->s);
+-        assert(sslBumpCertKey.size() > 0 && sslBumpCertKey[0] != '\0');
+-        if (ctx) {
+-            if (!ssl_ctx_cache || !ssl_ctx_cache->add(sslBumpCertKey.termedBuf(), new Security::ContextPointer(ctx))) {
+-                // If it is not in storage delete after using. Else storage deleted it.
+-                fd_table[clientConnection->fd].dynamicTlsContext = ctx;
+-            }
+-        } else {
+-            debugs(33, 2, HERE << "Failed to generate SSL cert for " << sslConnectHostOrIp);
+-        }
++    if (port->generateHostCertificates && !ctx) {
++        debugs(33, 2, "Failed to generate TLS cotnext for " << sslConnectHostOrIp);
+     }
+ 
+     // If generated ssl context = NULL, try to use static ssl context.
+     if (!ctx) {
+         if (!port->secure.staticContext) {
+             debugs(83, DBG_IMPORTANT, "Closing " << clientConnection->remote << " as lacking TLS context");
+             clientConnection->close();
+             return;
+         } else {
+             debugs(33, 5, "Using static TLS context.");
+             ctx = port->secure.staticContext;
+         }
+     }
+ 
+     if (!httpsCreate(clientConnection, ctx))
+         return;
+ 
+     // bumped intercepted conns should already have Config.Timeout.request set
+     // but forwarded connections may only have Config.Timeout.lifetime. [Re]set
+     // to make sure the connection does not get stuck on non-SSL clients.
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2017-06-19 13:53:03 +0000
++++ src/client_side.h	2017-07-14 08:34:51 +0000
+@@ -207,46 +207,44 @@
+ 
+ #if USE_OPENSSL
+     /// the second part of old httpsAccept, waiting for future HttpsServer home
+     void postHttpsAccept();
+ 
+     /// Initializes and starts a peek-and-splice negotiation with the SSL client
+     void startPeekAndSplice();
+ 
+     /// Called when a peek-and-splice step finished. For example after
+     /// server SSL certificates received and fake server SSL certificates
+     /// generated
+     void doPeekAndSpliceStep();
+     /// called by FwdState when it is done bumping the server
+     void httpsPeeked(Comm::ConnectionPointer serverConnection);
+ 
+     /// Splice a bumped client connection on peek-and-splice mode
+     bool splice();
+ 
+     /// Start to create dynamic Security::ContextPointer for host or uses static port SSL context.
+     void getSslContextStart();
+-    /**
+-     * Done create dynamic ssl certificate.
+-     *
+-     * \param[in] isNew if generated certificate is new, so we need to add this certificate to storage.
+-     */
+-    void getSslContextDone(Security::ContextPointer &, bool isNew = false);
++
++    /// finish configuring the newly created SSL context"
++    void getSslContextDone(Security::ContextPointer &);
++
+     /// Callback function. It is called when squid receive message from ssl_crtd.
+     static void sslCrtdHandleReplyWrapper(void *data, const Helper::Reply &reply);
+     /// Proccess response from ssl_crtd.
+     void sslCrtdHandleReply(const Helper::Reply &reply);
+ 
+     void switchToHttps(HttpRequest *request, Ssl::BumpMode bumpServerMode);
+     void parseTlsHandshake();
+     bool switchedToHttps() const { return switchedToHttps_; }
+     Ssl::ServerBump *serverBump() {return sslServerBump;}
+     inline void setServerBump(Ssl::ServerBump *srvBump) {
+         if (!sslServerBump)
+             sslServerBump = srvBump;
+         else
+             assert(sslServerBump == srvBump);
+     }
+     const SBuf &sslCommonName() const {return sslCommonName_;}
+     void resetSslCommonName(const char *name) {sslCommonName_ = name;}
+     const SBuf &tlsClientSni() const { return tlsClientSni_; }
+     /// Fill the certAdaptParams with the required data for certificate adaptation
+     /// and create the key for storing/retrieve the certificate to/from the cache
+@@ -342,62 +340,71 @@
+ 
+     BodyPipe::Pointer bodyPipe; ///< set when we are reading request body
+ 
+ private:
+     /* ::Server API */
+     virtual bool connFinishedWithConn(int size);
+     virtual void checkLogging();
+ 
+     void clientAfterReadingRequests();
+     bool concurrentRequestQueueFilled() const;
+ 
+     void pinNewConnection(const Comm::ConnectionPointer &pinServer, HttpRequest *request, CachePeer *aPeer, bool auth);
+ 
+     /* PROXY protocol functionality */
+     bool proxyProtocolValidateClient();
+     bool parseProxyProtocolHeader();
+     bool parseProxy1p0();
+     bool parseProxy2p0();
+     bool proxyProtocolError(const char *reason);
+ 
++#if USE_OPENSSL
++    /// \returns a pointer to the matching cached TLS context or nil
++    Security::ContextPointer getTlsContextFromCache(const SBuf &cacheKey, const Ssl::CertificateProperties &certProperties);
++
++    /// Attempts to add a given TLS context to the cache, replacing the old
++    /// same-key context, if any
++    void storeTlsContextToCache(const SBuf &cacheKey, Security::ContextPointer &ctx);
++#endif
++
+     /// whether PROXY protocol header is still expected
+     bool needProxyProtocolHeader_;
+ 
+ #if USE_AUTH
+     /// some user details that can be used to perform authentication on this connection
+     Auth::UserRequest::Pointer auth_;
+ #endif
+ 
+     /// the parser state for current HTTP/1.x input buffer processing
+     Http1::RequestParserPointer parser_;
+ 
+ #if USE_OPENSSL
+     bool switchedToHttps_;
+     bool parsingTlsHandshake; ///< whether we are getting/parsing TLS Hello bytes
+ 
+     /// The SSL server host name appears in CONNECT request or the server ip address for the intercepted requests
+     String sslConnectHostOrIp; ///< The SSL server host name as passed in the CONNECT request
+     SBuf sslCommonName_; ///< CN name for SSL certificate generation
+ 
+     /// TLS client delivered SNI value. Empty string if none has been received.
+     SBuf tlsClientSni_;
+-    String sslBumpCertKey; ///< Key to use to store/retrieve generated certificate
++    SBuf sslBumpCertKey; ///< Key to use to store/retrieve generated certificate
+ 
+     /// HTTPS server cert. fetching state for bump-ssl-server-first
+     Ssl::ServerBump *sslServerBump;
+     Ssl::CertSignAlgorithm signAlgorithm; ///< The signing algorithm to use
+ #endif
+ 
+     /// the reason why we no longer write the response or nil
+     const char *stoppedSending_;
+     /// the reason why we no longer read the request or nil
+     const char *stoppedReceiving_;
+     /// Connection annotations, clt_conn_tag and other tags are stored here.
+     /// If set, are propagated to the current and all future master transactions
+     /// on the connection.
+     NotePairs::Pointer theNotes;
+ };
+ 
+ void setLogUri(ClientHttpRequest * http, char const *uri, bool cleanUrl = false);
+ 
+ const char *findTrailingHTTPVersion(const char *uriAndHTTPVersion, const char *end = NULL);
+ 
+
+=== modified file 'src/security/cert_generators/file/certificate_db.cc'
+--- src/security/cert_generators/file/certificate_db.cc	2017-01-01 00:12:22 +0000
++++ src/security/cert_generators/file/certificate_db.cc	2017-07-14 13:51:38 +0000
+@@ -191,284 +191,281 @@
+             sq_TXT_DB_delete_row(db, i);
+             return;
+         }
+     }
+ }
+ 
+ #define countof(arr) (sizeof(arr)/sizeof(*arr))
+ void Ssl::CertificateDb::sq_TXT_DB_delete_row(TXT_DB *db, int idx) {
+     char **rrow;
+ #if SQUID_SSLTXTDB_PSTRINGDATA
+     rrow = (char **)sk_OPENSSL_PSTRING_delete(db->data, idx);
+ #else
+     rrow = (char **)sk_delete(db->data, idx);
+ #endif
+ 
+     if (!rrow)
+         return;
+ 
+     Row row(rrow, cnlNumber); // row wrapper used to free the rrow
+ 
+-    const Columns db_indexes[]= {cnlSerial, cnlName};
++    const Columns db_indexes[]= {cnlSerial, cnlKey};
+     for (unsigned int i = 0; i < countof(db_indexes); ++i) {
+         void *data = NULL;
+ #if SQUID_SSLTXTDB_PSTRINGDATA
+         if (LHASH_OF(OPENSSL_STRING) *fieldIndex =  db->index[db_indexes[i]])
+             data = lh_OPENSSL_STRING_delete(fieldIndex, rrow);
+ #else
+         if (LHASH *fieldIndex = db->index[db_indexes[i]])
+             data = lh_delete(fieldIndex, rrow);
+ #endif
+         if (data)
+             assert(data == rrow);
+     }
+ }
+ 
+ unsigned long Ssl::CertificateDb::index_serial_hash(const char **a) {
+     const char *n = a[Ssl::CertificateDb::cnlSerial];
+     while (*n == '0')
+         ++n;
+     return lh_strhash(n);
+ }
+ 
+ int Ssl::CertificateDb::index_serial_cmp(const char **a, const char **b) {
+     const char *aa, *bb;
+     for (aa = a[Ssl::CertificateDb::cnlSerial]; *aa == '0'; ++aa);
+     for (bb = b[Ssl::CertificateDb::cnlSerial]; *bb == '0'; ++bb);
+     return strcmp(aa, bb);
+ }
+ 
+ unsigned long Ssl::CertificateDb::index_name_hash(const char **a) {
+-    return(lh_strhash(a[Ssl::CertificateDb::cnlName]));
++    return(lh_strhash(a[Ssl::CertificateDb::cnlKey]));
+ }
+ 
+ int Ssl::CertificateDb::index_name_cmp(const char **a, const char **b) {
+-    return(strcmp(a[Ssl::CertificateDb::cnlName], b[CertificateDb::cnlName]));
++    return(strcmp(a[Ssl::CertificateDb::cnlKey], b[CertificateDb::cnlKey]));
+ }
+ 
+ const std::string Ssl::CertificateDb::db_file("index.txt");
+ const std::string Ssl::CertificateDb::cert_dir("certs");
+ const std::string Ssl::CertificateDb::size_file("size");
+ 
+ Ssl::CertificateDb::CertificateDb(std::string const & aDb_path, size_t aMax_db_size, size_t aFs_block_size)
+     :  db_path(aDb_path),
+        db_full(aDb_path + "/" + db_file),
+        cert_full(aDb_path + "/" + cert_dir),
+        size_full(aDb_path + "/" + size_file),
+        max_db_size(aMax_db_size),
+        fs_block_size((aFs_block_size ? aFs_block_size : 2048)),
+        dbLock(db_full),
+        enabled_disk_store(true) {
+     if (db_path.empty() && !max_db_size)
+         enabled_disk_store = false;
+     else if ((db_path.empty() && max_db_size) || (!db_path.empty() && !max_db_size))
+         throw std::runtime_error("security_file_certgen is missing the required parameter. There should be -s and -M parameters together.");
+ }
+ 
+-bool Ssl::CertificateDb::find(std::string const & host_name, Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey) {
++bool
++Ssl::CertificateDb::find(std::string const &key,  const Security::CertPointer &expectedOrig, Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey)
++{
+     const Locker locker(dbLock, Here);
+     load();
+-    return pure_find(host_name, cert, pkey);
++    return pure_find(key, expectedOrig, cert, pkey);
+ }
+ 
+ bool Ssl::CertificateDb::purgeCert(std::string const & key) {
+     const Locker locker(dbLock, Here);
+     load();
+     if (!db)
+         return false;
+ 
+-    if (!deleteByHostname(key))
++    if (!deleteByKey(key))
+         return false;
+ 
+     save();
+     return true;
+ }
+ 
+-bool Ssl::CertificateDb::addCertAndPrivateKey(Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey, std::string const & useName) {
++bool
++Ssl::CertificateDb::addCertAndPrivateKey(std::string const & useKey, const Security::CertPointer & cert, const Ssl::EVP_PKEY_Pointer & pkey, const Security::CertPointer &orig) {
+     const Locker locker(dbLock, Here);
+     load();
+     if (!db || !cert || !pkey)
+         return false;
+ 
++    if(useKey.empty())
++        return false;
++
+     // Functor to wrap xfree() for std::unique_ptr
+     typedef HardFun<void, const void*, &xfree> CharDeleter;
+ 
+     Row row;
+     ASN1_INTEGER * ai = X509_get_serialNumber(cert.get());
+     std::string serial_string;
+     Ssl::BIGNUM_Pointer serial(ASN1_INTEGER_to_BN(ai, NULL));
+     {
+         std::unique_ptr<char, CharDeleter> hex_bn(BN_bn2hex(serial.get()));
+         serial_string = std::string(hex_bn.get());
+     }
+     row.setValue(cnlSerial, serial_string.c_str());
+     char ** rrow = TXT_DB_get_by_index(db.get(), cnlSerial, row.getRow());
+     // We are creating certificates with unique serial numbers. If the serial
+     // number is found in the database, the same certificate is already stored.
+     if (rrow != NULL) {
+         // TODO: check if the stored row is valid.
+         return true;
+     }
+ 
+-    {
+-        std::unique_ptr<char, CharDeleter> subject(X509_NAME_oneline(X509_get_subject_name(cert.get()), nullptr, 0));
+-        Security::CertPointer findCert;
+-        Ssl::EVP_PKEY_Pointer findPkey;
+-        if (pure_find(useName.empty() ? subject.get() : useName, findCert, findPkey)) {
+-            // Replace with database certificate
+-            cert = std::move(findCert);
+-            pkey = std::move(findPkey);
+-            return true;
+-        }
+-        // pure_find may fail because the entry is expired, or because the
+-        // certs file is corrupted. Remove any entry with given hostname
+-        deleteByHostname(useName.empty() ? subject.get() : useName);
+-    }
++    // Remove any entry with given key
++    deleteByKey(useKey);
+ 
+     // check db size while trying to minimize calls to size()
+     size_t dbSize = size();
+     if ((dbSize == 0 && hasRows()) ||
+             (dbSize > 0 && !hasRows()) ||
+             (dbSize >  10 * max_db_size)) {
+         // Invalid database size, rebuild
+         dbSize = rebuildSize();
+     }
+     while (dbSize > max_db_size && deleteInvalidCertificate()) {
+         dbSize = size(); // get the current database size
+         // and try to find another invalid certificate if needed
+     }
+     // there are no more invalid ones, but there must be valid certificates
+     while (dbSize > max_db_size) {
+         if (!deleteOldestCertificate()) {
+             rebuildSize(); // No certificates in database.Update the size file.
+             save(); // Some entries may have been removed. Update the index file.
+             return false; // errors prevented us from freeing enough space
+         }
+         dbSize = size(); // get the current database size
+     }
+ 
+-    row.setValue(cnlType, "V");
+     ASN1_UTCTIME * tm = X509_get_notAfter(cert.get());
+     row.setValue(cnlExp_date, std::string(reinterpret_cast<char *>(tm->data), tm->length).c_str());
+-    row.setValue(cnlFile, "unknown");
+-    if (!useName.empty())
+-        row.setValue(cnlName, useName.c_str());
+-    else {
+-        std::unique_ptr<char, CharDeleter> subject(X509_NAME_oneline(X509_get_subject_name(cert.get()), nullptr, 0));
+-        row.setValue(cnlName, subject.get());
+-    }
++    std::unique_ptr<char, CharDeleter> subject(X509_NAME_oneline(X509_get_subject_name(cert.get()), nullptr, 0));
++    row.setValue(cnlName, subject.get());
++    row.setValue(cnlKey, useKey.c_str());
+ 
+     if (!TXT_DB_insert(db.get(), row.getRow())) {
+         // failed to add index (???) but we may have already modified
+         // the database so save before exit
+         save();
+         return false;
+     }
+     rrow = row.getRow();
+     row.reset();
+ 
+     std::string filename(cert_full + "/" + serial_string + ".pem");
+-    if (!writeCertAndPrivateKeyToFile(cert, pkey, filename.c_str())) {
++    if (!WriteEntry(filename.c_str(), cert, pkey, orig)) {
+         //remove row from txt_db and save
+         sq_TXT_DB_delete(db.get(), (const char **)rrow);
+         save();
+         return false;
+     }
+     addSize(filename);
+ 
+     save();
+     return true;
+ }
+ 
+-void Ssl::CertificateDb::create(std::string const & db_path) {
++void
++Ssl::CertificateDb::Create(std::string const & db_path) {
+     if (db_path == "")
+         throw std::runtime_error("Path to db is empty");
+     std::string db_full(db_path + "/" + db_file);
+     std::string cert_full(db_path + "/" + cert_dir);
+     std::string size_full(db_path + "/" + size_file);
+ 
+     if (mkdir(db_path.c_str(), 0777))
+         throw std::runtime_error("Cannot create " + db_path);
+ 
+     if (mkdir(cert_full.c_str(), 0777))
+         throw std::runtime_error("Cannot create " + cert_full);
+ 
+     std::ofstream size(size_full.c_str());
+     if (size)
+         size << 0;
+     else
+         throw std::runtime_error("Cannot open " + size_full + " to open");
+     std::ofstream db(db_full.c_str());
+     if (!db)
+         throw std::runtime_error("Cannot open " + db_full + " to open");
+ }
+ 
+-void Ssl::CertificateDb::check(std::string const & db_path, size_t max_db_size, size_t fs_block_size) {
++void
++Ssl::CertificateDb::Check(std::string const & db_path, size_t max_db_size, size_t fs_block_size) {
+     CertificateDb db(db_path, max_db_size, fs_block_size);
+     db.load();
+ 
+     // Call readSize to force rebuild size file in the case it is corrupted
+     (void)db.readSize();
+ }
+ 
+ size_t Ssl::CertificateDb::rebuildSize()
+ {
+     size_t dbSize = 0;
+ #if SQUID_SSLTXTDB_PSTRINGDATA
+     for (int i = 0; i < sk_OPENSSL_PSTRING_num(db.get()->data); ++i) {
+ #if SQUID_STACKOF_PSTRINGDATA_HACK
+         const char ** current_row = ((const char **)sk_value(CHECKED_STACK_OF(OPENSSL_PSTRING, db.get()->data), i));
+ #else
+         const char ** current_row = ((const char **)sk_OPENSSL_PSTRING_value(db.get()->data, i));
+ #endif
+ #else
+     for (int i = 0; i < sk_num(db.get()->data); ++i) {
+         const char ** current_row = ((const char **)sk_value(db.get()->data, i));
+ #endif
+         const std::string filename(cert_full + "/" + current_row[cnlSerial] + ".pem");
+         const size_t fSize = getFileSize(filename);
+         dbSize += fSize;
+     }
+     writeSize(dbSize);
+     return dbSize;
+ }
+ 
+-bool Ssl::CertificateDb::pure_find(std::string const & host_name, Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey) {
++bool
++Ssl::CertificateDb::pure_find(std::string const &key, const Security::CertPointer &expectedOrig, Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey)
++{
+     if (!db)
+         return false;
+ 
+     Row row;
+-    row.setValue(cnlName, host_name.c_str());
++    row.setValue(cnlKey, key.c_str());
+ 
+-    char **rrow = TXT_DB_get_by_index(db.get(), cnlName, row.getRow());
++    char **rrow = TXT_DB_get_by_index(db.get(), cnlKey, row.getRow());
+     if (rrow == NULL)
+         return false;
+ 
+     if (!sslDateIsInTheFuture(rrow[cnlExp_date]))
+         return false;
+ 
++    Security::CertPointer storedOrig;
+     // read cert and pkey from file.
+     std::string filename(cert_full + "/" + rrow[cnlSerial] + ".pem");
+-    readCertAndPrivateKeyFromFiles(cert, pkey, filename.c_str(), NULL);
+-    if (!cert || !pkey)
++    if (!ReadEntry(filename.c_str(), cert, pkey, storedOrig))
+         return false;
+-    return true;
++
++    if (!storedOrig && !expectedOrig)
++        return true;
++    else
++        return Ssl::CertificatesCmp(expectedOrig, storedOrig);
+ }
+ 
+ size_t Ssl::CertificateDb::size() {
+     return readSize();
+ }
+ 
+ void Ssl::CertificateDb::addSize(std::string const & filename) {
+     // readSize will rebuild 'size' file if missing or it is corrupted
+     size_t dbSize = readSize();
+     dbSize += getFileSize(filename);
+     writeSize(dbSize);
+ }
+ 
+ void Ssl::CertificateDb::subSize(std::string const & filename) {
+     // readSize will rebuild 'size' file if missing or it is corrupted
+     size_t dbSize = readSize();
+     const size_t fileSize = getFileSize(filename);
+     dbSize = dbSize > fileSize ? dbSize - fileSize : 0;
+     writeSize(dbSize);
+ }
+@@ -497,41 +494,41 @@
+     if (file_size < 0)
+         return 0;
+     return ((static_cast<size_t>(file_size) + fs_block_size - 1) / fs_block_size) * fs_block_size;
+ }
+ 
+ void Ssl::CertificateDb::load() {
+     // Load db from file.
+     Ssl::BIO_Pointer in(BIO_new(BIO_s_file()));
+     if (!in || BIO_read_filename(in.get(), db_full.c_str()) <= 0)
+         throw std::runtime_error("Uninitialized SSL certificate database directory: " + db_path + ". To initialize, run \"security_file_certgen -c -s " + db_path + "\".");
+ 
+     bool corrupt = false;
+     Ssl::TXT_DB_Pointer temp_db(TXT_DB_read(in.get(), cnlNumber));
+     if (!temp_db)
+         corrupt = true;
+ 
+     // Create indexes in db.
+     if (!corrupt && !TXT_DB_create_index(temp_db.get(), cnlSerial, NULL, LHASH_HASH_FN(index_serial_hash), LHASH_COMP_FN(index_serial_cmp)))
+         corrupt = true;
+ 
+-    if (!corrupt && !TXT_DB_create_index(temp_db.get(), cnlName, NULL, LHASH_HASH_FN(index_name_hash), LHASH_COMP_FN(index_name_cmp)))
++    if (!corrupt && !TXT_DB_create_index(temp_db.get(), cnlKey, NULL, LHASH_HASH_FN(index_name_hash), LHASH_COMP_FN(index_name_cmp)))
+         corrupt = true;
+ 
+     if (corrupt)
+         throw std::runtime_error("The SSL certificate database " + db_path + " is corrupted. Please rebuild");
+ 
+     db.reset(temp_db.release());
+ }
+ 
+ void Ssl::CertificateDb::save() {
+     if (!db)
+         throw std::runtime_error("The certificates database is not loaded");;
+ 
+     // To save the db to file,  create a new BIO with BIO file methods.
+     Ssl::BIO_Pointer out(BIO_new(BIO_s_file()));
+     if (!out || !BIO_write_filename(out.get(), const_cast<char *>(db_full.c_str())))
+         throw std::runtime_error("Failed to initialize " + db_full + " file for writing");;
+ 
+     if (TXT_DB_write(out.get(), db.get()) < 0)
+         throw std::runtime_error("Failed to write " + db_full + " file");
+ }
+@@ -579,61 +576,91 @@
+ bool Ssl::CertificateDb::deleteOldestCertificate()
+ {
+     if (!hasRows())
+         return false;
+ 
+ #if SQUID_SSLTXTDB_PSTRINGDATA
+ #if SQUID_STACKOF_PSTRINGDATA_HACK
+     const char **row = ((const char **)sk_value(CHECKED_STACK_OF(OPENSSL_PSTRING, db.get()->data), 0));
+ #else
+     const char **row = (const char **)sk_OPENSSL_PSTRING_value(db.get()->data, 0);
+ #endif
+ #else
+     const char **row = (const char **)sk_value(db.get()->data, 0);
+ #endif
+ 
+     deleteRow(row, 0);
+ 
+     return true;
+ }
+ 
+-bool Ssl::CertificateDb::deleteByHostname(std::string const & host) {
++bool
++Ssl::CertificateDb::deleteByKey(std::string const & key) {
+     if (!db)
+         return false;
+ 
+ #if SQUID_SSLTXTDB_PSTRINGDATA
+     for (int i = 0; i < sk_OPENSSL_PSTRING_num(db.get()->data); ++i) {
+ #if SQUID_STACKOF_PSTRINGDATA_HACK
+         const char ** current_row = ((const char **)sk_value(CHECKED_STACK_OF(OPENSSL_PSTRING, db.get()->data), i));
+ #else
+         const char ** current_row = ((const char **)sk_OPENSSL_PSTRING_value(db.get()->data, i));
+ #endif
+ #else
+     for (int i = 0; i < sk_num(db.get()->data); ++i) {
+         const char ** current_row = ((const char **)sk_value(db.get()->data, i));
+ #endif
+-        if (host == current_row[cnlName]) {
++        if (key == current_row[cnlKey]) {
+             deleteRow(current_row, i);
+             return true;
+         }
+     }
+     return false;
+ }
+ 
+ bool Ssl::CertificateDb::hasRows() const
+ {
+     if (!db)
+         return false;
+ 
+ #if SQUID_SSLTXTDB_PSTRINGDATA
+     if (sk_OPENSSL_PSTRING_num(db.get()->data) == 0)
+ #else
+     if (sk_num(db.get()->data) == 0)
+ #endif
+         return false;
+     return true;
+ }
+ 
+ bool Ssl::CertificateDb::IsEnabledDiskStore() const {
+     return enabled_disk_store;
+ }
+ 
++bool
++Ssl::CertificateDb::WriteEntry(const std::string &filename, const Security::CertPointer & cert, const Ssl::EVP_PKEY_Pointer & pkey, const Security::CertPointer &orig)
++{
++    Ssl::BIO_Pointer bio;
++    if (!Ssl::OpenCertsFileForWriting(bio, filename.c_str()))
++        return false;
++    if (!Ssl::WriteX509Certificate(bio, cert))
++        return false;
++    if (!Ssl::WritePrivateKey(bio, pkey))
++        return false;
++    if (orig && !Ssl::WriteX509Certificate(bio, orig))
++        return false;
++    return true;
++}
++
++bool
++Ssl::CertificateDb::ReadEntry(std::string filename, Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey, Security::CertPointer &orig)
++{
++    Ssl::BIO_Pointer bio;
++    if (!Ssl::OpenCertsFileForReading(bio, filename.c_str()))
++        return false;
++    if (!Ssl::ReadX509Certificate(bio, cert))
++        return false;
++    if (!Ssl::ReadPrivateKey(bio, pkey, NULL))
++        return false;
++    // The orig certificate is not mandatory
++    (void)Ssl::ReadX509Certificate(bio, orig);
++    return true;
++}
+
+=== modified file 'src/security/cert_generators/file/certificate_db.h'
+--- src/security/cert_generators/file/certificate_db.h	2017-01-01 00:12:22 +0000
++++ src/security/cert_generators/file/certificate_db.h	2017-07-14 09:56:48 +0000
+@@ -52,100 +52,107 @@
+     const int lineNo; ///<  where the lock was needed
+ };
+ 
+ /// convenience macro to pass source code location to Locker and others
+ #define Here __FILE__, __LINE__
+ 
+ /**
+  * Database class for storing SSL certificates and their private keys.
+  * A database consist by:
+  *     - A disk file to store current serial number
+  *     - A disk file to store the current database size
+  *     - A disk file which is a normal TXT_DB openSSL database
+  *     - A directory under which the certificates and their private keys stored.
+  *  The database before used must initialized with CertificateDb::create static method.
+  */
+ class CertificateDb
+ {
+ public:
+     /// Names of db columns.
+     enum Columns {
+-        cnlType = 0,
++        cnlKey = 0, //< The key to use for storing/retrieving entries from DB.
+         cnlExp_date,
+         cnlRev_date,
+         cnlSerial,
+-        cnlFile,
+         cnlName,
+         cnlNumber
+     };
+ 
+     /// A wrapper for OpenSSL database row of TXT_DB database.
+     class Row
+     {
+     public:
+         /// Create row wrapper.
+         Row();
+         ///Create row wrapper for row with width items
+         Row(char **row, size_t width);
+         /// Delete all row.
+         ~Row();
+         void setValue(size_t number, char const * value); ///< Set cell's value in row
+         char ** getRow(); ///< Raw row
+         void reset(); ///< Abandon row and don't free memory
+     private:
+         char **row; ///< Raw row
+         size_t width; ///< Number of cells in the row
+     };
+ 
+     CertificateDb(std::string const & db_path, size_t aMax_db_size, size_t aFs_block_size);
+-    /// Find certificate and private key for host name
+-    bool find(std::string const & host_name, Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey);
++    /// finds matching generated certificate and its private key
++    bool find(std::string const & key,  const Security::CertPointer &expectedOrig, Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey);
+     /// Delete a certificate from database
+     bool purgeCert(std::string const & key);
+     /// Save certificate to disk.
+-    bool addCertAndPrivateKey(Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey, std::string const & useName);
++    bool addCertAndPrivateKey(std::string const & useKey, const Security::CertPointer & cert, const Ssl::EVP_PKEY_Pointer & pkey, const Security::CertPointer &orig);
++
++    bool IsEnabledDiskStore() const; ///< Check enabled of dist store.
++
+     /// Create and initialize a database  under the  db_path
+-    static void create(std::string const & db_path);
++    static void Create(std::string const & db_path);
+     /// Check the database stored under the db_path.
+-    static void check(std::string const & db_path, size_t max_db_size, size_t fs_block_size);
+-    bool IsEnabledDiskStore() const; ///< Check enabled of dist store.
++    static void Check(std::string const & db_path, size_t max_db_size, size_t fs_block_size);
+ private:
+     void load(); ///< Load db from disk.
+     void save(); ///< Save db to disk.
+     size_t size(); ///< Get db size on disk in bytes.
+     /// Increase db size by the given file size and update size_file
+     void addSize(std::string const & filename);
+     /// Decrease db size by the given file size and update size_file
+     void subSize(std::string const & filename);
+     size_t readSize(); ///< Read size from file size_file
+     void writeSize(size_t db_size); ///< Write size to file size_file.
+     size_t getFileSize(std::string const & filename); ///< get file size on disk.
+     size_t rebuildSize(); ///< Rebuild size_file
+     /// Only find certificate in current db and return it.
+-    bool pure_find(std::string const & host_name, Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey);
++    bool pure_find(std::string const & key, const Security::CertPointer & expectedOrig, Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey);
+ 
+     void deleteRow(const char **row, int rowIndex); ///< Delete a row from TXT_DB
+     bool deleteInvalidCertificate(); ///< Delete invalid certificate.
+     bool deleteOldestCertificate(); ///< Delete oldest certificate.
+-    bool deleteByHostname(std::string const & host); ///< Delete using host name.
++    bool deleteByKey(std::string const & key); ///< Delete using key.
+     bool hasRows() const; ///< Whether the TXT_DB has stored items.
+ 
++    /// stores the db entry into a file
++    static bool WriteEntry(const std::string &filename, const Security::CertPointer & cert, const Ssl::EVP_PKEY_Pointer & pkey, const Security::CertPointer &orig);
++
++    /// loads a db entry from the file
++    static bool ReadEntry(std::string filename, Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey, Security::CertPointer &orig);
++
+     /// Removes the first matching row from TXT_DB. Ignores failures.
+     static void sq_TXT_DB_delete(TXT_DB *db, const char **row);
+     /// Remove the row on position idx from TXT_DB. Ignores failures.
+     static void sq_TXT_DB_delete_row(TXT_DB *db, int idx);
+ 
+     /// Callback hash function for serials. Used to create TXT_DB index of serials.
+     static unsigned long index_serial_hash(const char **a);
+     /// Callback compare function for serials. Used to create TXT_DB index of serials.
+     static int index_serial_cmp(const char **a, const char **b);
+     /// Callback hash function for names. Used to create TXT_DB index of names..
+     static unsigned long index_name_hash(const char **a);
+     /// Callback compare function for  names. Used to create TXT_DB index of names..
+     static int index_name_cmp(const char **a, const char **b);
+ 
+     /// Definitions required by openSSL, to use the index_* functions defined above
+     ///with TXT_DB_create_index.
+ #if SQUID_USE_SSLLHASH_HACK
+     static unsigned long index_serial_hash_LHASH_HASH(const void *a) {
+         return index_serial_hash((const char **)a);
+     }
+
+=== modified file 'src/security/cert_generators/file/security_file_certgen.cc'
+--- src/security/cert_generators/file/security_file_certgen.cc	2017-06-16 18:38:19 +0000
++++ src/security/cert_generators/file/security_file_certgen.cc	2017-07-14 13:52:04 +0000
+@@ -173,67 +173,58 @@
+         "-----END RSA PRIVATE KEY-----\n"
+         "\tCreate new private key and certificate request for \"host.dom\"\n"
+         "\tSign new request by received certificate and private key.\n"
+         "usage: security_file_certgen -c -s ssl_store_path\n"
+         "\t-c                   Init ssl db directories and exit.\n";
+     std::cerr << help_string << std::endl;
+ }
+ 
+ /// Process new request message.
+ static bool processNewRequest(Ssl::CrtdMessage & request_message, std::string const & db_path, size_t max_db_size, size_t fs_block_size)
+ {
+     Ssl::CertificateProperties certProperties;
+     std::string error;
+     if (!request_message.parseRequest(certProperties, error))
+         throw std::runtime_error("Error while parsing the crtd request: " + error);
+ 
+     Ssl::CertificateDb db(db_path, max_db_size, fs_block_size);
+ 
+     Security::CertPointer cert;
+     Ssl::EVP_PKEY_Pointer pkey;
+-    std::string &cert_subject = certProperties.dbKey();
++    Security::CertPointer orig;
++    std::string &certKey = Ssl::TxtKeyForCertificateProperties(certProperties);
+ 
+     bool dbFailed = false;
+     try {
+-        db.find(cert_subject, cert, pkey);
++        db.find(certKey, certProperties.mimicCert, cert, pkey);
+     } catch (std::runtime_error &err) {
+         dbFailed = true;
+         error = err.what();
+     }
+ 
+-    if (cert) {
+-        if (!Ssl::certificateMatchesProperties(cert.get(), certProperties)) {
+-            // The certificate changed (renewed or other reason).
+-            // Generete a new one with the updated fields.
+-            cert.reset();
+-            pkey.reset();
+-            db.purgeCert(cert_subject);
+-        }
+-    }
+-
+     if (!cert || !pkey) {
+         if (!Ssl::generateSslCertificate(cert, pkey, certProperties))
+             throw std::runtime_error("Cannot create ssl certificate or private key.");
+ 
+         if (!dbFailed && db.IsEnabledDiskStore()) {
+             try {
+-                if (!db.addCertAndPrivateKey(cert, pkey, cert_subject)) {
++                if (!db.addCertAndPrivateKey(certKey, cert, pkey, certProperties.mimicCert)) {
+                     dbFailed = true;
+                     error = "Cannot add certificate to db.";
+                 }
+             } catch (const std::runtime_error &err) {
+                 dbFailed = true;
+                 error = err.what();
+             }
+         }
+     }
+ 
+     if (dbFailed)
+         std::cerr << "security_file_certgen helper database '" << db_path  << "' failed: " << error << std::endl;
+ 
+     std::string bufferToWrite;
+     if (!Ssl::writeCertAndPrivateKeyToMemory(cert, pkey, bufferToWrite))
+         throw std::runtime_error("Cannot write ssl certificate or/and private key to memory.");
+ 
+     Ssl::CrtdMessage response_message(Ssl::CrtdMessage::REPLY);
+     response_message.setCode("OK");
+     response_message.setBody(bufferToWrite);
+@@ -272,60 +263,60 @@
+                     throw std::runtime_error("Error when parsing -M options value");
+                 }
+                 break;
+             case 'v':
+                 std::cout << "security_file_certgen version " << VERSION << std::endl;
+                 exit(EXIT_SUCCESS);
+                 break;
+             case 'c':
+                 create_new_db = true;
+                 break;
+             case 'h':
+                 usage();
+                 exit(EXIT_SUCCESS);
+             default:
+                 exit(EXIT_FAILURE);
+             }
+         }
+ 
+         if (create_new_db) {
+             std::cout << "Initialization SSL db..." << std::endl;
+-            Ssl::CertificateDb::create(db_path);
++            Ssl::CertificateDb::Create(db_path);
+             std::cout << "Done" << std::endl;
+             exit(EXIT_SUCCESS);
+         }
+ 
+         if (fs_block_size == 0) {
+             struct statvfs sfs;
+ 
+             if (xstatvfs(db_path.c_str(), &sfs)) {
+                 fs_block_size = 2048;
+             } else {
+                 fs_block_size = sfs.f_frsize;
+                 // Sanity check; make sure we have a meaningful value.
+                 if (fs_block_size < 512)
+                     fs_block_size = 2048;
+             }
+         }
+ 
+         {
+-            Ssl::CertificateDb::check(db_path, max_db_size, fs_block_size);
++            Ssl::CertificateDb::Check(db_path, max_db_size, fs_block_size);
+         }
+         // Initialize SSL subsystem
+         SSL_load_error_strings();
+         SSLeay_add_ssl_algorithms();
+         // process request.
+         for (;;) {
+             char request[HELPER_INPUT_BUFFER];
+             Ssl::CrtdMessage request_message(Ssl::CrtdMessage::REQUEST);
+             Ssl::CrtdMessage::ParseResult parse_result = Ssl::CrtdMessage::INCOMPLETE;
+ 
+             while (parse_result == Ssl::CrtdMessage::INCOMPLETE) {
+                 if (fgets(request, HELPER_INPUT_BUFFER, stdin) == NULL)
+                     exit(EXIT_FAILURE);
+                 size_t gcount = strlen(request);
+                 parse_result = request_message.parse(request, gcount);
+             }
+ 
+             if (parse_result == Ssl::CrtdMessage::ERROR) {
+                 throw std::runtime_error("Cannot parse request message.");
+             } else if (request_message.getCode() == Ssl::CrtdMessage::code_new_certificate) {
+
+=== modified file 'src/ssl/ServerBump.h'
+--- src/ssl/ServerBump.h	2017-06-12 15:40:16 +0000
++++ src/ssl/ServerBump.h	2017-07-14 10:49:54 +0000
+@@ -1,57 +1,61 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef _SQUID_SSL_PEEKER_H
+ #define _SQUID_SSL_PEEKER_H
+ 
+ #include "base/AsyncJob.h"
+ #include "base/CbcPointer.h"
+ #include "comm/forward.h"
+ #include "HttpRequest.h"
+ #include "ip/Address.h"
+ #include "security/forward.h"
++#include "Store.h"
+ 
+ class ConnStateData;
+ class store_client;
+ 
+ namespace Ssl
+ {
+ 
+ /**
+  * Maintains bump-server-first related information.
+  */
+ class ServerBump
+ {
+     CBDATA_CLASS(ServerBump);
+ 
+ public:
+     explicit ServerBump(HttpRequest *fakeRequest, StoreEntry *e = NULL, Ssl::BumpMode mode = Ssl::bumpServerFirst);
+     ~ServerBump();
+     void attachServerSession(const Security::SessionPointer &); ///< Sets the server TLS session object
+     const Security::CertErrors *sslErrors() const; ///< SSL [certificate validation] errors
+ 
++    /// whether there was a successful connection to (and peeking at) the origin server
++    bool connectedOk() const {return entry && entry->isEmpty();}
++
+     /// faked, minimal request; required by Client API
+     HttpRequest::Pointer request;
+     StoreEntry *entry; ///< for receiving Squid-generated error messages
+     /// HTTPS server certificate. Maybe it is different than the one
+     /// it is stored in serverSession object (error SQUID_X509_V_ERR_CERT_CHANGE)
+     Security::CertPointer serverCert;
+     struct {
+         Ssl::BumpMode step1; ///< The SSL bump mode at step1
+         Ssl::BumpMode step2; ///< The SSL bump mode at step2
+         Ssl::BumpMode step3; ///< The SSL bump mode at step3
+     } act; ///< bumping actions at various bumping steps
+     Ssl::BumpStep step; ///< The SSL bumping step
+ 
+ private:
+     Security::SessionPointer serverSession; ///< The TLS session object on server side.
+     store_client *sc; ///< dummy client to prevent entry trimming
+ };
+ 
+ } // namespace Ssl
+ 
+
+=== modified file 'src/ssl/context_storage.h'
+--- src/ssl/context_storage.h	2017-01-01 00:12:22 +0000
++++ src/ssl/context_storage.h	2017-07-14 08:20:33 +0000
+@@ -31,41 +31,41 @@
+ 
+ namespace  Ssl
+ {
+ 
+ /** Reports cached SSL certificate stats to Cache Manager.
+  * TODO: Use "Report" functions instead friend class.
+  */
+ class CertificateStorageAction : public Mgr::Action
+ {
+ public:
+     CertificateStorageAction(const Mgr::Command::Pointer &cmd);
+     static Pointer Create(const Mgr::Command::Pointer &cmd);
+     virtual void dump (StoreEntry *sentry);
+     /**
+      * We do not support aggregation of information across workers
+      * TODO: aggregate these stats
+      */
+     virtual bool aggregatable() const { return false; }
+ };
+ 
+-typedef LruMap<Security::ContextPointer, SSL_CTX_SIZE> LocalContextStorage;
++typedef LruMap<SBuf, Security::ContextPointer, SSL_CTX_SIZE> LocalContextStorage;
+ 
+ /// Class for storing/manipulating LocalContextStorage per local listening address/port.
+ class GlobalContextStorage
+ {
+     friend class CertificateStorageAction;
+ public:
+     GlobalContextStorage();
+     ~GlobalContextStorage();
+     /// Create new SSL context storage for the local listening address/port.
+     void addLocalStorage(Ip::Address const & address, size_t size_of_store);
+     /// Return the local storage for the given listening address/port.
+     LocalContextStorage *getLocalStorage(Ip::Address const & address);
+     /// When reconfigring should be called this method.
+     void reconfigureStart();
+ private:
+     /// Called by getLocalStorage method
+     void reconfigureFinish();
+     bool reconfiguring; ///< True if system reconfiguring now.
+     /// Storage used on configure or reconfigure.
+     std::map<Ip::Address, size_t> configureStorage;
+
+=== modified file 'src/ssl/gadgets.cc'
+--- src/ssl/gadgets.cc	2017-05-27 01:03:47 +0000
++++ src/ssl/gadgets.cc	2017-07-14 13:54:10 +0000
+@@ -1,31 +1,32 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "ssl/gadgets.h"
+ 
++#include <openssl/asn1.h>
+ #if HAVE_OPENSSL_X509V3_H
+ #include <openssl/x509v3.h>
+ #endif
+ 
+ EVP_PKEY * Ssl::createSslPrivateKey()
+ {
+     Ssl::EVP_PKEY_Pointer pkey(EVP_PKEY_new());
+ 
+     if (!pkey)
+         return NULL;
+ 
+     BIGNUM_Pointer bn(BN_new());
+     if (!bn)
+         return NULL;
+ 
+     if (!BN_set_word(bn.get(), RSA_F4))
+         return NULL;
+ 
+     Ssl::RSA_Pointer rsa(RSA_new());
+     if (!rsa)
+@@ -100,60 +101,40 @@
+ 
+     BIO_Pointer bio(BIO_new(BIO_s_mem()));
+     if (!bio)
+         return false;
+ 
+     if (!PEM_write_bio_X509 (bio.get(), cert.get()))
+         return false;
+ 
+     char *ptr = NULL;
+     long len = BIO_get_mem_data(bio.get(), &ptr);
+     if (!ptr)
+         return false;
+ 
+     if (!bufferToWrite.empty())
+         bufferToWrite.append(" "); // add a space...
+ 
+     bufferToWrite.append(ptr, len);
+     return true;
+ }
+ 
+-bool Ssl::writeCertAndPrivateKeyToFile(Security::CertPointer const & cert, Ssl::EVP_PKEY_Pointer const & pkey, char const * filename)
+-{
+-    if (!pkey || !cert)
+-        return false;
+-
+-    Ssl::BIO_Pointer bio(BIO_new(BIO_s_file()));
+-    if (!bio)
+-        return false;
+-    if (!BIO_write_filename(bio.get(), const_cast<char *>(filename)))
+-        return false;
+-
+-    if (!PEM_write_bio_X509(bio.get(), cert.get()))
+-        return false;
+-
+-    if (!PEM_write_bio_PrivateKey(bio.get(), pkey.get(), NULL, NULL, 0, NULL, NULL))
+-        return false;
+-
+-    return true;
+-}
+-
+ bool Ssl::readCertAndPrivateKeyFromMemory(Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey, char const * bufferToRead)
+ {
+     Ssl::BIO_Pointer bio(BIO_new(BIO_s_mem()));
+     BIO_puts(bio.get(), bufferToRead);
+ 
+     X509 * certPtr = NULL;
+     cert.resetWithoutLocking(PEM_read_bio_X509(bio.get(), &certPtr, 0, 0));
+     if (!cert)
+         return false;
+ 
+     EVP_PKEY * pkeyPtr = NULL;
+     pkey.resetWithoutLocking(PEM_read_bio_PrivateKey(bio.get(), &pkeyPtr, 0, 0));
+     if (!pkey)
+         return false;
+ 
+     return true;
+ }
+ 
+ bool Ssl::readCertFromMemory(Security::CertPointer & cert, char const * bufferToRead)
+ {
+@@ -221,74 +202,90 @@
+     "signUntrusted",
+     "signSelf",
+     NULL
+ };
+ 
+ const char *Ssl::CertAdaptAlgorithmStr[] = {
+     "setValidAfter",
+     "setValidBefore",
+     "setCommonName",
+     NULL
+ };
+ 
+ Ssl::CertificateProperties::CertificateProperties():
+     setValidAfter(false),
+     setValidBefore(false),
+     setCommonName(false),
+     signAlgorithm(Ssl::algSignEnd),
+     signHash(NULL)
+ {}
+ 
+-std::string & Ssl::CertificateProperties::dbKey() const
++static void
++printX509Signature(const Security::CertPointer &cert, std::string &out)
++{
++    X509_ALGOR *sig_alg;
++    ASN1_BIT_STRING *sig = nullptr;
++    X509_get0_signature(&sig, &sig_alg, cert.get());
++
++    if (sig && sig->data) {
++        const unsigned char *s = sig->data;
++        for (int i = 0; i < sig->length; ++i) {
++            char hex[3];
++            snprintf(hex, sizeof(hex), "%02x", s[i]);
++            out.append(hex);
++        }
++    }
++}
++
++std::string &
++Ssl::TxtKeyForCertificateProperties(const Ssl::CertificateProperties &properties)
+ {
+     static std::string certKey;
+     certKey.clear();
+     certKey.reserve(4096);
+-    if (mimicCert.get()) {
+-        char buf[1024];
+-        certKey.append(X509_NAME_oneline(X509_get_subject_name(mimicCert.get()), buf, sizeof(buf)));
+-    }
++    if (properties.mimicCert.get())
++        printX509Signature(properties.mimicCert, certKey);
+ 
+     if (certKey.empty()) {
+         certKey.append("/CN=", 4);
+-        certKey.append(commonName);
++        certKey.append(properties.commonName);
+     }
+ 
+-    if (setValidAfter)
++    if (properties.setValidAfter)
+         certKey.append("+SetValidAfter=on", 17);
+ 
+-    if (setValidBefore)
++    if (properties.setValidBefore)
+         certKey.append("+SetValidBefore=on", 18);
+ 
+-    if (setCommonName) {
++    if (properties.setCommonName) {
+         certKey.append("+SetCommonName=", 15);
+-        certKey.append(commonName);
++        certKey.append(properties.commonName);
+     }
+ 
+-    if (signAlgorithm != Ssl::algSignEnd) {
++    if (properties.signAlgorithm != Ssl::algSignEnd) {
+         certKey.append("+Sign=", 6);
+-        certKey.append(certSignAlgorithm(signAlgorithm));
++        certKey.append(certSignAlgorithm(properties.signAlgorithm));
+     }
+ 
+-    if (signHash != NULL) {
++    if (properties.signHash != NULL) {
+         certKey.append("+SignHash=", 10);
+-        certKey.append(EVP_MD_name(signHash));
++        certKey.append(EVP_MD_name(properties.signHash));
+     }
+ 
+     return certKey;
+ }
+ 
+ /// Check if mimicCert certificate has the Authority Key Identifier extension
+ /// and if yes add the extension to cert certificate with the same fields if
+ /// possible. If the issuerCert certificate  does not have the Subject Key
+ /// Identifier extension (required to build the keyIdentifier field of
+ /// AuthorityKeyIdentifier) then the authorityCertIssuer and
+ /// authorityCertSerialNumber fields added.
+ static bool
+ mimicAuthorityKeyId(Security::CertPointer &cert, Security::CertPointer const &mimicCert, Security::CertPointer const &issuerCert)
+ {
+     if (!mimicCert.get() || !issuerCert.get())
+         return false;
+ 
+     Ssl::AUTHORITY_KEYID_Pointer akid((AUTHORITY_KEYID *)X509_get_ext_d2i(mimicCert.get(), NID_authority_key_identifier, nullptr, nullptr));
+ 
+     bool addKeyId = false, addIssuer = false;
+@@ -681,80 +678,113 @@
+     // The x509Fingerprint return an SHA1 hash.
+     // both SHA1 hash and maximum serial number size are 20 bytes.
+     BIGNUM *r = x509Digest(fakeCert);
+     if (!r)
+         return false;
+ 
+     serial.reset(r);
+     return true;
+ }
+ 
+ bool Ssl::generateSslCertificate(Security::CertPointer & certToStore, Ssl::EVP_PKEY_Pointer & pkeyToStore, Ssl::CertificateProperties const &properties)
+ {
+     Ssl::BIGNUM_Pointer serial;
+ 
+     if (!createSerial(serial, properties))
+         return false;
+ 
+     return  generateFakeSslCertificate(certToStore, pkeyToStore, properties, serial);
+ }
+ 
+-/**
+- \ingroup ServerProtocolSSLInternal
+- * Read certificate from file.
+- */
+-static X509 * readSslX509Certificate(char const * certFilename)
++bool
++Ssl::OpenCertsFileForReading(Ssl::BIO_Pointer &bio, const char *filename)
+ {
+-    if (!certFilename)
+-        return NULL;
+-    Ssl::BIO_Pointer bio(BIO_new(BIO_s_file()));
++    bio.reset(BIO_new(BIO_s_file()));
+     if (!bio)
+-        return NULL;
+-    if (!BIO_read_filename(bio.get(), certFilename))
+-        return NULL;
+-    X509 *certificate = PEM_read_bio_X509(bio.get(), NULL, NULL, NULL);
+-    return certificate;
++        return false;
++    if (!BIO_read_filename(bio.get(), filename))
++        return false;
++    return true;
++}
++
++bool
++Ssl::ReadX509Certificate(Ssl::BIO_Pointer &bio, Security::CertPointer & cert)
++{
++    assert(bio);
++    if (X509 *certificate = PEM_read_bio_X509(bio.get(), NULL, NULL, NULL)) {
++        cert.resetWithoutLocking(certificate);
++        return true;
++    }
++    return false;
+ }
+ 
+-EVP_PKEY * Ssl::readSslPrivateKey(char const * keyFilename, pem_password_cb *passwd_callback)
++bool
++Ssl::ReadPrivateKey(Ssl::BIO_Pointer &bio, Ssl::EVP_PKEY_Pointer &pkey, pem_password_cb *passwd_callback)
++{
++    assert(bio);
++    if (EVP_PKEY *akey = PEM_read_bio_PrivateKey(bio.get(), NULL, passwd_callback, NULL)) {
++        pkey.resetWithoutLocking(akey);
++        return true;
++    }
++    return false;
++}
++
++void
++Ssl::ReadPrivateKeyFromFile(char const * keyFilename, Ssl::EVP_PKEY_Pointer &pkey, pem_password_cb *passwd_callback)
+ {
+     if (!keyFilename)
+-        return NULL;
+-    Ssl::BIO_Pointer bio(BIO_new(BIO_s_file()));
++        return;
++    Ssl::BIO_Pointer bio;
++    if (!OpenCertsFileForReading(bio, keyFilename))
++        return;
++    ReadPrivateKey(bio, pkey, passwd_callback);
++}
++
++bool
++Ssl::OpenCertsFileForWriting(Ssl::BIO_Pointer &bio, const char *filename)
++{
++    bio.reset(BIO_new(BIO_s_file()));
+     if (!bio)
+-        return NULL;
+-    if (!BIO_read_filename(bio.get(), keyFilename))
+-        return NULL;
+-    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio.get(), NULL, passwd_callback, NULL);
+-    return pkey;
++        return false;
++    if (!BIO_write_filename(bio.get(), const_cast<char *>(filename)))
++        return false;
++    return true;
+ }
+ 
+-void Ssl::readCertAndPrivateKeyFromFiles(Security::CertPointer & cert, Ssl::EVP_PKEY_Pointer & pkey, char const * certFilename, char const * keyFilename)
++bool
++Ssl::WriteX509Certificate(Ssl::BIO_Pointer &bio, const Security::CertPointer & cert)
+ {
+-    if (keyFilename == NULL)
+-        keyFilename = certFilename;
+-    pkey.resetWithoutLocking(readSslPrivateKey(keyFilename));
+-    cert.resetWithoutLocking(readSslX509Certificate(certFilename));
+-    if (!pkey || !cert || !X509_check_private_key(cert.get(), pkey.get())) {
+-        pkey.reset();
+-        cert.reset();
+-    }
++    if (!cert || !bio)
++        return false;
++    if (!PEM_write_bio_X509(bio.get(), cert.get()))
++        return false;
++    return true;
++}
++
++bool
++Ssl::WritePrivateKey(Ssl::BIO_Pointer &bio, const Ssl::EVP_PKEY_Pointer &pkey)
++{
++    if (!pkey || !bio)
++        return false;
++    if (!PEM_write_bio_PrivateKey(bio.get(), pkey.get(), NULL, NULL, 0, NULL, NULL))
++        return false;
++    return true;
+ }
+ 
+ bool Ssl::sslDateIsInTheFuture(char const * date)
+ {
+     ASN1_UTCTIME tm;
+     tm.flags = 0;
+     tm.type = 23;
+     tm.data = (unsigned char *)date;
+     tm.length = strlen(date);
+ 
+     return (X509_cmp_current_time(&tm) > 0);
+ }
+ 
+ /// Print the time represented by a ASN1_TIME struct to a string using GeneralizedTime format
+ static bool asn1timeToGeneralizedTimeStr(ASN1_TIME *aTime, char *buf, int bufLen)
+ {
+     // ASN1_Time  holds time to UTCTime or GeneralizedTime form.
+     // UTCTime has the form YYMMDDHHMMSS[Z | [+|-]offset]
+     // GeneralizedTime has the form YYYYMMDDHHMMSS[Z | [+|-] offset]
+ 
+@@ -876,20 +906,45 @@
+     const int nameLen = X509_NAME_get_text_by_NID(
+                             X509_get_subject_name(x509),
+                             nid,  name, sizeof(name));
+ 
+     if (nameLen > 0)
+         return name;
+ 
+     return NULL;
+ }
+ 
+ const char *Ssl::CommonHostName(X509 *x509)
+ {
+     return getSubjectEntry(x509, NID_commonName);
+ }
+ 
+ const char *Ssl::getOrganization(X509 *x509)
+ {
+     return getSubjectEntry(x509, NID_organizationName);
+ }
+ 
++
++bool
++Ssl::CertificatesCmp(const Security::CertPointer &cert1, const Security::CertPointer &cert2)
++{
++    if (!cert1 || ! cert2)
++        return false;
++
++    int cert1Len;
++    unsigned char *cert1Asn = NULL;
++    cert1Len = ASN1_item_i2d((ASN1_VALUE *)cert1.get(), &cert1Asn, ASN1_ITEM_rptr(X509));
++
++    int cert2Len;
++    unsigned char *cert2Asn = NULL;
++    cert2Len = ASN1_item_i2d((ASN1_VALUE *)cert2.get(), &cert2Asn, ASN1_ITEM_rptr(X509));
++
++    if (cert1Len != cert2Len)
++        return false;
++
++    bool ret = (memcmp(cert1Asn, cert2Asn, cert1Len) == 0);
++
++    OPENSSL_free(cert1Asn);
++    OPENSSL_free(cert2Asn);
++
++    return ret;
++}
+
+=== modified file 'src/ssl/gadgets.h'
+--- src/ssl/gadgets.h	2017-01-01 00:12:22 +0000
++++ src/ssl/gadgets.h	2017-07-14 13:48:55 +0000
+@@ -82,57 +82,94 @@
+ /**
+  \ingroup SslCrtdSslAPI
+  * Create 1024 bits rsa key.
+  */
+ EVP_PKEY * createSslPrivateKey();
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+  * Write private key and SSL certificate to memory.
+  */
+ bool writeCertAndPrivateKeyToMemory(Security::CertPointer const & cert, EVP_PKEY_Pointer const & pkey, std::string & bufferToWrite);
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+  * Append SSL certificate to bufferToWrite.
+  */
+ bool appendCertToMemory(Security::CertPointer const & cert, std::string & bufferToWrite);
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+- * Write private key and SSL certificate to file.
+- */
+-bool writeCertAndPrivateKeyToFile(Security::CertPointer const & cert, EVP_PKEY_Pointer const & pkey, char const * filename);
+-
+-/**
+- \ingroup SslCrtdSslAPI
+  * Write private key and SSL certificate to memory.
+  */
+ bool readCertAndPrivateKeyFromMemory(Security::CertPointer & cert, EVP_PKEY_Pointer & pkey, char const * bufferToRead);
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+  * Read SSL certificate from memory.
+  */
+ bool readCertFromMemory(Security::CertPointer & cert, char const * bufferToRead);
+ 
+ /**
++ \ingroup SslCrtdSslAPI
++ * Read private key from file.
++ */
++void ReadPrivateKeyFromFile(char const * keyFilename, EVP_PKEY_Pointer &pkey, pem_password_cb *passwd_callback);
++
++/**
++ \ingroup SslCrtdSslAPI
++ * Initialize the bio with the file 'filename' openned for reading
++ */
++bool OpenCertsFileForReading(BIO_Pointer &bio, const char *filename);
++
++/**
++ \ingroup SslCrtdSslAPI
++ * Read a certificate from bio
++ */
++bool ReadX509Certificate(BIO_Pointer &bio, Security::CertPointer & cert);
++
++/**
++ \ingroup SslCrtdSslAPI
++ * Read a private key from bio
++ */
++bool ReadPrivateKey(BIO_Pointer &bio, EVP_PKEY_Pointer &pkey, pem_password_cb *passwd_callback);
++
++/**
++ \ingroup SslCrtdSslAPI
++ * Initialize the bio with the file 'filename' openned for writting 
++ */
++
++bool OpenCertsFileForWriting(BIO_Pointer &bio, const char *filename);
++
++/**
++ \ingroup SslCrtdSslAPI
++ * Write certificate to BIO.
++ */
++bool WriteX509Certificate(BIO_Pointer &bio, const Security::CertPointer & cert);
++
++/**
++ \ingroup SslCrtdSslAPI
++ * Write private key to BIO.
++ */
++bool WritePrivateKey(BIO_Pointer &bio, const EVP_PKEY_Pointer &pkey);
++
++/**
+   \ingroup SslCrtdSslAPI
+  * Supported certificate signing algorithms
+  */
+ enum CertSignAlgorithm {algSignTrusted = 0, algSignUntrusted, algSignSelf, algSignEnd};
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+  * Short names for certificate signing algorithms
+  */
+ 
+ extern const char *CertSignAlgorithmStr[];
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+  * Return the short name of the signing algorithm "sg"
+  */
+ inline const char *certSignAlgorithm(int sg)
+ {
+     if (sg >=0 && sg < Ssl::algSignEnd)
+         return Ssl::CertSignAlgorithmStr[sg];
+@@ -177,83 +214,73 @@
+     return NULL;
+ }
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+  * Simple struct to pass certificate generation parameters to generateSslCertificate function.
+  */
+ class CertificateProperties
+ {
+ public:
+     CertificateProperties();
+     Security::CertPointer mimicCert; ///< Certificate to mimic
+     Security::CertPointer signWithX509; ///< Certificate to sign the generated request
+     EVP_PKEY_Pointer signWithPkey; ///< The key of the signing certificate
+     bool setValidAfter; ///< Do not mimic "Not Valid After" field
+     bool setValidBefore; ///< Do not mimic "Not Valid Before" field
+     bool setCommonName; ///< Replace the CN field of the mimicing subject with the given
+     std::string commonName; ///< A CN to use for the generated certificate
+     CertSignAlgorithm signAlgorithm; ///< The signing algorithm to use
+     const EVP_MD *signHash; ///< The signing hash to use
+-    /// Returns certificate database primary key. New fake certificates
+-    /// purge old fake certificates with the same key.
+-    std::string & dbKey() const;
+ private:
+     CertificateProperties(CertificateProperties &);
+     CertificateProperties &operator =(CertificateProperties const &);
+ };
+ 
++/// \ingroup SslCrtdSslAPI
++/// \returns certificate database key"
++std::string &TxtKeyForCertificateProperties(const CertificateProperties &);
++    
+ /**
+  \ingroup SslCrtdSslAPI
+  * Decide on the kind of certificate and generate a CA- or self-signed one.
+  * The  generated certificate will inherite properties from certToMimic
+  * Return generated certificate and private key in resultX509 and resultPkey
+  * variables.
+  */
+ bool generateSslCertificate(Security::CertPointer & cert, EVP_PKEY_Pointer & pkey, CertificateProperties const &properties);
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+- * Read private key from file. Make sure that this is not encrypted file.
+- */
+-EVP_PKEY * readSslPrivateKey(char const * keyFilename, pem_password_cb *passwd_callback = NULL);
+-
+-/**
+- \ingroup SslCrtdSslAPI
+- *  Read certificate and private key from files.
+- * \param certFilename name of file with certificate.
+- * \param keyFilename name of file with private key.
+- */
+-void readCertAndPrivateKeyFromFiles(Security::CertPointer & cert, EVP_PKEY_Pointer & pkey, char const * certFilename, char const * keyFilename);
+-
+-/**
+- \ingroup SslCrtdSslAPI
+  * Verify date. Date format it ASN1_UTCTIME. if there is out of date error,
+  * return false.
+ */
+ bool sslDateIsInTheFuture(char const * date);
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+  * Check if the major fields of a certificates matches the properties given by
+  * a CertficateProperties object
+  \return true if the certificates matches false otherwise.
+ */
+ bool certificateMatchesProperties(X509 *peer_cert, CertificateProperties const &properties);
+ 
+ /**
+    \ingroup ServerProtocolSSLAPI
+    * Returns CN from the certificate, suitable for use as a host name.
+    * Uses static memory to temporary store the extracted name.
+ */
+ const char *CommonHostName(X509 *x509);
+ 
+ /**
+    \ingroup ServerProtocolSSLAPI
+    * Returns Organization from the certificate.
+    * Uses static memory to temporary store the extracted name.
+ */
+ const char *getOrganization(X509 *x509);
+ 
++/// \ingroup ServerProtocolSSLAPI
++/// \return whether both certificates exist and are the same (e.g., have identical ASN.1 images)
++bool CertificatesCmp(const Security::CertPointer &cert1, const Security::CertPointer &cert2);
+ } // namespace Ssl
+ #endif // SQUID_SSL_GADGETS_H
+ 
+
+=== modified file 'src/ssl/helper.cc'
+--- src/ssl/helper.cc	2017-06-12 16:05:59 +0000
++++ src/ssl/helper.cc	2017-07-12 14:51:28 +0000
+@@ -237,102 +237,102 @@
+ {
+     if (!ssl_crt_validator)
+         return;
+     helperShutdown(ssl_crt_validator);
+     wordlistDestroy(&ssl_crt_validator->cmdline);
+     delete ssl_crt_validator;
+     ssl_crt_validator = NULL;
+ 
+     // CertValidationHelper::HelperCache is a static member, it is not good policy to
+     // reset it here. Will work because the current Ssl::CertValidationHelper is
+     // always the same static object.
+     delete HelperCache;
+     HelperCache = NULL;
+ }
+ 
+ class submitData
+ {
+     CBDATA_CLASS(submitData);
+ 
+ public:
+-    std::string query;
++    SBuf query;
+     AsyncCall::Pointer callback;
+     Security::SessionPointer ssl;
+ };
+ CBDATA_CLASS_INIT(submitData);
+ 
+ static void
+ sslCrtvdHandleReplyWrapper(void *data, const ::Helper::Reply &reply)
+ {
+     Ssl::CertValidationMsg replyMsg(Ssl::CrtdMessage::REPLY);
+     Ssl::CertValidationResponse::Pointer validationResponse = new Ssl::CertValidationResponse;
+     std::string error;
+ 
+     submitData *crtdvdData = static_cast<submitData *>(data);
+     STACK_OF(X509) *peerCerts = SSL_get_peer_cert_chain(crtdvdData->ssl.get());
+     if (reply.result == ::Helper::BrokenHelper) {
+         debugs(83, DBG_IMPORTANT, "\"ssl_crtvd\" helper error response: " << reply.other().content());
+         validationResponse->resultCode = ::Helper::BrokenHelper;
+     } else if (!reply.other().hasContent()) {
+         debugs(83, DBG_IMPORTANT, "\"ssl_crtvd\" helper returned NULL response");
+         validationResponse->resultCode = ::Helper::BrokenHelper;
+     } else if (replyMsg.parse(reply.other().content(), reply.other().contentSize()) != Ssl::CrtdMessage::OK ||
+                !replyMsg.parseResponse(*validationResponse, peerCerts, error) ) {
+         debugs(83, DBG_IMPORTANT, "WARNING: Reply from ssl_crtvd for " << " is incorrect");
+         debugs(83, DBG_IMPORTANT, "Certificate cannot be validated. ssl_crtvd response: " << replyMsg.getBody());
+         validationResponse->resultCode = ::Helper::BrokenHelper;
+     } else
+         validationResponse->resultCode = reply.result;
+ 
+     Ssl::CertValidationHelper::CbDialer *dialer = dynamic_cast<Ssl::CertValidationHelper::CbDialer*>(crtdvdData->callback->getDialer());
+     Must(dialer);
+     dialer->arg1 = validationResponse;
+     ScheduleCallHere(crtdvdData->callback);
+ 
+     if (Ssl::CertValidationHelper::HelperCache &&
+             (validationResponse->resultCode == ::Helper::Okay || validationResponse->resultCode == ::Helper::Error)) {
+         Ssl::CertValidationResponse::Pointer *item = new Ssl::CertValidationResponse::Pointer(validationResponse);
+-        if (!Ssl::CertValidationHelper::HelperCache->add(crtdvdData->query.c_str(), item))
++        if (!Ssl::CertValidationHelper::HelperCache->add(crtdvdData->query, item))
+             delete item;
+     }
+ 
+     delete crtdvdData;
+ }
+ 
+ void Ssl::CertValidationHelper::sslSubmit(Ssl::CertValidationRequest const &request, AsyncCall::Pointer &callback)
+ {
+     assert(ssl_crt_validator);
+ 
+     Ssl::CertValidationMsg message(Ssl::CrtdMessage::REQUEST);
+     message.setCode(Ssl::CertValidationMsg::code_cert_validate);
+     message.composeRequest(request);
+     debugs(83, 5, "SSL crtvd request: " << message.compose().c_str());
+ 
+     submitData *crtdvdData = new submitData;
+-    crtdvdData->query = message.compose();
+-    crtdvdData->query += '\n';
++    crtdvdData->query.assign(message.compose().c_str());
++    crtdvdData->query.append('\n');
+     crtdvdData->callback = callback;
+     crtdvdData->ssl = request.ssl;
+     Ssl::CertValidationResponse::Pointer const*validationResponse;
+ 
+     if (CertValidationHelper::HelperCache &&
+-            (validationResponse = CertValidationHelper::HelperCache->get(crtdvdData->query.c_str()))) {
++            (validationResponse = CertValidationHelper::HelperCache->get(crtdvdData->query))) {
+ 
+         CertValidationHelper::CbDialer *dialer = dynamic_cast<CertValidationHelper::CbDialer*>(callback->getDialer());
+         Must(dialer);
+         dialer->arg1 = *validationResponse;
+         ScheduleCallHere(callback);
+         delete crtdvdData;
+         return;
+     }
+ 
+     if (!ssl_crt_validator->trySubmit(crtdvdData->query.c_str(), sslCrtvdHandleReplyWrapper, crtdvdData)) {
+         Ssl::CertValidationResponse::Pointer resp = new Ssl::CertValidationResponse;;
+         resp->resultCode = ::Helper::BrokenHelper;
+         Ssl::CertValidationHelper::CbDialer *dialer = dynamic_cast<Ssl::CertValidationHelper::CbDialer*>(callback->getDialer());
+         Must(dialer);
+         dialer->arg1 = resp;
+         ScheduleCallHere(callback);
+         delete crtdvdData;
+         return;
+     }
+ }
+
+=== modified file 'src/ssl/helper.h'
+--- src/ssl/helper.h	2017-01-01 00:12:22 +0000
++++ src/ssl/helper.h	2017-07-14 08:21:03 +0000
+@@ -44,29 +44,29 @@
+ 
+ class CertValidationRequest;
+ class CertValidationResponse;
+ class CertValidationHelper
+ {
+ public:
+     typedef UnaryMemFunT<Security::PeerConnector, CertValidationResponse::Pointer> CbDialer;
+ 
+     typedef void CVHCB(void *, Ssl::CertValidationResponse const &);
+     static CertValidationHelper * GetInstance(); ///< Instance class.
+     void Init(); ///< Init helper structure.
+     void Shutdown(); ///< Shutdown helper structure.
+     /// Submit crtd request message to external crtd server.
+     void sslSubmit(Ssl::CertValidationRequest const & request, AsyncCall::Pointer &);
+ private:
+     CertValidationHelper();
+     ~CertValidationHelper();
+ 
+     helper * ssl_crt_validator; ///< helper for management of ssl_crtd.
+ public:
+-    typedef LruMap<Ssl::CertValidationResponse::Pointer, sizeof(Ssl::CertValidationResponse::Pointer) + sizeof(Ssl::CertValidationResponse)> LruCache;
++    typedef LruMap<SBuf, Ssl::CertValidationResponse::Pointer, sizeof(Ssl::CertValidationResponse::Pointer) + sizeof(Ssl::CertValidationResponse)> LruCache;
+     static LruCache *HelperCache; ///< cache for cert validation helper
+ };
+ 
+ } //namespace Ssl
+ 
+ #endif /* USE_OPENSSL */
+ #endif // SQUID_SSL_HELPER_H
+ 
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2017-06-16 12:15:30 +0000
++++ src/ssl/support.cc	2017-07-14 14:05:05 +0000
+@@ -877,59 +877,65 @@
+ 
+ /// Create SSL context and apply ssl certificate and private key to it.
+ Security::ContextPointer
+ Ssl::createSSLContext(Security::CertPointer & x509, Ssl::EVP_PKEY_Pointer & pkey, AnyP::PortCfg &port)
+ {
+     Security::ContextPointer ctx(port.secure.createBlankContext());
+ 
+     if (!SSL_CTX_use_certificate(ctx.get(), x509.get()))
+         return Security::ContextPointer();
+ 
+     if (!SSL_CTX_use_PrivateKey(ctx.get(), pkey.get()))
+         return Security::ContextPointer();
+ 
+     if (!configureSslContext(ctx, port))
+         return Security::ContextPointer();
+ 
+     return ctx;
+ }
+ 
+ Security::ContextPointer
+-Ssl::generateSslContextUsingPkeyAndCertFromMemory(const char * data, AnyP::PortCfg &port)
++Ssl::GenerateSslContextUsingPkeyAndCertFromMemory(const char * data, AnyP::PortCfg &port, bool trusted)
+ {
+     Security::CertPointer cert;
+     Ssl::EVP_PKEY_Pointer pkey;
+     if (!readCertAndPrivateKeyFromMemory(cert, pkey, data) || !cert || !pkey)
+         return Security::ContextPointer();
+ 
+-    return createSSLContext(cert, pkey, port);
++    Security::ContextPointer ctx(createSSLContext(cert, pkey, port));
++    if (ctx && trusted)
++        Ssl::chainCertificatesToSSLContext(ctx, port);
++    return ctx;
+ }
+ 
+ Security::ContextPointer
+-Ssl::generateSslContext(CertificateProperties const &properties, AnyP::PortCfg &port)
++Ssl::GenerateSslContext(CertificateProperties const &properties, AnyP::PortCfg &port, bool trusted)
+ {
+     Security::CertPointer cert;
+     Ssl::EVP_PKEY_Pointer pkey;
+     if (!generateSslCertificate(cert, pkey, properties) || !cert || !pkey)
+         return Security::ContextPointer();
+ 
+-    return createSSLContext(cert, pkey, port);
++    Security::ContextPointer ctx(createSSLContext(cert, pkey, port));
++    if (ctx && trusted)
++        Ssl::chainCertificatesToSSLContext(ctx, port);
++    return ctx;
+ }
+ 
+ void
+ Ssl::chainCertificatesToSSLContext(Security::ContextPointer &ctx, AnyP::PortCfg &port)
+ {
+     assert(ctx);
+     // Add signing certificate to the certificates chain
+     X509 *signingCert = port.signingCert.get();
+     if (SSL_CTX_add_extra_chain_cert(ctx.get(), signingCert)) {
+         // increase the certificate lock
+         X509_up_ref(signingCert);
+     } else {
+         const int ssl_error = ERR_get_error();
+         debugs(33, DBG_IMPORTANT, "WARNING: can not add signing certificate to SSL context chain: " << Security::ErrorString(ssl_error));
+     }
+     Ssl::addChainToSslContext(ctx, port.certsToChain.get());
+ }
+ 
+ void
+ Ssl::configureUnconfiguredSslContext(Security::ContextPointer &ctx, Ssl::CertSignAlgorithm signAlgorithm,AnyP::PortCfg &port)
+@@ -986,45 +992,41 @@
+ {
+ #if HAVE_SSL_CTX_GET0_CERTIFICATE
+     X509 * cert = SSL_CTX_get0_certificate(ctx.get());
+ #elif SQUID_USE_SSLGETCERTIFICATE_HACK
+     // SSL_get_certificate is buggy in openssl versions 1.0.1d and 1.0.1e
+     // Try to retrieve certificate directly from Security::ContextPointer object
+     X509 ***pCert = (X509 ***)ctx->cert;
+     X509 * cert = pCert && *pCert ? **pCert : NULL;
+ #elif SQUID_SSLGETCERTIFICATE_BUGGY
+     X509 * cert = NULL;
+     assert(0);
+ #else
+     // Temporary ssl for getting X509 certificate from SSL_CTX.
+     Security::SessionPointer ssl(Security::NewSessionObject(ctx));
+     X509 * cert = SSL_get_certificate(ssl.get());
+ #endif
+     if (!cert)
+         return false;
+     ASN1_TIME * time_notBefore = X509_get_notBefore(cert);
+     ASN1_TIME * time_notAfter = X509_get_notAfter(cert);
+-    bool ret = (X509_cmp_current_time(time_notBefore) < 0 && X509_cmp_current_time(time_notAfter) > 0);
+-    if (!ret)
+-        return false;
+-
+-    return certificateMatchesProperties(cert, properties);
++    return (X509_cmp_current_time(time_notBefore) < 0 && X509_cmp_current_time(time_notAfter) > 0);
+ }
+ 
+ bool
+ Ssl::setClientSNI(SSL *ssl, const char *fqdn)
+ {
+     //The SSL_CTRL_SET_TLSEXT_HOSTNAME is a openssl macro which indicates
+     // if the TLS servername extension (SNI) is enabled in openssl library.
+ #if defined(SSL_CTRL_SET_TLSEXT_HOSTNAME)
+     if (!SSL_set_tlsext_host_name(ssl, fqdn)) {
+         const int ssl_error = ERR_get_error();
+         debugs(83, 3,  "WARNING: unable to set TLS servername extension (SNI): " <<
+                Security::ErrorString(ssl_error) << "\n");
+         return false;
+     }
+     return true;
+ #else
+     debugs(83, 7,  "no support for TLS servername extension (SNI)\n");
+     return false;
+ #endif
+ }
+@@ -1324,60 +1326,178 @@
+     return certificate;
+ }
+ 
+ void Ssl::readCertChainAndPrivateKeyFromFiles(Security::CertPointer & cert, EVP_PKEY_Pointer & pkey, X509_STACK_Pointer & chain, char const * certFilename, char const * keyFilename)
+ {
+     if (keyFilename == NULL)
+         keyFilename = certFilename;
+ 
+     if (certFilename == NULL)
+         certFilename = keyFilename;
+ 
+     debugs(83, DBG_IMPORTANT, "Using certificate in " << certFilename);
+ 
+     if (!chain)
+         chain.reset(sk_X509_new_null());
+     if (!chain)
+         debugs(83, DBG_IMPORTANT, "WARNING: unable to allocate memory for cert chain");
+     // XXX: ssl_ask_password_cb needs SSL_CTX_set_default_passwd_cb_userdata()
+     // so this may not fully work iff Config.Program.ssl_password is set.
+     pem_password_cb *cb = ::Config.Program.ssl_password ? &ssl_ask_password_cb : NULL;
+-    pkey.resetWithoutLocking(readSslPrivateKey(keyFilename, cb));
++    Ssl::ReadPrivateKeyFromFile(keyFilename, pkey, cb);
+     cert.resetWithoutLocking(readSslX509CertificatesChain(certFilename, chain.get()));
+     if (!cert) {
+         debugs(83, DBG_IMPORTANT, "WARNING: missing cert in '" << certFilename << "'");
+     } else if (!pkey) {
+         debugs(83, DBG_IMPORTANT, "WARNING: missing private key in '" << keyFilename << "'");
+     } else if (!X509_check_private_key(cert.get(), pkey.get())) {
+         debugs(83, DBG_IMPORTANT, "WARNING: X509_check_private_key() failed to verify signing cert");
+     } else
+         return; // everything is okay
+ 
+     pkey.reset();
+     cert.reset();
+ }
+ 
+ bool Ssl::generateUntrustedCert(Security::CertPointer &untrustedCert, EVP_PKEY_Pointer &untrustedPkey, Security::CertPointer const  &cert, EVP_PKEY_Pointer const & pkey)
+ {
+     // Generate the self-signed certificate, using a hard-coded subject prefix
+     Ssl::CertificateProperties certProperties;
+     if (const char *cn = CommonHostName(cert.get())) {
+         certProperties.commonName = "Not trusted by \"";
+         certProperties.commonName += cn;
+         certProperties.commonName += "\"";
+     } else if (const char *org = getOrganization(cert.get())) {
+         certProperties.commonName =  "Not trusted by \"";
+         certProperties.commonName += org;
+         certProperties.commonName += "\"";
+     } else
+         certProperties.commonName =  "Not trusted";
+     certProperties.setCommonName = true;
+     // O, OU, and other CA subject fields will be mimicked
+     // Expiration date and other common properties will be mimicked
+     certProperties.signAlgorithm = Ssl::algSignSelf;
+     certProperties.signWithPkey.resetAndLock(pkey.get());
+     certProperties.mimicCert.resetAndLock(cert.get());
+     return Ssl::generateSslCertificate(untrustedCert, untrustedPkey, certProperties);
+ }
+ 
++void Ssl::UniqueKeyForCertificateProperties(const Ssl::CertificateProperties &certProperties, SBuf &key)
++{
++    bool origSignatureAsKey = false;
++    if (certProperties.mimicCert.get()) {
++        ASN1_BIT_STRING *sig = nullptr;
++        X509_ALGOR *sig_alg;
++        X509_get0_signature(&sig, &sig_alg, certProperties.mimicCert.get());
++        if (sig) {
++            origSignatureAsKey = true;
++            key.append((const char *)sig->data, sig->length);
++        }
++    }
++
++    if (!origSignatureAsKey || certProperties.setCommonName) {
++        // Use common name instead
++        key.append(certProperties.commonName.c_str());
++    }
++    key.append(certProperties.setCommonName ? '1' : '0');
++    key.append(certProperties.setValidAfter ? '1' : '0');
++    key.append(certProperties.setValidBefore ? '1' : '0');
++    key.append(certProperties.signAlgorithm != Ssl:: algSignEnd ? certSignAlgorithm(certProperties.signAlgorithm) : "-");
++    key.append(certProperties.signHash ? EVP_MD_name(certProperties.signHash) : "-");
++
++    if (certProperties.mimicCert) {
++        BIO *bio = BIO_new_SBuf(&key);
++        ASN1_item_i2d_bio(ASN1_ITEM_rptr(X509), bio, (ASN1_VALUE *)certProperties.mimicCert.get());
++    }
++}
++
++static int
++bio_sbuf_create(BIO* bio)
++{
++    BIO_set_init(bio, 0);
++    BIO_set_data(bio, NULL);
++    return 1;
++}
++
++static int
++bio_sbuf_destroy(BIO* bio)
++{
++    if (!bio)
++        return 0;
++    return 1;
++}
++
++int
++bio_sbuf_write(BIO* bio, const char* data, int len)
++{
++    SBuf *buf = static_cast<SBuf *>(BIO_get_data(bio));
++    buf->append(data, len);
++    return len;
++}
++
++int
++bio_sbuf_puts(BIO* bio, const char* data)
++{
++    SBuf *buf = static_cast<SBuf *>(BIO_get_data(bio));
++    size_t oldLen = buf->length();
++    buf->append(data);
++    return buf->length() - oldLen;
++}
++
++long
++bio_sbuf_ctrl(BIO* bio, int cmd, long num, void* ptr) {
++    SBuf *buf = static_cast<SBuf *>(BIO_get_data(bio));
++    switch (cmd) {
++    case BIO_CTRL_RESET:
++        buf->clear();
++        return 1;
++    case BIO_CTRL_FLUSH:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++
++#if HAVE_LIBCRYPTO_BIO_METH_NEW
++static BIO_METHOD *BioSBufMethods = nullptr;
++#else
++static BIO_METHOD BioSBufMethods = {
++    BIO_TYPE_MEM,
++    "Squid SBuf",
++    bio_sbuf_write,
++    nullptr,
++    bio_sbuf_puts,
++    nullptr,
++    bio_sbuf_ctrl,
++    bio_sbuf_create,
++    bio_sbuf_destroy,
++    NULL,
++
++};
++#endif
++
++BIO *Ssl::BIO_new_SBuf(SBuf *buf)
++{
++#if HAVE_LIBCRYPTO_BIO_METH_NEW
++    if (!BioSBufMethods) {
++        BioSBufMethods = BIO_meth_new(BIO_TYPE_MEM, "Squid-SBuf");
++        BIO_meth_set_write(BioSBufMethods, bio_sbuf_write);
++        BIO_meth_set_read(BioSBufMethods, nullptr);
++        BIO_meth_set_puts(BioSBufMethods, bio_sbuf_puts);
++        BIO_meth_set_gets(BioSBufMethods, nullptr);
++        BIO_meth_set_ctrl(BioSBufMethods, bio_sbuf_ctrl);
++        BIO_meth_set_create(BioSBufMethods, bio_sbuf_create);
++        BIO_meth_set_destroy(BioSBufMethods, bio_sbuf_destroy);
++    }
++#else
++    BIO *bio = BIO_new(&BioSBufMethods);
++#endif
++    if (!bio)
++        return nullptr;
++    BIO_set_data(bio, buf);
++    BIO_set_init(bio, 1);
++    return bio;
++}
++
+ #endif /* USE_OPENSSL */
+ 
+
+=== modified file 'src/ssl/support.h'
+--- src/ssl/support.h	2017-06-07 15:57:21 +0000
++++ src/ssl/support.h	2017-07-14 14:04:57 +0000
+@@ -191,57 +191,57 @@
+ bool loadCerts(const char *certsFile, Ssl::CertsIndexedList &list);
+ 
+ /**
+  \ingroup ServerProtocolSSLAPI
+  * Load PEM-encoded certificates to the squid untrusteds certificates
+  * internal DB from the given file.
+  */
+ bool loadSquidUntrusted(const char *path);
+ 
+ /**
+  \ingroup ServerProtocolSSLAPI
+  * Removes all certificates from squid untrusteds certificates
+  * internal DB and frees all memory
+  */
+ void unloadSquidUntrusted();
+ 
+ /**
+   \ingroup ServerProtocolSSLAPI
+   * Decide on the kind of certificate and generate a CA- or self-signed one
+ */
+-Security::ContextPointer generateSslContext(CertificateProperties const &properties, AnyP::PortCfg &port);
++Security::ContextPointer GenerateSslContext(CertificateProperties const &properties, AnyP::PortCfg &port, bool trusted);
+ 
+ /**
+   \ingroup ServerProtocolSSLAPI
+   * Check if the certificate of the given context is still valid
+   \param sslContext The context to check
+   \param properties Check if the context certificate matches the given properties
+   \return true if the contexts certificate is valid, false otherwise
+  */
+ bool verifySslCertificate(Security::ContextPointer &, CertificateProperties const &);
+ 
+ /**
+   \ingroup ServerProtocolSSLAPI
+   * Read private key and certificate from memory and generate SSL context
+   * using their.
+  */
+-Security::ContextPointer generateSslContextUsingPkeyAndCertFromMemory(const char * data, AnyP::PortCfg &port);
++Security::ContextPointer GenerateSslContextUsingPkeyAndCertFromMemory(const char * data, AnyP::PortCfg &port, bool trusted);
+ 
+ /**
+   \ingroup ServerProtocolSSLAPI
+   * Create an SSL context using the provided certificate and key
+  */
+ Security::ContextPointer createSSLContext(Security::CertPointer & x509, Ssl::EVP_PKEY_Pointer & pkey, AnyP::PortCfg &port);
+ 
+ /**
+  \ingroup ServerProtocolSSLAPI
+  * Chain signing certificate and chained certificates to an SSL Context
+  */
+ void chainCertificatesToSSLContext(Security::ContextPointer &, AnyP::PortCfg &);
+ 
+ /**
+  \ingroup ServerProtocolSSLAPI
+  * Configure a previously unconfigured SSL context object.
+  */
+ void configureUnconfiguredSslContext(Security::ContextPointer &, Ssl::CertSignAlgorithm signAlgorithm, AnyP::PortCfg &);
+ 
+ /**
+@@ -301,40 +301,52 @@
+ bool checkX509ServerValidity(X509 *cert, const char *server);
+ 
+ /**
+    \ingroup ServerProtocolSSLAPI
+    * Convert a given ASN1_TIME to a string form.
+    \param tm the time in ASN1_TIME form
+    \param buf the buffer to write the output
+    \param len write at most len bytes
+    \return The number of bytes written
+  */
+ int asn1timeToString(ASN1_TIME *tm, char *buf, int len);
+ 
+ /**
+    \ingroup ServerProtocolSSLAPI
+    * Sets the hostname for the Server Name Indication (SNI) TLS extension
+    * if supported by the used openssl toolkit.
+    \return true if SNI set false otherwise
+ */
+ bool setClientSNI(SSL *ssl, const char *fqdn);
+ 
++
++/**
++  \ingroup ServerProtocolSSLAPI
++  * Generates a unique key based on CertificateProperties object and store it to key
++ */
++void UniqueKeyForCertificateProperties(const Ssl::CertificateProperties &certProperties, SBuf &key);
++
++/**
++  \ingroup ServerProtocolSSLAPI
++  Generates an OpenSSL BIO for writting to an SBuf object
++ */
++BIO *BIO_new_SBuf(SBuf *buf);
+ } //namespace Ssl
+ 
+ #if _SQUID_WINDOWS_
+ 
+ #if defined(__cplusplus)
+ 
+ /** \cond AUTODOCS-IGNORE */
+ namespace Squid
+ {
+ /** \endcond */
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ inline
+ int SSL_set_fd(SSL *ssl, int fd)
+ {
+     return ::SSL_set_fd(ssl, _get_osfhandle(fd));
+ }
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ #define SSL_set_fd(ssl,fd) Squid::SSL_set_fd(ssl,fd)
+
+=== modified file 'src/tests/stub_client_side.cc'
+--- src/tests/stub_client_side.cc	2017-03-01 04:52:46 +0000
++++ src/tests/stub_client_side.cc	2017-07-04 07:55:28 +0000
+@@ -26,37 +26,37 @@
+ bool ConnStateData::transparent() const STUB_RETVAL(false)
+ void ConnStateData::stopReceiving(const char *) STUB
+ void ConnStateData::stopSending(const char *) STUB
+ void ConnStateData::expectNoForwarding() STUB
+ void ConnStateData::noteMoreBodySpaceAvailable(BodyPipe::Pointer) STUB
+ void ConnStateData::noteBodyConsumerAborted(BodyPipe::Pointer) STUB
+ bool ConnStateData::handleReadData() STUB_RETVAL(false)
+ bool ConnStateData::handleRequestBodyData() STUB_RETVAL(false)
+ void ConnStateData::pinConnection(const Comm::ConnectionPointer &, HttpRequest *, CachePeer *, bool, bool) STUB
+ void ConnStateData::unpinConnection(const bool) STUB
+ const Comm::ConnectionPointer ConnStateData::validatePinnedConnection(HttpRequest *, const CachePeer *) STUB_RETVAL(NULL)
+ void ConnStateData::clientPinnedConnectionClosed(const CommCloseCbParams &) STUB
+ void ConnStateData::connStateClosed(const CommCloseCbParams &) STUB
+ void ConnStateData::requestTimeout(const CommTimeoutCbParams &) STUB
+ void ConnStateData::swanSong() STUB
+ void ConnStateData::quitAfterError(HttpRequest *) STUB
+ NotePairs::Pointer ConnStateData::notes() STUB_RETVAL(NotePairs::Pointer())
+ #if USE_OPENSSL
+ void ConnStateData::httpsPeeked(Comm::ConnectionPointer) STUB
+ void ConnStateData::getSslContextStart() STUB
+-void ConnStateData::getSslContextDone(Security::ContextPointer &, bool) STUB
++void ConnStateData::getSslContextDone(Security::ContextPointer &) STUB
+ void ConnStateData::sslCrtdHandleReplyWrapper(void *, const Helper::Reply &) STUB
+ void ConnStateData::sslCrtdHandleReply(const Helper::Reply &) STUB
+ void ConnStateData::switchToHttps(HttpRequest *, Ssl::BumpMode) STUB
+ void ConnStateData::buildSslCertGenerationParams(Ssl::CertificateProperties &) STUB
+ bool ConnStateData::serveDelayedError(Http::Stream *) STUB_RETVAL(false)
+ #endif
+ 
+ void setLogUri(ClientHttpRequest *, char const *, bool) STUB
+ const char *findTrailingHTTPVersion(const char *, const char *) STUB_RETVAL(NULL)
+ int varyEvaluateMatch(StoreEntry *, HttpRequest *) STUB_RETVAL(0)
+ void clientOpenListenSockets(void) STUB
+ void clientHttpConnectionsClose(void) STUB
+ void httpRequestFree(void *) STUB
+ void clientPackRangeHdr(const HttpReplyPointer &, const HttpHdrRangeSpec *, String, MemBuf *) STUB
+ void clientPackTermBound(String, MemBuf *) STUB
+ 
+
+=== modified file 'src/tests/stub_libsslsquid.cc'
+--- src/tests/stub_libsslsquid.cc	2017-01-12 13:26:45 +0000
++++ src/tests/stub_libsslsquid.cc	2017-07-14 14:02:55 +0000
+@@ -48,33 +48,33 @@
+ const String & Ssl::ErrorDetail::toString() const STUB_RETSTATREF(String)
+ 
+ #include "ssl/support.h"
+ namespace Ssl
+ {
+ bool InitServerContext(Security::ContextPointer &, AnyP::PortCfg &) STUB_RETVAL(false)
+ bool InitClientContext(Security::ContextPointer &, Security::PeerOptions &, const char *) STUB_RETVAL(false)
+ } // namespace Ssl
+ const char *sslGetUserEmail(SSL *ssl) STUB_RETVAL(NULL)
+ const char *sslGetUserAttribute(SSL *ssl, const char *attribute_name) STUB_RETVAL(NULL)
+ const char *sslGetCAAttribute(SSL *ssl, const char *attribute_name) STUB_RETVAL(NULL)
+ const char *sslGetUserCertificatePEM(SSL *ssl) STUB_RETVAL(NULL)
+ const char *sslGetUserCertificateChainPEM(SSL *ssl) STUB_RETVAL(NULL)
+ namespace Ssl
+ {
+ //GETX509ATTRIBUTE GetX509UserAttribute;
+ //GETX509ATTRIBUTE GetX509CAAttribute;
+ //GETX509ATTRIBUTE GetX509Fingerprint;
+ std::vector<const char *> BumpModeStr = {""};
+ bool generateUntrustedCert(Security::CertPointer & untrustedCert, EVP_PKEY_Pointer & untrustedPkey, Security::CertPointer const & cert, EVP_PKEY_Pointer const & pkey) STUB_RETVAL(false)
+-Security::ContextPointer generateSslContext(CertificateProperties const &, AnyP::PortCfg &) STUB_RETVAL(Security::ContextPointer())
++Security::ContextPointer GenerateSslContext(CertificateProperties const &, AnyP::PortCfg &, bool) STUB_RETVAL(Security::ContextPointer())
+ bool verifySslCertificate(Security::ContextPointer &, CertificateProperties const &) STUB_RETVAL(false)
+-Security::ContextPointer generateSslContextUsingPkeyAndCertFromMemory(const char *, AnyP::PortCfg &) STUB_RETVAL(Security::ContextPointer())
++Security::ContextPointer GenerateSslContextUsingPkeyAndCertFromMemory(const char *, AnyP::PortCfg &, bool) STUB_RETVAL(Security::ContextPointer())
+ void addChainToSslContext(Security::ContextPointer &, STACK_OF(X509) *) STUB
+ void readCertChainAndPrivateKeyFromFiles(Security::CertPointer & cert, EVP_PKEY_Pointer & pkey, X509_STACK_Pointer & chain, char const * certFilename, char const * keyFilename) STUB
+ int matchX509CommonNames(X509 *peer_cert, void *check_data, int (*check_func)(void *check_data,  ASN1_STRING *cn_data)) STUB_RETVAL(0)
+ bool checkX509ServerValidity(X509 *cert, const char *server) STUB_RETVAL(false)
+ int asn1timeToString(ASN1_TIME *tm, char *buf, int len) STUB_RETVAL(0)
+ bool setClientSNI(SSL *ssl, const char *fqdn) STUB_RETVAL(false)
+ } //namespace Ssl
+ 
+ #endif
+ 
+

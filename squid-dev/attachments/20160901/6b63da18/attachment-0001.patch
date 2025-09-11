@@ -1,0 +1,729 @@
+Reject or sanitize more problematic Content-Length values.
+
+Squid is violating HTTP MUSTs by forwarding messages with problematic
+Content-Length values. Some of those bugs were fixed in trunk r14215.
+This change handles multiple values inside one Content-Length header
+field, negative values, and trailing garbage.
+
+TODO: Handle malformed values with leading signs (e.g., "-0" or "+1").
+
+Also improved httpHeaderParseOffset(): Added detection of overflowing
+and underflowing integer values; polished malformed value detection
+code. The function no longer considers empty strings valid and reports
+trailing characters. The function still accepts leading whitespace and
+signs. It is still the wrong approach to HTTP numbers parsing, but
+further improvements are out of scope because they are complicated and
+would require significant caller rewrites.
+
+=== modified file 'src/HttpHeader.cc'
+--- src/HttpHeader.cc	2016-08-18 12:43:27 +0000
++++ src/HttpHeader.cc	2016-09-01 23:10:20 +0000
+@@ -1,34 +1,36 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 55    HTTP Header */
+ 
+ #include "squid.h"
++#include "base/CharacterSet.h"
+ #include "base/EnumIterator.h"
+ #include "base64.h"
+ #include "globals.h"
++#include "http/one/Parser.h"
+ #include "HttpHdrCc.h"
+ #include "HttpHdrContRange.h"
+ #include "HttpHdrScTarget.h" // also includes HttpHdrSc.h
+ #include "HttpHeader.h"
+ #include "HttpHeaderFieldInfo.h"
+ #include "HttpHeaderStat.h"
+ #include "HttpHeaderTools.h"
+ #include "MemBuf.h"
+ #include "mgr/Registration.h"
+ #include "profiler/Profiler.h"
+ #include "rfc1123.h"
+ #include "SquidConfig.h"
+ #include "StatHist.h"
+ #include "Store.h"
+ #include "StrList.h"
+ #include "TimeOrTag.h"
+ #include "util.h"
+ 
+ #include <algorithm>
+ 
+@@ -38,40 +40,77 @@
+ 
+ /*
+  * On naming conventions:
+  *
+  * HTTP/1.1 defines message-header as
+  *
+  * message-header = field-name ":" [ field-value ] CRLF
+  * field-name     = token
+  * field-value    = *( field-content | LWS )
+  *
+  * HTTP/1.1 does not give a name name a group of all message-headers in a message.
+  * Squid 1.1 seems to refer to that group _plus_ start-line as "headers".
+  *
+  * HttpHeader is an object that represents all message-headers in a message.
+  * HttpHeader does not manage start-line.
+  *
+  * HttpHeader is implemented as a collection of header "entries".
+  * An entry is a (field_id, field_name, field_value) triplet.
+  */
+ 
++/// Finds the intended Content-Length value while parsing message-header fields.
++/// Deals with complications such as value lists and/or repeated fields.
++class ContentLengthInterpreter
++{
++public:
++    explicit ContentLengthInterpreter(const int aDebugLevel);
++
++    /// updates history based on the given message-header field
++    /// \return true iff the field should be added/remembered for future use
++    bool checkField(const String &field);
++
++    /// intended Content-Length value if sawGood is set and sawBad is not set
++    /// meaningless otherwise
++    int64_t value;
++
++    /* for debugging (declared here to minimize padding) */
++    const char *headerWideProblem; ///< worst header-wide problem found (or nil)
++    const int debugLevel; ///< debugging level for certain warnings
++
++    /// whether a malformed Content-Length value was present
++    bool sawBad;
++
++    /// whether all remembered fields should be removed
++    /// removed fields ought to be replaced with the intended value (if known)
++    /// irrelevant if sawBad is set
++    bool needsSanitizing;
++
++    /// whether a valid field value was present, possibly among problematic ones
++    /// irrelevant if sawBad is set
++    bool sawGood;
++
++protected:
++    bool goodSuffix(const char *suffix, const char * const end) const;
++    bool checkValue(const char *start, const int size);
++    bool checkList(const String &list);
++};
++
+ /*
+  * local constants and vars
+  */
+ 
+ // statistics counters for headers. clients must not allow Http::HdrType::BAD_HDR to be counted
+ std::vector<HttpHeaderFieldStat> headerStatsTable(Http::HdrType::enumEnd_);
+ 
+ /* request-only headers. Used for cachemgr */
+ static HttpHeaderMask RequestHeadersMask;   /* set run-time using RequestHeaders */
+ 
+ /* reply-only headers. Used for cachemgr */
+ static HttpHeaderMask ReplyHeadersMask;     /* set run-time using ReplyHeaders */
+ 
+ /* header accounting */
+ // NP: keep in sync with enum http_hdr_owner_type
+ static HttpHeaderStat HttpHeaderStats[] = {
+     HttpHeaderStat(/*hoNone*/ "all", NULL),
+ #if USE_HTCP
+     HttpHeaderStat(/*hoHtcpReply*/ "HTCP reply", &ReplyHeadersMask),
+ #endif
+@@ -118,40 +157,154 @@ httpHeaderInitModule(void)
+     assert(8 * sizeof(HttpHeaderMask) >= Http::HdrType::enumEnd_);
+ 
+     // masks are needed for stats page still
+     for (auto h : WholeEnum<Http::HdrType>()) {
+         if (Http::HeaderLookupTable.lookup(h).request)
+             CBIT_SET(RequestHeadersMask,h);
+         if (Http::HeaderLookupTable.lookup(h).reply)
+             CBIT_SET(ReplyHeadersMask,h);
+     }
+ 
+     /* header stats initialized by class constructor */
+     assert(HttpHeaderStatCount == hoReply + 1);
+ 
+     /* init dependent modules */
+     httpHdrCcInitModule();
+     httpHdrScInitModule();
+ 
+     httpHeaderRegisterWithCacheManager();
+ }
+ 
++ContentLengthInterpreter::ContentLengthInterpreter(const int aDebugLevel):
++    value(-1),
++    headerWideProblem(nullptr),
++    debugLevel(aDebugLevel),
++    sawBad(false),
++    needsSanitizing(false),
++    sawGood(false)
++{
++}
++
++/// checks whether all characters after the Content-Length are allowed
++bool
++ContentLengthInterpreter::goodSuffix(const char *suffix, const char * const end) const
++{
++    // optimize for the common case that does not need delimiters
++    if (suffix == end)
++        return true;
++
++    for (const CharacterSet &delimiters = Http::One::Parser::DelimiterCharacters();
++            suffix < end; ++suffix) {
++        if (!delimiters[*suffix])
++            return false;
++    }
++    // needsSanitizing = true; // TODO: Always remove trailing whitespace?
++    return true; // including empty suffix
++}
++
++/// handles a single-token Content-Length value
++/// rawValue null-termination requirements are those of httpHeaderParseOffset()
++bool
++ContentLengthInterpreter::checkValue(const char *rawValue, const int valueSize)
++{
++    Must(!sawBad);
++
++    int64_t latestValue = -1;
++    char *suffix = nullptr;
++    // TODO: Handle malformed values with leading signs (e.g., "-0" or "+1").
++    if (!httpHeaderParseOffset(rawValue, &latestValue, &suffix)) {
++        debugs(55, DBG_IMPORTANT, "WARNING: Malformed" << Raw("Content-Length", rawValue, valueSize));
++        sawBad = true;
++        return false;
++    }
++
++    if (latestValue < 0) {
++        debugs(55, debugLevel, "WARNING: Negative" << Raw("Content-Length", rawValue, valueSize));
++        sawBad = true;
++        return false;
++    }
++
++    // check for garbage after the number
++    if (!goodSuffix(suffix, rawValue + valueSize)) {
++        debugs(55, debugLevel, "WARNING: Trailing garbage in" << Raw("Content-Length", rawValue, valueSize));
++        sawBad = true;
++        return false;
++    }
++
++    if (sawGood) {
++        /* we have found at least two, possibly identical values */
++
++        needsSanitizing = true; // replace identical values with a single value
++
++        const bool conflicting = value != latestValue;
++        if (conflicting)
++            headerWideProblem = "Conflicting"; // overwrite any lesser problem
++        else if (!headerWideProblem) // preserve a possibly worse problem
++            headerWideProblem = "Duplicate";
++
++        // with relaxed_header_parser, identical values are permitted
++        sawBad = !Config.onoff.relaxed_header_parser || conflicting;
++        return false; // conflicting or duplicate
++    }
++
++    sawGood = true;
++    value = latestValue;
++    return true;
++}
++
++/// handles Content-Length: a, b, c
++bool
++ContentLengthInterpreter::checkList(const String &list)
++{
++    Must(!sawBad);
++
++    if (!Config.onoff.relaxed_header_parser) {
++        debugs(55, debugLevel, "WARNING: List-like" << Raw("Content-Length", list.rawBuf(), list.size()));
++        sawBad = true;
++        return false;
++    }
++
++    needsSanitizing = true; // remove extra commas (at least)
++
++    const char *pos = nullptr;
++    const char *item = nullptr;;
++    int ilen = -1;
++    while (strListGetItem(&list, ',', &item, &ilen, &pos)) {
++        if (!checkValue(item, ilen) && sawBad)
++            break;
++        // keep going after a duplicate value to find conflicting ones
++    }
++    return false; // no need to keep this list field; it will be sanitized away
++}
++
++bool
++ContentLengthInterpreter::checkField(const String &rawValue)
++{
++    if (sawBad)
++        return false; // one rotten apple is enough to spoil all of them
++
++    // TODO: Optimize by always parsing the first integer first.
++    return rawValue.pos(',') ?
++           checkList(rawValue) :
++           checkValue(rawValue.rawBuf(), rawValue.size());
++}
++
+ /*
+  * HttpHeader Implementation
+  */
+ 
+ HttpHeader::HttpHeader() : owner (hoNone), len (0), conflictingContentLength_(false)
+ {
+     httpHeaderMaskInit(&mask, 0);
+ }
+ 
+ HttpHeader::HttpHeader(const http_hdr_owner_type anOwner): owner(anOwner), len(0), conflictingContentLength_(false)
+ {
+     assert(anOwner > hoNone && anOwner < hoEnd);
+     debugs(55, 7, "init-ing hdr: " << this << " owner: " << owner);
+     httpHeaderMaskInit(&mask, 0);
+ }
+ 
+ HttpHeader::HttpHeader(const HttpHeader &other): owner(other.owner), len(other.len), conflictingContentLength_(false)
+ {
+     httpHeaderMaskInit(&mask, 0);
+     update(&other); // will update the mask as well
+@@ -303,58 +456,58 @@ HttpHeader::update(HttpHeader const *fre
+ 
+     pos = HttpHeaderInitPos;
+     while ((e = fresh->getEntry(&pos))) {
+         /* deny bad guys (ok to check for Http::HdrType::OTHER) here */
+ 
+         if (skipUpdateHeader(e->id))
+             continue;
+ 
+         debugs(55, 7, "Updating header '" << Http::HeaderLookupTable.lookup(e->id).name << "' in cached entry");
+ 
+         addEntry(e->clone());
+     }
+     return true;
+ }
+ 
+ int
+ HttpHeader::parse(const char *header_start, size_t hdrLen)
+ {
+     const char *field_ptr = header_start;
+     const char *header_end = header_start + hdrLen; // XXX: remove
+-    HttpHeaderEntry *e, *e2;
+     int warnOnError = (Config.onoff.relaxed_header_parser <= 0 ? DBG_IMPORTANT : 2);
+ 
+     PROF_start(HttpHeaderParse);
+ 
+     assert(header_start && header_end);
+     debugs(55, 7, "parsing hdr: (" << this << ")" << std::endl << getStringPrefix(header_start, hdrLen));
+     ++ HttpHeaderStats[owner].parsedCount;
+ 
+     char *nulpos;
+     if ((nulpos = (char*)memchr(header_start, '\0', hdrLen))) {
+         debugs(55, DBG_IMPORTANT, "WARNING: HTTP header contains NULL characters {" <<
+                getStringPrefix(header_start, nulpos-header_start) << "}\nNULL\n{" << getStringPrefix(nulpos+1, hdrLen-(nulpos-header_start)-1));
+         PROF_stop(HttpHeaderParse);
+         clean();
+         return 0;
+     }
+ 
++    ContentLengthInterpreter clen(warnOnError);
+     /* common format headers are "<name>:[ws]<value>" lines delimited by <CRLF>.
+      * continuation lines start with a (single) space or tab */
+     while (field_ptr < header_end) {
+         const char *field_start = field_ptr;
+         const char *field_end;
+ 
+         do {
+             const char *this_line = field_ptr;
+             field_ptr = (const char *)memchr(field_ptr, '\n', header_end - field_ptr);
+ 
+             if (!field_ptr) {
+                 // missing <LF>
+                 PROF_stop(HttpHeaderParse);
+                 clean();
+                 return 0;
+             }
+ 
+             field_end = field_ptr;
+ 
+             ++field_ptr;    /* Move to next line */
+@@ -402,117 +555,103 @@ HttpHeader::parse(const char *header_sta
+                 debugs(55, warnOnError, "WARNING: Blank continuation line in HTTP header {" <<
+                        getStringPrefix(header_start, hdrLen) << "}");
+                 PROF_stop(HttpHeaderParse);
+                 clean();
+                 return 0;
+             }
+         } while (field_ptr < header_end && (*field_ptr == ' ' || *field_ptr == '\t'));
+ 
+         if (field_start == field_end) {
+             if (field_ptr < header_end) {
+                 debugs(55, warnOnError, "WARNING: unparseable HTTP header field near {" <<
+                        getStringPrefix(field_start, hdrLen-(field_start-header_start)) << "}");
+                 PROF_stop(HttpHeaderParse);
+                 clean();
+                 return 0;
+             }
+ 
+             break;      /* terminating blank line */
+         }
+ 
++        HttpHeaderEntry *e;
+         if ((e = HttpHeaderEntry::parse(field_start, field_end)) == NULL) {
+             debugs(55, warnOnError, "WARNING: unparseable HTTP header field {" <<
+                    getStringPrefix(field_start, field_end-field_start) << "}");
+             debugs(55, warnOnError, " in {" << getStringPrefix(header_start, hdrLen) << "}");
+ 
+             if (Config.onoff.relaxed_header_parser)
+                 continue;
+ 
+             PROF_stop(HttpHeaderParse);
+             clean();
+             return 0;
+         }
+ 
+-        // XXX: RFC 7230 Section 3.3.3 item #4 requires sending a 502 error in
+-        // several cases that we do not yet cover. TODO: Rewrite to cover more.
+-        if (e->id == Http::HdrType::CONTENT_LENGTH && (e2 = findEntry(e->id)) != nullptr) {
+-            if (e->value != e2->value) {
+-                int64_t l1, l2;
+-                debugs(55, warnOnError, "WARNING: found two conflicting content-length headers in {" <<
+-                       getStringPrefix(header_start, hdrLen) << "}");
+-
+-                if (!Config.onoff.relaxed_header_parser) {
+-                    delete e;
+-                    PROF_stop(HttpHeaderParse);
+-                    clean();
+-                    return 0;
+-                }
+-
+-                if (!httpHeaderParseOffset(e->value.termedBuf(), &l1)) {
+-                    debugs(55, DBG_IMPORTANT, "WARNING: Unparseable content-length '" << e->value << "'");
+-                    delete e;
+-                    continue;
+-                } else if (!httpHeaderParseOffset(e2->value.termedBuf(), &l2)) {
+-                    debugs(55, DBG_IMPORTANT, "WARNING: Unparseable content-length '" << e2->value << "'");
+-                    delById(e2->id);
+-                } else {
+-                    if (l1 != l2)
+-                        conflictingContentLength_ = true;
+-                    delete e;
+-                    continue;
+-                }
+-            } else {
+-                debugs(55, warnOnError, "NOTICE: found double content-length header");
+-                delete e;
++        if (e->id == Http::HdrType::CONTENT_LENGTH && !clen.checkField(e->value)) {
++            delete e;
+ 
+-                if (Config.onoff.relaxed_header_parser)
+-                    continue;
++            if (Config.onoff.relaxed_header_parser)
++                continue; // clen has printed any necessary warnings
+ 
+-                PROF_stop(HttpHeaderParse);
+-                clean();
+-                return 0;
+-            }
++            PROF_stop(HttpHeaderParse);
++            clean();
++            return 0;
+         }
+ 
+         if (e->id == Http::HdrType::OTHER && stringHasWhitespace(e->name.termedBuf())) {
+             debugs(55, warnOnError, "WARNING: found whitespace in HTTP header name {" <<
+                    getStringPrefix(field_start, field_end-field_start) << "}");
+ 
+             if (!Config.onoff.relaxed_header_parser) {
+                 delete e;
+                 PROF_stop(HttpHeaderParse);
+                 clean();
+                 return 0;
+             }
+         }
+ 
+         addEntry(e);
+     }
+ 
++    if (clen.headerWideProblem) {
++        debugs(55, warnOnError, "WARNING: " << clen.headerWideProblem <<
++               " Content-Length field values in" <<
++               Raw("header", header_start, hdrLen));
++    }
++
+     if (chunked()) {
+         // RFC 2616 section 4.4: ignore Content-Length with Transfer-Encoding
++        // RFC 7230 section 3.3.3 #3: Transfer-Encoding overwrites Content-Length
++        delById(Http::HdrType::CONTENT_LENGTH);
++        // and clen state becomes irrelevant
++    } else if (clen.sawBad) {
++        // ensure our callers do not accidentally see bad Content-Length values
+         delById(Http::HdrType::CONTENT_LENGTH);
+-        // RFC 7230 section 3.3.3 #4: ignore Content-Length conflicts with Transfer-Encoding
+-        conflictingContentLength_ = false;
+-    } else if (conflictingContentLength_) {
+-        // ensure our callers do not see the conflicting Content-Length value
++        conflictingContentLength_ = true; // TODO: Rename to badContentLength_.
++    } else if (clen.needsSanitizing) {
++        // RFC 7230 section 3.3.2: MUST either reject or ... [sanitize];
++        // ensure our callers see a clean Content-Length value or none at all
+         delById(Http::HdrType::CONTENT_LENGTH);
++        if (clen.sawGood) {
++            putInt64(Http::HdrType::CONTENT_LENGTH, clen.value);
++            debugs(55, 5, "sanitized Content-Length to be " << clen.value);
++        }
+     }
+ 
+     PROF_stop(HttpHeaderParse);
+     return 1;           /* even if no fields where found, it is a valid header */
+ }
+ 
+ /* packs all the entries using supplied packer */
+ void
+ HttpHeader::packInto(Packable * p, bool mask_sensitive_info) const
+ {
+     HttpHeaderPos pos = HttpHeaderInitPos;
+     const HttpHeaderEntry *e;
+     assert(p);
+     debugs(55, 7, this << " into " << p <<
+            (mask_sensitive_info ? " while masking" : ""));
+     /* pack all entries one by one */
+     while ((e = getEntry(&pos))) {
+         if (!mask_sensitive_info) {
+             e->packInto(p);
+             continue;
+@@ -1462,46 +1601,43 @@ HttpHeaderEntry::packInto(Packable * p)
+     p->append(value.rawBuf(), value.size());
+     p->append("\r\n", 2);
+ }
+ 
+ int
+ HttpHeaderEntry::getInt() const
+ {
+     int val = -1;
+     int ok = httpHeaderParseInt(value.termedBuf(), &val);
+     httpHeaderNoteParsedEntry(id, value, ok == 0);
+     /* XXX: Should we check ok - ie
+      * return ok ? -1 : value;
+      */
+     return val;
+ }
+ 
+ int64_t
+ HttpHeaderEntry::getInt64() const
+ {
+     int64_t val = -1;
+-    int ok = httpHeaderParseOffset(value.termedBuf(), &val);
+-    httpHeaderNoteParsedEntry(id, value, ok == 0);
+-    /* XXX: Should we check ok - ie
+-     * return ok ? -1 : value;
+-     */
+-    return val;
++    const bool ok = httpHeaderParseOffset(value.termedBuf(), &val);
++    httpHeaderNoteParsedEntry(id, value, ok);
++    return val; // remains -1 if !ok (XXX: bad method API)
+ }
+ 
+ static void
+ httpHeaderNoteParsedEntry(Http::HdrType id, String const &context, bool error)
+ {
+     if (id != Http::HdrType::BAD_HDR)
+         ++ headerStatsTable[id].parsCount;
+ 
+     if (error) {
+         if (id != Http::HdrType::BAD_HDR)
+             ++ headerStatsTable[id].errCount;
+         debugs(55, 2, "cannot parse hdr field: '" << Http::HeaderLookupTable.lookup(id).name << ": " << context << "'");
+     }
+ }
+ 
+ /*
+  * Reports
+  */
+ 
+ /* tmp variable used to pass stat info to dumpers */
+
+=== modified file 'src/HttpHeaderTools.cc'
+--- src/HttpHeaderTools.cc	2016-04-22 11:39:23 +0000
++++ src/HttpHeaderTools.cc	2016-09-01 23:10:20 +0000
+@@ -121,52 +121,63 @@ getStringPrefix(const char *str, size_t
+ }
+ 
+ /**
+  * parses an int field, complains if soemthing went wrong, returns true on
+  * success
+  */
+ int
+ httpHeaderParseInt(const char *start, int *value)
+ {
+     assert(value);
+     *value = atoi(start);
+ 
+     if (!*value && !xisdigit(*start)) {
+         debugs(66, 2, "failed to parse an int header field near '" << start << "'");
+         return 0;
+     }
+ 
+     return 1;
+ }
+ 
+-int
+-httpHeaderParseOffset(const char *start, int64_t * value)
++bool
++httpHeaderParseOffset(const char *start, int64_t *value, char **endPtr)
+ {
++    char *end = nullptr;
+     errno = 0;
+-    int64_t res = strtoll(start, NULL, 10);
+-    if (!res && EINVAL == errno) {   /* maybe not portable? */
+-        debugs(66, 7, "failed to parse offset in " << start);
+-        return 0;
++    const int64_t res = strtoll(start, &end, 10);
++    if (errno && !res) {
++        debugs(66, 7, "failed to parse malformed offset in " << start);
++        return false;
++    }
++    if (errno == ERANGE && (res == LLONG_MIN || res == LLONG_MAX)) { // no overflow
++        debugs(66, 7, "failed to parse huge offset in " << start);
++        return false;
++    }
++    if (start == end) {
++        debugs(66, 7, "failed to parse empty offset");
++        return false;
+     }
+     *value = res;
++    if (endPtr)
++        *endPtr = end;
+     debugs(66, 7, "offset " << start << " parsed as " << res);
+-    return 1;
++    return true;
+ }
+ 
+ /**
+  * Parses a quoted-string field (RFC 2616 section 2.2), complains if
+  * something went wrong, returns non-zero on success.
+  * Un-escapes quoted-pair characters found within the string.
+  * start should point at the first double-quote.
+  */
+ int
+ httpHeaderParseQuotedString(const char *start, const int len, String *val)
+ {
+     const char *end, *pos;
+     val->clean();
+     if (*start != '"') {
+         debugs(66, 2, HERE << "failed to parse a quoted-string header field near '" << start << "'");
+         return 0;
+     }
+     pos = start + 1;
+ 
+     while (*pos != '"' && len > (pos-start)) {
+
+=== modified file 'src/HttpHeaderTools.h'
+--- src/HttpHeaderTools.h	2016-04-01 18:12:14 +0000
++++ src/HttpHeaderTools.h	2016-09-01 23:10:20 +0000
+@@ -100,32 +100,38 @@ public:
+ 
+     /// HTTP header field name
+     std::string fieldName;
+ 
+     /// HTTP header field value, possibly with macros
+     std::string fieldValue;
+ 
+     /// when the header field should be added (always if nil)
+     ACLList *aclList;
+ 
+     /// compiled HTTP header field value (no macros)
+     Format::Format *valueFormat;
+ 
+     /// internal ID for "known" headers or HDR_OTHER
+     Http::HdrType fieldId;
+ 
+     /// whether fieldValue may contain macros
+     bool quoted;
+ };
+ 
+-int httpHeaderParseOffset(const char *start, int64_t * off);
++/// A strtoll(10) wrapper that checks for strtoll() failures and other problems.
++/// XXX: This function is not fully compatible with some HTTP syntax rules.
++/// Just like strtoll(), allows whitespace prefix, a sign, and _any_ suffix.
++/// Requires at least one digit to be present.
++/// Sets "off" and "end" arguments if and only if no problems were found.
++/// \return true if and only if no problems were found.
++bool httpHeaderParseOffset(const char *start, int64_t *offPtr, char **endPtr = nullptr);
+ 
+ int httpHeaderHasConnDir(const HttpHeader * hdr, const char *directive);
+ int httpHeaderParseInt(const char *start, int *val);
+ void httpHeaderPutStrf(HttpHeader * hdr, Http::HdrType id, const char *fmt,...) PRINTF_FORMAT_ARG3;
+ 
+ const char *getStringPrefix(const char *str, size_t len);
+ 
+ void httpHdrMangleList(HttpHeader *, HttpRequest *, const AccessLogEntryPointer &al, req_or_rep_t req_or_rep);
+ 
+ #endif
+ 
+
+=== modified file 'src/http/one/Parser.h'
+--- src/http/one/Parser.h	2016-08-02 15:06:37 +0000
++++ src/http/one/Parser.h	2016-09-01 23:11:07 +0000
+@@ -89,55 +89,55 @@ public:
+     char *getHeaderField(const char *name);
+ 
+     /// the remaining unprocessed section of buffer
+     const SBuf &remaining() const {return buf_;}
+ 
+ #if USE_HTTP_VIOLATIONS
+     /// the right debugs() level for parsing HTTP violation messages
+     int violationLevel() const;
+ #endif
+ 
+     /**
+      * HTTP status code resulting from the parse process.
+      * to be used on the invalid message handling.
+      *
+      * Http::scNone indicates incomplete parse,
+      * Http::scOkay indicates no error,
+      * other codes represent a parse error.
+      */
+     Http::StatusCode parseStatusCode;
+ 
++    /// the characters which are to be considered valid whitespace
++    /// (WSP / BSP / OWS)
++    static const CharacterSet &DelimiterCharacters();
++
+ protected:
+     /**
+      * detect and skip the CRLF or (if tolerant) LF line terminator
+      * consume from the tokenizer.
+      *
+      * throws if non-terminator is detected.
+      * \retval true only if line terminator found.
+      * \retval false incomplete or missing line terminator, need more data.
+      */
+     bool skipLineTerminator(Http1::Tokenizer &tok) const;
+ 
+-    /// the characters which are to be considered valid whitespace
+-    /// (WSP / BSP / OWS)
+-    static const CharacterSet &DelimiterCharacters();
+-
+     /**
+      * Scan to find the mime headers block for current message.
+      *
+      * \retval true   If mime block (or a blocks non-existence) has been
+      *                identified accurately within limit characters.
+      *                mimeHeaderBlock_ has been updated and buf_ consumed.
+      *
+      * \retval false  An error occured, or no mime terminator found within limit.
+      */
+     bool grabMimeBlock(const char *which, const size_t limit);
+ 
+     /// RFC 7230 section 2.6 - 7 magic octets
+     static const SBuf Http1magic;
+ 
+     /// bytes remaining to be parsed
+     SBuf buf_;
+ 
+     /// what stage the parser is currently up to
+     ParseState parsingStage_;
+ 
+

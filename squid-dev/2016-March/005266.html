@@ -1,0 +1,328 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20assertion%20failed%3A%20Write.cc%3A41%3A%0A%20%22%21ccb-%3Eactive%28%29%22&In-Reply-To=%3C56E1E8B7.7000801%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005265.html">
+   <LINK REL="Next"  HREF="005300.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20assertion%20failed%3A%20Write.cc%3A41%3A%0A%20%22%21ccb-%3Eactive%28%29%22&In-Reply-To=%3C56E1E8B7.7000801%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Thu Mar 10 21:35:51 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005265.html">[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;
+</A></li>
+        <LI>Next message: <A HREF="005300.html">[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5266">[ date ]</a>
+              <a href="thread.html#5266">[ thread ]</a>
+              <a href="subject.html#5266">[ subject ]</a>
+              <a href="author.html#5266">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 03/10/2016 12:14 PM, Christos Tsantilas wrote:
+
+&gt;<i>  I am attaching two patches for this bug. 
+</I>
+I will re-summarize the problem we are dealing with using higher-level
+concepts so that it is easier to grok what Christos is talking about:
+
+1. Ftp::Client cannot deal with more than one FTP command at a time.
+
+2. Ftp::Server must _delay_ reading the next FTP command due to #1.
+
+3. Delaying is complicated because Ftp::Server receives responses from
+   &quot;Squid&quot; (ICAP, errors, caching, etc.), and not Ftp::Client itself:
+   Ftp:Server may receive a response for the current FTP command
+   long _before_ Ftp::Client is done dealing with that same command!
+   Christos has highlighted a few specific cases where that happens.
+
+   [ In HTTP, this problem is much smaller because the two Squid HTTP
+     sides do not share much state: New Http::Client objects are created
+     as needed for the same ConnStateData object while the old ones
+     are finishing their Http::Client jobs. ]
+
+4. The current Squid code (v3.5 and trunk) contains a mechanism for #2,
+   but that mechanism does not handle a now-known race condition. The
+   bug leads to the Write.cc assertion. Our take1 patch fixes that bug.
+
+5. While working on #4, we realized that the existing mechanism for #2
+   relies on Ftp::Client existence and other conditions that may not
+   materialize. If things go wrong, Ftp::Server may get stuck waiting
+   for Ftp::Client that either did not exist or did not end the wait.
+   Our take2 patch revises the mechanism for #2 to be much more robust.
+   We do not know of any specific way to hit the bugs fixed by take2,
+   but that does not mean it is (and will remain) impossible.
+
+Take2 also relays FTP origin errors to the FTP user in more cases.
+
+
+&gt;<i> One simple for squid-3.5 (t1
+</I>&gt;<i> patch) and one more complex (t2 patch). The simple patch solve the bug
+</I>&gt;<i> for now, but may leave other similar bugs in squid.
+</I>
+Amos, do you want us to port take2 to v3.5? The take1 patch for v3.5 is
+enough to fix the known assertion. Take2 fixes that assertion as well,
+but it is bigger because it also fixes design problems that may lead to
+other bugs in v3.5. Which one do you want in v3.5?
+
+For trunk/v4, there is no doubt in my mind that we should use take2 (or
+its polished variant).
+
+
+The rest is my take2 review.
+
+
+&gt;<i> +    bool clientSideWaitingForUs; ///&lt; whether the client is waiting for us
+</I>
+Let's avoid confusing &quot;client side&quot; and &quot;client&quot; terms in new code,
+especially when it is Ftp::Server that is waiting:
+
+  /// whether we are between Ftp::Server::startWaitingForOrigin() and
+  /// Ftp::Server::stopWaitingForOrigin() calls
+  bool originWaitInProgress;
+
+
+&gt;<i> +void
+</I>&gt;<i> +Ftp::Relay::swanSong()
+</I>&gt;<i> +{
+</I>&gt;<i> +    if (clientSideWaitingForUs) {
+</I>&gt;<i> +        CbcPointer&lt;ConnStateData&gt; &amp;mgr = fwd-&gt;request-&gt;clientConnectionManager;
+</I>&gt;<i> +        if (mgr.valid()) {
+</I>&gt;<i> +            if (Ftp::Server *srv = dynamic_cast&lt;Ftp::Server*&gt;(mgr.get())) {
+</I>&gt;<i> +                typedef UnaryMemFunT&lt;Ftp::Server, int&gt; CbDialer;
+</I>&gt;<i> +                AsyncCall::Pointer call = asyncCall(11, 3, &quot;Ftp::Server::stopWaitingForOrigin&quot;,
+</I>&gt;<i> +                                                    CbDialer(srv, &amp;Ftp::Server::stopWaitingForOrigin, 0));
+</I>&gt;<i> +                ScheduleCallHere(call);
+</I>
+and
+
+&gt;<i>  void
+</I>&gt;<i>  Ftp::Relay::serverComplete()
+</I>&gt;<i>  {
+</I>&gt;<i>      CbcPointer&lt;ConnStateData&gt; &amp;mgr = fwd-&gt;request-&gt;clientConnectionManager;
+</I>&gt;<i>      if (mgr.valid()) {
+</I>&gt;<i> +        if (clientSideWaitingForUs) {
+</I>&gt;<i> +            if (Ftp::Server *srv = dynamic_cast&lt;Ftp::Server*&gt;(mgr.get())) {
+</I>&gt;<i> +               typedef UnaryMemFunT&lt;Ftp::Server, int&gt; CbDialer;
+</I>&gt;<i> +               AsyncCall::Pointer call = asyncCall(11, 3, &quot;Ftp::Server::stopWaitingForOrigin&quot;,
+</I>&gt;<i> +                                                   CbDialer(srv, &amp;Ftp::Server::stopWaitingForOrigin, ctrl.replycode));
+</I>&gt;<i> +               ScheduleCallHere(call);
+</I>&gt;<i> +               clientSideWaitingForUs = false;
+</I>&gt;<i> +            }
+</I>&gt;<i> +        }
+</I>
+
+Let's move this nearly duplicated code into a new
+Ftp::Relay::stopOriginWait(int code) method _and_ always clear
+clientSideWaitingForUs/originWaitInProgress there.
+
+
+&gt;<i>  void
+</I>&gt;<i>  Ftp::Server::writeForwardedReply(const HttpReply *reply)
+</I>&gt;<i>  {
+</I>&gt;<i>      Must(reply);
+</I>&gt;<i>  
+</I>&gt;<i> +    if (master-&gt;waitingForOrigin) {
+</I>&gt;<i> +        delayedReply = reply;
+</I>&gt;<i> +        return;
+</I>&gt;<i> +    }
+</I>&gt;<i> +
+</I>
+If this method is called twice while waitingForOrigin is true, should we
+throw an exception, honor the first reply, or honor the last one? Please
+adjust the code as need. *If* honoring the last reply is the best
+strategy (which is what take2 does), add a comment:
+
+    delayedReply = reply; // and forget any previous ones
+
+
+&gt;<i> +    debugs(33, 5, &quot;Transfering data in progress, waitting server side to finish&quot;);
+</I>
+I suggest using &quot;waiting for Ftp::Client data transfer to end&quot; for
+brevity sake. This will also fix the two spelling errors in the above text.
+
+
+&gt;<i> +    // Currently only data upload and data download requests are 
+</I>&gt;<i> +    // waiting for the origin:
+</I>&gt;<i> +    // Must(master-&gt;serverState  == fssHandleUploadRequest ||
+</I>&gt;<i> +    //      master-&gt;serverState == fssHandleDataRequest);
+</I>
+True, but our code does not _rely_ on that, right? I would remove that
+comment to avoid the implication that it does rely on that and we are
+just afraid to check.
+
+If you decide to keep this comment or enable these Must()s, please move
+all that _after_ waitingForOrigin is cleared.
+
+
+&gt;<i>     if (master-&gt;serverState == fssHandleDataRequest) {
+</I>&gt;<i> +        if (!master-&gt;userDataDone) {
+</I>...
+&gt;<i> +            originDataDownloadAbortedOnError = (originStatus &gt; 400);
+</I>&gt;<i> +            return;
+</I>&gt;<i> +        }
+</I>&gt;<i> +
+</I>&gt;<i> +        completeDataExchange();
+</I>&gt;<i> +    } else {
+</I>&gt;<i> +        if (delayedReply != NULL) {
+</I>&gt;<i> +            writeForwardedReply(delayedReply.getRaw());
+</I>&gt;<i> +            delayedReply = NULL;
+</I>&gt;<i> +        }
+</I>&gt;<i> +    }
+</I>
+
+The above logic looks correct to me, but I feel like I am reading an
+inside-out code. Please consider this instead:
+
+// HttpReply in fssHandleDataRequest lacks status code
+if (master-&gt;serverState == fssHandleDataRequest)
+    originDataDownloadAbortedOnError = (originStatus &gt; 400);
+
+if (!master-&gt;userDataDone) {
+    ... your big comment here ...
+    // HttpReply in fssHandleDataRequest lacks status code
+    if (master-&gt;serverState == fssHandleDataRequest)
+        originDataDownloadAbortedOnError = (originStatus &gt; 400);
+
+    debugs(33, 5 &quot;too early to write the response&quot;);
+    return;
+}
+
+if (delayedReply) {
+    writeForwardedReply(delayedReply.getRaw());
+    delayedReply = nullptr;
+} else {
+    completeDataExchange();
+}
+
+
+Please note that my &quot;HttpReply in fssHandleDataRequest lacks status
+code&quot; is based on your IRC comments, but it does not mesh well with your
+&quot;If the server side aborted with an error before we are done, we need to
+record it&quot; source code comment which seems to imply that we should use
+originStatus in all &quot;server aborted first&quot; cases and not just those
+where serverState is fssHandleDataRequest. Please adjust the final
+comment as needed.
+
+
+&gt;<i> +            originDataDownloadAbortedOnError = (originStatus &gt; 400);
+</I>
+To minimize questions/doubts, please include 400 unless it is a
+successful status.
+
+
+&gt;<i> +    //Adjust our reply if the server responded with an error:
+</I>&gt;<i> +    if (master-&gt;userDataDone == 226 &amp;&amp; originDataDownloadAbortedOnError)
+</I>&gt;<i> +        master-&gt;userDataDone = 451;
+</I>
+Please add a debugs() statement here so that we know why the code was
+changed during triage.
+
+
+&gt;<i> -    MasterState(): serverState(fssBegin), clientReadGreeting(false), userDataDone(0), waitForOriginData(false) {}
+</I>&gt;<i> +MasterState(): serverState(fssBegin), clientReadGreeting(false), userDataDone(false), waitingForOrigin(false) {}
+</I>
+Unnecessary and wrong initial value change for userDataDone.
+
+
+&gt;<i> +    /// whether we have to wait the transfer on the Squid-origin data connection
+</I>&gt;<i> +    /// to be finished
+</I>
+Let's shorten that to &quot;whether we wait for the origin data transfer to end&quot;.
+
+&gt;<i> +    /// whether the transfer aborted with an error on server side
+</I>&gt;<i> +    bool originDataDownloadAbortedOnError;
+</I>
+Avoid &quot;server side&quot; with &quot;whether the origin data transfer aborted&quot;.
+
+
+&gt;<i> +    /// Set when the HttpReply can not be forwarded right now to the client 
+</I>&gt;<i> +    /// and must be delayed unless the server side is done.
+</I>
+Simplify and describe the member meaning, not what the code does with
+it: &quot;a response which writing was postponed until stopWaitingForOrigin()&quot;.
+
+
+&gt;<i> -    /// whether the transfer on the Squid-origin data connection is not over yet
+</I>&gt;<i> -    bool waitForOriginData;
+</I>&gt;<i> +    /// whether we have to wait the transfer on the Squid-origin data connection
+</I>&gt;<i> +    /// to be finished
+</I>&gt;<i> +    bool waitingForOrigin;
+</I>
+To reduce &quot;global&quot; or &quot;shared&quot; state, if you can now move
+waitingForOrigin to Ftp::Server, you should do that IMO.
+
+
+All of these are pretty much cosmetic changes that do not alter the
+proposed patch functionality AFAICT. IMO, if there are no objections,
+the polished patch should go into trunk (see above regarding v3.5).
+
+
+Thank you,
+
+Alex.
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005265.html">[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;
+</A></li>
+	<LI>Next message: <A HREF="005300.html">[squid-dev] [PATCH] assertion failed: Write.cc:41: &quot;!ccb-&gt;active()&quot;
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5266">[ date ]</a>
+              <a href="thread.html#5266">[ thread ]</a>
+              <a href="subject.html#5266">[ subject ]</a>
+              <a href="author.html#5266">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

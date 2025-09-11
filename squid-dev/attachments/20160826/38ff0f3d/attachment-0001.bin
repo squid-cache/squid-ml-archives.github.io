@@ -1,0 +1,950 @@
+Squid should ignore a [revalidation] response with an older Date header.
+
+Before this patch, Squid violated the RFC 7234 section 4 MUST
+requirement: "When more than one suitable response is stored, a cache
+MUST use the most recent response (as determined by the Date header
+field)." This problem may be damaging in cache hierarchies where
+parent caches may have different responses. Trusting the older response
+may lead to excessive IMS requests, cache thrashing and other problems.
+
+=== modified file 'src/HttpReply.cc'
+--- src/HttpReply.cc	2016-07-23 13:36:56 +0000
++++ src/HttpReply.cc	2016-08-25 14:12:11 +0000
+@@ -600,30 +600,37 @@
+ 
+         // warning-value MUST end with quote
+         if (p >= item && *p == '"') {
+             const char *const warnDateEnd = p;
+             --p;
+             while (p >= item && *p != '"') --p; // find the next quote
+ 
+             const char *warnDateBeg = p + 1;
+             --p;
+             while (p >= item && xisspace(*p)) --p; // skip whitespace
+ 
+             if (p >= item && *p == '"' && warnDateBeg - p > 2) {
+                 // found warn-text
+                 String warnDate;
+                 warnDate.append(warnDateBeg, warnDateEnd - warnDateBeg);
+                 const time_t time = parse_rfc1123(warnDate.termedBuf());
+                 keep = (time > 0 && time == date); // keep valid and matching date
+             }
+         }
+ 
+         if (keep) {
+             if (newValue.size())
+                 newValue.append(", ");
+             newValue.append(item, len);
+         }
+     }
+ 
+     return newValue;
+ }
+ 
++bool
++HttpReply::olderThan(const HttpReply *them) const
++{
++    if (!them || !them->date || !date)
++        return false;
++    return date < them->date;
++}
+
+=== modified file 'src/HttpReply.h'
+--- src/HttpReply.h	2016-07-23 13:36:56 +0000
++++ src/HttpReply.h	2016-08-25 14:12:11 +0000
+@@ -85,60 +85,64 @@
+     HttpReply *make304() const;
+ 
+     void redirect(Http::StatusCode, const char *);
+ 
+     int64_t bodySize(const HttpRequestMethod&) const;
+ 
+     /** Checks whether received body exceeds known maximum size.
+      * Requires a prior call to calcMaxBodySize().
+      */
+     bool receivedBodyTooLarge(HttpRequest&, int64_t receivedBodySize);
+ 
+     /** Checks whether expected body exceeds known maximum size.
+      * Requires a prior call to calcMaxBodySize().
+      */
+     bool expectedBodyTooLarge(HttpRequest& request);
+ 
+     int validatorsMatch (HttpReply const *other) const;
+ 
+     void packHeadersInto(Packable * p) const;
+ 
+     /** Clone this reply.
+      *  Could be done as a copy-contructor but we do not want to accidently copy a HttpReply..
+      */
+     HttpReply *clone() const;
+ 
+     /// Remove Warnings with warn-date different from Date value
+     void removeStaleWarnings();
+ 
+     virtual void hdrCacheInit();
+ 
++    /// whether our Date header value is smaller than theirs
++    /// \returns false if any information is missing
++    bool olderThan(const HttpReply *them) const;
++
+ private:
+     /** initialize */
+     void init();
+ 
+     void clean();
+ 
+     void hdrCacheClean();
+ 
+     void packInto(Packable * p) const;
+ 
+     /* ez-routines */
+     /** \return construct 304 reply and pack it into a MemBuf */
+     MemBuf *packed304Reply() const;
+ 
+     /* header manipulation */
+     time_t hdrExpirationTime();
+ 
+     /** Calculates and stores maximum body size if needed.
+      * Used by receivedBodyTooLarge() and expectedBodyTooLarge().
+      */
+     void calcMaxBodySize(HttpRequest& request) const;
+ 
+     String removeStaleWarningValues(const String &value);
+ 
+     mutable int64_t bodySizeMax; /**< cached result of calcMaxBodySize */
+ 
+ protected:
+     virtual void packFirstLineInto(Packable * p, bool) const { sline.packInto(p); }
+ 
+     virtual bool parseFirstLine(const char *start, const char *end);
+
+=== modified file 'src/LogTags.cc'
+--- src/LogTags.cc	2016-06-02 09:49:19 +0000
++++ src/LogTags.cc	2016-08-26 12:09:16 +0000
+@@ -28,52 +28,55 @@
+     "TCP_DENIED_REPLY",
+     "TCP_OFFLINE_HIT",
+     "TCP_REDIRECT",
+     "TCP_TUNNEL",
+     "UDP_HIT",
+     "UDP_MISS",
+     "UDP_DENIED",
+     "UDP_INVALID",
+     "UDP_MISS_NOFETCH",
+     "ICP_QUERY",
+     "TYPE_MAX"
+ };
+ 
+ /*
+  * This method is documented in http://wiki.squid-cache.org/SquidFaq/SquidLogs#Squid_result_codes
+  * Please keep the wiki up to date
+  */
+ const char *
+ LogTags::c_str() const
+ {
+     static char buf[1024];
+     *buf = 0;
+     int pos = 0;
+ 
+     // source tags
+     if (oldType && oldType < LOG_TYPE_MAX)
+         pos += snprintf(buf, sizeof(buf), "%s",Str_[oldType]);
+     else
+         pos += snprintf(buf, sizeof(buf), "NONE");
+ 
++    if (flags.ignored)
++        pos += snprintf(buf+pos,sizeof(buf)-pos, "_IGNORED");
++
+     // error tags
+-    if (err.timedout)
++    if (flags.timedout)
+         pos += snprintf(buf+pos,sizeof(buf)-pos, "_TIMEDOUT");
+-    if (err.aborted)
++    if (flags.aborted)
+         pos += snprintf(buf+pos,sizeof(buf)-pos, "_ABORTED");
+ 
+     return buf;
+ }
+ 
+ bool
+ LogTags::isTcpHit() const
+ {
+     return
+         (oldType == LOG_TCP_HIT) ||
+         (oldType == LOG_TCP_IMS_HIT) ||
+         (oldType == LOG_TCP_REFRESH_FAIL_OLD) ||
+         (oldType == LOG_TCP_REFRESH_UNMODIFIED) ||
+         (oldType == LOG_TCP_NEGATIVE_HIT) ||
+         (oldType == LOG_TCP_MEM_HIT) ||
+         (oldType == LOG_TCP_OFFLINE_HIT);
+ }
+ 
+
+=== modified file 'src/LogTags.h'
+--- src/LogTags.h	2016-06-02 09:49:19 +0000
++++ src/LogTags.h	2016-08-26 13:24:58 +0000
+@@ -22,66 +22,72 @@
+     LOG_TCP_HIT,
+     LOG_TCP_MISS,
+     LOG_TCP_REFRESH_UNMODIFIED, // refresh from origin revalidated existing entry
+     LOG_TCP_REFRESH_FAIL_OLD,   // refresh from origin failed, stale reply sent
+     LOG_TCP_REFRESH_FAIL_ERR,   // refresh from origin failed, error forwarded
+     LOG_TCP_REFRESH_MODIFIED,   // refresh from origin replaced existing entry
+     LOG_TCP_REFRESH,            // refresh from origin started, but still pending
+     LOG_TCP_CLIENT_REFRESH_MISS,
+     LOG_TCP_IMS_HIT,
+     LOG_TCP_SWAPFAIL_MISS,
+     LOG_TCP_NEGATIVE_HIT,
+     LOG_TCP_MEM_HIT,
+     LOG_TCP_DENIED,
+     LOG_TCP_DENIED_REPLY,
+     LOG_TCP_OFFLINE_HIT,
+     LOG_TCP_REDIRECT,
+     LOG_TCP_TUNNEL,             // a binary tunnel was established for this transaction
+     LOG_UDP_HIT,
+     LOG_UDP_MISS,
+     LOG_UDP_DENIED,
+     LOG_UDP_INVALID,
+     LOG_UDP_MISS_NOFETCH,
+     LOG_ICP_QUERY,
+     LOG_TYPE_MAX
+ } LogTags_ot;
+ 
+ class LogTags
+ {
+ public:
+     LogTags(LogTags_ot t) : oldType(t) {assert(oldType < LOG_TYPE_MAX);}
++    // XXX: this operator does not reset flags
++    // TODO: either replace with a category-only setter or remove
+     LogTags &operator =(const LogTags_ot &t) {assert(t < LOG_TYPE_MAX); oldType = t; return *this;}
+ 
+     /// compute the status access.log field
+     const char *c_str() const;
+ 
+     /// determine if the log tag code indicates a cache HIT
+     bool isTcpHit() const;
+ 
+-    /// error states terminating the transaction
+-    struct Errors {
+-        Errors() : timedout(false), aborted(false) {}
++    /// Things that may happen to a transaction while it is being
++    /// processed according to its LOG_* category. Logged as _SUFFIX(es).
++    /// Unlike LOG_* categories, these flags may not be mutually exclusive.
++    class Flags {
++        public:
++            Flags() : ignored(false), timedout(false), aborted(false) {}
+ 
+-        bool timedout; ///< tag: TIMEDOUT - terminated due to a lifetime or I/O timeout
+-        bool aborted;  ///< tag: ABORTED  - other abnormal termination (e.g., I/O error)
+-    } err;
++            bool ignored; ///< _IGNORED: the response was not used for anything
++            bool timedout; ///< _TIMEDOUT: terminated due to a lifetime or I/O timeout
++            bool aborted;  ///< _ABORTED: other abnormal termination (e.g., I/O error)
++    } flags;
+ 
+ private:
+     /// list of string representations for LogTags_ot
+     static const char *Str_[];
+ 
+ public: // XXX: only until client_db.cc stats are redesigned.
+ 
+     // deprecated LogTag enum value
+     LogTags_ot oldType;
+ };
+ 
+ /// iterator for LogTags_ot enumeration
+ inline LogTags_ot &operator++ (LogTags_ot &aLogType)
+ {
+     int tmp = (int)aLogType;
+     aLogType = (LogTags_ot)(++tmp);
+     return aLogType;
+ }
+ 
+ #endif
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-08-19 02:32:01 +0000
++++ src/client_side.cc	2016-08-26 12:11:11 +0000
+@@ -2388,61 +2388,61 @@
+             }
+         } else if (!fd_table[io.conn->fd].ssl)
+ #endif
+         {
+             const HttpRequestMethod method;
+             if (clientTunnelOnError(this, NULL, NULL, method, ERR_REQUEST_START_TIMEOUT, Http::scNone, NULL)) {
+                 // Tunnel established. Set receivedFirstByte to avoid loop.
+                 receivedFirstByte();
+                 return;
+             }
+         }
+     }
+     /*
+     * Just close the connection to not confuse browsers
+     * using persistent connections. Some browsers open
+     * a connection and then do not use it until much
+     * later (presumeably because the request triggering
+     * the open has already been completed on another
+     * connection)
+     */
+     debugs(33, 3, "requestTimeout: FD " << io.fd << ": lifetime is expired.");
+     io.conn->close();
+ }
+ 
+ static void
+ clientLifetimeTimeout(const CommTimeoutCbParams &io)
+ {
+     ClientHttpRequest *http = static_cast<ClientHttpRequest *>(io.data);
+     debugs(33, DBG_IMPORTANT, "WARNING: Closing client connection due to lifetime timeout");
+     debugs(33, DBG_IMPORTANT, "\t" << http->uri);
+-    http->logType.err.timedout = true;
++    http->logType.flags.timedout = true;
+     if (Comm::IsConnOpen(io.conn))
+         io.conn->close();
+ }
+ 
+ ConnStateData::ConnStateData(const MasterXaction::Pointer &xact) :
+     AsyncJob("ConnStateData"), // kids overwrite
+     Server(xact),
+     bodyParser(nullptr),
+ #if USE_OPENSSL
+     sslBumpMode(Ssl::bumpEnd),
+ #endif
+     needProxyProtocolHeader_(false),
+ #if USE_OPENSSL
+     switchedToHttps_(false),
+     parsingTlsHandshake(false),
+     sslServerBump(NULL),
+     signAlgorithm(Ssl::algSignTrusted),
+ #endif
+     stoppedSending_(NULL),
+     stoppedReceiving_(NULL)
+ {
+     flags.readMore = true; // kids may overwrite
+     flags.swanSang = false;
+ 
+     pinning.host = NULL;
+     pinning.port = -1;
+     pinning.pinned = false;
+     pinning.auth = false;
+     pinning.zeroReply = false;
+     pinning.peer = NULL;
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2016-08-17 23:11:56 +0000
++++ src/client_side_reply.cc	2016-08-26 12:11:21 +0000
+@@ -379,126 +379,138 @@
+ {
+     clientReplyContext *context = (clientReplyContext *)data;
+     context->handleIMSReply(result);
+ }
+ 
+ void
+ clientReplyContext::sendClientOldEntry()
+ {
+     /* Get the old request back */
+     restoreState();
+     /* here the data to send is in the next nodes buffers already */
+     assert(!EBIT_TEST(http->storeEntry()->flags, ENTRY_ABORTED));
+     /* sendMoreData tracks the offset as well.
+      * Force it back to zero */
+     reqofs = 0;
+     StoreIOBuffer tempresult (reqsize, reqofs, next()->readBuffer.data);
+     sendMoreData(tempresult);
+ }
+ 
+ /* This is the workhorse of the HandleIMSReply callback.
+  *
+  * It is called when we've got data back from the origin following our
+  * IMS request to revalidate a stale entry.
+  */
+ void
+ clientReplyContext::handleIMSReply(StoreIOBuffer result)
+ {
+     if (deleting)
+         return;
+ 
+-    debugs(88, 3, "handleIMSReply: " << http->storeEntry()->url() << ", " << (long unsigned) result.length << " bytes" );
++    debugs(88, 3, http->storeEntry()->url() << ", " << (long unsigned) result.length << " bytes" );
+ 
+     if (http->storeEntry() == NULL)
+         return;
+ 
+     if (result.flags.error && !EBIT_TEST(http->storeEntry()->flags, ENTRY_ABORTED))
+         return;
+ 
+     /* update size of the request */
+     reqsize = result.length + reqofs;
+ 
+     const Http::StatusCode status = http->storeEntry()->getReply()->sline.status();
+ 
+     // request to origin was aborted
+     if (EBIT_TEST(http->storeEntry()->flags, ENTRY_ABORTED)) {
+-        debugs(88, 3, "handleIMSReply: request to origin aborted '" << http->storeEntry()->url() << "', sending old entry to client" );
++        debugs(88, 3, "request to origin aborted '" << http->storeEntry()->url() << "', sending old entry to client" );
+         http->logType = LOG_TCP_REFRESH_FAIL_OLD;
+         sendClientOldEntry();
+     }
+ 
+     const HttpReply *old_rep = old_entry->getReply();
+ 
+     // origin replied 304
+     if (status == Http::scNotModified) {
+         http->logType = LOG_TCP_REFRESH_UNMODIFIED;
+         http->request->flags.staleIfHit = false; // old_entry is no longer stale
+ 
+         // update headers on existing entry
+         Store::Root().updateOnNotModified(old_entry, *http->storeEntry());
+ 
+         // if client sent IMS
+ 
+         if (http->request->flags.ims && !old_entry->modifiedSince(http->request)) {
+             // forward the 304 from origin
+-            debugs(88, 3, "handleIMSReply: origin replied 304, revalidating existing entry and forwarding 304 to client");
++            debugs(88, 3, "origin replied 304, revalidating existing entry and forwarding 304 to client");
+             sendClientUpstreamResponse();
+         } else {
+             // send existing entry, it's still valid
+-            debugs(88, 3, "handleIMSReply: origin replied 304, revalidating existing entry and sending " <<
++            debugs(88, 3, "origin replied 304, revalidating existing entry and sending " <<
+                    old_rep->sline.status() << " to client");
+             sendClientOldEntry();
+         }
+     }
+ 
+     // origin replied with a non-error code
+     else if (status > Http::scNone && status < Http::scInternalServerError) {
+-        // forward response from origin
+-        http->logType = LOG_TCP_REFRESH_MODIFIED;
+-        debugs(88, 3, "handleIMSReply: origin replied " << status << ", replacing existing entry and forwarding to client");
+-
+-        if (collapsedRevalidation)
+-            http->storeEntry()->clearPublicKeyScope();
+-
+-        sendClientUpstreamResponse();
++
++        const HttpReply *new_rep = http->storeEntry()->getReply();
++        // RFC 7234 section 4: a cache MUST use the most recent response
++        // (as determined by the Date header field)
++        if (new_rep->olderThan(old_rep)) {
++            http->logType.flags.ignored = true;
++            debugs(88, 3, "origin replied " << status <<
++                    " but with an older date header, sending old entry (" <<
++                    old_rep->sline.status() << ") to client");
++            sendClientOldEntry();
++        } else {
++            http->logType = LOG_TCP_REFRESH_MODIFIED;
++            debugs(88, 3, "origin replied " << status <<
++                    ", replacing existing entry and forwarding to client");
++
++            if (collapsedRevalidation)
++                http->storeEntry()->clearPublicKeyScope();
++
++            sendClientUpstreamResponse();
++        }
+     }
+ 
+     // origin replied with an error
+     else if (http->request->flags.failOnValidationError) {
+         http->logType = LOG_TCP_REFRESH_FAIL_ERR;
+-        debugs(88, 3, "handleIMSReply: origin replied with error " << status <<
++        debugs(88, 3, "origin replied with error " << status <<
+                ", forwarding to client due to fail_on_validation_err");
+         sendClientUpstreamResponse();
+     } else {
+         // ignore and let client have old entry
+         http->logType = LOG_TCP_REFRESH_FAIL_OLD;
+-        debugs(88, 3, "handleIMSReply: origin replied with error " <<
++        debugs(88, 3, "origin replied with error " <<
+                status << ", sending old entry (" << old_rep->sline.status() << ") to client");
+         sendClientOldEntry();
+     }
+ }
+ 
+ SQUIDCEXTERN CSR clientGetMoreData;
+ SQUIDCEXTERN CSD clientReplyDetach;
+ 
+ /**
+  * clientReplyContext::cacheHit Should only be called until the HTTP reply headers
+  * have been parsed.  Normally this should be a single call, but
+  * it might take more than one.  As soon as we have the headers,
+  * we hand off to clientSendMoreData, processExpired, or
+  * processMiss.
+  */
+ void
+ clientReplyContext::CacheHit(void *data, StoreIOBuffer result)
+ {
+     clientReplyContext *context = (clientReplyContext *)data;
+     context->cacheHit(result);
+ }
+ 
+ /**
+  * Process a possible cache HIT.
+  */
+ void
+ clientReplyContext::cacheHit(StoreIOBuffer result)
+ {
+     /** Ignore if the HIT object is being deleted. */
+     if (deleting) {
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2016-08-15 11:26:37 +0000
++++ src/http.cc	2016-08-25 14:12:11 +0000
+@@ -63,61 +63,62 @@
+ #if USE_AUTH
+ #include "auth/UserRequest.h"
+ #endif
+ #if USE_DELAY_POOLS
+ #include "DelayPools.h"
+ #endif
+ 
+ #define SQUID_ENTER_THROWING_CODE() try {
+ #define SQUID_EXIT_THROWING_CODE(status) \
+     status = true; \
+     } \
+     catch (const std::exception &e) { \
+     debugs (11, 1, "Exception error:" << e.what()); \
+     status = false; \
+     }
+ 
+ CBDATA_CLASS_INIT(HttpStateData);
+ 
+ static const char *const crlf = "\r\n";
+ 
+ static void httpMaybeRemovePublic(StoreEntry *, Http::StatusCode);
+ static void copyOneHeaderFromClientsideRequestToUpstreamRequest(const HttpHeaderEntry *e, const String strConnection, const HttpRequest * request,
+         HttpHeader * hdr_out, const int we_do_ranges, const HttpStateFlags &);
+ 
+ HttpStateData::HttpStateData(FwdState *theFwdState) :
+     AsyncJob("HttpStateData"),
+     Client(theFwdState),
+     lastChunk(0),
+     httpChunkDecoder(NULL),
+     payloadSeen(0),
+-    payloadTruncated(0)
++    payloadTruncated(0),
++    sawDateGoBack(false)
+ {
+     debugs(11,5,HERE << "HttpStateData " << this << " created");
+     ignoreCacheControl = false;
+     surrogateNoStore = false;
+     serverConnection = fwd->serverConnection();
+ 
+     // reset peer response time stats for %<pt
+     request->hier.peer_http_request_sent.tv_sec = 0;
+     request->hier.peer_http_request_sent.tv_usec = 0;
+ 
+     if (fwd->serverConnection() != NULL)
+         _peer = cbdataReference(fwd->serverConnection()->getPeer());         /* might be NULL */
+ 
+     if (_peer) {
+         request->flags.proxying = true;
+         /*
+          * This NEIGHBOR_PROXY_ONLY check probably shouldn't be here.
+          * We might end up getting the object from somewhere else if,
+          * for example, the request to this neighbor fails.
+          */
+         if (_peer->options.proxy_only)
+             entry->releaseRequest();
+ 
+ #if USE_DELAY_POOLS
+         entry->setNoDelay(_peer->options.no_delay);
+ #endif
+     }
+ 
+     /*
+      * register the handler to free HTTP state data when the FD closes
+@@ -141,132 +142,134 @@
+     debugs(11,5, HERE << "HttpStateData " << this << " destroyed; " << serverConnection);
+ }
+ 
+ const Comm::ConnectionPointer &
+ HttpStateData::dataConnection() const
+ {
+     return serverConnection;
+ }
+ 
+ void
+ HttpStateData::httpStateConnClosed(const CommCloseCbParams &params)
+ {
+     debugs(11, 5, "httpStateFree: FD " << params.fd << ", httpState=" << params.data);
+     doneWithFwd = "httpStateConnClosed()"; // assume FwdState is monitoring too
+     mustStop("HttpStateData::httpStateConnClosed");
+ }
+ 
+ void
+ HttpStateData::httpTimeout(const CommTimeoutCbParams &)
+ {
+     debugs(11, 4, serverConnection << ": '" << entry->url() << "'");
+ 
+     if (entry->store_status == STORE_PENDING) {
+         fwd->fail(new ErrorState(ERR_READ_TIMEOUT, Http::scGatewayTimeout, fwd->request));
+     }
+ 
+     closeServer();
+     mustStop("HttpStateData::httpTimeout");
+ }
+ 
++static StoreEntry *
++findPreviouslyCachedEntry(StoreEntry *newEntry) {
++    assert(newEntry->mem_obj);
++    return newEntry->mem_obj->request ?
++        storeGetPublicByRequest(newEntry->mem_obj->request) :
++        storeGetPublic(newEntry->mem_obj->storeId(), newEntry->mem_obj->method);
++}
++
+ /// Remove an existing public store entry if the incoming response (to be
+ /// stored in a currently private entry) is going to invalidate it.
+ static void
+ httpMaybeRemovePublic(StoreEntry * e, Http::StatusCode status)
+ {
+     int remove = 0;
+     int forbidden = 0;
+-    StoreEntry *pe;
+ 
+     // If the incoming response already goes into a public entry, then there is
+     // nothing to remove. This protects ready-for-collapsing entries as well.
+     if (!EBIT_TEST(e->flags, KEY_PRIVATE))
+         return;
+ 
+     switch (status) {
+ 
+     case Http::scOkay:
+ 
+     case Http::scNonAuthoritativeInformation:
+ 
+     case Http::scMultipleChoices:
+ 
+     case Http::scMovedPermanently:
+ 
+     case Http::scFound:
+ 
+     case Http::scGone:
+ 
+     case Http::scNotFound:
+         remove = 1;
+ 
+         break;
+ 
+     case Http::scForbidden:
+ 
+     case Http::scMethodNotAllowed:
+         forbidden = 1;
+ 
+         break;
+ 
+ #if WORK_IN_PROGRESS
+ 
+     case Http::scUnauthorized:
+         forbidden = 1;
+ 
+         break;
+ 
+ #endif
+ 
+     default:
+ #if QUESTIONABLE
+         /*
+          * Any 2xx response should eject previously cached entities...
+          */
+ 
+         if (status >= 200 && status < 300)
+             remove = 1;
+ 
+ #endif
+ 
+         break;
+     }
+ 
+     if (!remove && !forbidden)
+         return;
+ 
+-    assert(e->mem_obj);
+-
+-    if (e->mem_obj->request)
+-        pe = storeGetPublicByRequest(e->mem_obj->request);
+-    else
+-        pe = storeGetPublic(e->mem_obj->storeId(), e->mem_obj->method);
++    StoreEntry *pe = findPreviouslyCachedEntry(e);
+ 
+     if (pe != NULL) {
+         assert(e != pe);
+ #if USE_HTCP
+         neighborsHtcpClear(e, NULL, e->mem_obj->request, e->mem_obj->method, HTCP_CLR_INVALIDATION);
+ #endif
+         pe->release();
+     }
+ 
+     /** \par
+      * Also remove any cached HEAD response in case the object has
+      * changed.
+      */
+     if (e->mem_obj->request)
+         pe = storeGetPublicByRequestMethod(e->mem_obj->request, Http::METHOD_HEAD);
+     else
+         pe = storeGetPublic(e->mem_obj->storeId(), Http::METHOD_HEAD);
+ 
+     if (pe != NULL) {
+         assert(e != pe);
+ #if USE_HTCP
+         neighborsHtcpClear(e, NULL, e->mem_obj->request, HttpRequestMethod(Http::METHOD_HEAD), HTCP_CLR_INVALIDATION);
+ #endif
+         pe->release();
+     }
+ }
+ 
+ void
+ HttpStateData::processSurrogateControl(HttpReply *reply)
+ {
+@@ -303,60 +306,67 @@
+     }
+ }
+ 
+ int
+ HttpStateData::cacheableReply()
+ {
+     HttpReply const *rep = finalReply();
+     HttpHeader const *hdr = &rep->header;
+     const char *v;
+ #if USE_HTTP_VIOLATIONS
+ 
+     const RefreshPattern *R = NULL;
+ 
+     /* This strange looking define first looks up the refresh pattern
+      * and then checks if the specified flag is set. The main purpose
+      * of this is to simplify the refresh pattern lookup and USE_HTTP_VIOLATIONS
+      * condition
+      */
+ #define REFRESH_OVERRIDE(flag) \
+     ((R = (R ? R : refreshLimits(entry->mem_obj->storeId()))) , \
+     (R && R->flags.flag))
+ #else
+ #define REFRESH_OVERRIDE(flag) 0
+ #endif
+ 
+     if (EBIT_TEST(entry->flags, RELEASE_REQUEST)) {
+         debugs(22, 3, "NO because " << *entry << " has been released.");
+         return 0;
+     }
+ 
++    // RFC 7234 section 4: a cache MUST use the most recent response
++    // (as determined by the Date header field)
++    if (sawDateGoBack) {
++        debugs(22, 3, "NO because " << *entry << " has an older date header.");
++        return 0;
++    }
++
+     // Check for Surrogate/1.0 protocol conditions
+     // NP: reverse-proxy traffic our parent server has instructed us never to cache
+     if (surrogateNoStore) {
+         debugs(22, 3, HERE << "NO because Surrogate-Control:no-store");
+         return 0;
+     }
+ 
+     // RFC 2616: HTTP/1.1 Cache-Control conditions
+     if (!ignoreCacheControl) {
+         // XXX: check to see if the request headers alone were enough to prevent caching earlier
+         // (ie no-store request header) no need to check those all again here if so.
+         // for now we are not reliably doing that so we waste CPU re-checking request CC
+ 
+         // RFC 2616 section 14.9.2 - MUST NOT cache any response with request CC:no-store
+         if (request && request->cache_control && request->cache_control->noStore() &&
+                 !REFRESH_OVERRIDE(ignore_no_store)) {
+             debugs(22, 3, HERE << "NO because client request Cache-Control:no-store");
+             return 0;
+         }
+ 
+         // NP: request CC:no-cache only means cache READ is forbidden. STORE is permitted.
+         if (rep->cache_control && rep->cache_control->hasNoCache() && rep->cache_control->noCache().size() > 0) {
+             /* TODO: we are allowed to cache when no-cache= has parameters.
+              * Provided we strip away any of the listed headers unless they are revalidated
+              * successfully (ie, must revalidate AND these headers are prohibited on stale replies).
+              * That is a bit tricky for squid right now so we avoid caching entirely.
+              */
+             debugs(22, 3, HERE << "NO because server reply Cache-Control:no-cache has parameters");
+             return 0;
+         }
+@@ -889,61 +899,64 @@
+ 
+     /*Allow pinned connections only if the Proxy-support header exists in
+       reply and has in its list the "Session-Based-Authentication"
+       which means that the peer supports connection pinning.
+      */
+     if (!hdr->has(Http::HdrType::PROXY_SUPPORT))
+         return false;
+ 
+     header = hdr->getStrOrList(Http::HdrType::PROXY_SUPPORT);
+     /* XXX This ought to be done in a case-insensitive manner */
+     rc = (strstr(header.termedBuf(), "Session-Based-Authentication") != NULL);
+ 
+     return rc;
+ }
+ 
+ // Called when we parsed (and possibly adapted) the headers but
+ // had not starting storing (a.k.a., sending) the body yet.
+ void
+ HttpStateData::haveParsedReplyHeaders()
+ {
+     Client::haveParsedReplyHeaders();
+ 
+     Ctx ctx = ctx_enter(entry->mem_obj->urlXXX());
+     HttpReply *rep = finalReply();
+ 
+     entry->timestampsSet();
+ 
+     /* Check if object is cacheable or not based on reply code */
+     debugs(11, 3, "HTTP CODE: " << rep->sline.status());
+ 
+-    if (neighbors_do_private_keys)
++    if (const StoreEntry *oldEntry = findPreviouslyCachedEntry(entry))
++        sawDateGoBack = rep->olderThan(oldEntry->getReply());
++
++    if (neighbors_do_private_keys && !sawDateGoBack)
+         httpMaybeRemovePublic(entry, rep->sline.status());
+ 
+     bool varyFailure = false;
+     if (rep->header.has(Http::HdrType::VARY)
+ #if X_ACCELERATOR_VARY
+             || rep->header.has(Http::HdrType::HDR_X_ACCELERATOR_VARY)
+ #endif
+        ) {
+         const SBuf vary(httpMakeVaryMark(request, rep));
+ 
+         if (vary.isEmpty()) {
+             entry->makePrivate();
+             if (!fwd->reforwardableStatus(rep->sline.status()))
+                 EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+             varyFailure = true;
+         } else {
+             entry->mem_obj->vary_headers = vary;
+         }
+     }
+ 
+     if (!varyFailure) {
+         /*
+          * If its not a reply that we will re-forward, then
+          * allow the client to get it.
+          */
+         if (!fwd->reforwardableStatus(rep->sline.status()))
+             EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+ 
+         switch (cacheableReply()) {
+ 
+
+=== modified file 'src/http.h'
+--- src/http.h	2016-03-25 20:11:29 +0000
++++ src/http.h	2016-08-25 14:12:11 +0000
+@@ -102,38 +102,42 @@
+     bool maybeMakeSpaceAvailable(bool grow);
+ 
+     // consuming request body
+     virtual void handleMoreRequestBodyAvailable();
+     virtual void handleRequestBodyProducerAborted();
+ 
+     void writeReplyBody();
+     bool decodeAndWriteReplyBody();
+     bool finishingBrokenPost();
+     bool finishingChunkedRequest();
+     void doneSendingRequestBody();
+     void requestBodyHandler(MemBuf &);
+     virtual void sentRequestBody(const CommIoCbParams &io);
+     void wroteLast(const CommIoCbParams &io);
+     void sendComplete();
+     void httpStateConnClosed(const CommCloseCbParams &params);
+     void httpTimeout(const CommTimeoutCbParams &params);
+ 
+     mb_size_t buildRequestPrefix(MemBuf * mb);
+     static bool decideIfWeDoRanges (HttpRequest * orig_request);
+     bool peerSupportsConnectionPinning() const;
+ 
+     /// Parser being used at present to parse the HTTP/ICY server response.
+     Http1::ResponseParserPointer hp;
+     Http1::TeChunkedParser *httpChunkDecoder;
+ 
+     /// amount of message payload/body received so far.
+     int64_t payloadSeen;
+     /// positive when we read more than we wanted
+     int64_t payloadTruncated;
++
++    /// Whether we received a Date header older than that of a matching
++    /// cached response.
++    bool sawDateGoBack;
+ };
+ 
+ int httpCachable(const HttpRequestMethod&);
+ void httpStart(FwdState *);
+ SBuf httpMakeVaryMark(HttpRequest * request, HttpReply const * reply);
+ 
+ #endif /* SQUID_HTTP_H */
+ 
+
+=== modified file 'src/http/Stream.cc'
+--- src/http/Stream.cc	2016-07-02 06:47:55 +0000
++++ src/http/Stream.cc	2016-08-26 12:09:57 +0000
+@@ -503,63 +503,63 @@
+     }
+ }
+ 
+ clientStreamNode *
+ Http::Stream::getTail() const
+ {
+     if (http->client_stream.tail)
+         return static_cast<clientStreamNode *>(http->client_stream.tail->data);
+ 
+     return nullptr;
+ }
+ 
+ clientStreamNode *
+ Http::Stream::getClientReplyContext() const
+ {
+     return static_cast<clientStreamNode *>(http->client_stream.tail->prev->data);
+ }
+ 
+ ConnStateData *
+ Http::Stream::getConn() const
+ {
+     assert(http && http->getConn());
+     return http->getConn();
+ }
+ 
+ /// remembers the abnormal connection termination for logging purposes
+ void
+ Http::Stream::noteIoError(const int xerrno)
+ {
+     if (http) {
+-        http->logType.err.timedout = (xerrno == ETIMEDOUT);
++        http->logType.flags.timedout = (xerrno == ETIMEDOUT);
+         // aborted even if xerrno is zero (which means read abort/eof)
+-        http->logType.err.aborted = (xerrno != ETIMEDOUT);
++        http->logType.flags.aborted = (xerrno != ETIMEDOUT);
+     }
+ }
+ 
+ void
+ Http::Stream::finished()
+ {
+     ConnStateData *conn = getConn();
+ 
+     /* we can't handle any more stream data - detach */
+     clientStreamDetach(getTail(), http);
+ 
+     assert(connRegistered_);
+     connRegistered_ = false;
+     conn->pipeline.popMe(Http::StreamPointer(this));
+ }
+ 
+ /// called when we encounter a response-related error
+ void
+ Http::Stream::initiateClose(const char *reason)
+ {
+     debugs(33, 4, clientConnection << " because " << reason);
+     getConn()->stopSending(reason); // closes ASAP
+ }
+ 
+ void
+ Http::Stream::deferRecipientForLater(clientStreamNode *node, HttpReply *rep, StoreIOBuffer receivedData)
+ {
+     debugs(33, 2, "Deferring request " << http->uri);
+     assert(flags.deferred == 0);
+     flags.deferred = 1;
+

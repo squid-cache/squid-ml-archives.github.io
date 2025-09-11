@@ -1,0 +1,1194 @@
+Update all stored headers on revalidation.
+
+According to RFC 7234 section 4.3.4. when a proxy receives 304 (Not Modified)
+response, it should update every header, except Warning headers (which need
+special processing). Also RFC 7232 section 4.1. does not prohibit origin servers
+from sending any headers in 304 responses. That means that Squid now should not
+ignore headers, which earlier were considered as malicious/faulty.
+
+=== modified file 'src/HttpHeader.cc'
+--- src/HttpHeader.cc	2016-05-18 05:21:28 +0000
++++ src/HttpHeader.cc	2016-06-21 14:22:55 +0000
+@@ -128,76 +128,76 @@
+ 
+     /* header stats initialized by class constructor */
+     assert(HttpHeaderStatCount == hoReply + 1);
+ 
+     /* init dependent modules */
+     httpHdrCcInitModule();
+     httpHdrScInitModule();
+ 
+     httpHeaderRegisterWithCacheManager();
+ }
+ 
+ /*
+  * HttpHeader Implementation
+  */
+ 
+ HttpHeader::HttpHeader() : owner (hoNone), len (0), conflictingContentLength_(false)
+ {
+     httpHeaderMaskInit(&mask, 0);
+ }
+ 
+ HttpHeader::HttpHeader(const http_hdr_owner_type anOwner): owner(anOwner), len(0), conflictingContentLength_(false)
+ {
+     assert(anOwner > hoNone && anOwner < hoEnd);
+     debugs(55, 7, "init-ing hdr: " << this << " owner: " << owner);
+     httpHeaderMaskInit(&mask, 0);
+ }
+ 
+ HttpHeader::HttpHeader(const HttpHeader &other): owner(other.owner), len(other.len), conflictingContentLength_(false)
+ {
+     httpHeaderMaskInit(&mask, 0);
+-    update(&other, NULL); // will update the mask as well
++    update(&other); // will update the mask as well
+ }
+ 
+ HttpHeader::~HttpHeader()
+ {
+     clean();
+ }
+ 
+ HttpHeader &
+ HttpHeader::operator =(const HttpHeader &other)
+ {
+     if (this != &other) {
+         // we do not really care, but the caller probably does
+         assert(owner == other.owner);
+         clean();
+-        update(&other, NULL); // will update the mask as well
++        update(&other); // will update the mask as well
+         len = other.len;
+         conflictingContentLength_ = other.conflictingContentLength_;
+     }
+     return *this;
+ }
+ 
+ void
+ HttpHeader::clean()
+ {
+ 
+     assert(owner > hoNone && owner < hoEnd);
+     debugs(55, 7, "cleaning hdr: " << this << " owner: " << owner);
+ 
+     PROF_start(HttpHeaderClean);
+ 
+     if (owner <= hoReply) {
+         /*
+          * An unfortunate bug.  The entries array is initialized
+          * such that count is set to zero.  httpHeaderClean() seems to
+          * be called both when 'hdr' is created, and destroyed.  Thus,
+          * we accumulate a large number of zero counts for 'hdr' before
+          * it is ever used.  Can't think of a good way to fix it, except
+          * adding a state variable that indicates whether or not 'hdr'
+          * has been used.  As a hack, just never count zero-sized header
+          * arrays.
+          */
+         if (!entries.empty())
+             HttpHeaderStats[owner].hdrUCountDistr.count(entries.size());
+ 
+         ++ HttpHeaderStats[owner].destroyedCount;
+@@ -212,84 +212,106 @@
+             debugs(55, DBG_CRITICAL, "BUG: invalid entry (" << e->id << "). Ignored.");
+         } else {
+             if (owner <= hoReply)
+                 HttpHeaderStats[owner].fieldTypeDistr.count(e->id);
+             delete e;
+         }
+     }
+ 
+     entries.clear();
+     httpHeaderMaskInit(&mask, 0);
+     len = 0;
+     conflictingContentLength_ = false;
+     PROF_stop(HttpHeaderClean);
+ }
+ 
+ /* append entries (also see httpHeaderUpdate) */
+ void
+ HttpHeader::append(const HttpHeader * src)
+ {
+     assert(src);
+     assert(src != this);
+     debugs(55, 7, "appending hdr: " << this << " += " << src);
+ 
+     for (auto e : src->entries) {
+         if (e)
+             addEntry(e->clone());
+     }
+ }
+ 
+ void
+-HttpHeader::update (HttpHeader const *fresh, HttpHeaderMask const *denied_mask)
++HttpHeader::updateWarnings()
++{
++    int count = 0;
++    HttpHeaderPos pos = HttpHeaderInitPos;
++
++    // RFC 7234, section 4.3.4: delete 1xx warnings and retain 2xx warnings
++    while (HttpHeaderEntry *e = getEntry(&pos)) {
++        if (e->id == Http::HdrType::WARNING && (e->getInt()/100 == 1) )
++            delAt(pos, count);
++    }
++}
++
++bool
++HttpHeader::skipUpdateHeader(const Http::HdrType id) const
++{
++    // RFC 7234, section 4.3.4: use fields other from Warning for update
++    return id == Http::HdrType::WARNING;
++}
++
++void
++HttpHeader::update(HttpHeader const *fresh)
+ {
+     const HttpHeaderEntry *e;
+     HttpHeaderPos pos = HttpHeaderInitPos;
+     assert(fresh);
+     assert(this != fresh);
+ 
++    updateWarnings();
++
+     while ((e = fresh->getEntry(&pos))) {
+         /* deny bad guys (ok to check for Http::HdrType::OTHER) here */
+ 
+-        if (denied_mask && CBIT_TEST(*denied_mask, e->id))
++        if (skipUpdateHeader(e->id))
+             continue;
+ 
+         if (e->id != Http::HdrType::OTHER)
+             delById(e->id);
+         else
+             delByName(e->name.termedBuf());
+     }
+ 
+     pos = HttpHeaderInitPos;
+     while ((e = fresh->getEntry(&pos))) {
+         /* deny bad guys (ok to check for Http::HdrType::OTHER) here */
+ 
+-        if (denied_mask && CBIT_TEST(*denied_mask, e->id))
++        if (skipUpdateHeader(e->id))
+             continue;
+ 
+         debugs(55, 7, "Updating header '" << Http::HeaderLookupTable.lookup(e->id).name << "' in cached entry");
+ 
+         addEntry(e->clone());
+     }
+ }
+ 
+ int
+ HttpHeader::parse(const char *header_start, size_t hdrLen)
+ {
+     const char *field_ptr = header_start;
+     const char *header_end = header_start + hdrLen; // XXX: remove
+     HttpHeaderEntry *e, *e2;
+     int warnOnError = (Config.onoff.relaxed_header_parser <= 0 ? DBG_IMPORTANT : 2);
+ 
+     PROF_start(HttpHeaderParse);
+ 
+     assert(header_start && header_end);
+     debugs(55, 7, "parsing hdr: (" << this << ")" << std::endl << getStringPrefix(header_start, hdrLen));
+     ++ HttpHeaderStats[owner].parsedCount;
+ 
+     char *nulpos;
+     if ((nulpos = (char*)memchr(header_start, '\0', hdrLen))) {
+         debugs(55, DBG_IMPORTANT, "WARNING: HTTP header contains NULL characters {" <<
+                getStringPrefix(header_start, nulpos-header_start) << "}\nNULL\n{" << getStringPrefix(nulpos+1, hdrLen-(nulpos-header_start)-1));
+         PROF_stop(HttpHeaderParse);
+         clean();
+         return 0;
+     }
+
+=== modified file 'src/HttpHeader.h'
+--- src/HttpHeader.h	2016-03-01 16:19:49 +0000
++++ src/HttpHeader.h	2016-06-21 14:38:41 +0000
+@@ -54,61 +54,61 @@
+     HttpHeaderEntry(Http::HdrType id, const char *name, const char *value);
+     ~HttpHeaderEntry();
+     static HttpHeaderEntry *parse(const char *field_start, const char *field_end);
+     HttpHeaderEntry *clone() const;
+     void packInto(Packable *p) const;
+     int getInt() const;
+     int64_t getInt64() const;
+ 
+     Http::HdrType id;
+     String name;
+     String value;
+ };
+ 
+ class ETag;
+ class TimeOrTag;
+ 
+ class HttpHeader
+ {
+ 
+ public:
+     HttpHeader();
+     explicit HttpHeader(const http_hdr_owner_type owner);
+     HttpHeader(const HttpHeader &other);
+     ~HttpHeader();
+ 
+     HttpHeader &operator =(const HttpHeader &other);
+ 
+     /* Interface functions */
+     void clean();
+     void append(const HttpHeader * src);
+-    void update (HttpHeader const *fresh, HttpHeaderMask const *denied_mask);
++    void update(HttpHeader const *fresh);
+     void compact();
+     int parse(const char *header_start, size_t len);
+     void packInto(Packable * p, bool mask_sensitive_info=false) const;
+     HttpHeaderEntry *getEntry(HttpHeaderPos * pos) const;
+     HttpHeaderEntry *findEntry(Http::HdrType id) const;
+     int delByName(const char *name);
+     int delById(Http::HdrType id);
+     void delAt(HttpHeaderPos pos, int &headers_deleted);
+     void refreshMask();
+     void addEntry(HttpHeaderEntry * e);
+     void insertEntry(HttpHeaderEntry * e);
+     String getList(Http::HdrType id) const;
+     bool getList(Http::HdrType id, String *s) const;
+     bool conflictingContentLength() const { return conflictingContentLength_; }
+     String getStrOrList(Http::HdrType id) const;
+     String getByName(const SBuf &name) const;
+     String getByName(const char *name) const;
+     String getById(Http::HdrType id) const;
+     /// sets value and returns true iff a [possibly empty] field identified by id is there
+     bool getByIdIfPresent(Http::HdrType id, String &result) const;
+     /// sets value and returns true iff a [possibly empty] named field is there
+     bool getByNameIfPresent(const SBuf &s, String &value) const;
+     bool getByNameIfPresent(const char *name, int namelen, String &value) const;
+     String getByNameListMember(const char *name, const char *member, const char separator) const;
+     String getListMember(Http::HdrType id, const char *member, const char separator) const;
+     int has(Http::HdrType id) const;
+     void putInt(Http::HdrType id, int number);
+     void putInt64(Http::HdrType id, int64_t number);
+     void putTime(Http::HdrType id, time_t htime);
+     void putStr(Http::HdrType id, const char *str);
+@@ -118,54 +118,56 @@
+     void putRange(const HttpHdrRange * range);
+     void putSc(HttpHdrSc *sc);
+     void putWarning(const int code, const char *const text); ///< add a Warning header
+     void putExt(const char *name, const char *value);
+     int getInt(Http::HdrType id) const;
+     int64_t getInt64(Http::HdrType id) const;
+     time_t getTime(Http::HdrType id) const;
+     const char *getStr(Http::HdrType id) const;
+     const char *getLastStr(Http::HdrType id) const;
+     HttpHdrCc *getCc() const;
+     HttpHdrRange *getRange() const;
+     HttpHdrSc *getSc() const;
+     HttpHdrContRange *getContRange() const;
+     const char *getAuth(Http::HdrType id, const char *auth_scheme) const;
+     ETag getETag(Http::HdrType id) const;
+     TimeOrTag getTimeOrTag(Http::HdrType id) const;
+     int hasListMember(Http::HdrType id, const char *member, const char separator) const;
+     int hasByNameListMember(const char *name, const char *member, const char separator) const;
+     void removeHopByHopEntries();
+     inline bool chunked() const; ///< whether message uses chunked Transfer-Encoding
+ 
+     /* protected, do not use these, use interface functions instead */
+     std::vector<HttpHeaderEntry *> entries;     /**< parsed fields in raw format */
+     HttpHeaderMask mask;    /**< bit set <=> entry present */
+     http_hdr_owner_type owner;  /**< request or reply */
+     int len;            /**< length when packed, not counting terminating null-byte */
+ 
+ protected:
+     /** \deprecated Public access replaced by removeHopByHopEntries() */
+     void removeConnectionHeaderEntries();
++    bool skipUpdateHeader(const Http::HdrType id) const;
++    void updateWarnings();
+ 
+ private:
+     HttpHeaderEntry *findLastEntry(Http::HdrType id) const;
+     bool conflictingContentLength_; ///< found different Content-Length fields
+ };
+ 
+ int httpHeaderParseQuotedString(const char *start, const int len, String *val);
+ 
+ /// quotes string using RFC 7230 quoted-string rules
+ SBuf httpHeaderQuoteString(const char *raw);
+ 
+ void httpHeaderCalcMask(HttpHeaderMask * mask, Http::HdrType http_hdr_type_enums[], size_t count);
+ 
+ inline bool
+ HttpHeader::chunked() const
+ {
+     return has(Http::HdrType::TRANSFER_ENCODING) &&
+            hasListMember(Http::HdrType::TRANSFER_ENCODING, "chunked", ',');
+ }
+ 
+ void httpHeaderInitModule(void);
+ 
+ #endif /* SQUID_HTTPHEADER_H */
+ 
+
+=== modified file 'src/HttpReply.cc'
+--- src/HttpReply.cc	2016-04-22 11:39:23 +0000
++++ src/HttpReply.cc	2016-06-21 14:18:16 +0000
+@@ -1,89 +1,57 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 58    HTTP Reply (Response) */
+ 
+ #include "squid.h"
+ #include "acl/AclSizeLimit.h"
+ #include "acl/FilledChecklist.h"
+ #include "base/EnumIterator.h"
+ #include "globals.h"
+ #include "HttpBody.h"
+ #include "HttpHdrCc.h"
+ #include "HttpHdrContRange.h"
+ #include "HttpHdrSc.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+ #include "MemBuf.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "Store.h"
+ #include "StrList.h"
+ 
+-/* local constants */
+-
+-/* If we receive a 304 from the origin during a cache revalidation, we must
+- * update the headers of the existing entry. Specifically, we need to update all
+- * end-to-end headers and not any hop-by-hop headers (rfc2616 13.5.3).
+- *
+- * This is not the whole story though: since it is possible for a faulty/malicious
+- * origin server to set headers it should not in a 304, we must explicitly ignore
+- * these too. Specifically all entity-headers except those permitted in a 304
+- * (rfc2616 10.3.5) must be ignored.
+- *
+- * The list of headers we don't update is made up of:
+- *     all hop-by-hop headers
+- *     all entity-headers except Expires and Content-Location
+- *
+- * These headers are now stored in RegisteredHeadersHash.gperf and accessible
+- * as Http::HeaderLookupTable.lookup(id).denied304
+- */
+-static HttpHeaderMask Denied304HeadersMask;
+-
+-/* module initialization */
+-void
+-httpReplyInitModule(void)
+-{
+-    assert(Http::scNone == 0); // HttpReply::parse() interface assumes that
+-    httpHeaderMaskInit(&Denied304HeadersMask, 0);
+-
+-    for (auto id : WholeEnum<Http::HdrType>()) {
+-        if (Http::HeaderLookupTable.lookup(id).denied304)
+-            CBIT_SET(Denied304HeadersMask, id);
+-    }
+-}
+ 
+ HttpReply::HttpReply() : HttpMsg(hoReply), date (0), last_modified (0),
+     expires (0), surrogate_control (NULL), content_range (NULL), keep_alive (0),
+     protoPrefix("HTTP/"), bodySizeMax(-2)
+ {
+     init();
+ }
+ 
+ HttpReply::~HttpReply()
+ {
+     if (do_clean)
+         clean();
+ }
+ 
+ void
+ HttpReply::init()
+ {
+     hdrCacheInit();
+     sline.init();
+     pstate = psReadyToParseStartLine;
+     do_clean = true;
+ }
+ 
+ void HttpReply::reset()
+ {
+ 
+     // reset should not reset the protocol; could have made protoPrefix a
+     // virtual function instead, but it is not clear whether virtual methods
+     // are allowed with MEMPROXY_CLASS() and whether some cbdata void*
+     // conversions are not going to kill virtual tables
+@@ -249,62 +217,61 @@
+         one.clean();
+         two.clean();
+         return 0;
+     }
+ 
+     if (last_modified != otherRep->last_modified)
+         return 0;
+ 
+     /* MD5 */
+     one = header.getStrOrList(Http::HdrType::CONTENT_MD5);
+ 
+     two = otherRep->header.getStrOrList(Http::HdrType::CONTENT_MD5);
+ 
+     if (one.size()==0 || two.size()==0 || one.caseCmp(two)!=0 ) {
+         one.clean();
+         two.clean();
+         return 0;
+     }
+ 
+     return 1;
+ }
+ 
+ void
+ HttpReply::updateOnNotModified(HttpReply const * freshRep)
+ {
+     assert(freshRep);
+ 
+     /* clean cache */
+     hdrCacheClean();
+     /* update raw headers */
+-    header.update(&freshRep->header,
+-                  (const HttpHeaderMask *) &Denied304HeadersMask);
++    header.update(&freshRep->header);
+ 
+     header.compact();
+     /* init cache */
+     hdrCacheInit();
+ }
+ 
+ /* internal routines */
+ 
+ time_t
+ HttpReply::hdrExpirationTime()
+ {
+     /* The s-maxage and max-age directive takes priority over Expires */
+ 
+     if (cache_control) {
+         if (date >= 0) {
+             if (cache_control->hasSMaxAge())
+                 return date + cache_control->sMaxAge();
+ 
+             if (cache_control->hasMaxAge())
+                 return date + cache_control->maxAge();
+         } else {
+             /*
+              * Conservatively handle the case when we have a max-age
+              * header, but no Date for reference?
+              */
+ 
+             if (cache_control->hasSMaxAge())
+                 return squid_curtime;
+ 
+             if (cache_control->hasMaxAge())
+
+=== modified file 'src/adaptation/History.cc'
+--- src/adaptation/History.cc	2016-01-01 00:12:18 +0000
++++ src/adaptation/History.cc	2016-06-21 14:14:13 +0000
+@@ -123,61 +123,61 @@
+     if (theXxName.size() <= 0)
+         return false;
+ 
+     name = theXxName;
+     value = theXxValue;
+     return true;
+ }
+ 
+ void Adaptation::History::updateNextServices(const String &services)
+ {
+     if (theNextServices != TheNullServices)
+         debugs(93,3, HERE << "old services: " << theNextServices);
+     debugs(93,3, HERE << "new services: " << services);
+     Must(services != TheNullServices);
+     theNextServices = services;
+ }
+ 
+ bool Adaptation::History::extractNextServices(String &value)
+ {
+     if (theNextServices == TheNullServices)
+         return false;
+ 
+     value = theNextServices;
+     theNextServices = TheNullServices; // prevents resetting the plan twice
+     return true;
+ }
+ 
+ void Adaptation::History::recordMeta(const HttpHeader *lm)
+ {
+     lastMeta.clean();
+-    lastMeta.update(lm, NULL);
++    lastMeta.update(lm);
+ 
+-    allMeta.update(lm, NULL);
++    allMeta.update(lm);
+     allMeta.compact();
+ }
+ 
+ void
+ Adaptation::History::recordAdaptationService(SBuf &srvId)
+ {
+     theAdaptationServices.push_back(srvId);
+ }
+ 
+ void
+ Adaptation::History::setFutureServices(const DynamicGroupCfg &services)
+ {
+     if (!theFutureServices.empty())
+         debugs(93,3, HERE << "old future services: " << theFutureServices);
+     debugs(93,3, HERE << "new future services: " << services);
+     theFutureServices = services; // may be empty
+ }
+ 
+ bool Adaptation::History::extractFutureServices(DynamicGroupCfg &value)
+ {
+     if (theFutureServices.empty())
+         return false;
+ 
+     value = theFutureServices;
+     theFutureServices.clear();
+     return true;
+ }
+ 
+
+=== modified file 'src/client_side_request.cc'
+--- src/client_side_request.cc	2016-05-28 07:46:14 +0000
++++ src/client_side_request.cc	2016-06-21 14:14:39 +0000
+@@ -330,61 +330,61 @@
+         http->al->cache.start_time = current_time;
+     /* this is only used to adjust the connection offset in client_side.c */
+     http->req_sz = 0;
+     tempBuffer.length = taillen;
+     tempBuffer.data = tailbuf;
+     /* client stream setup */
+     clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, new clientReplyContext(http), streamcallback,
+                      streamdetach, streamdata, tempBuffer);
+     /* make it visible in the 'current acctive requests list' */
+     /* Set flags */
+     /* internal requests only makes sense in an
+      * accelerator today. TODO: accept flags ? */
+     http->flags.accel = true;
+     /* allow size for url rewriting */
+     url_sz = strlen(url) + Config.appendDomainLen + 5;
+     http->uri = (char *)xcalloc(url_sz, 1);
+     strcpy(http->uri, url);
+ 
+     if ((request = HttpRequest::CreateFromUrl(http->uri, method)) == NULL) {
+         debugs(85, 5, "Invalid URL: " << http->uri);
+         return -1;
+     }
+ 
+     /*
+      * now update the headers in request with our supplied headers. urlParse
+      * should return a blank header set, but we use Update to be sure of
+      * correctness.
+      */
+     if (header)
+-        request->header.update(header, NULL);
++        request->header.update(header);
+ 
+     http->log_uri = xstrdup(urlCanonicalClean(request));
+ 
+     /* http struct now ready */
+ 
+     /*
+      * build new header list *? TODO
+      */
+     request->flags.accelerated = http->flags.accel;
+ 
+     request->flags.internalClient = true;
+ 
+     /* this is an internally created
+      * request, not subject to acceleration
+      * target overrides */
+     /*
+      * FIXME? Do we want to detect and handle internal requests of internal
+      * objects ?
+      */
+ 
+     /* Internally created requests cannot have bodies today */
+     request->content_length = 0;
+ 
+     request->client_addr.setNoAddr();
+ 
+ #if FOLLOW_X_FORWARDED_FOR
+     request->indirect_client_addr.setNoAddr();
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+ 
+     request->my_addr.setNoAddr();   /* undefined for internal requests */
+
+=== modified file 'src/http/RegisteredHeadersHash.cci'
+--- src/http/RegisteredHeadersHash.cci	2016-03-11 17:52:03 +0000
++++ src/http/RegisteredHeadersHash.cci	2016-06-21 15:26:50 +0000
+@@ -155,222 +155,222 @@
+     case 1:
+         hval += asso_values[(unsigned char)str[0]];
+         break;
+     }
+     return hval + asso_values[(unsigned char)str[len - 1]];
+ }
+ 
+ static const unsigned char lengthtable[] =
+ {
+     0,  0,  0,  0,  0,  0,  0,  5,  3,  7,  2,  3,  0,  5,
+     6,  7, 13,  6,  9,  9, 11,  6,  6,  4, 15,  7,  6,  7,
+     8, 13, 13,  8,  6, 12,  4, 12,  7, 18, 18, 10, 13,  7,
+     13, 16,  0, 19,  4, 16, 13, 10,  5, 13, 17, 10, 16, 20,
+     17,  6, 19, 16, 14, 11,  8,  4,  6,  4, 10, 18, 15,  3,
+     4, 19, 13, 14, 10, 14, 13, 12, 15, 14, 15, 12, 11, 10,
+     9, 10,  7, 15, 19, 17,  0, 13, 16, 25,  0,  0,  0,  0,
+     0,  0, 21,  0,  0,  0,  0,  0,  0,  0,  7, 13,  0,  0,
+     0, 11
+ };
+ 
+ static const struct HeaderTableRecord HttpHeaderDefinitionsTable[] =
+ {
+     {""}, {""}, {""}, {""}, {""}, {""}, {""},
+ #line 78 "RegisteredHeadersHash.gperf"
+     {"Range", Http::HdrType::RANGE, Http::HdrFieldType::ftPRange, HdrKind::RequestHeader},
+ #line 31 "RegisteredHeadersHash.gperf"
+     {"Age", Http::HdrType::AGE, Http::HdrFieldType::ftInt, HdrKind::ReplyHeader},
+ #line 79 "RegisteredHeadersHash.gperf"
+     {"Referer", Http::HdrType::REFERER, Http::HdrFieldType::ftStr, HdrKind::RequestHeader},
+ #line 85 "RegisteredHeadersHash.gperf"
+-    {"TE", Http::HdrType::TE, Http::HdrFieldType::ftStr, HdrKind::RequestHeader|HdrKind::HopByHopHeader|HdrKind::Denied304Header},
++    {"TE", Http::HdrType::TE, Http::HdrFieldType::ftStr, HdrKind::RequestHeader|HdrKind::HopByHopHeader},
+ #line 94 "RegisteredHeadersHash.gperf"
+     {"Via", Http::HdrType::VIA, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader},
+     {""},
+ #line 86 "RegisteredHeadersHash.gperf"
+     {"Title", Http::HdrType::TITLE, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 51 "RegisteredHeadersHash.gperf"
+     {"Expect", Http::HdrType::EXPECT, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader},
+ #line 87 "RegisteredHeadersHash.gperf"
+-    {"Trailer", Http::HdrType::TRAILER, Http::HdrFieldType::ftStr, HdrKind::HopByHopHeader|HdrKind::Denied304Header},
++    {"Trailer", Http::HdrType::TRAILER, Http::HdrFieldType::ftStr, HdrKind::HopByHopHeader},
+ #line 80 "RegisteredHeadersHash.gperf"
+     {"Request-Range", Http::HdrType::REQUEST_RANGE, Http::HdrFieldType::ftPRange, HdrKind::None},
+ #line 26 "RegisteredHeadersHash.gperf"
+     {"Accept", Http::HdrType::ACCEPT, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader},
+ #line 89 "RegisteredHeadersHash.gperf"
+     {"Translate", Http::HdrType::TRANSLATE, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 69 "RegisteredHeadersHash.gperf"
+     {"Negotiate", Http::HdrType::NEGOTIATE, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 81 "RegisteredHeadersHash.gperf"
+     {"Retry-After", Http::HdrType::RETRY_AFTER, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader},
+ #line 71 "RegisteredHeadersHash.gperf"
+     {"Pragma", Http::HdrType::PRAGMA, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader},
+ #line 47 "RegisteredHeadersHash.gperf"
+     {"Cookie", Http::HdrType::COOKIE, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 93 "RegisteredHeadersHash.gperf"
+     {"Vary", Http::HdrType::VARY, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader},
+ #line 29 "RegisteredHeadersHash.gperf"
+     {"Accept-Language", Http::HdrType::ACCEPT_LANGUAGE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader},
+ #line 109 "RegisteredHeadersHash.gperf"
+     {"FTP-Pre", Http::HdrType::FTP_PRE, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 82 "RegisteredHeadersHash.gperf"
+     {"Server", Http::HdrType::SERVER, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader},
+ #line 52 "RegisteredHeadersHash.gperf"
+     {"Expires", Http::HdrType::EXPIRES, Http::HdrFieldType::ftDate_1123, HdrKind::EntityHeader},
+ #line 60 "RegisteredHeadersHash.gperf"
+     {"If-Range", Http::HdrType::IF_RANGE, Http::HdrFieldType::ftDate_1123_or_ETag, HdrKind::None},
+ #line 35 "RegisteredHeadersHash.gperf"
+     {"Authorization", Http::HdrType::AUTHORIZATION, Http::HdrFieldType::ftStr, HdrKind::RequestHeader},
+ #line 45 "RegisteredHeadersHash.gperf"
+-    {"Content-Range", Http::HdrType::CONTENT_RANGE, Http::HdrFieldType::ftPContRange, HdrKind::EntityHeader|HdrKind::Denied304Header},
++    {"Content-Range", Http::HdrType::CONTENT_RANGE, Http::HdrFieldType::ftPContRange, HdrKind::EntityHeader},
+ #line 66 "RegisteredHeadersHash.gperf"
+     {"Location", Http::HdrType::LOCATION, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader},
+ #line 77 "RegisteredHeadersHash.gperf"
+     {"Public", Http::HdrType::PUBLIC, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader},
+ #line 38 "RegisteredHeadersHash.gperf"
+     {"Content-Base", Http::HdrType::CONTENT_BASE, Http::HdrFieldType::ftStr, HdrKind::EntityHeader},
+ #line 49 "RegisteredHeadersHash.gperf"
+     {"Date", Http::HdrType::DATE, Http::HdrFieldType::ftDate_1123, HdrKind::GeneralHeader},
+ #line 46 "RegisteredHeadersHash.gperf"
+-    {"Content-Type", Http::HdrType::CONTENT_TYPE, Http::HdrFieldType::ftStr, HdrKind::EntityHeader|HdrKind::Denied304Header},
++    {"Content-Type", Http::HdrType::CONTENT_TYPE, Http::HdrFieldType::ftStr, HdrKind::EntityHeader},
+ #line 91 "RegisteredHeadersHash.gperf"
+-    {"Upgrade", Http::HdrType::UPGRADE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader|HdrKind::Denied304Header},
++    {"Upgrade", Http::HdrType::UPGRADE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader},
+ #line 72 "RegisteredHeadersHash.gperf"
+-    {"Proxy-Authenticate", Http::HdrType::PROXY_AUTHENTICATE, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader|HdrKind::Denied304Header},
++    {"Proxy-Authenticate", Http::HdrType::PROXY_AUTHENTICATE, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader},
+ #line 33 "RegisteredHeadersHash.gperf"
+     {"Alternate-Protocol", Http::HdrType::ALTERNATE_PROTOCOL, Http::HdrFieldType::ftStr, HdrKind::HopByHopHeader},
+ #line 113 "RegisteredHeadersHash.gperf"
+     {"*INVALID*:", Http::HdrType::BAD_HDR, Http::HdrFieldType::ftInvalid, HdrKind::None},
+ #line 30 "RegisteredHeadersHash.gperf"
+     {"Accept-Ranges", Http::HdrType::ACCEPT_RANGES, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader},
+ #line 97 "RegisteredHeadersHash.gperf"
+     {"X-Cache", Http::HdrType::X_CACHE, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader},
+ #line 76 "RegisteredHeadersHash.gperf"
+     {"Proxy-support", Http::HdrType::PROXY_SUPPORT, Http::HdrFieldType::ftStr, HdrKind::ListHeader},
+ #line 75 "RegisteredHeadersHash.gperf"
+     {"Proxy-Connection", Http::HdrType::PROXY_CONNECTION, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader},
+     {""},
+ #line 74 "RegisteredHeadersHash.gperf"
+-    {"Proxy-Authorization", Http::HdrType::PROXY_AUTHORIZATION, Http::HdrFieldType::ftStr, HdrKind::RequestHeader|HdrKind::HopByHopHeader|HdrKind::Denied304Header},
++    {"Proxy-Authorization", Http::HdrType::PROXY_AUTHORIZATION, Http::HdrFieldType::ftStr, HdrKind::RequestHeader|HdrKind::HopByHopHeader},
+ #line 55 "RegisteredHeadersHash.gperf"
+     {"Host", Http::HdrType::HOST, Http::HdrFieldType::ftStr, HdrKind::RequestHeader},
+ #line 41 "RegisteredHeadersHash.gperf"
+-    {"Content-Language", Http::HdrType::CONTENT_LANGUAGE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader|HdrKind::Denied304Header},
++    {"Content-Language", Http::HdrType::CONTENT_LANGUAGE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader},
+ #line 101 "RegisteredHeadersHash.gperf"
+     {"X-Squid-Error", Http::HdrType::X_SQUID_ERROR, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader},
+ #line 83 "RegisteredHeadersHash.gperf"
+     {"Set-Cookie", Http::HdrType::SET_COOKIE, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader},
+ #line 32 "RegisteredHeadersHash.gperf"
+-    {"Allow", Http::HdrType::ALLOW, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader|HdrKind::Denied304Header},
++    {"Allow", Http::HdrType::ALLOW, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader},
+ #line 36 "RegisteredHeadersHash.gperf"
+     {"Cache-Control", Http::HdrType::CACHE_CONTROL, Http::HdrFieldType::ftPCc, HdrKind::ListHeader|HdrKind::GeneralHeader},
+ #line 105 "RegisteredHeadersHash.gperf"
+     {"Surrogate-Control", Http::HdrType::SURROGATE_CONTROL, Http::HdrFieldType::ftPSc, HdrKind::ListHeader|HdrKind::ReplyHeader},
+ #line 92 "RegisteredHeadersHash.gperf"
+     {"User-Agent", Http::HdrType::USER_AGENT, Http::HdrFieldType::ftStr, HdrKind::RequestHeader},
+ #line 43 "RegisteredHeadersHash.gperf"
+     {"Content-Location", Http::HdrType::CONTENT_LOCATION, Http::HdrFieldType::ftStr, HdrKind::EntityHeader},
+ #line 104 "RegisteredHeadersHash.gperf"
+     {"Surrogate-Capability", Http::HdrType::SURROGATE_CAPABILITY, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader},
+ #line 58 "RegisteredHeadersHash.gperf"
+     {"If-Modified-Since", Http::HdrType::IF_MODIFIED_SINCE, Http::HdrFieldType::ftDate_1123, HdrKind::RequestHeader},
+ #line 112 "RegisteredHeadersHash.gperf"
+     {"Other:", Http::HdrType::OTHER, Http::HdrFieldType::ftStr, HdrKind::EntityHeader},
+ #line 61 "RegisteredHeadersHash.gperf"
+     {"If-Unmodified-Since", Http::HdrType::IF_UNMODIFIED_SINCE, Http::HdrFieldType::ftDate_1123, HdrKind::None},
+ #line 96 "RegisteredHeadersHash.gperf"
+     {"WWW-Authenticate", Http::HdrType::WWW_AUTHENTICATE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader},
+ #line 27 "RegisteredHeadersHash.gperf"
+     {"Accept-Charset", Http::HdrType::ACCEPT_CHARSET, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader},
+ #line 107 "RegisteredHeadersHash.gperf"
+     {"FTP-Command", Http::HdrType::FTP_COMMAND, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 57 "RegisteredHeadersHash.gperf"
+     {"If-Match", Http::HdrType::IF_MATCH, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader},
+ #line 54 "RegisteredHeadersHash.gperf"
+     {"From", Http::HdrType::FROM, Http::HdrFieldType::ftStr, HdrKind::RequestHeader},
+ #line 70 "RegisteredHeadersHash.gperf"
+     {"Origin", Http::HdrType::ORIGIN, Http::HdrFieldType::ftStr, HdrKind::RequestHeader},
+ #line 50 "RegisteredHeadersHash.gperf"
+     {"ETag", Http::HdrType::ETAG, Http::HdrFieldType::ftETag, HdrKind::EntityHeader},
+ #line 62 "RegisteredHeadersHash.gperf"
+-    {"Keep-Alive", Http::HdrType::KEEP_ALIVE, Http::HdrFieldType::ftStr, HdrKind::HopByHopHeader|HdrKind::Denied304Header},
++    {"Keep-Alive", Http::HdrType::KEEP_ALIVE, Http::HdrFieldType::ftStr, HdrKind::HopByHopHeader},
+ #line 102 "RegisteredHeadersHash.gperf"
+     {"X-Accelerator-Vary", Http::HdrType::HDR_X_ACCELERATOR_VARY, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader},
+ #line 103 "RegisteredHeadersHash.gperf"
+     {"X-Next-Services", Http::HdrType::X_NEXT_SERVICES, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader},
+ #line 63 "RegisteredHeadersHash.gperf"
+     {"Key", Http::HdrType::KEY, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader},
+ #line 65 "RegisteredHeadersHash.gperf"
+     {"Link", Http::HdrType::LINK, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader},
+ #line 39 "RegisteredHeadersHash.gperf"
+     {"Content-Disposition", Http::HdrType::CONTENT_DISPOSITION, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 100 "RegisteredHeadersHash.gperf"
+     {"X-Request-URI", Http::HdrType::X_REQUEST_URI, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader},
+ #line 98 "RegisteredHeadersHash.gperf"
+     {"X-Cache-Lookup", Http::HdrType::X_CACHE_LOOKUP, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader},
+ #line 110 "RegisteredHeadersHash.gperf"
+     {"FTP-Status", Http::HdrType::FTP_STATUS, Http::HdrFieldType::ftInt, HdrKind::None},
+ #line 56 "RegisteredHeadersHash.gperf"
+     {"HTTP2-Settings", Http::HdrType::HTTP2_SETTINGS, Http::HdrFieldType::ftStr, HdrKind::RequestHeader|HdrKind::HopByHopHeader},
+ #line 64 "RegisteredHeadersHash.gperf"
+     {"Last-Modified", Http::HdrType::LAST_MODIFIED, Http::HdrFieldType::ftDate_1123, HdrKind::EntityHeader},
+ #line 67 "RegisteredHeadersHash.gperf"
+     {"Max-Forwards", Http::HdrType::MAX_FORWARDS, Http::HdrFieldType::ftInt64, HdrKind::RequestHeader},
+ #line 99 "RegisteredHeadersHash.gperf"
+     {"X-Forwarded-For", Http::HdrType::X_FORWARDED_FOR, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader},
+ #line 42 "RegisteredHeadersHash.gperf"
+-    {"Content-Length", Http::HdrType::CONTENT_LENGTH, Http::HdrFieldType::ftInt64, HdrKind::EntityHeader|HdrKind::Denied304Header},
++    {"Content-Length", Http::HdrType::CONTENT_LENGTH, Http::HdrFieldType::ftInt64, HdrKind::EntityHeader},
+ #line 106 "RegisteredHeadersHash.gperf"
+     {"Front-End-Https", Http::HdrType::FRONT_END_HTTPS, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 68 "RegisteredHeadersHash.gperf"
+     {"Mime-Version", Http::HdrType::MIME_VERSION, Http::HdrFieldType::ftStr, HdrKind::GeneralHeader},
+ #line 44 "RegisteredHeadersHash.gperf"
+-    {"Content-MD5", Http::HdrType::CONTENT_MD5, Http::HdrFieldType::ftStr, HdrKind::EntityHeader|HdrKind::Denied304Header},
++    {"Content-MD5", Http::HdrType::CONTENT_MD5, Http::HdrFieldType::ftStr, HdrKind::EntityHeader},
+ #line 37 "RegisteredHeadersHash.gperf"
+-    {"Connection", Http::HdrType::CONNECTION, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader|HdrKind::Denied304Header},
++    {"Connection", Http::HdrType::CONNECTION, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader},
+ #line 53 "RegisteredHeadersHash.gperf"
+     {"Forwarded", Http::HdrType::FORWARDED, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader},
+ #line 111 "RegisteredHeadersHash.gperf"
+     {"FTP-Reason", Http::HdrType::FTP_REASON, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 48 "RegisteredHeadersHash.gperf"
+     {"Cookie2", Http::HdrType::COOKIE2, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 28 "RegisteredHeadersHash.gperf"
+     {"Accept-Encoding", Http::HdrType::ACCEPT_ENCODING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader|HdrKind::ReplyHeader},
+ #line 34 "RegisteredHeadersHash.gperf"
+     {"Authentication-Info", Http::HdrType::AUTHENTICATION_INFO, Http::HdrFieldType::ftStr, HdrKind::ListHeader},
+ #line 88 "RegisteredHeadersHash.gperf"
+-    {"Transfer-Encoding", Http::HdrType::TRANSFER_ENCODING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader|HdrKind::Denied304Header},
++    {"Transfer-Encoding", Http::HdrType::TRANSFER_ENCODING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader},
+     {""},
+ #line 108 "RegisteredHeadersHash.gperf"
+     {"FTP-Arguments", Http::HdrType::FTP_ARGUMENTS, Http::HdrFieldType::ftStr, HdrKind::None},
+ #line 40 "RegisteredHeadersHash.gperf"
+-    {"Content-Encoding", Http::HdrType::CONTENT_ENCODING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader|HdrKind::Denied304Header},
++    {"Content-Encoding", Http::HdrType::CONTENT_ENCODING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader},
+ #line 73 "RegisteredHeadersHash.gperf"
+     {"Proxy-Authentication-Info", Http::HdrType::PROXY_AUTHENTICATION_INFO, Http::HdrFieldType::ftStr, HdrKind::ListHeader},
+     {""}, {""}, {""}, {""}, {""}, {""},
+ #line 90 "RegisteredHeadersHash.gperf"
+     {"Unless-Modified-Since", Http::HdrType::UNLESS_MODIFIED_SINCE, Http::HdrFieldType::ftStr, HdrKind::None},
+     {""}, {""}, {""}, {""}, {""}, {""}, {""},
+ #line 95 "RegisteredHeadersHash.gperf"
+     {"Warning", Http::HdrType::WARNING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader},
+ #line 59 "RegisteredHeadersHash.gperf"
+     {"If-None-Match", Http::HdrType::IF_NONE_MATCH, Http::HdrFieldType::ftStr, HdrKind::ListHeader},
+     {""}, {""}, {""},
+ #line 84 "RegisteredHeadersHash.gperf"
+     {"Set-Cookie2", Http::HdrType::SET_COOKIE2, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader}
+ };
+ 
+ const struct HeaderTableRecord *
+ HttpHeaderHashTable::lookup (const char *str, unsigned int len)
+ {
+     if (len <= MAX_WORD_LENGTH && len >= MIN_WORD_LENGTH)
+     {
+         int key = HttpHeaderHash (str, len);
+ 
+         if (key <= MAX_HASH_VALUE && key >= 0)
+             if (len == lengthtable[key])
+             {
+                 const char *s = HttpHeaderDefinitionsTable[key].name;
+ 
+                 if ((((unsigned char)*str ^ (unsigned char)*s) & ~32) == 0 && !gperf_case_memcmp (str, s, len))
+                     return &HttpHeaderDefinitionsTable[key];
+             }
+
+=== modified file 'src/http/RegisteredHeadersHash.gperf'
+--- src/http/RegisteredHeadersHash.gperf	2016-03-11 17:52:03 +0000
++++ src/http/RegisteredHeadersHash.gperf	2016-06-21 15:27:19 +0000
+@@ -2,113 +2,113 @@
+ /* AUTO GENERATED FROM RegisteredHeadersHash.gperf. DO NOT EDIT */
+ 
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ %}
+ %language=C++
+ %define hash-function-name HttpHeaderHash
+ %define lookup-function-name lookup
+ %define class-name HttpHeaderHashTable
+ %define word-array-name HttpHeaderDefinitionsTable
+ %compare-lengths
+ %compare-strncmp
+ %readonly-tables
+ %enum
+ %global-table
+ %ignore-case
+ %struct-type 
+ struct HeaderTableRecord;
+ %%
+ Accept, Http::HdrType::ACCEPT, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader
+ Accept-Charset, Http::HdrType::ACCEPT_CHARSET, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader
+ Accept-Encoding, Http::HdrType::ACCEPT_ENCODING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader|HdrKind::ReplyHeader
+ Accept-Language, Http::HdrType::ACCEPT_LANGUAGE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader
+ Accept-Ranges, Http::HdrType::ACCEPT_RANGES, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader
+ Age, Http::HdrType::AGE, Http::HdrFieldType::ftInt, HdrKind::ReplyHeader
+-Allow, Http::HdrType::ALLOW, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader|HdrKind::Denied304Header
++Allow, Http::HdrType::ALLOW, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader
+ Alternate-Protocol, Http::HdrType::ALTERNATE_PROTOCOL, Http::HdrFieldType::ftStr, HdrKind::HopByHopHeader
+ Authentication-Info, Http::HdrType::AUTHENTICATION_INFO, Http::HdrFieldType::ftStr, HdrKind::ListHeader
+ Authorization, Http::HdrType::AUTHORIZATION, Http::HdrFieldType::ftStr, HdrKind::RequestHeader
+ Cache-Control, Http::HdrType::CACHE_CONTROL, Http::HdrFieldType::ftPCc, HdrKind::ListHeader|HdrKind::GeneralHeader
+-Connection, Http::HdrType::CONNECTION, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader|HdrKind::Denied304Header
++Connection, Http::HdrType::CONNECTION, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader
+ Content-Base, Http::HdrType::CONTENT_BASE, Http::HdrFieldType::ftStr, HdrKind::EntityHeader
+ Content-Disposition, Http::HdrType::CONTENT_DISPOSITION, Http::HdrFieldType::ftStr, HdrKind::None
+-Content-Encoding, Http::HdrType::CONTENT_ENCODING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader|HdrKind::Denied304Header
+-Content-Language, Http::HdrType::CONTENT_LANGUAGE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader|HdrKind::Denied304Header
+-Content-Length, Http::HdrType::CONTENT_LENGTH, Http::HdrFieldType::ftInt64, HdrKind::EntityHeader|HdrKind::Denied304Header
++Content-Encoding, Http::HdrType::CONTENT_ENCODING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader
++Content-Language, Http::HdrType::CONTENT_LANGUAGE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader
++Content-Length, Http::HdrType::CONTENT_LENGTH, Http::HdrFieldType::ftInt64, HdrKind::EntityHeader
+ Content-Location, Http::HdrType::CONTENT_LOCATION, Http::HdrFieldType::ftStr, HdrKind::EntityHeader
+-Content-MD5, Http::HdrType::CONTENT_MD5, Http::HdrFieldType::ftStr, HdrKind::EntityHeader|HdrKind::Denied304Header
+-Content-Range, Http::HdrType::CONTENT_RANGE, Http::HdrFieldType::ftPContRange, HdrKind::EntityHeader|HdrKind::Denied304Header
+-Content-Type, Http::HdrType::CONTENT_TYPE, Http::HdrFieldType::ftStr, HdrKind::EntityHeader|HdrKind::Denied304Header
++Content-MD5, Http::HdrType::CONTENT_MD5, Http::HdrFieldType::ftStr, HdrKind::EntityHeader
++Content-Range, Http::HdrType::CONTENT_RANGE, Http::HdrFieldType::ftPContRange, HdrKind::EntityHeader
++Content-Type, Http::HdrType::CONTENT_TYPE, Http::HdrFieldType::ftStr, HdrKind::EntityHeader
+ Cookie, Http::HdrType::COOKIE, Http::HdrFieldType::ftStr, HdrKind::None
+ Cookie2, Http::HdrType::COOKIE2, Http::HdrFieldType::ftStr, HdrKind::None
+ Date, Http::HdrType::DATE, Http::HdrFieldType::ftDate_1123, HdrKind::GeneralHeader
+ ETag, Http::HdrType::ETAG, Http::HdrFieldType::ftETag, HdrKind::EntityHeader
+ Expect, Http::HdrType::EXPECT, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader
+ Expires, Http::HdrType::EXPIRES, Http::HdrFieldType::ftDate_1123, HdrKind::EntityHeader
+ Forwarded, Http::HdrType::FORWARDED, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader
+ From, Http::HdrType::FROM, Http::HdrFieldType::ftStr, HdrKind::RequestHeader
+ Host, Http::HdrType::HOST, Http::HdrFieldType::ftStr, HdrKind::RequestHeader
+ HTTP2-Settings, Http::HdrType::HTTP2_SETTINGS, Http::HdrFieldType::ftStr, HdrKind::RequestHeader|HdrKind::HopByHopHeader
+ If-Match, Http::HdrType::IF_MATCH, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader
+ If-Modified-Since, Http::HdrType::IF_MODIFIED_SINCE, Http::HdrFieldType::ftDate_1123, HdrKind::RequestHeader
+ If-None-Match, Http::HdrType::IF_NONE_MATCH, Http::HdrFieldType::ftStr, HdrKind::ListHeader
+ If-Range, Http::HdrType::IF_RANGE, Http::HdrFieldType::ftDate_1123_or_ETag, HdrKind::None
+ If-Unmodified-Since, Http::HdrType::IF_UNMODIFIED_SINCE, Http::HdrFieldType::ftDate_1123, HdrKind::None
+-Keep-Alive, Http::HdrType::KEEP_ALIVE, Http::HdrFieldType::ftStr, HdrKind::HopByHopHeader|HdrKind::Denied304Header
++Keep-Alive, Http::HdrType::KEEP_ALIVE, Http::HdrFieldType::ftStr, HdrKind::HopByHopHeader
+ Key, Http::HdrType::KEY, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader
+ Last-Modified, Http::HdrType::LAST_MODIFIED, Http::HdrFieldType::ftDate_1123, HdrKind::EntityHeader
+ Link, Http::HdrType::LINK, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::EntityHeader
+ Location, Http::HdrType::LOCATION, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+ Max-Forwards, Http::HdrType::MAX_FORWARDS, Http::HdrFieldType::ftInt64, HdrKind::RequestHeader
+ Mime-Version, Http::HdrType::MIME_VERSION, Http::HdrFieldType::ftStr, HdrKind::GeneralHeader
+ Negotiate, Http::HdrType::NEGOTIATE, Http::HdrFieldType::ftStr, HdrKind::None
+ Origin, Http::HdrType::ORIGIN, Http::HdrFieldType::ftStr, HdrKind::RequestHeader
+ Pragma, Http::HdrType::PRAGMA, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader
+-Proxy-Authenticate, Http::HdrType::PROXY_AUTHENTICATE, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader|HdrKind::Denied304Header
++Proxy-Authenticate, Http::HdrType::PROXY_AUTHENTICATE, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+ Proxy-Authentication-Info, Http::HdrType::PROXY_AUTHENTICATION_INFO, Http::HdrFieldType::ftStr, HdrKind::ListHeader
+-Proxy-Authorization, Http::HdrType::PROXY_AUTHORIZATION, Http::HdrFieldType::ftStr, HdrKind::RequestHeader|HdrKind::HopByHopHeader|HdrKind::Denied304Header
++Proxy-Authorization, Http::HdrType::PROXY_AUTHORIZATION, Http::HdrFieldType::ftStr, HdrKind::RequestHeader|HdrKind::HopByHopHeader
+ Proxy-Connection, Http::HdrType::PROXY_CONNECTION, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader
+ Proxy-support, Http::HdrType::PROXY_SUPPORT, Http::HdrFieldType::ftStr, HdrKind::ListHeader
+ Public, Http::HdrType::PUBLIC, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+ Range, Http::HdrType::RANGE, Http::HdrFieldType::ftPRange, HdrKind::RequestHeader
+ Referer, Http::HdrType::REFERER, Http::HdrFieldType::ftStr, HdrKind::RequestHeader
+ Request-Range, Http::HdrType::REQUEST_RANGE, Http::HdrFieldType::ftPRange, HdrKind::None
+ Retry-After, Http::HdrType::RETRY_AFTER, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+ Server, Http::HdrType::SERVER, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+ Set-Cookie, Http::HdrType::SET_COOKIE, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+ Set-Cookie2, Http::HdrType::SET_COOKIE2, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+-TE, Http::HdrType::TE, Http::HdrFieldType::ftStr, HdrKind::RequestHeader|HdrKind::HopByHopHeader|HdrKind::Denied304Header
++TE, Http::HdrType::TE, Http::HdrFieldType::ftStr, HdrKind::RequestHeader|HdrKind::HopByHopHeader
+ Title, Http::HdrType::TITLE, Http::HdrFieldType::ftStr, HdrKind::None
+-Trailer, Http::HdrType::TRAILER, Http::HdrFieldType::ftStr, HdrKind::HopByHopHeader|HdrKind::Denied304Header
+-Transfer-Encoding, Http::HdrType::TRANSFER_ENCODING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader|HdrKind::Denied304Header
++Trailer, Http::HdrType::TRAILER, Http::HdrFieldType::ftStr, HdrKind::HopByHopHeader
++Transfer-Encoding, Http::HdrType::TRANSFER_ENCODING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader
+ Translate, Http::HdrType::TRANSLATE, Http::HdrFieldType::ftStr, HdrKind::None
+ Unless-Modified-Since, Http::HdrType::UNLESS_MODIFIED_SINCE, Http::HdrFieldType::ftStr, HdrKind::None
+-Upgrade, Http::HdrType::UPGRADE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader|HdrKind::Denied304Header
++Upgrade, Http::HdrType::UPGRADE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader|HdrKind::HopByHopHeader
+ User-Agent, Http::HdrType::USER_AGENT, Http::HdrFieldType::ftStr, HdrKind::RequestHeader
+ Vary, Http::HdrType::VARY, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader
+ Via, Http::HdrType::VIA, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader
+ Warning, Http::HdrType::WARNING, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader
+ WWW-Authenticate, Http::HdrType::WWW_AUTHENTICATE, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader
+ X-Cache, Http::HdrType::X_CACHE, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+ X-Cache-Lookup, Http::HdrType::X_CACHE_LOOKUP, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+ X-Forwarded-For, Http::HdrType::X_FORWARDED_FOR, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::GeneralHeader
+ X-Request-URI, Http::HdrType::X_REQUEST_URI, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+ X-Squid-Error, Http::HdrType::X_SQUID_ERROR, Http::HdrFieldType::ftStr, HdrKind::ReplyHeader
+ X-Accelerator-Vary, Http::HdrType::HDR_X_ACCELERATOR_VARY, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader
+ X-Next-Services, Http::HdrType::X_NEXT_SERVICES, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::ReplyHeader
+ Surrogate-Capability, Http::HdrType::SURROGATE_CAPABILITY, Http::HdrFieldType::ftStr, HdrKind::ListHeader|HdrKind::RequestHeader
+ Surrogate-Control, Http::HdrType::SURROGATE_CONTROL, Http::HdrFieldType::ftPSc, HdrKind::ListHeader|HdrKind::ReplyHeader
+ Front-End-Https, Http::HdrType::FRONT_END_HTTPS, Http::HdrFieldType::ftStr, HdrKind::None
+ FTP-Command, Http::HdrType::FTP_COMMAND, Http::HdrFieldType::ftStr, HdrKind::None
+ FTP-Arguments, Http::HdrType::FTP_ARGUMENTS, Http::HdrFieldType::ftStr, HdrKind::None
+ FTP-Pre, Http::HdrType::FTP_PRE, Http::HdrFieldType::ftStr, HdrKind::None
+ FTP-Status, Http::HdrType::FTP_STATUS, Http::HdrFieldType::ftInt, HdrKind::None
+ FTP-Reason, Http::HdrType::FTP_REASON, Http::HdrFieldType::ftStr, HdrKind::None
+ Other:, Http::HdrType::OTHER, Http::HdrFieldType::ftStr, HdrKind::EntityHeader
+ *INVALID*:, Http::HdrType::BAD_HDR, Http::HdrFieldType::ftInvalid, HdrKind::None
+ %%
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2016-04-22 11:39:23 +0000
++++ src/main.cc	2016-06-21 14:19:37 +0000
+@@ -1153,62 +1153,60 @@
+         WIN32_IpAddrChangeMonitorInit();
+     }
+ 
+ #endif
+ 
+     ipcache_init();
+ 
+     fqdncache_init();
+ 
+     parseEtcHosts();
+ 
+     Dns::Init();
+ 
+ #if USE_SSL_CRTD
+     Ssl::Helper::GetInstance()->Init();
+ #endif
+ 
+ #if USE_OPENSSL
+     if (Ssl::CertValidationHelper::GetInstance())
+         Ssl::CertValidationHelper::GetInstance()->Init();
+ #endif
+ 
+     redirectInit();
+ #if USE_AUTH
+     authenticateInit(&Auth::TheConfig);
+ #endif
+     externalAclInit();
+ 
+     httpHeaderInitModule(); /* must go before any header processing (e.g. the one in errorInitialize) */
+ 
+-    httpReplyInitModule();  /* must go before accepting replies */
+-
+     errorInitialize();
+ 
+     accessLogInit();
+ 
+ #if ICAP_CLIENT
+     icapLogOpen();
+ #endif
+ 
+ #if USE_IDENT
+     Ident::Init();
+ #endif
+ 
+ #if SQUID_SNMP
+ 
+     snmpInit();
+ 
+ #endif
+ #if MALLOC_DBG
+ 
+     malloc_debug(0, malloc_debug_level);
+ 
+ #endif
+ 
+     if (!configured_once) {
+         if (unlinkdNeeded())
+             unlinkdInit();
+ 
+         urlInitialize();
+         statInit();
+         storeInit();
+
+=== modified file 'src/tests/testRock.cc'
+--- src/tests/testRock.cc	2016-03-24 17:02:25 +0000
++++ src/tests/testRock.cc	2016-06-21 14:19:08 +0000
+@@ -119,62 +119,60 @@
+ testRock::commonInit()
+ {
+     static bool inited = false;
+ 
+     if (inited)
+         return;
+ 
+     StoreFileSystem::SetupAllFs();
+ 
+     Config.Store.avgObjectSize = 1024;
+     Config.Store.objectsPerBucket = 20;
+     Config.Store.maxObjectSize = 2048;
+ 
+     Config.store_dir_select_algorithm = xstrdup("round-robin");
+ 
+     Config.replPolicy = new RemovalPolicySettings;
+     Config.replPolicy->type = xstrdup("lru");
+     Config.replPolicy->args = NULL;
+ 
+     /* garh garh */
+     storeReplAdd("lru", createRemovalPolicy_lru);
+ 
+     visible_appname_string = xstrdup(APP_FULLNAME);
+ 
+     Mem::Init();
+ 
+     comm_init();
+ 
+     httpHeaderInitModule(); /* must go before any header processing (e.g. the one in errorInitialize) */
+ 
+-    httpReplyInitModule();  /* must go before accepting replies */
+-
+     mem_policy = createRemovalPolicy(Config.replPolicy);
+ 
+     inited = true;
+ }
+ 
+ void
+ testRock::storeInit()
+ {
+     /* ok, ready to use */
+     Store::Root().init();
+ 
+     /* rebuild is a scheduled event */
+     StockEventLoop loop;
+ 
+     /* our swapdir must be scheduled to rebuild */
+     CPPUNIT_ASSERT_EQUAL(2, StoreController::store_dirs_rebuilding);
+ 
+     loop.run();
+ 
+     /* cannot use loop.run(); as the loop will never idle: the store-dir
+      * clean() scheduled event prevents it
+      */
+ 
+     /* nothing left to rebuild */
+     CPPUNIT_ASSERT_EQUAL(0, StoreController::store_dirs_rebuilding);
+ }
+ 
+ static const char *
+ storeId(const int i)
+ {
+
+=== modified file 'src/tests/testUfs.cc'
+--- src/tests/testUfs.cc	2016-01-15 06:47:59 +0000
++++ src/tests/testUfs.cc	2016-06-21 14:19:24 +0000
+@@ -49,62 +49,60 @@
+ }
+ 
+ void
+ testUfs::commonInit()
+ {
+     static bool inited = false;
+ 
+     if (inited)
+         return;
+ 
+     Config.Store.avgObjectSize = 1024;
+     Config.Store.objectsPerBucket = 20;
+     Config.Store.maxObjectSize = 2048;
+ 
+     Config.store_dir_select_algorithm = xstrdup("round-robin");
+ 
+     Config.replPolicy = new RemovalPolicySettings;
+     Config.replPolicy->type = xstrdup("lru");
+ 
+     Config.memShared.defaultTo(false);
+ 
+     /* garh garh */
+     storeReplAdd("lru", createRemovalPolicy_lru);
+ 
+     Mem::Init();
+ 
+     comm_init();
+ 
+     httpHeaderInitModule(); /* must go before any header processing (e.g. the one in errorInitialize) */
+ 
+-    httpReplyInitModule();  /* must go before accepting replies */
+-
+     inited = true;
+ }
+ 
+ void
+ testUfs::testUfsSearch()
+ {
+     /* test sequence
+      * make a valid working ufs swapdir
+      * put two entries in it and sync logs
+      * search the ufs dir
+      * check the entries we find are what we want
+      */
+ 
+     if (0 > system ("rm -rf " TESTDIR))
+         throw std::runtime_error("Failed to clean test work directory");
+ 
+     Store::Init();
+ 
+     MySwapDirPointer aStore (new Fs::Ufs::UFSSwapDir("ufs", "Blocking"));
+ 
+     aStore->IO = new Fs::Ufs::UFSStrategy(DiskIOModule::Find("Blocking")->createStrategy());
+ 
+     addSwapDir(aStore);
+ 
+     commonInit();
+     mem_policy = createRemovalPolicy(Config.replPolicy);
+ 
+     char *path=xstrdup(TESTDIR);
+ 
+     char *config_line=xstrdup("100 1 1");
+

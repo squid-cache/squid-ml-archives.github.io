@@ -1,0 +1,270 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] TidyPointer removal
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20TidyPointer%20removal&In-Reply-To=%3C577EE499.8060806%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006133.html">
+   <LINK REL="Next"  HREF="006136.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] TidyPointer removal</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20TidyPointer%20removal&In-Reply-To=%3C577EE499.8060806%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] TidyPointer removal">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Thu Jul  7 23:24:09 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006133.html">[squid-dev] [PATCH] TidyPointer removal
+</A></li>
+        <LI>Next message: <A HREF="006136.html">[squid-dev] [PATCH] TidyPointer removal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6135">[ date ]</a>
+              <a href="thread.html#6135">[ thread ]</a>
+              <a href="subject.html#6135">[ subject ]</a>
+              <a href="author.html#6135">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 07/07/2016 01:40 PM, Amos Jeffries wrote:
+&gt;<i> On 4/07/2016 5:39 a.m., Alex Rousskov wrote:
+</I>&gt;&gt;&gt;<i> +    /// Reset raw pointer - delete last one and save new one.
+</I>&gt;&gt;&gt;<i> +    void reset(T *t) {
+</I>&gt;&gt;&gt;<i> +        deletePointer();
+</I>&gt;&gt;&gt;<i> +        raw = t;
+</I>&gt;&gt;&gt;<i>      }
+</I>
+
+&gt;&gt;<i> I do not think we can have a reset() method like this because the
+</I>&gt;&gt;<i> standard shared_ptr::reset() has a very different semantics. Let's call
+</I>&gt;&gt;<i> this absorb(). This is like a raw pointer assignment operator, but we
+</I>&gt;&gt;<i> want to keep it &quot;explicit&quot; because we think this is a dangerous operation.
+</I>
+
+&gt;<i> What different semantics do you see in there?
+</I>
+Good question! This issue is confusing for me, so I apologize if this
+explanation is messy:
+
+Facts:
+
+* resetWithoutLocking(x) does not increment the reference counter for x.
+* resetAndLock(x) increments the reference counter for x.
+
+What does the standard shared_ptr::reset(x) method do?
+
+* If shared_ptr counts all references to x, internal and external, then
+shared_ptr::reset(x) is like our resetAndLock(x) -- it increments the
+counter.
+
+* If standard shared_ptr only counts external references, then
+shared_ptr::reset(x) is like our resetWithoutLocking(x) -- it does not
+increment the counter.
+
+This logic is totally flawed, on several levels, but this trap might
+help illustrating why I find this issue confusing.
+
+To fix our logic, we should not misrepresent what shared_ptr does
+internally, but look at its API instead. The standard API guarantees
+that the following sequence leads to object X destruction:
+
+  {
+      std::shared_ptr s;
+      X *x = createX();
+      s.reset(x);
+      // s is destroyed upon exiting its scope
+  }
+
+Which of our two LockingPointer::reset*() methods provides the same
+guarantee?
+
+The correct answer is: None! In our case, the reset*() caller has to
+know createX() details to call the right reset*() method, even though
+createX() returns a &quot;raw&quot; pointer that knows nothing about our
+LockingPointer. Similarly, the caller must know createX() details to
+decide whether it is safe to call the LockingPointer constructor!
+
+This mess happens because, in some cases, OpenSSL effectively returns an
+already managed pointer, even though it does not know about our
+LockingPointer. Or, in other words, it happens because we [have to]
+share the pointer management mechanism with OpenSSL, but that mechanism
+does not come in a form of a smart pointer -- it is hidden inside the X
+object itself.
+
+With a standard API, there is only one reset(x). In our case, we have to
+have two. Thus, none of them can be called reset()! We have to force the
+caller to make a choice, depending on the context (i.e., the source of x).
+
+BTW, your decision to name both methods reset*() is superior to my
+earlier suggestion to name them absorb() and reset(). Let's leave your
+reset*() names intact.
+
+We may also want to hide the constructor behind two static methods for
+similar reasons -- whether X is properly destructed in the following
+example depends on createX() details, and it really should not:
+
+  {
+      LockingPointer lp(createX());
+  }
+
+
+
+&gt;<i> +    void resetWithoutLocking(T *t) {
+</I>&gt;<i> +        unlock();
+</I>&gt;<i> +        raw = t;
+</I>&gt;<i>      }
+</I>&gt;<i>  
+</I>&gt;<i>      void resetAndLock(T *t) {
+</I>&gt;<i> +        if (t != get()) {
+</I>&gt;<i> +            resetWithoutLocking(t);
+</I>&gt;<i> +            lock(t);
+</I>&gt;<i> +        }
+</I>&gt;<i> +    }
+</I>
+We should probably add self-reset protection to both cases or to none.
+
+
+&gt;<i> +    void unlock() {
+</I>&gt;<i> +        if (raw)
+</I>&gt;<i> +            UnLocker(raw);
+</I>&gt;<i> +        raw = nullptr;
+</I>&gt;<i> +    }
+</I>
+Let's move assignment inside the if-statement to save a few CPU cycles.
+
+
+&gt;<i> +    T *raw; ///&lt; pointer to T object or nullptr
+</I>
+That description adds virtually no information. How about something like
+this: &quot;Normally, no other code will have this raw pointer. However,
+OpenSSL may keep raw pointers and manage their reference counts. When
+OpenSSL shares a pointer with us, the caller must not use LockingPointer
+constructor and must call resetAndLock().&quot;
+
+
+&gt;<i> +    explicit LockingPointer(T *t = nullptr): raw(t) {}
+</I>
+I recommend calling resetWithoutLocking() here even though it could
+waste a few CPU cycles. This is the only dangerous part remaining in the
+LockingPointer interface, and it may help being explicit here.
+
+
+&gt;<i>  typedef void* SessionPtr;
+</I>&gt;<i> +CtoCpp1(xfree, SessionPtr);
+</I>
+xfree() is already a C++ function and does not need wrapping, right?
+
+
+
+
+&gt;&gt;<i> Please also add a public clear(void) method that reset(t) will call
+</I>&gt;&gt;<i> instead of lock() when t is nil. Alternatively, add a reset(void) method
+</I>&gt;&gt;<i> with the same semantics as clear(void) -- that is what std::shared_ptr does.
+</I>&gt;<i> 
+</I>&gt;<i> I do not see any clear() method in shared_ptr documentation.
+</I>&gt;<i> &lt;<A HREF="http://en.cppreference.com/mwiki/index.php?title=Special%3ASearch&amp;search=clear%28%29">http://en.cppreference.com/mwiki/index.php?title=Special%3ASearch&amp;search=clear%28%29</A>&gt;
+</I>
+Yes, I know. As I said, they provide a reset(void) instead. If you think
+we should add reset(void) instead of clear(), let's add that, but please
+do add one instead of [ab]using reset*(nullptr).
+
+
+&gt;<i> + * The lock() method increments Object's reference counter.
+</I>&gt;<i> + *
+</I>&gt;<i> + * The unlock() method decrements Object's reference counter and destroys
+</I>&gt;<i> + * the object when the counter reaches zero.
+</I>
+Please remove or move/merge these descriptions with their corresponding
+private methods descriptions. No need to place this private info in the
+class description. Sorry I did not mention that earlier.
+
+
+&gt;&gt;<i> Please note that the originally proposed commit message no longer
+</I>&gt;&gt;<i> applies to your changes so we need a new one.
+</I>&gt;&gt;<i>
+</I>&gt;<i> 
+</I>&gt;<i> &quot;
+</I>&gt;<i> This replaces TidyPointer with std::unique_ptr and re-implements the
+</I>&gt;<i> part of TidyPointer which LockingPointer was using. Removing the
+</I>&gt;<i> inheritence in the process and updating methods names for clarity.
+</I>
+No serious objections, but I suggest:
+
+-----------
+Replaced TidyPointer with std::unique_ptr.
+
+LockingPointer is now a stand-alone class that is understood (and
+documented) as a typical shared pointer with OpenSSL-friendly object
+importing methods. Replaced its TidyPointer::reset() abuse with an
+explicit resetWithoutLocking() method after reviewing that all such
+calls needed no locking indeed.
+-----------
+
+
+&gt;<i> The LockingPointer still has some of the issues which led us down the
+</I>&gt;<i> path to getting here. I've chosen to submit for review at this point to
+</I>&gt;<i> ensure we still have a fully working Squid before going further down
+</I>&gt;<i> this trail.
+</I>
+I do not recall any remaining in-scope LockingPointer issues except that
+the constructor does not force the caller to pick the right importing
+route. What issues did I forget about?
+
+
+All of the above changes do not require another review round IMO.
+
+
+Thank you,
+
+Alex.
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006133.html">[squid-dev] [PATCH] TidyPointer removal
+</A></li>
+	<LI>Next message: <A HREF="006136.html">[squid-dev] [PATCH] TidyPointer removal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6135">[ date ]</a>
+              <a href="thread.html#6135">[ thread ]</a>
+              <a href="subject.html#6135">[ subject ]</a>
+              <a href="author.html#6135">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

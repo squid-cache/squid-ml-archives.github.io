@@ -1,0 +1,532 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] shuffle SessionCacheRunner to libsecurity
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20shuffle%20SessionCacheRunner%20to%20libsecurity&In-Reply-To=%3C56BCC2D4.7030801%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005140.html">
+   <LINK REL="Next"  HREF="005120.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] shuffle SessionCacheRunner to libsecurity</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20shuffle%20SessionCacheRunner%20to%20libsecurity&In-Reply-To=%3C56BCC2D4.7030801%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] shuffle SessionCacheRunner to libsecurity">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Thu Feb 11 17:20:20 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005140.html">[squid-dev] [PATCH] Cert Validation memory leaks
+</A></li>
+        <LI>Next message: <A HREF="005120.html">[squid-dev] [PATCH] shuffle SessionCacheRunner to libsecurity
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5119">[ date ]</a>
+              <a href="thread.html#5119">[ thread ]</a>
+              <a href="subject.html#5119">[ subject ]</a>
+              <a href="author.html#5119">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Move the Runner object which manages the SSL session cache into libsecurity.
+
+Unfortunately the OpenSSL session cache callbacks cannot also be moved
+due to circular dependency issues. However, when those are resolved by
+later libsecurity API additions the callbacks will be much easier to
+shift. For now the three symbols shared between the two libraries are
+exposed by libsslsquid in the Ssl:: namespace.
+
+Cache initialization is now moved into the Runner. Binding its state
+initialization more tightly to the memory allocation and initialization.
+Which also removes the need for explicit main.cc dependency.
+
+
+One issue was uncovered during this:
+
+* While ssl/support.h was defining a destruct_session_cache() function
+that appeared to release the cache memory, it was not actually being
+used anywhere. Which unless a fortuitous sequence of events is happening
+means that OpenSSL locks we create for the cache entries may not be
+released properly. On the other hand the cache should only be erased on
+shutdown so the effects of this are minor.
+
+The unused function has been removed and the issue is now expicitly
+noted in the Runner shutdown handling method.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/main.cc'
+--- src/main.cc	2016-02-01 11:52:03 +0000
++++ src/main.cc	2016-02-11 15:39:37 +0000
+@@ -1152,9 +1152,6 @@
+ #endif
+ 
+ #if USE_OPENSSL
+-    if (!configured_once)
+-        Ssl::initialize_session_cache();
+-
+     if (Ssl::CertValidationHelper::GetInstance())
+         Ssl::CertValidationHelper::GetInstance()-&gt;Init();
+ #endif
+
+=== modified file 'src/security/Makefile.am'
+--- src/security/Makefile.am	2016-02-01 11:52:03 +0000
++++ src/security/Makefile.am	2016-02-09 09:17:37 +0000
+@@ -25,4 +25,5 @@
+ 	PeerOptions.h \
+ 	ServerOptions.cc \
+ 	ServerOptions.h \
++	Session.cc \
+ 	Session.h
+
+=== added file 'src/security/Session.cc'
+--- src/security/Session.cc	1970-01-01 00:00:00 +0000
++++ src/security/Session.cc	2016-02-11 09:57:26 +0000
+@@ -0,0 +1,110 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include &quot;squid.h&quot;
++#include &quot;anyp/PortCfg.h&quot;
++#include &quot;base/RunnersRegistry.h&quot;
++#include &quot;ipc/MemMap.h&quot;
++#include &quot;security/Session.h&quot;
++#include &quot;SquidConfig.h&quot;
++
++#define SSL_SESSION_ID_SIZE 32
++#define SSL_SESSION_MAX_SIZE 10*1024
++
++static bool
++isTlsServer()
++{
++    for (AnyP::PortCfgPointer s = HttpPortList; s != nullptr; s = s-&gt;next) {
++        if (s-&gt;secure.encryptTransport)
++            return true;
++        if (s-&gt;flags.tunnelSslBumping)
++            return true;
++    }
++
++    return false;
++}
++
++void
++initializeSessionCache()
++{
++#if USE_OPENSSL
++    // Check if the MemMap keys and data are enough big to hold
++    // session ids and session data
++    assert(SSL_SESSION_ID_SIZE &gt;= MEMMAP_SLOT_KEY_SIZE);
++    assert(SSL_SESSION_MAX_SIZE &gt;= MEMMAP_SLOT_DATA_SIZE);
++
++    int configuredItems = ::Config.SSL.sessionCacheSize / sizeof(Ipc::MemMap::Slot);
++    if (IamWorkerProcess() &amp;&amp; configuredItems)
++        Ssl::SessionCache = new Ipc::MemMap(Ssl::SessionCacheName);
++    else {
++        Ssl::SessionCache = nullptr;
++        return;
++    }
++
++    for (AnyP::PortCfgPointer s = HttpPortList; s != nullptr; s = s-&gt;next) {
++        if (s-&gt;secure.staticContext.get())
++            Ssl::SetSessionCallbacks(s-&gt;secure.staticContext.get());
++    }
++#endif
++}
++
++/// initializes shared memory segments used by MemStore
++class SharedSessionCacheRr: public Ipc::Mem::RegisteredRunner
++{
++public:
++    /* RegisteredRunner API */
++    SharedSessionCacheRr(): owner(nullptr) {}
++    virtual void useConfig();
++    virtual ~SharedSessionCacheRr();
++
++protected:
++    virtual void create();
++
++private:
++    Ipc::MemMap::Owner *owner;
++};
++
++RunnerRegistrationEntry(SharedSessionCacheRr);
++
++void
++SharedSessionCacheRr::useConfig()
++{
++#if USE_OPENSSL // while Ssl:: bits in use
++    if (Ssl::SessionCache || !isTlsServer()) //no need to configure ssl session cache.
++        return;
++
++    Ipc::Mem::RegisteredRunner::useConfig();
++    initializeSessionCache();
++#endif
++}
++
++void
++SharedSessionCacheRr::create()
++{
++    if (!isTlsServer()) //no need to configure ssl session cache.
++        return;
++
++#if USE_OPENSSL // while Ssl:: bits in use
++    if (int items = Config.SSL.sessionCacheSize / sizeof(Ipc::MemMap::Slot))
++        owner = Ipc::MemMap::Init(Ssl::SessionCacheName, items);
++#endif
++}
++
++SharedSessionCacheRr::~SharedSessionCacheRr()
++{
++#if 0
++    // XXX: the Ssl::SessionCache memory (if any) is leaked.
++    // at least technically. OpenSSL is never informed about this memory
++    // being no longer used and the bulk SHM chunk being released.
++    // Any locks it is holding for the sessions may stay set.
++//      delete Ssl::SessionCache;
++#endif
++
++    delete owner;
++}
++
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2016-01-27 04:41:56 +0000
++++ src/ssl/support.cc	2016-02-11 10:23:02 +0000
+@@ -33,9 +33,8 @@
+ 
+ #include &lt;cerrno&gt;
+ 
+-static void setSessionCallbacks(Security::ContextPtr ctx);
+-Ipc::MemMap *SslSessionCache = NULL;
+-const char *SslSessionCacheName = &quot;ssl_session_cache&quot;;
++Ipc::MemMap *Ssl::SessionCache = NULL;
++const char *Ssl::SessionCacheName = &quot;ssl_session_cache&quot;;
+ 
+ static Ssl::CertsIndexedList SquidUntrustedCerts;
+ 
+@@ -552,7 +551,7 @@
+     if (port.secure.parsedFlags &amp; SSL_FLAG_DONT_VERIFY_DOMAIN)
+         SSL_CTX_set_ex_data(sslContext, ssl_ctx_ex_index_dont_verify_domain, (void *) -1);
+ 
+-    setSessionCallbacks(sslContext);
++    Ssl::SetSessionCallbacks(sslContext);
+ 
+     return true;
+ }
+@@ -1368,7 +1367,7 @@
+ static int
+ store_session_cb(SSL *ssl, SSL_SESSION *session)
+ {
+-    if (!SslSessionCache)
++    if (!Ssl::SessionCache)
+         return 0;
+ 
+     debugs(83, 5, &quot;Request to store SSL Session &quot;);
+@@ -1384,7 +1383,7 @@
+     memset(key, 0, sizeof(key));
+     memcpy(key, id, idlen);
+     int pos;
+-    Ipc::MemMap::Slot *slotW = SslSessionCache-&gt;openForWriting((const cache_key*)key, pos);
++    Ipc::MemMap::Slot *slotW = Ssl::SessionCache-&gt;openForWriting((const cache_key*)key, pos);
+     if (slotW) {
+         int lenRequired =  i2d_SSL_SESSION(session, NULL);
+         if (lenRequired &lt;  MEMMAP_SLOT_DATA_SIZE) {
+@@ -1392,7 +1391,7 @@
+             lenRequired = i2d_SSL_SESSION(session, &amp;p);
+             slotW-&gt;set(key, NULL, lenRequired, squid_curtime + Config.SSL.session_ttl);
+         }
+-        SslSessionCache-&gt;closeForWriting(pos);
++        Ssl::SessionCache-&gt;closeForWriting(pos);
+         debugs(83, 5, &quot;wrote an ssl session entry of size &quot; &lt;&lt; lenRequired &lt;&lt; &quot; at pos &quot; &lt;&lt; pos);
+     }
+     return 0;
+@@ -1401,27 +1400,27 @@
+ static void
+ remove_session_cb(SSL_CTX *, SSL_SESSION *sessionID)
+ {
+-    if (!SslSessionCache)
++    if (!Ssl::SessionCache)
+         return ;
+ 
+     debugs(83, 5, &quot;Request to remove corrupted or not valid SSL Session &quot;);
+     int pos;
+-    Ipc::MemMap::Slot const *slot = SslSessionCache-&gt;openForReading((const cache_key*)sessionID, pos);
++    Ipc::MemMap::Slot const *slot = Ssl::SessionCache-&gt;openForReading((const cache_key*)sessionID, pos);
+     if (slot == NULL)
+         return;
+-    SslSessionCache-&gt;closeForReading(pos);
++    Ssl::SessionCache-&gt;closeForReading(pos);
+     // TODO:
+     // What if we are not able to remove the session?
+     // Maybe schedule a job to remove it later?
+     // For now we just have an invalid entry in cache until will be expired
+     // The openSSL will reject it when we try to use it
+-    SslSessionCache-&gt;free(pos);
++    Ssl::SessionCache-&gt;free(pos);
+ }
+ 
+ static SSL_SESSION *
+ get_session_cb(SSL *, unsigned char *sessionID, int len, int *copy)
+ {
+-    if (!SslSessionCache)
++    if (!Ssl::SessionCache)
+         return NULL;
+ 
+     SSL_SESSION *session = NULL;
+@@ -1431,7 +1430,7 @@
+            len &lt;&lt; p[0] &lt;&lt; &quot;:&quot; &lt;&lt; p[1]);
+ 
+     int pos;
+-    Ipc::MemMap::Slot const *slot = SslSessionCache-&gt;openForReading((const cache_key*)sessionID, pos);
++    Ipc::MemMap::Slot const *slot = Ssl::SessionCache-&gt;openForReading((const cache_key*)sessionID, pos);
+     if (slot != NULL) {
+         if (slot-&gt;expire &gt; squid_curtime) {
+             const unsigned char *ptr = slot-&gt;p;
+@@ -1439,7 +1438,7 @@
+             debugs(83, 5, &quot;Session retrieved from cache at pos &quot; &lt;&lt; pos);
+         } else
+             debugs(83, 5, &quot;Session in cache expired&quot;);
+-        SslSessionCache-&gt;closeForReading(pos);
++        Ssl::SessionCache-&gt;closeForReading(pos);
+     }
+ 
+     if (!session)
+@@ -1453,10 +1452,10 @@
+     return session;
+ }
+ 
+-static void
+-setSessionCallbacks(Security::ContextPtr ctx)
++void
++Ssl::SetSessionCallbacks(Security::ContextPtr ctx)
+ {
+-    if (SslSessionCache) {
++    if (Ssl::SessionCache) {
+         SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER|SSL_SESS_CACHE_NO_INTERNAL);
+         SSL_CTX_sess_set_new_cb(ctx, store_session_cb);
+         SSL_CTX_sess_set_remove_cb(ctx, remove_session_cb);
+@@ -1464,94 +1463,5 @@
+     }
+ }
+ 
+-static bool
+-isSslServer()
+-{
+-    for (AnyP::PortCfgPointer s = HttpPortList; s != NULL; s = s-&gt;next) {
+-        if (s-&gt;secure.encryptTransport)
+-            return true;
+-        if (s-&gt;flags.tunnelSslBumping)
+-            return true;
+-    }
+-
+-    return false;
+-}
+-
+-#define SSL_SESSION_ID_SIZE 32
+-#define SSL_SESSION_MAX_SIZE 10*1024
+-
+-void
+-Ssl::initialize_session_cache()
+-{
+-
+-    if (!isSslServer()) //no need to configure ssl session cache.
+-        return;
+-
+-    // Check if the MemMap keys and data are enough big to hold
+-    // session ids and session data
+-    assert(SSL_SESSION_ID_SIZE &gt;= MEMMAP_SLOT_KEY_SIZE);
+-    assert(SSL_SESSION_MAX_SIZE &gt;= MEMMAP_SLOT_DATA_SIZE);
+-
+-    int configuredItems = ::Config.SSL.sessionCacheSize / sizeof(Ipc::MemMap::Slot);
+-    if (IamWorkerProcess() &amp;&amp; configuredItems)
+-        SslSessionCache = new Ipc::MemMap(SslSessionCacheName);
+-    else {
+-        SslSessionCache = NULL;
+-        return;
+-    }
+-
+-    for (AnyP::PortCfgPointer s = HttpPortList; s != NULL; s = s-&gt;next) {
+-        if (s-&gt;secure.staticContext.get())
+-            setSessionCallbacks(s-&gt;secure.staticContext.get());
+-    }
+-}
+-
+-void
+-destruct_session_cache()
+-{
+-    delete SslSessionCache;
+-}
+-
+-/// initializes shared memory segments used by MemStore
+-class SharedSessionCacheRr: public Ipc::Mem::RegisteredRunner
+-{
+-public:
+-    /* RegisteredRunner API */
+-    SharedSessionCacheRr(): owner(NULL) {}
+-    virtual void useConfig();
+-    virtual ~SharedSessionCacheRr();
+-
+-protected:
+-    virtual void create();
+-
+-private:
+-    Ipc::MemMap::Owner *owner;
+-};
+-
+-RunnerRegistrationEntry(SharedSessionCacheRr);
+-
+-void
+-SharedSessionCacheRr::useConfig()
+-{
+-    Ipc::Mem::RegisteredRunner::useConfig();
+-}
+-
+-void
+-SharedSessionCacheRr::create()
+-{
+-    if (!isSslServer()) //no need to configure ssl session cache.
+-        return;
+-
+-    int items;
+-    items = Config.SSL.sessionCacheSize / sizeof(Ipc::MemMap::Slot);
+-    if (items)
+-        owner =  Ipc::MemMap::Init(SslSessionCacheName, items);
+-}
+-
+-SharedSessionCacheRr::~SharedSessionCacheRr()
+-{
+-    delete owner;
+-}
+-
+ #endif /* USE_OPENSSL */
+ 
+
+=== modified file 'src/ssl/support.h'
+--- src/ssl/support.h	2016-01-27 16:56:38 +0000
++++ src/ssl/support.h	2016-02-11 10:22:35 +0000
+@@ -56,6 +56,11 @@
+ class PortCfg;
+ };
+ 
++namespace Ipc
++{
++class MemMap;
++}
++
+ namespace Ssl
+ {
+ /// initialize the SSL library global state.
+@@ -102,6 +107,10 @@
+ /// Holds a list of certificate SSL errors
+ typedef CbDataList&lt;Ssl::CertError&gt; CertErrors;
+ 
++void SetSessionCallbacks(Security::ContextPtr);
++extern Ipc::MemMap *SessionCache;
++extern const char *SessionCacheName;
++
+ } //namespace Ssl
+ 
+ /// \ingroup ServerProtocolSSLAPI
+@@ -304,17 +313,6 @@
+ */
+ bool setClientSNI(SSL *ssl, const char *fqdn);
+ 
+-/**
+-   \ingroup ServerProtocolSSLAPI
+-   * Initializes the shared session cache if configured
+-*/
+-void initialize_session_cache();
+-
+-/**
+-   \ingroup ServerProtocolSSLAPI
+-   * Destroy the shared session cache if configured
+-*/
+-void destruct_session_cache();
+ } //namespace Ssl
+ 
+ #if _SQUID_WINDOWS_
+
+=== modified file 'src/tests/stub_libsslsquid.cc'
+--- src/tests/stub_libsslsquid.cc	2016-01-01 00:12:18 +0000
++++ src/tests/stub_libsslsquid.cc	2016-02-11 16:50:04 +0000
+@@ -82,8 +82,6 @@
+ bool checkX509ServerValidity(X509 *cert, const char *server) STUB_RETVAL(false)
+ int asn1timeToString(ASN1_TIME *tm, char *buf, int len) STUB_RETVAL(0)
+ bool setClientSNI(SSL *ssl, const char *fqdn) STUB_RETVAL(false)
+-void initialize_session_cache() STUB
+-void destruct_session_cache() STUB
+ } //namespace Ssl
+ 
+ #endif
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005140.html">[squid-dev] [PATCH] Cert Validation memory leaks
+</A></li>
+	<LI>Next message: <A HREF="005120.html">[squid-dev] [PATCH] shuffle SessionCacheRunner to libsecurity
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5119">[ date ]</a>
+              <a href="thread.html#5119">[ thread ]</a>
+              <a href="subject.html#5119">[ subject ]</a>
+              <a href="author.html#5119">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,621 @@
+Fix Auth::UserRequest::denyMessage() misuse.
+
+This method was improperly used in contexts where actually
+Auth::UserRequest::setDenyMessage() expected. Probably the reason was
+that both denyMessage() and getDenyMessage() were not constant,
+provoking such 'misuse'.
+
+Also placed some common code into UserRequest::denyMessageFromHelper(),
+eliminating code duplication. Though there are still many places
+where code is duplicated inside auth/ntlm/UserRequest.cc and
+auth/negotiate/UserRequest.cc.
+
+=== modified file 'src/auth/UserRequest.cc'
+--- src/auth/UserRequest.cc	2016-12-20 09:12:07 +0000
++++ src/auth/UserRequest.cc	2017-01-01 21:19:25 +0000
+@@ -1,51 +1,53 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 29    Authenticator */
+ 
+ /* The functions in this file handle authentication.
+  * They DO NOT perform access control or auditing.
+  * See acl.c for access control and client_side.c for auditing */
+ 
+ #include "squid.h"
+ #include "acl/FilledChecklist.h"
+ #include "auth/Config.h"
+ #include "client_side.h"
+ #include "comm/Connection.h"
+ #include "fatal.h"
+ #include "format/Format.h"
++#include "helper.h"
++#include "helper/Reply.h"
+ #include "http/Stream.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+ #include "MemBuf.h"
+ 
+ /* Generic Functions */
+ 
+ char const *
+ Auth::UserRequest::username() const
+ {
+     if (user() != NULL)
+         return user()->username();
+     else
+         return NULL;
+ }
+ 
+ /**** PUBLIC FUNCTIONS (ALL GENERIC!)  ****/
+ 
+ /* send the initial data to an authenticator module */
+ void
+ Auth::UserRequest::start(HttpRequest *request, AccessLogEntry::Pointer &al, AUTHCB * handler, void *data)
+ {
+     assert(handler);
+     assert(data);
+     debugs(29, 9, this);
+     startHelperLookup(request, al, handler, data);
+ }
+ 
+ bool
+ Auth::UserRequest::valid() const
+@@ -89,67 +91,67 @@
+ 
+ Auth::UserRequest::UserRequest():
+     _auth_user(NULL),
+     message(NULL),
+     lastReply(AUTH_ACL_CANNOT_AUTHENTICATE)
+ {
+     debugs(29, 5, HERE << "initialised request " << this);
+ }
+ 
+ Auth::UserRequest::~UserRequest()
+ {
+     assert(LockCount()==0);
+     debugs(29, 5, HERE << "freeing request " << this);
+ 
+     if (user() != NULL) {
+         /* release our references to the user credentials */
+         user(NULL);
+     }
+ 
+     safe_free(message);
+ }
+ 
+ void
+ Auth::UserRequest::setDenyMessage(char const *aString)
+ {
+     safe_free(message);
+     message = xstrdup(aString);
+ }
+ 
+ char const *
+-Auth::UserRequest::getDenyMessage()
++Auth::UserRequest::getDenyMessage() const
+ {
+     return message;
+ }
+ 
+ char const *
+-Auth::UserRequest::denyMessage(char const * const default_message)
++Auth::UserRequest::denyMessage(char const * const default_message) const
+ {
+     if (getDenyMessage() == NULL)
+         return default_message;
+ 
+     return getDenyMessage();
+ }
+ 
+ static void
+ authenticateAuthUserRequestSetIp(Auth::UserRequest::Pointer auth_user_request, Ip::Address &ipaddr)
+ {
+     Auth::User::Pointer auth_user = auth_user_request->user();
+ 
+     if (!auth_user)
+         return;
+ 
+     auth_user->addIp(ipaddr);
+ }
+ 
+ void
+ authenticateAuthUserRequestRemoveIp(Auth::UserRequest::Pointer auth_user_request, Ip::Address const &ipaddr)
+ {
+     Auth::User::Pointer auth_user = auth_user_request->user();
+ 
+     if (!auth_user)
+         return;
+ 
+     auth_user->removeIp(ipaddr);
+ }
+ 
+ void
+@@ -547,30 +549,41 @@
+ void
+ authenticateAddTrailer(HttpReply * rep, Auth::UserRequest::Pointer auth_user_request, HttpRequest *, int accelerated)
+ {
+     if (auth_user_request != NULL)
+         auth_user_request->addAuthenticationInfoTrailer(rep, accelerated);
+ }
+ 
+ Auth::Scheme::Pointer
+ Auth::UserRequest::scheme() const
+ {
+     return Auth::Scheme::Find(user()->config->type());
+ }
+ 
+ const char *
+ Auth::UserRequest::helperRequestKeyExtras(HttpRequest *request, AccessLogEntry::Pointer &al)
+ {
+     if (Format::Format *reqFmt = user()->config->keyExtras) {
+         static MemBuf mb;
+         mb.reset();
+         // We should pass AccessLogEntry as second argument ....
+         Auth::UserRequest::Pointer oldReq = request->auth_user_request;
+         request->auth_user_request = this;
+         reqFmt->assemble(mb, al, 0);
+         request->auth_user_request = oldReq;
+         debugs(29, 5, "Assembled line to send :" << mb.content());
+         return mb.content();
+     }
+     return NULL;
+ }
+ 
++void
++Auth::UserRequest::denyMessageFromHelper(const char *proto, const Helper::Reply &reply)
++{
++    static SBuf messageNote;
++    if (!reply.notes.find(messageNote, "message")) {
++        messageNote.append(proto);
++        messageNote.append(" Authentication denied with no reason given");
++    }
++    setDenyMessage(messageNote.c_str());
++}
++
+
+=== modified file 'src/auth/UserRequest.h'
+--- src/auth/UserRequest.h	2016-01-01 00:12:18 +0000
++++ src/auth/UserRequest.h	2017-01-01 21:19:36 +0000
+@@ -152,89 +152,92 @@
+      * - cached in the HttpRequest parameter from a previous authentication of this request
+      * - cached in the ConnStateData paremeter from a previous authentication of this connection
+      *   (only applies to some situations. ie NTLM, Negotiate, Kerberos auth schemes,
+      *    or decrypted SSL requests from inside an authenticated CONNECT tunnel)
+      * - cached in the user credentials cache from a previous authentication of the same credentials
+      *   (only applies to cacheable authentication methods, ie Basic auth)
+      * - new credentials created from HTTP headers in this request
+      *
+      * The found credentials are returned in aUR and if successfully authenticated
+      * may now be cached in one or more of the above locations.
+      *
+      * \return Some AUTH_ACL_* state
+      */
+     static AuthAclState tryToAuthenticateAndSetAuthUser(UserRequest::Pointer *aUR, Http::HdrType, HttpRequest *, ConnStateData *, Ip::Address &, AccessLogEntry::Pointer &);
+ 
+     /// Add the appropriate [Proxy-]Authenticate header to the given reply
+     static void addReplyAuthHeader(HttpReply * rep, UserRequest::Pointer auth_user_request, HttpRequest * request, int accelerated, int internal);
+ 
+     /** Start an asynchronous helper lookup to verify the user credentials
+      *
+      * Uses startHelperLookup() for scheme-specific actions.
+      *
+      * The given callback will be called when the auth module has performed
+      * it's external activities.
+      *
+      * \param handler   Handler to process the callback when its run
+      * \param data  CBDATA for handler
+      */
+     void start(HttpRequest *request, AccessLogEntry::Pointer &al, AUTHCB *handler, void *data);
+ 
+-    char const * denyMessage(char const * const default_message = NULL);
++    char const * denyMessage(char const * const default_message = NULL) const;
+ 
+     /** Possibly overrideable in future */
+     void setDenyMessage(char const *);
+ 
+     /** Possibly overrideable in future */
+-    char const * getDenyMessage();
++    char const * getDenyMessage() const;
+ 
+     /**
+      * Squid does not make assumptions about where the username is stored.
+      * This function must return a pointer to a NULL terminated string to be used in logging the request.
+      * The string should NOT be allocated each time this function is called.
+      *
+      \retval NULL   No username/usercode is known.
+      \retval *      Null-terminated username string.
+      */
+     char const *username() const;
+ 
+     Scheme::Pointer scheme() const;
+ 
+     virtual const char * connLastHeader();
+ 
+     /**
+      * The string representation of the credentials send by client
+      */
+     virtual const char *credentialsStr() = 0;
+ 
+     const char *helperRequestKeyExtras(HttpRequest *, AccessLogEntry::Pointer &al);
+ 
++    /// Sets the reason of 'authentication denied' helper response.
++    void denyMessageFromHelper(char const *proto, const Helper::Reply &reply);
++
+ protected:
+     /**
+      * The scheme-specific actions to be performed when sending helper lookup.
+      *
+      * \see void start(HttpRequest *, AccessLogEntry::Pointer &, AUTHCB *, void *);
+      */
+     virtual void startHelperLookup(HttpRequest *request, AccessLogEntry::Pointer &al, AUTHCB *handler, void *data) = 0;
+ 
+ private:
+ 
+     static AuthAclState authenticate(UserRequest::Pointer * auth_user_request, Http::HdrType headertype, HttpRequest * request, ConnStateData * conn, Ip::Address &src_addr, AccessLogEntry::Pointer &al);
+ 
+     /** return a message on the 407 error pages */
+     char *message;
+ 
+     /**
+      * We only attempt authentication once per http request. This
+      * is to allow multiple auth acl references from different _access areas
+      * when using connection based authentication
+      */
+     AuthAclState lastReply;
+ };
+ 
+ } // namespace Auth
+ 
+ /* AuthUserRequest */
+ 
+ /// \ingroup AuthAPI
+ void authenticateFixHeader(HttpReply *, Auth::UserRequest::Pointer, HttpRequest *, int, int);
+ /// \ingroup AuthAPI
+
+=== modified file 'src/auth/negotiate/UserRequest.cc'
+--- src/auth/negotiate/UserRequest.cc	2016-12-31 16:05:53 +0000
++++ src/auth/negotiate/UserRequest.cc	2017-01-01 19:00:57 +0000
+@@ -280,130 +280,122 @@
+     // add new helper kv-pair notes to the credentials object
+     // so that any transaction using those credentials can access them
+     auth_user_request->user()->notes.appendNewOnly(&reply.notes);
+     // remove any private credentials detail which got added.
+     auth_user_request->user()->notes.remove("token");
+ 
+     Auth::Negotiate::UserRequest *lm_request = dynamic_cast<Auth::Negotiate::UserRequest *>(auth_user_request.getRaw());
+     assert(lm_request != NULL);
+     assert(lm_request->waiting);
+ 
+     lm_request->waiting = 0;
+     safe_free(lm_request->client_blob);
+ 
+     assert(auth_user_request->user() != NULL);
+     assert(auth_user_request->user()->auth_type == Auth::AUTH_NEGOTIATE);
+ 
+     if (lm_request->authserver == NULL)
+         lm_request->authserver = reply.whichServer.get(); // XXX: no locking?
+     else
+         assert(reply.whichServer == lm_request->authserver);
+ 
+     switch (reply.result) {
+     case Helper::TT:
+         /* we have been given a blob to send to the client */
+         safe_free(lm_request->server_blob);
+         lm_request->request->flags.mustKeepalive = true;
+         if (lm_request->request->flags.proxyKeepalive) {
+             const char *tokenNote = reply.notes.findFirst("token");
+             lm_request->server_blob = xstrdup(tokenNote);
+             auth_user_request->user()->credentials(Auth::Handshake);
+-            auth_user_request->denyMessage("Authentication in progress");
++            auth_user_request->setDenyMessage("Authentication in progress");
+             debugs(29, 4, HERE << "Need to challenge the client with a server token: '" << tokenNote << "'");
+         } else {
+             auth_user_request->user()->credentials(Auth::Failed);
+-            auth_user_request->denyMessage("Negotiate authentication requires a persistent connection");
++            auth_user_request->setDenyMessage("Negotiate authentication requires a persistent connection");
+         }
+         break;
+ 
+     case Helper::Okay: {
+         const char *userNote = reply.notes.findFirst("user");
+         const char *tokenNote = reply.notes.findFirst("token");
+         if (userNote == NULL || tokenNote == NULL) {
+             // XXX: handle a success with no username better
+             /* protocol error */
+             fatalf("authenticateNegotiateHandleReply: *** Unsupported helper response ***, '%s'\n", reply.other().content());
+             break;
+         }
+ 
+         /* we're finished, release the helper */
+         auth_user_request->user()->username(userNote);
+-        auth_user_request->denyMessage("Login successful");
++        auth_user_request->setDenyMessage("Login successful");
+         safe_free(lm_request->server_blob);
+         lm_request->server_blob = xstrdup(tokenNote);
+         lm_request->releaseAuthServer();
+ 
+         /* connection is authenticated */
+         debugs(29, 4, HERE << "authenticated user " << auth_user_request->user()->username());
+         auto local_auth_user = lm_request->user();
+         auto cached_user = Auth::Negotiate::User::Cache()->lookup(auth_user_request->user()->userKey());
+         if (!cached_user) {
+             local_auth_user->addToNameCache();
+         } else {
+             /* we can't seamlessly recheck the username due to the
+              * challenge-response nature of the protocol.
+              * Just free the temporary auth_user after merging as
+              * much of it new state into the existing one as possible */
+             cached_user->absorb(local_auth_user);
+             /* from here on we are working with the original cached credentials. */
+             local_auth_user = cached_user;
+             auth_user_request->user(local_auth_user);
+         }
+         /* set these to now because this is either a new login from an
+          * existing user or a new user */
+         local_auth_user->expiretime = current_time.tv_sec;
+         auth_user_request->user()->credentials(Auth::Ok);
+         debugs(29, 4, HERE << "Successfully validated user via Negotiate. Username '" << auth_user_request->user()->username() << "'");
+     }
+     break;
+ 
+     case Helper::Error: {
+-        const char *tokenNote = reply.notes.findFirst("token");
+-
+-        SBuf messageNote;
+         /* authentication failure (wrong password, etc.) */
+-        if (reply.notes.find(messageNote, "message"))
+-            auth_user_request->denyMessage(messageNote.c_str());
+-        else
+-            auth_user_request->denyMessage("Negotiate Authentication denied with no reason given");
++        auth_user_request->denyMessageFromHelper("Negotiate", reply);
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+-        if (tokenNote != NULL)
++        if (const char *tokenNote = reply.notes.findFirst("token"))
+             lm_request->server_blob = xstrdup(tokenNote);
+         lm_request->releaseAuthServer();
+         debugs(29, 4, "Failed validating user via Negotiate. Result: " << reply);
+     }
+     break;
+ 
+     case Helper::Unknown:
+         debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication Helper '" << reply.whichServer << "' crashed!.");
+     /* continue to the next case */
+ 
+     case Helper::TimedOut:
+     case Helper::BrokenHelper: {
+         /* TODO kick off a refresh process. This can occur after a YR or after
+          * a KK. If after a YR release the helper and resubmit the request via
+          * Authenticate Negotiate start.
+          * If after a KK deny the user's request w/ 407 and mark the helper as
+          * Needing YR. */
+         SBuf errNote;
+         if (reply.result == Helper::Unknown)
+-            auth_user_request->denyMessage("Internal Error");
+-        else if (reply.notes.find(errNote, "message"))
+-            auth_user_request->denyMessage(errNote.c_str());
++            auth_user_request->setDenyMessage("Internal Error");
+         else
+-            auth_user_request->denyMessage("Negotiate Authentication failed with no reason given");
++            auth_user_request->denyMessageFromHelper("Negotiate", reply);
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+         debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication validating user. Result: " << reply);
+     } // break;
+     }
+ 
+     if (lm_request->request) {
+         HTTPMSGUNLOCK(lm_request->request);
+         lm_request->request = NULL;
+     }
+     r->handler(r->data);
+     delete r;
+ }
+ 
+
+=== modified file 'src/auth/ntlm/UserRequest.cc'
+--- src/auth/ntlm/UserRequest.cc	2016-12-31 16:05:53 +0000
++++ src/auth/ntlm/UserRequest.cc	2017-01-01 19:01:21 +0000
+@@ -275,127 +275,120 @@
+     // add new helper kv-pair notes to the credentials object
+     // so that any transaction using those credentials can access them
+     auth_user_request->user()->notes.appendNewOnly(&reply.notes);
+     // remove any private credentials detail which got added.
+     auth_user_request->user()->notes.remove("token");
+ 
+     Auth::Ntlm::UserRequest *lm_request = dynamic_cast<Auth::Ntlm::UserRequest *>(auth_user_request.getRaw());
+     assert(lm_request != NULL);
+     assert(lm_request->waiting);
+ 
+     lm_request->waiting = 0;
+     safe_free(lm_request->client_blob);
+ 
+     assert(auth_user_request->user() != NULL);
+     assert(auth_user_request->user()->auth_type == Auth::AUTH_NTLM);
+ 
+     if (lm_request->authserver == NULL)
+         lm_request->authserver = reply.whichServer.get(); // XXX: no locking?
+     else
+         assert(reply.whichServer == lm_request->authserver);
+ 
+     switch (reply.result) {
+     case Helper::TT:
+         /* we have been given a blob to send to the client */
+         safe_free(lm_request->server_blob);
+         lm_request->request->flags.mustKeepalive = true;
+         if (lm_request->request->flags.proxyKeepalive) {
+             const char *serverBlob = reply.notes.findFirst("token");
+             lm_request->server_blob = xstrdup(serverBlob);
+             auth_user_request->user()->credentials(Auth::Handshake);
+-            auth_user_request->denyMessage("Authentication in progress");
++            auth_user_request->setDenyMessage("Authentication in progress");
+             debugs(29, 4, HERE << "Need to challenge the client with a server token: '" << serverBlob << "'");
+         } else {
+             auth_user_request->user()->credentials(Auth::Failed);
+-            auth_user_request->denyMessage("NTLM authentication requires a persistent connection");
++            auth_user_request->setDenyMessage("NTLM authentication requires a persistent connection");
+         }
+         break;
+ 
+     case Helper::Okay: {
+         /* we're finished, release the helper */
+         const char *userLabel = reply.notes.findFirst("user");
+         if (!userLabel) {
+             auth_user_request->user()->credentials(Auth::Failed);
+             safe_free(lm_request->server_blob);
+             lm_request->releaseAuthServer();
+             debugs(29, DBG_CRITICAL, "ERROR: NTLM Authentication helper returned no username. Result: " << reply);
+             break;
+         }
+         auth_user_request->user()->username(userLabel);
+-        auth_user_request->denyMessage("Login successful");
++        auth_user_request->setDenyMessage("Login successful");
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+ 
+         debugs(29, 4, HERE << "Successfully validated user via NTLM. Username '" << userLabel << "'");
+         /* connection is authenticated */
+         debugs(29, 4, HERE << "authenticated user " << auth_user_request->user()->username());
+         /* see if this is an existing user */
+         auto local_auth_user = lm_request->user();
+         auto cached_user = Auth::Ntlm::User::Cache()->lookup(auth_user_request->user()->userKey());
+         if (!cached_user) {
+             local_auth_user->addToNameCache();
+         } else {
+             /* we can't seamlessly recheck the username due to the
+              * challenge-response nature of the protocol.
+              * Just free the temporary auth_user after merging as
+              * much of it new state into the existing one as possible */
+             cached_user->absorb(local_auth_user);
+             /* from here on we are working with the original cached credentials. */
+             local_auth_user = cached_user;
+             auth_user_request->user(local_auth_user);
+         }
+         /* set these to now because this is either a new login from an
+          * existing user or a new user */
+         local_auth_user->expiretime = current_time.tv_sec;
+         auth_user_request->user()->credentials(Auth::Ok);
+         debugs(29, 4, HERE << "Successfully validated user via NTLM. Username '" << auth_user_request->user()->username() << "'");
+     }
+     break;
+ 
+     case Helper::Error: {
+         /* authentication failure (wrong password, etc.) */
+-        SBuf errNote;
+-        if (reply.notes.find(errNote, "message"))
+-            auth_user_request->denyMessage(errNote.c_str());
+-        else
+-            auth_user_request->denyMessage("NTLM Authentication denied with no reason given");
++        auth_user_request->denyMessageFromHelper("NTLM", reply);
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+         debugs(29, 4, "Failed validating user via NTLM. Result: " << reply);
+     }
+     break;
+ 
+     case Helper::Unknown:
+         debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication Helper '" << reply.whichServer << "' crashed!.");
+     /* continue to the next case */
+ 
+     case Helper::TimedOut:
+     case Helper::BrokenHelper: {
+         /* TODO kick off a refresh process. This can occur after a YR or after
+          * a KK. If after a YR release the helper and resubmit the request via
+          * Authenticate NTLM start.
+          * If after a KK deny the user's request w/ 407 and mark the helper as
+          * Needing YR. */
+-        SBuf errNote;
+         if (reply.result == Helper::Unknown)
+-            auth_user_request->denyMessage("Internal Error");
+-        else if (reply.notes.find(errNote, "message"))
+-            auth_user_request->denyMessage(errNote.c_str());
++            auth_user_request->setDenyMessage("Internal Error");
+         else
+-            auth_user_request->denyMessage("NTLM Authentication failed with no reason given");
++            auth_user_request->denyMessageFromHelper("NTLM", reply);
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+         debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication validating user. Result: " << reply);
+     }
+     break;
+     }
+ 
+     if (lm_request->request) {
+         HTTPMSGUNLOCK(lm_request->request);
+         lm_request->request = NULL;
+     }
+     r->handler(r->data);
+     delete r;
+ }
+ 
+
+=== modified file 'src/tests/stub_libauth.cc'
+--- src/tests/stub_libauth.cc	2016-12-19 10:27:54 +0000
++++ src/tests/stub_libauth.cc	2017-01-01 21:52:51 +0000
+@@ -32,53 +32,53 @@
+ #include <vector>
+ std::vector<Auth::Scheme::Pointer> *Auth::Scheme::_Schemes = NULL;
+ void Auth::Scheme::AddScheme(Auth::Scheme::Pointer) STUB
+ Auth::Scheme::Pointer Auth::Scheme::Find(const char *) STUB_RETVAL(NULL)
+ std::vector<Auth::Scheme::Pointer> & Auth::Scheme::GetSchemes() STUB_RETVAL(*_Schemes);
+ void Auth::Scheme::FreeAll() STUB
+ 
+ #include "auth/SchemesConfig.h"
+ void Auth::SchemesConfig::expand() STUB
+ 
+ #include "auth/User.h"
+ Auth::User::User(Auth::SchemeConfig *, const char *) STUB
+ Auth::CredentialState Auth::User::credentials() const STUB_RETVAL(credentials_state)
+ void Auth::User::credentials(CredentialState) STUB
+ void Auth::User::absorb(Auth::User::Pointer) STUB
+ Auth::User::~User() STUB_NOP
+ void Auth::User::clearIp() STUB
+ void Auth::User::removeIp(Ip::Address) STUB
+ void Auth::User::addIp(Ip::Address) STUB
+ void Auth::User::CredentialsCacheStats(StoreEntry *) STUB
+ 
+ #include "auth/UserRequest.h"
+ char const * Auth::UserRequest::username() const STUB_RETVAL("stub_username")
+ void Auth::UserRequest::start(HttpRequest *, AccessLogEntry::Pointer &, AUTHCB *, void *) STUB
+ bool Auth::UserRequest::valid() const STUB_RETVAL(false)
+ void * Auth::UserRequest::operator new (size_t) STUB_RETVAL((void *)1)
+ void Auth::UserRequest::operator delete (void *) STUB
+ Auth::UserRequest::UserRequest() STUB
+ Auth::UserRequest::~UserRequest() STUB
+ void Auth::UserRequest::setDenyMessage(char const *) STUB
+-char const * Auth::UserRequest::getDenyMessage() STUB_RETVAL("stub")
+-char const * Auth::UserRequest::denyMessage(char const * const) STUB_RETVAL("stub")
++char const * Auth::UserRequest::getDenyMessage() const STUB_RETVAL("stub")
++char const * Auth::UserRequest::denyMessage(char const * const) const STUB_RETVAL("stub")
+ void authenticateAuthUserRequestRemoveIp(Auth::UserRequest::Pointer, Ip::Address const &) STUB
+ void authenticateAuthUserRequestClearIp(Auth::UserRequest::Pointer) STUB
+ int authenticateAuthUserRequestIPCount(Auth::UserRequest::Pointer) STUB_RETVAL(0)
+ int authenticateUserAuthenticated(Auth::UserRequest::Pointer) STUB_RETVAL(0)
+ Auth::Direction Auth::UserRequest::direction() STUB_RETVAL(Auth::CRED_ERROR)
+ void Auth::UserRequest::addAuthenticationInfoHeader(HttpReply *, int) STUB
+ void Auth::UserRequest::addAuthenticationInfoTrailer(HttpReply *, int) STUB
+ void Auth::UserRequest::releaseAuthServer() STUB
+ const char * Auth::UserRequest::connLastHeader() STUB_RETVAL("stub")
+ AuthAclState Auth::UserRequest::authenticate(Auth::UserRequest::Pointer *, Http::HdrType, HttpRequest *, ConnStateData *, Ip::Address &, AccessLogEntry::Pointer &) STUB_RETVAL(AUTH_AUTHENTICATED)
+ AuthAclState Auth::UserRequest::tryToAuthenticateAndSetAuthUser(Auth::UserRequest::Pointer *, Http::HdrType, HttpRequest *, ConnStateData *, Ip::Address &, AccessLogEntry::Pointer &) STUB_RETVAL(AUTH_AUTHENTICATED)
+ void Auth::UserRequest::addReplyAuthHeader(HttpReply *, Auth::UserRequest::Pointer, HttpRequest *, int, int) STUB
+ void authenticateFixHeader(HttpReply *, Auth::UserRequest::Pointer, HttpRequest *, int, int) STUB
+ void authenticateAddTrailer(HttpReply *, Auth::UserRequest::Pointer, HttpRequest *, int) STUB
+ Auth::Scheme::Pointer Auth::UserRequest::scheme() const STUB_RETVAL(NULL)
+ 
+ #include "AuthReg.h"
+ void Auth::Init() STUB_NOP
+ 
+ #endif /* USE_AUTH */
+ 
+

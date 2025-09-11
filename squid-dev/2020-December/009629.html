@@ -1,0 +1,197 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] File descriptor leak at ICAP reqmod rewrites of CONNECT requests
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20File%20descriptor%20leak%20at%20ICAP%20reqmod%20rewrites%20of%0A%20CONNECT%20requests&In-Reply-To=%3CCAHMdmWGyPZ%3DnJR90HR1duFS4QGcSzyiFV4aE4G2TTv4u3HvzWA%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="009628.html">
+   <LINK REL="Next"  HREF="009630.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] File descriptor leak at ICAP reqmod rewrites of CONNECT requests</H1>
+    <B>Alexey Sergin</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20File%20descriptor%20leak%20at%20ICAP%20reqmod%20rewrites%20of%0A%20CONNECT%20requests&In-Reply-To=%3CCAHMdmWGyPZ%3DnJR90HR1duFS4QGcSzyiFV4aE4G2TTv4u3HvzWA%40mail.gmail.com%3E"
+       TITLE="[squid-dev] File descriptor leak at ICAP reqmod rewrites of CONNECT requests">alexey.sergin at gmail.com
+       </A><BR>
+    <I>Thu Dec 24 22:05:11 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="009628.html">[squid-dev] File descriptor leak at ICAP reqmod rewrites of CONNECT requests
+</A></li>
+        <LI>Next message (by thread): <A HREF="009630.html">[squid-dev] File descriptor leak at ICAP reqmod rewrites of CONNECT requests
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9629">[ date ]</a>
+              <a href="thread.html#9629">[ thread ]</a>
+              <a href="subject.html#9629">[ subject ]</a>
+              <a href="author.html#9629">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>&gt;&gt;<i> Could you please give me some advice on a better/proper fix, if close()
+</I>&gt;&gt;<i> at &quot;abandoning&quot; time is wrong?
+</I>&gt;<i>
+</I>&gt;<i> Unfortunately, I cannot.
+</I>
+In fact, your message was very helpful! Thank you.
+
+
+&gt;<i> In general, responding with a 403 does not invalidate the client
+</I>&gt;<i> connection, so it does not have to be closed. Said that, I am sure there
+</I>&gt;<i> are use cases where such closure would be a good idea. I would not be
+</I>&gt;<i> surprised if Squid closes the connection after denying regular requests.
+</I>
+Yes, rfc7231 states that:
+   Any 2xx (Successful) response indicates that the sender (and all
+   inbound proxies) will switch to tunnel mode immediately after the
+   blank line that concludes the successful response's header section;
+   data received after that blank line is from the server identified by
+   the request-target.  Any response other than a successful response
+   indicates that the tunnel has not yet been formed and that the
+   connection remains governed by HTTP.
+
+In case of non-2xx http response from icap reqmod, the client connection
+should continue to function in http mode, so there is no need to close it.
+
+In case of 2xx http response from icap reqmod, Squid will not do any
+tunneling stuff for this CONNECT request, and thus it would be better to
+close the client connection. However I am not aware of any reasonable
+scenario where icap (reqmod) server would rewrite a CONNECT request with
+2xx http response.
+
+
+&gt;<i> What is currently missing (at least) is understanding of what is going
+</I>&gt;<i> on. The correct fix, whatever it is, would be determined by that
+</I>&gt;<i> understanding.
+</I>
+The reason ConnStateData::kick() gets into the &quot;abandoning&quot; branch is due
+to a combination of the following circumstances:
+
+1. Function clientProcessRequest() executes this code:
+    // Let tunneling code be fully responsible for CONNECT requests
+    if (http-&gt;request-&gt;method == Http::METHOD_CONNECT) {
+        context-&gt;mayUseConnection(true);
+        conn-&gt;flags.readMore = false;
+    }
+
+2. No tunneling is actually set up in case of icap reqmod rewrite of
+CONNECT request with http response;
+
+3. Conditions for ConnStateData::kick() &quot;abandoning&quot; branch are satisfied
+after the processing of CONNECT request finishes.
+
+
+ACL deny of CONNECT request could trigger the same &quot;abandoning&quot; conditions,
+but it does not, because:
+
+1. ClientRequestContext::clientAccessCheckDone(ACCESS_DENIED) sets
+ClientRequestContext::readNextRequest and ClientRequestContext::error
+variables;
+
+2. ClientHttpRequest::doCallouts() checks those variables and executes:
+    getConn()-&gt;flags.readMore = true; // resume any pipeline reads.
+
+
+I tried to apply the same approach (as in the ACL) for the case of ICAP
+REQMOD, please see attached patch.
+I've done limited testing and the patch seems to fix the problem.
+
+Is ClientHttpRequest::handleAdaptedHeader() time suitable for re-enabling
+connection readMore flag and for connection stopReceiving()?
+Would it be better to postpone the re-enabling /  to a later stage
+stopReceiving()?
+Maybe to ClientHttpRequest::endRequestSatisfaction() ?
+
+
+Thanks!
+
+
+On Fri, Dec 11, 2020 at 6:40 PM Alex Rousskov &lt;
+<A HREF="http://lists.squid-cache.org/listinfo/squid-dev">rousskov at measurement-factory.com</A>&gt; wrote:
+
+&gt;<i> On 12/10/20 3:33 PM, Alexey Sergin wrote:
+</I>&gt;<i>
+</I>&gt;<i> &gt; - Squid writes to cache.log a message like &quot;kick abandoning &lt;....&gt;&quot;;
+</I>&gt;<i>
+</I>&gt;<i> These messages indicate a Squid bug, most likely in REQMOD request
+</I>&gt;<i> satisfaction implementation specific to CONNECT use cases. The messages
+</I>&gt;<i> are not prefixed with a &quot;BUG&quot; label, but they should be.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> &gt; - Squid does not close the file descriptor used for http client
+</I>&gt;<i> connection.
+</I>&gt;<i>
+</I>&gt;<i> Yes, that is a likely side effect of the above-mentioned bug.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> &gt; client_side.cc. Closing clientConnection right after
+</I>&gt;<i> &gt; &quot;debugs(&lt;....&gt;abandoning&lt;....&gt;)&quot; fixes the leak.
+</I>&gt;<i>
+</I>&gt;<i> &gt; Is it ok to always close() clientConnection when &quot;abandoning&quot; thing
+</I>&gt;<i> &gt; happens?
+</I>&gt;<i>
+</I>&gt;<i> &gt; Are there any known scenarios where this close() would be
+</I>&gt;<i> &gt; inappropriate?
+</I>&gt;<i>
+</I>&gt;<i> Unknown. Such a closure (alone) is not a proper fix. If well-tested, it
+</I>&gt;<i> may be considered to be a good-enough workaround, but no more than that.
+</I>&gt;<i>
+</I>&gt;<i> What is currently missing (at least) is understanding of what is going
+</I>&gt;<i> on. The correct fix, whatever it is, would be determined by that
+</I>&gt;<i> understanding.
+</I>&gt;<i>
+</I>&gt;<i> In general, responding with a 403 does not invalidate the client
+</I>&gt;<i> connection, so it does not have to be closed. Said that, I am sure there
+</I>&gt;<i> are use cases where such closure would be a good idea. I would not be
+</I>&gt;<i> surprised if Squid closes the connection after denying regular requests.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> &gt; Could you please give me some advice on a better/proper fix, if close()
+</I>&gt;<i> &gt; at &quot;abandoning&quot; time is wrong?
+</I>&gt;<i>
+</I>&gt;<i> Unfortunately, I cannot. Somebody needs to investigate the problem and
+</I>&gt;<i> identify the bug in ConnStateData::kick() logic (or elsewhere).
+</I>&gt;<i>
+</I>&gt;<i> Alex.
+</I>&gt;<i>
+</I>-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/attachments/20201225/f56bb97f/attachment.htm">http://lists.squid-cache.org/pipermail/squid-dev/attachments/20201225/f56bb97f/attachment.htm</A>&gt;
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: reqmod_connect.patch
+Type: text/x-patch
+Size: 1788 bytes
+Desc: not available
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/attachments/20201225/f56bb97f/attachment.bin">http://lists.squid-cache.org/pipermail/squid-dev/attachments/20201225/f56bb97f/attachment.bin</A>&gt;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="009628.html">[squid-dev] File descriptor leak at ICAP reqmod rewrites of CONNECT requests
+</A></li>
+	<LI>Next message (by thread): <A HREF="009630.html">[squid-dev] File descriptor leak at ICAP reqmod rewrites of CONNECT requests
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9629">[ date ]</a>
+              <a href="thread.html#9629">[ thread ]</a>
+              <a href="subject.html#9629">[ subject ]</a>
+              <a href="author.html#9629">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

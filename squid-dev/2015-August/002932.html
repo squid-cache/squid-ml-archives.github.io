@@ -1,0 +1,809 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] PackableStream for cachemgr reports
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20PackableStream%20for%20cachemgr%20reports&In-Reply-To=%3C55C238A2.2050703%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="003012.html">
+   <LINK REL="Next"  HREF="002937.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] PackableStream for cachemgr reports</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20PackableStream%20for%20cachemgr%20reports&In-Reply-To=%3C55C238A2.2050703%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] PackableStream for cachemgr reports">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Wed Aug  5 16:24:02 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003012.html">[squid-dev] [CODE] iterating over enums
+</A></li>
+        <LI>Next message: <A HREF="002937.html">[squid-dev] [PATCH] PackableStream for cachemgr reports
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2932">[ date ]</a>
+              <a href="thread.html#2932">[ thread ]</a>
+              <a href="subject.html#2932">[ subject ]</a>
+              <a href="author.html#2932">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Adds a PackableStream class which provides std::ostream semantics for
+writing data to a cachemgr report.
+
+FYI: This follows on from discussiosn back in 2011 regarding how to
+restructure the cachemgr internal data storage for relay between workers
+vs the report output formatting.
+
+Current trunk 'improved' code uses FooActionData classes to store and
+relay the report data internally, and classes implementing the Action
+API to format the report for delivery.
+
+
+For easy transition I have added an overload dump() method to the Action
+class API. New FooAction child classes should override the
+dump(ostream&amp;) method instead of the StoreEntry one. Writing their data
+to the stream.
+
+Older actions overload the now-deprecated dump(StoreEntry*) method and
+use some complicate nested function calls or share helper functions in
+complex ways which make it hard to upgrade all at once. So for now the
+dump(StoreEntry*) is made a stub that calls dump(ostream&amp;) if not
+overridden explicitly.
+
+The CacheManager class still uses dump(StoreEntry*) to get the reply
+payload from Action childs regardless of which dumper they implement.
+
+The basic report types are converted as part of this to be the first
+Actions using the stream output. The menu action in particular is
+slightly polished to benefit from stream abilities.
+
+
+Future steps along this path (in no particular order) are:
+* convert old Action classes to new API
+* refactor old C-code report generators to be Action classes
+ - fixing display output syntax to minimal YAML as we go on both the
+above. It mostly is already, but some reports have wrong syntax.
+* update Actions to be hidden from the menu display
+* update Actions to support menu name aliases
+* update Action API to receive client desired format
+
+Amos
+
+-------------- next part --------------
+=== modified file 'src/CacheManager.h'
+--- src/CacheManager.h	2015-08-01 02:13:13 +0000
++++ src/CacheManager.h	2015-08-03 12:11:21 +0000
+@@ -28,40 +28,40 @@
+  */
+ class CacheManager
+ {
+ public:
+     typedef std::vector&lt;Mgr::ActionProfilePointer&gt; Menu;
+ 
+     void registerProfile(char const * action, char const * desc,
+                          OBJH * handler,
+                          int pw_req_flag, int atomic);
+     void registerProfile(char const * action, char const * desc,
+                          Mgr::ClassActionCreationHandler *handler,
+                          int pw_req_flag, int atomic);
+     Mgr::ActionProfilePointer findAction(char const * action) const;
+     Mgr::Action::Pointer createNamedAction(const char *actionName);
+     Mgr::Action::Pointer createRequestedAction(const Mgr::ActionParams &amp;);
+     const Menu&amp; menu() const { return menu_; }
+ 
+     void Start(const Comm::ConnectionPointer &amp;client, HttpRequest * request, StoreEntry * entry);
+ 
+     static CacheManager* GetInstance();
+-    const char *ActionProtection(const Mgr::ActionProfilePointer &amp;profile);
++    const char *ActionProtection(const Mgr::ActionProfile &amp;profile);
+ 
+ protected:
+     CacheManager() {} ///&lt; use Instance() instead
+ 
+     Mgr::CommandPointer ParseUrl(const char *url);
+     void ParseHeaders(const HttpRequest * request, Mgr::ActionParams &amp;params);
+     int CheckPassword(const Mgr::Command &amp;cmd);
+     char *PasswdGet(Mgr::ActionPasswordList *, const char *);
+ 
+     void registerProfile(const Mgr::ActionProfilePointer &amp;profile);
+ 
+     Menu menu_;
+ 
+ private:
+     static CacheManager* instance;
+ };
+ 
+ #endif /* SQUID_CACHEMANAGER_H */
+ 
+
+=== modified file 'src/base/Makefile.am'
+--- src/base/Makefile.am	2015-08-03 02:08:22 +0000
++++ src/base/Makefile.am	2015-08-04 15:09:03 +0000
+@@ -11,28 +11,29 @@
+ noinst_LTLIBRARIES = libbase.la
+ 
+ libbase_la_SOURCES = \
+ 	AsyncCall.cc \
+ 	AsyncCall.h \
+ 	AsyncCbdataCalls.h \
+ 	AsyncJob.h \
+ 	AsyncJob.cc \
+ 	AsyncJobCalls.h \
+ 	AsyncCallQueue.cc \
+ 	AsyncCallQueue.h \
+ 	CbcPointer.h \
+ 	CbDataList.h \
+ 	CharacterSet.h \
+ 	CharacterSet.cc \
+ 	InstanceId.h \
+ 	Lock.h \
+ 	LookupTable.h \
+ 	LruMap.h \
+ 	Packable.h \
++	PackableStream.h \
+ 	RegexPattern.cc \
+ 	RegexPattern.h \
+ 	RunnersRegistry.cc \
+ 	RunnersRegistry.h \
+ 	Subscription.h \
+ 	TextException.cc \
+ 	TextException.h \
+ 	TidyPointer.h
+
+=== added file 'src/base/PackableStream.h'
+--- src/base/PackableStream.h	1970-01-01 00:00:00 +0000
++++ src/base/PackableStream.h	2015-08-03 12:06:45 +0000
+@@ -0,0 +1,88 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SRC_BASE_PACKABLESTREAM_H
++#define SQUID_SRC_BASE_PACKABLESTREAM_H
++
++#include &quot;base/Packable.h&quot;
++
++#include &lt;iomanip&gt;
++#include &lt;ostream&gt;
++
++/**
++ * A streambuf interface for writing to Packable objects.
++ * Typical use is via a PackableStream rather than direct manipulation.
++ */
++class PackableStreamBuf : public std::streambuf
++{
++public:
++    PackableStreamBuf(Packable *out) : outBuf(out) {}
++    ~PackableStreamBuf() {}
++
++protected:
++    /**
++     * flush the current buffer and the character that is overflowing
++     * to the Packable.
++     */
++    virtual int_type overflow(int_type aChar = traits_type::eof()) {
++        std::streamsize pending(pptr() - pbase());
++
++        if (pending &amp;&amp; sync ())
++            return traits_type::eof();
++
++        if (aChar != traits_type::eof()) {
++            // NP: cast because GCC promotes int_type to 32-bit type
++            //     std::basic_streambuf&lt;char&gt;::int_type {aka int}
++            //     despite the definition with 8-bit type value.
++            char chars[1] = {char(aChar)};
++
++            if (aChar != traits_type::eof())
++                outBuf-&gt;append(chars, 1);
++        }
++
++        pbump (-pending);  // Reset pptr().
++        return aChar;
++    }
++
++    /* push the buffer to the store */
++    virtual int sync() {
++        std::streamsize pending(pptr() - pbase());
++        if (pending)
++            outBuf-&gt;append(pbase(), pending);
++        return 0;
++    }
++
++    /* write multiple characters to the store entry
++     * - this is an optimisation method.
++     */
++    virtual std::streamsize xsputn(const char * chars, std::streamsize number) {
++        if (number)
++            outBuf-&gt;append(chars, number);
++        return number;
++    }
++
++private:
++    Packable *outBuf;
++};
++
++class PackableStream : public std::ostream
++{
++public:
++    /* create a stream for writing text etc into theEntry */
++    // See <A HREF="http://www.codecomments.com/archive292-2005-2-396222.html">http://www.codecomments.com/archive292-2005-2-396222.html</A>
++    PackableStream(Packable *entry): std::ostream(0), theBuffer(entry) {
++        rdbuf(&amp;theBuffer); // set the buffer to now-initialized theBuffer
++        clear(); //clear badbit set by calling init(0)
++    }
++
++private:
++    PackableStreamBuf theBuffer;
++};
++
++#endif /* SQUID_SRC_BASE_PACKABLESTREAM_H */
++
+
+=== modified file 'src/cache_manager.cc'
+--- src/cache_manager.cc	2015-01-13 07:25:36 +0000
++++ src/cache_manager.cc	2015-08-03 12:12:09 +0000
+@@ -191,41 +191,41 @@
+         /*
+          * emx's sscanf insists of returning 2 because it sets request
+          * to null
+          */
+         if (strncmp(&quot;cache_<A HREF="object://">object://</A>&quot;,url,15)==0)
+             xstrncpy(request, &quot;menu&quot;, MAX_URL);
+         else
+             xstrncpy(request, &quot;index&quot;, MAX_URL);
+     }
+ #endif
+ 
+     debugs(16, 3, HERE &lt;&lt; &quot;MGR request: t=&quot; &lt;&lt; t &lt;&lt; &quot;, host='&quot; &lt;&lt; host &lt;&lt; &quot;', request='&quot; &lt;&lt; request &lt;&lt; &quot;', pos=&quot; &lt;&lt; pos &lt;&lt;
+            &quot;, password='&quot; &lt;&lt; password &lt;&lt; &quot;', params='&quot; &lt;&lt; params &lt;&lt; &quot;'&quot;);
+ 
+     Mgr::ActionProfile::Pointer profile = findAction(request);
+     if (!profile) {
+         debugs(16, DBG_IMPORTANT, &quot;CacheManager::ParseUrl: action '&quot; &lt;&lt; request &lt;&lt; &quot;' not found&quot;);
+         return NULL;
+     }
+ 
+-    const char *prot = ActionProtection(profile);
++    const char *prot = ActionProtection(*profile);
+     if (!strcmp(prot, &quot;disabled&quot;) || !strcmp(prot, &quot;hidden&quot;)) {
+         debugs(16, DBG_IMPORTANT, &quot;CacheManager::ParseUrl: action '&quot; &lt;&lt; request &lt;&lt; &quot;' is &quot; &lt;&lt; prot);
+         return NULL;
+     }
+ 
+     Mgr::Command::Pointer cmd = new Mgr::Command;
+     if (!Mgr::QueryParams::Parse(params, cmd-&gt;params.queryParams))
+         return NULL;
+     cmd-&gt;profile = profile;
+     cmd-&gt;params.httpUri = url;
+     cmd-&gt;params.userName = String();
+     cmd-&gt;params.password = password;
+     cmd-&gt;params.actionName = request;
+     return cmd;
+ }
+ 
+ /// \ingroup CacheManagerInternal
+ /*
+  \ingroup CacheManagerInternal
+  * Decodes the headers needed to perform user authentication and fills
+@@ -403,47 +403,46 @@
+         return;
+     }
+ 
+     if (UsingSmp() &amp;&amp; IamWorkerProcess()) {
+         // is client the right connection to pass here?
+         AsyncJob::Start(new Mgr::Forwarder(client, cmd-&gt;params, request, entry));
+         return;
+     }
+ 
+     Mgr::Action::Pointer action = cmd-&gt;profile-&gt;creator-&gt;create(cmd);
+     Must(action != NULL);
+     action-&gt;run(entry, true);
+ }
+ 
+ /*
+  \ingroup CacheManagerInternal
+  * Renders the protection level text for an action.
+  * Also doubles as a check for the protection level.
+  */
+ const char *
+-CacheManager::ActionProtection(const Mgr::ActionProfile::Pointer &amp;profile)
++CacheManager::ActionProtection(const Mgr::ActionProfile &amp;profile)
+ {
+-    assert(profile != NULL);
+-    const char *pwd = PasswdGet(Config.passwd_list, profile-&gt;name);
++    const char *pwd = PasswdGet(Config.passwd_list, profile.name);
+ 
+     if (!pwd)
+-        return profile-&gt;isPwReq ? &quot;hidden&quot; : &quot;public&quot;;
++        return profile.isPwReq ? &quot;hidden&quot; : &quot;public&quot;;
+ 
+     if (!strcmp(pwd, &quot;disable&quot;))
+         return &quot;disabled&quot;;
+ 
+     if (strcmp(pwd, &quot;none&quot;) == 0)
+         return &quot;public&quot;;
+ 
+     return &quot;protected&quot;;
+ }
+ 
+ /*
+  * \ingroup CacheManagerInternal
+  * gets from the global Config the password the user would need to supply
+  * for the action she queried
+  */
+ char *
+ CacheManager::PasswdGet(Mgr::ActionPasswordList * a, const char *action)
+ {
+     wordlist *w;
+ 
+
+=== modified file 'src/mgr/Action.cc'
+--- src/mgr/Action.cc	2015-01-13 07:25:36 +0000
++++ src/mgr/Action.cc	2015-08-04 15:13:44 +0000
+@@ -1,54 +1,63 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 16    Cache Manager API */
+ 
+ #include &quot;squid.h&quot;
++#include &quot;base/PackableStream.h&quot;
+ #include &quot;comm/Connection.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;ipc/Port.h&quot;
+ #include &quot;mgr/Action.h&quot;
+ #include &quot;mgr/ActionCreator.h&quot;
+ #include &quot;mgr/ActionParams.h&quot;
+ #include &quot;mgr/ActionProfile.h&quot;
+ #include &quot;mgr/Command.h&quot;
+ #include &quot;mgr/Request.h&quot;
+ #include &quot;mgr/Response.h&quot;
+ #include &quot;SquidTime.h&quot;
+ #include &quot;Store.h&quot;
+ 
+ Mgr::Action::Action(const Command::Pointer &amp;aCmd): cmd(aCmd)
+ {
+     Must(cmd != NULL);
+     Must(cmd-&gt;profile != NULL);
+ }
+ 
+ Mgr::Action::~Action()
+ {
+ }
+ 
++void
++Mgr::Action::dump(StoreEntry *e)
++{
++    PackableStream p(e);
++    dump(p);
++    p.flush();
++}
++
+ const Mgr::Command &amp;
+ Mgr::Action::command() const
+ {
+     Must(cmd != NULL);
+     return *cmd;
+ }
+ 
+ bool
+ Mgr::Action::atomic() const
+ {
+     return command().profile-&gt;isAtomic;
+ }
+ 
+ const char*
+ Mgr::Action::name() const
+ {
+     return command().profile-&gt;name;
+ }
+ 
+ StoreEntry*
+
+=== modified file 'src/mgr/Action.h'
+--- src/mgr/Action.h	2015-01-13 07:25:36 +0000
++++ src/mgr/Action.h	2015-08-04 15:12:07 +0000
+@@ -1,36 +1,38 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 16    Cache Manager API */
+ 
+ #ifndef SQUID_MGR_ACTION_H
+ #define SQUID_MGR_ACTION_H
+ 
+ #include &quot;ipc/forward.h&quot;
+ #include &quot;mgr/forward.h&quot;
+ 
++#include &lt;iosfwd&gt;
++
+ class StoreEntry;
+ 
+ namespace Mgr
+ {
+ 
+ /// Base API for organizing the processing of a compiled cache manager command.
+ /// Not a job because all methods are synchronous (but they may start jobs).
+ class Action: public RefCountable
+ {
+ public:
+     typedef RefCount&lt;Action&gt; Pointer;
+ 
+ public:
+     Action(const CommandPointer &amp;aCmd);
+     virtual ~Action();
+ 
+     /* for local Cache Manager use */
+ 
+     /// collect + fillEntry: collect local information and fill the store entry
+     void run(StoreEntry *entry, bool writeHttpHeader);
+@@ -63,34 +65,38 @@
+     /// combined data should be written at the end of the coordinated response
+     virtual bool aggregatable() const { return true; } // most kid classes are
+ 
+     bool atomic() const; ///&lt; dump() call writes everything before returning
+     const char *name() const; ///&lt; label as seen in the cache manager menu
+     const Command &amp;command() const; ///&lt; the cause of this action
+ 
+     StoreEntry *createStoreEntry() const; ///&lt; creates store entry from params
+ 
+     ///&lt; Content-Type: header value for this report
+     virtual const char *contentType() const {return &quot;text/plain;charset=utf-8&quot;;}
+ 
+ protected:
+     /// calculate and keep local action-specific information
+     virtual void collect() {}
+ 
+     /** start writing action-specific info to Store entry;
+      * may collect info during dump, especially if collect() did nothing
+      * non-atomic() actions may continue writing asynchronously after returning
+      */
+-    virtual void dump(StoreEntry *) {}
++    virtual void dump(std::ostream &amp;) {}
++
++    // magic wrapper.
++    // old code will override this instead of the new ostream dumper.
++    virtual void dump(StoreEntry *e);
+ 
+ private:
+     const CommandPointer cmd; ///&lt; the command that caused this action
+ 
+ private:
+     Action(const Action &amp;); // not implemented
+     Action &amp;operator= (const Action &amp;); // not implemented
+ };
+ 
+ } // namespace Mgr
+ 
+ #endif /* SQUID_MGR_ACTION_H */
+ 
+
+=== modified file 'src/mgr/BasicActions.cc'
+--- src/mgr/BasicActions.cc	2015-01-13 07:25:36 +0000
++++ src/mgr/BasicActions.cc	2015-08-03 12:09:35 +0000
+@@ -14,146 +14,146 @@
+ #include &quot;mgr/ActionCreator.h&quot;
+ #include &quot;mgr/ActionProfile.h&quot;
+ #include &quot;mgr/BasicActions.h&quot;
+ #include &quot;mgr/Registration.h&quot;
+ #include &quot;protos.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ #include &quot;Store.h&quot;
+ 
+ Mgr::IndexAction::Pointer
+ Mgr::IndexAction::Create(const Command::Pointer &amp;cmd)
+ {
+     return new IndexAction(cmd);
+ }
+ 
+ Mgr::IndexAction::IndexAction(const Command::Pointer &amp;aCmd): Action(aCmd)
+ {
+     debugs(16, 5, HERE);
+ }
+ 
+ void
+-Mgr::IndexAction::dump(StoreEntry *)
++Mgr::IndexAction::dump(std::ostream &amp;)
+ {
+     debugs(16, 5, HERE);
+ }
+ 
+ Mgr::MenuAction::Pointer
+ Mgr::MenuAction::Create(const Command::Pointer &amp;cmd)
+ {
+     return new MenuAction(cmd);
+ }
+ 
+ Mgr::MenuAction::MenuAction(const Command::Pointer &amp;aCmd): Action(aCmd)
+ {
+     debugs(16, 5, HERE);
+ }
+ 
+ void
+-Mgr::MenuAction::dump(StoreEntry* entry)
++Mgr::MenuAction::dump(std::ostream &amp;p)
+ {
+     debugs(16, 5, HERE);
+-    Must(entry != NULL);
+ 
+-    typedef CacheManager::Menu::const_iterator Iterator;
+-    const CacheManager::Menu&amp; menu = CacheManager::GetInstance()-&gt;menu();
+-
+-    for (Iterator a = menu.begin(); a != menu.end(); ++a) {
+-        storeAppendPrintf(entry, &quot; %-22s\t%-32s\t%s\n&quot;,
+-                          (*a)-&gt;name, (*a)-&gt;desc,
+-                          CacheManager::GetInstance()-&gt;ActionProtection(*a));
++    p.fill(' '); // space pad the menu fields for readability
++    p.setf(std::ios::left);
++    for (auto &amp;a : CacheManager::GetInstance()-&gt;menu()) {
++        p &lt;&lt; '\t' // menu is a table
++          &lt;&lt; std::setw(22) &lt;&lt; a-&gt;name &lt;&lt; '\t'
++          &lt;&lt; std::setw(32) &lt;&lt; a-&gt;desc &lt;&lt; '\t'
++          &lt;&lt; std::setw(8) &lt;&lt; CacheManager::GetInstance()-&gt;ActionProtection(*a)
++          &lt;&lt; '\n';
+     }
++    p.unsetf(std::ios::left);
+ }
+ 
+ Mgr::ShutdownAction::Pointer
+ Mgr::ShutdownAction::Create(const Command::Pointer &amp;cmd)
+ {
+     return new ShutdownAction(cmd);
+ }
+ 
+ Mgr::ShutdownAction::ShutdownAction(const Command::Pointer &amp;aCmd): Action(aCmd)
+ {
+     debugs(16, 5, HERE);
+ }
+ 
+ void
+-Mgr::ShutdownAction::dump(StoreEntry *)
++Mgr::ShutdownAction::dump(std::ostream &amp;)
+ {
+     debugs(16, DBG_CRITICAL, &quot;Shutdown by Cache Manager command.&quot;);
+     shut_down(SIGTERM);
+ }
+ 
+ Mgr::ReconfigureAction::Pointer
+ Mgr::ReconfigureAction::Create(const Command::Pointer &amp;cmd)
+ {
+     return new ReconfigureAction(cmd);
+ }
+ 
+ Mgr::ReconfigureAction::ReconfigureAction(const Command::Pointer &amp;aCmd):
+     Action(aCmd)
+ {
+     debugs(16, 5, HERE);
+ }
+ 
+ void
+-Mgr::ReconfigureAction::dump(StoreEntry* entry)
++Mgr::ReconfigureAction::dump(std::ostream &amp;p)
+ {
+     debugs(16, DBG_IMPORTANT, &quot;Reconfigure by Cache Manager command.&quot;);
+-    storeAppendPrintf(entry, &quot;Reconfiguring Squid Process ....&quot;);
++    p &lt;&lt; &quot;Reconfiguring Squid Process ....&quot;;
+     reconfigure(SIGHUP);
+ }
+ 
+ Mgr::RotateAction::Pointer
+ Mgr::RotateAction::Create(const Command::Pointer &amp;cmd)
+ {
+     return new RotateAction(cmd);
+ }
+ 
+ Mgr::RotateAction::RotateAction(const Command::Pointer &amp;aCmd): Action(aCmd)
+ {
+     debugs(16, 5, HERE);
+ }
+ 
+ void
+-Mgr::RotateAction::dump(StoreEntry* entry)
++Mgr::RotateAction::dump(std::ostream &amp;p)
+ {
+     debugs(16, DBG_IMPORTANT, &quot;Rotate Logs by Cache Manager command.&quot;);
+-    storeAppendPrintf(entry, &quot;Rotating Squid Process Logs ....&quot;);
++    p &lt;&lt; &quot;Rotating Squid Process Logs ....&quot;;
+ #if defined(_SQUID_LINUX_THREADS_)
+     rotate_logs(SIGQUIT);
+ #else
+     rotate_logs(SIGUSR1);
+ #endif
+ }
+ 
+ Mgr::OfflineToggleAction::Pointer
+ Mgr::OfflineToggleAction::Create(const Command::Pointer &amp;cmd)
+ {
+     return new OfflineToggleAction(cmd);
+ }
+ 
+ Mgr::OfflineToggleAction::OfflineToggleAction(const Command::Pointer &amp;aCmd):
+     Action(aCmd)
+ {
+     debugs(16, 5, HERE);
+ }
+ 
+ void
+-Mgr::OfflineToggleAction::dump(StoreEntry* entry)
++Mgr::OfflineToggleAction::dump(std::ostream &amp;p)
+ {
+     Config.onoff.offline = !Config.onoff.offline;
+     debugs(16, DBG_IMPORTANT, &quot;offline_mode now &quot; &lt;&lt; (Config.onoff.offline ? &quot;ON&quot; : &quot;OFF&quot;) &lt;&lt; &quot; by Cache Manager request.&quot;);
+ 
+-    storeAppendPrintf(entry, &quot;offline_mode is now %s\n&quot;,
+-                      Config.onoff.offline ? &quot;ON&quot; : &quot;OFF&quot;);
++    p &lt;&lt; &quot;offline_mode is now &quot; &lt;&lt; (Config.onoff.offline ? &quot;ON&quot; : &quot;OFF&quot;);
+ }
+ 
+ void
+ Mgr::RegisterBasics()
+ {
+     RegisterAction(&quot;index&quot;, &quot;Cache Manager Interface&quot;, &amp;Mgr::IndexAction::Create, 0, 1);
+     RegisterAction(&quot;menu&quot;, &quot;Cache Manager Menu&quot;, &amp;Mgr::MenuAction::Create, 0, 1);
+     RegisterAction(&quot;offline_toggle&quot;, &quot;Toggle offline_mode setting&quot;, &amp;Mgr::OfflineToggleAction::Create, 1, 1);
+     RegisterAction(&quot;shutdown&quot;, &quot;Shut Down the Squid Process&quot;, &amp;Mgr::ShutdownAction::Create, 1, 1);
+     RegisterAction(&quot;reconfigure&quot;, &quot;Reconfigure Squid&quot;, &amp;Mgr::ReconfigureAction::Create, 1, 1);
+     RegisterAction(&quot;rotate&quot;, &quot;Rotate Squid Logs&quot;, &amp;Mgr::RotateAction::Create, 1, 1);
+ }
+ 
+
+=== modified file 'src/mgr/BasicActions.h'
+--- src/mgr/BasicActions.h	2015-01-13 07:25:36 +0000
++++ src/mgr/BasicActions.h	2015-08-03 12:04:57 +0000
+@@ -10,93 +10,93 @@
+ 
+ #ifndef SQUID_MGR_BASIC_ACTIONS_H
+ #define SQUID_MGR_BASIC_ACTIONS_H
+ 
+ #include &quot;mgr/Action.h&quot;
+ 
+ /* a collection of simple, mostly stateless actions */
+ 
+ namespace Mgr
+ {
+ 
+ /// A dummy action placeholder for the no-action requests
+ /// a templated Cache Manager index ('home') page.
+ /// Display output is produced directly by the receiving worker
+ /// without invoking the co-ordinator or action Job.
+ class IndexAction: public Action
+ {
+ public:
+     static Pointer Create(const CommandPointer &amp;cmd);
+     /* Action API */
+-    virtual void dump(StoreEntry *entry);
++    virtual void dump(std::ostream &amp;);
+ 
+ protected:
+     IndexAction(const CommandPointer &amp;cmd);
+ };
+ 
+ /// returns available Cache Manager actions and their access requirements
+ class MenuAction: public Action
+ {
+ public:
+     static Pointer Create(const CommandPointer &amp;cmd);
+     /* Action API */
+-    virtual void dump(StoreEntry *entry);
++    virtual void dump(std::ostream &amp;);
+ 
+ protected:
+     MenuAction(const CommandPointer &amp;cmd);
+ };
+ 
+ /// shuts Squid down
+ class ShutdownAction: public Action
+ {
+ public:
+     static Pointer Create(const CommandPointer &amp;cmd);
+     /* Action API */
+-    virtual void dump(StoreEntry *entry);
++    virtual void dump(std::ostream &amp;);
+ 
+ protected:
+     ShutdownAction(const CommandPointer &amp;cmd);
+ };
+ 
+ /// reconfigures Squid
+ class ReconfigureAction: public Action
+ {
+ public:
+     static Pointer Create(const CommandPointer &amp;cmd);
+     /* Action API */
+-    virtual void dump(StoreEntry *entry);
++    virtual void dump(std::ostream &amp;);
+ 
+ protected:
+     ReconfigureAction(const CommandPointer &amp;cmd);
+ };
+ 
+ /// starts log rotation
+ class RotateAction: public Action
+ {
+ public:
+     static Pointer Create(const CommandPointer &amp;cmd);
+     /* Action API */
+-    virtual void dump(StoreEntry *entry);
++    virtual void dump(std::ostream &amp;);
+ 
+ protected:
+     RotateAction(const CommandPointer &amp;cmd);
+ };
+ 
+ /// changes offline mode
+ class OfflineToggleAction: public Action
+ {
+ public:
+     static Pointer Create(const CommandPointer &amp;cmd);
+     /* Action API */
+-    virtual void dump(StoreEntry *entry);
++    virtual void dump(std::ostream &amp;);
+ 
+ protected:
+     OfflineToggleAction(const CommandPointer &amp;cmd);
+ };
+ 
+ /// Registeres profiles for the actions above; \todo move elsewhere?
+ void RegisterBasics();
+ 
+ } // namespace Mgr
+ 
+ #endif /* SQUID_MGR_BASIC_ACTIONS_H */
+ 
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003012.html">[squid-dev] [CODE] iterating over enums
+</A></li>
+	<LI>Next message: <A HREF="002937.html">[squid-dev] [PATCH] PackableStream for cachemgr reports
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2932">[ date ]</a>
+              <a href="thread.html#2932">[ thread ]</a>
+              <a href="subject.html#2932">[ subject ]</a>
+              <a href="author.html#2932">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,720 @@
+=== modified file 'src/HttpHeaderTools.cc'
+--- src/HttpHeaderTools.cc	2015-09-05 18:52:17 +0000
++++ src/HttpHeaderTools.cc	2015-12-29 21:11:42 +0000
+@@ -224,53 +224,53 @@ httpHeaderParseQuotedString(const char *
+     if (!val->termedBuf())
+         val->limitInit("", 0);
+     return 1;
+ }
+ 
+ SBuf
+ httpHeaderQuoteString(const char *raw)
+ {
+     assert(raw);
+ 
+     // TODO: Optimize by appending a sequence of characters instead of a char.
+     // This optimization may be easier with Tokenizer after raw becomes SBuf.
+ 
+     // RFC 7230 says a "sender SHOULD NOT generate a quoted-pair in a
+     // quoted-string except where necessary" (i.e., DQUOTE and backslash)
+     bool needInnerQuote = false;
+     for (const char *s = raw; !needInnerQuote &&  *s; ++s)
+         needInnerQuote = *s == '"' || *s == '\\';
+ 
+     SBuf quotedStr;
+-    quotedStr.append('"');
++    quotedStr.push_back('"');
+ 
+     if (needInnerQuote) {
+         for (const char *s = raw; *s; ++s) {
+             if (*s == '"' || *s == '\\')
+-                quotedStr.append('\\');
+-            quotedStr.append(*s);
++                quotedStr.push_back('\\');
++            quotedStr.push_back(*s);
+         }
+     } else {
+         quotedStr.append(raw);
+     }
+ 
+-    quotedStr.append('"');
++    quotedStr.push_back('"');
+     return quotedStr;
+ }
+ 
+ /**
+  * Checks the anonymizer (header_access) configuration.
+  *
+  * \retval 0    Header is explicitly blocked for removal
+  * \retval 1    Header is explicitly allowed
+  * \retval 1    Header has been replaced, the current version can be used.
+  * \retval 1    Header has no access controls to test
+  */
+ static int
+ httpHdrMangle(HttpHeaderEntry * e, HttpRequest * request, int req_or_rep)
+ {
+     int retval;
+ 
+     /* check with anonymizer tables */
+     HeaderManglers *hms = NULL;
+     assert(e);
+ 
+
+=== modified file 'src/SBuf.cc'
+--- src/SBuf.cc	2015-10-29 23:08:05 +0000
++++ src/SBuf.cc	2015-12-30 14:56:59 +0000
+@@ -146,45 +146,45 @@ SBuf::GetStorePrototype()
+ 
+ SBuf&
+ SBuf::assign(const SBuf &S)
+ {
+     debugs(24, 7, "assigning " << id << " from " <<  S.id);
+     if (&S == this) //assignment to self. Noop.
+         return *this;
+     ++stats.assignFast;
+     store_ = S.store_;
+     off_ = S.off_;
+     len_ = S.len_;
+     return *this;
+ }
+ 
+ SBuf&
+ SBuf::assign(const char *S, size_type n)
+ {
+     const Locker blobKeeper(this, S);
+     debugs(24, 6, id << " from c-string, n=" << n << ")");
+     clear();
+-    return append(S, n); //bounds checked in append()
++    return append(S, n); //bounds checked in push_back()
+ }
+ 
+ void
+-SBuf::reserveCapacity(size_type minCapacity)
++SBuf::reserve(size_type minCapacity)
+ {
+     Must(minCapacity <= maxSize);
+     cow(minCapacity);
+ }
+ 
+ char *
+ SBuf::rawSpace(size_type minSpace)
+ {
+     Must(length() <= maxSize - minSpace);
+     debugs(24, 7, "reserving " << minSpace << " for " << id);
+     ++stats.rawAccess;
+     // we're not concerned about RefCounts here,
+     // the store knows the last-used portion. If
+     // it's available, we're effectively claiming ownership
+     // of it. If it's not, we need to go away (realloc)
+     if (store_->canAppend(off_+len_, minSpace)) {
+         debugs(24, 7, id << " not growing");
+         return bufEnd();
+     }
+     // TODO: we may try to memmove before realloc'ing in order to avoid
+@@ -215,46 +215,55 @@ SBuf&
+ SBuf::append(const SBuf &S)
+ {
+     const Locker blobKeeper(this, S.buf());
+     return lowAppend(S.buf(), S.length());
+ }
+ 
+ SBuf &
+ SBuf::append(const char * S, size_type Ssize)
+ {
+     const Locker blobKeeper(this, S);
+     if (S == NULL)
+         return *this;
+     if (Ssize == SBuf::npos)
+         Ssize = strlen(S);
+     debugs(24, 7, "from c-string to id " << id);
+     // coverity[access_dbuff_in_call]
+     return lowAppend(S, Ssize);
+ }
+ 
+ SBuf &
+-SBuf::append(const char c)
++SBuf::push_back(const char c)
+ {
+     return lowAppend(&c, 1);
+ }
+ 
+ SBuf&
++SBuf::append(size_type n, const char c)
++{
++    reserve(length() + n);
++    for (size_type j = 0; j < n; ++j)
++        lowAppend(&c, 1);
++    return *this;
++}
++
++SBuf&
+ SBuf::Printf(const char *fmt, ...)
+ {
+     // with printf() the fmt or an arg might be a dangerous char*
+     // NP: cant rely on vappendf() Locker because of clear()
+     const Locker blobKeeper(this, buf());
+ 
+     va_list args;
+     va_start(args, fmt);
+     clear();
+     vappendf(fmt, args);
+     va_end(args);
+     return *this;
+ }
+ 
+ SBuf&
+ SBuf::appendf(const char *fmt, ...)
+ {
+     va_list args;
+     va_start(args, fmt);
+     vappendf(fmt, args);
+
+=== modified file 'src/SBuf.h'
+--- src/SBuf.h	2015-11-18 05:46:36 +0000
++++ src/SBuf.h	2015-12-30 14:56:59 +0000
+@@ -216,41 +216,44 @@ public:
+      *
+      * Copy a c-style string into a SBuf. Shortcut for SBuf.assign(S)
+      * It is the caller's duty to free the imported string, if needed.
+      * \note not \0-clean
+      */
+     SBuf& operator =(const char *S) {return assign(S);}
+ 
+     /** reset the SBuf as if it was just created.
+      *
+      * Resets the SBuf to empty, memory is freed lazily.
+      */
+     void clear();
+ 
+     /** Append operation
+      *
+      * Append the supplied SBuf to the current one; extend storage as needed.
+      */
+     SBuf& append(const SBuf & S);
+ 
+     /// Append a single character. The character may be NUL (\0).
+-    SBuf& append(const char c);
++    SBuf& push_back(const char c);
++
++    /// Append n consecutive copies of c
++    SBuf& append(size_type n, const char c);
+ 
+     /** Append operation for C-style strings.
+      *
+      * Append the supplied c-string to the SBuf; extend storage
+      * as needed.
+      *
+      * \param S the c string to be copied. Can be NULL.
+      * \param Ssize how many bytes to import into the SBuf. If it is npos
+      *              or unspecified, imports to end-of-cstring. If S is NULL,
+      *              Ssize is ignored.
+      * \note to append a std::string use the pattern
+      *     cstr_append(stdstr.data(), stdstd.length())
+      */
+     SBuf& append(const char * S, size_type Ssize);
+     SBuf& append(const char * S) { return append(S,npos); }
+ 
+     /** Assignment operation with printf(3)-style definition
+      * \note arguments may be evaluated more than once, be careful
+      *       of side-effects
+      */
+@@ -473,62 +476,49 @@ public:
+     /// Returns the number of bytes stored in SBuf.
+     size_type length() const {return len_;}
+ 
+     /** Get the length of the SBuf, as a signed integer
+      *
+      * Compatibility function for printf(3) which requires a signed int
+      * \throw SBufTooBigException if the SBuf is too big for a signed integer
+      */
+     int plength() const {
+         if (length()>INT_MAX)
+             throw SBufTooBigException(__FILE__, __LINE__);
+         return static_cast<int>(length());
+     }
+ 
+     /** Check whether the SBuf is empty
+      *
+      * \return true if length() == 0
+      */
+     bool isEmpty() const {return (len_==0);}
+ 
+-    /** Request to guarantee the SBuf's free store space.
+-     *
+-     * After the reserveSpace request, the SBuf is guaranteed to have at
+-     * least minSpace bytes of unused backing store following the currently
+-     * used portion and single ownership of the backing store.
+-     * \throw SBufTooBigException if the user tries to allocate too big a SBuf
+-     */
+-    void reserveSpace(size_type minSpace) {
+-        Must(minSpace <= maxSize);
+-        Must(length() <= maxSize - minSpace);
+-        reserveCapacity(length()+minSpace);
+-    }
+-
+     /** Request to guarantee the SBuf's store capacity
+      *
+      * After this method is called, the SBuf is guaranteed to have at least
+      * minCapacity bytes of total buffer size, including the currently-used
+      * portion; it is also guaranteed that after this call this SBuf
+      * has unique ownership of the underlying memory store.
+      * \throw SBufTooBigException if the user tries to allocate too big a SBuf
+      */
+-    void reserveCapacity(size_type minCapacity);
++    void reserve(size_type minCapacity = 0);
+ 
+     /** slicing method
+      *
+      * Removes SBuf prefix and suffix, leaving a sequence of 'n'
+      * bytes starting from position 'pos', first byte is at pos 0.
+      * It is an in-place-modifying version of substr.
+      * \param pos start sub-stringing from this byte. If it is
+      *      npos or it is greater than the SBuf length, the SBuf is cleared and
+      *      an empty SBuf is returned.
+      * \param n maximum number of bytes of the resulting SBuf.
+      *     npos means "to end of SBuf".
+      *     if it is 0, the SBuf is cleared and an empty SBuf is returned.
+      *     if it overflows the end of the SBuf, it is capped to the end of SBuf
+      * \see substr, trim
+      */
+     SBuf& chop(size_type pos, size_type n = npos);
+ 
+     /** Remove characters in the toremove set at the beginning, end or both
+      *
+      * \param toremove characters to be removed. Stops chomping at the first
+@@ -631,53 +621,53 @@ public:
+      * \return same as sscanf
+      * \see man sscanf(3)
+      */
+     int scanf(const char *format, ...);
+ 
+     /// converts all characters to lower case; \see man tolower(3)
+     void toLower();
+ 
+     /// converts all characters to upper case; \see man toupper(3)
+     void toUpper();
+ 
+     /** String export function
+      * converts the SBuf to a legacy String, by copy.
+      * \deprecated
+      */
+     String toString() const;
+ 
+     /// std::string export function
+     std::string toStdString() const { return std::string(buf(),length()); }
+ 
+-    iterator begin() {
++    iterator begin() const {
+         return iterator(*this, 0);
+     }
+ 
+-    iterator end() {
++    iterator end() const {
+         return iterator(*this, length());
+     }
+ 
+-    reverse_iterator rbegin() {
++    reverse_iterator rbegin() const {
+         return reverse_iterator(*this, length());
+     }
+ 
+-    reverse_iterator rend() {
++    reverse_iterator rend() const {
+         return reverse_iterator(*this, 0);
+     }
+ 
+     // TODO: possibly implement erase() similar to std::string's erase
+     // TODO: possibly implement a replace() call
+ private:
+ 
+     /**
+      * Keeps SBuf's MemBlob alive in a blob-destroying context where
+      * a seemingly unrelated memory pointer may belong to the same blob.
+      * For [an extreme] example, consider: a.append(a).
+      * Compared to an SBuf temporary, this class is optimized to
+      * preserve blobs only if needed and to reduce debugging noise.
+      */
+     class Locker
+     {
+     public:
+         Locker(SBuf *parent, const char *otherBuffer) {
+             // lock if otherBuffer intersects the parents buffer area
+             const MemBlob *blob = parent->store_.getRaw();
+
+=== modified file 'src/SBufAlgos.h'
+--- src/SBufAlgos.h	2015-08-24 17:49:50 +0000
++++ src/SBufAlgos.h	2015-12-30 14:56:59 +0000
+@@ -54,41 +54,41 @@ private:
+     SBuf::size_type separatorLen_;
+ };
+ 
+ /// join all the SBuf in a container of SBuf into a single SBuf, separating with separator
+ template <class Container>
+ SBuf
+ SBufContainerJoin(const Container &items, const SBuf& separator)
+ {
+     // optimization: pre-calculate needed storage
+     const SBuf::size_type sz = std::accumulate(items.begin(), items.end(), 0, SBufAddLength(separator));
+ 
+     // sz can be zero in two cases: either items is empty, or all items
+     //  are zero-length. In the former case, we must protect against
+     //  dereferencing the iterator later on, and checking sz is more efficient
+     //  than checking items.size(). This check also provides an optimization
+     //  for the latter case without adding complexity.
+     if (sz == 0)
+         return SBuf();
+ 
+     SBuf rv;
+-    rv.reserveSpace(sz);
++    rv.reserve(sz);
+ 
+     typename Container::const_iterator i(items.begin());
+     rv.append(*i);
+     ++i;
+     for (; i != items.end(); ++i)
+         rv.append(separator).append(*i);
+     return rv;
+ }
+ 
+ namespace std {
+ /// default hash functor to support std::unordered_map<SBuf,*>
+ template <>
+ struct hash<SBuf>
+ {
+     size_t operator()(const SBuf &) const noexcept;
+ };
+ }
+ 
+ /** hash functor for SBufs, meant so support case-insensitive std::unordered_map
+  *
+
+=== modified file 'src/adaptation/icap/Xaction.cc'
+--- src/adaptation/icap/Xaction.cc	2015-11-28 03:00:35 +0000
++++ src/adaptation/icap/Xaction.cc	2015-12-30 14:56:59 +0000
+@@ -438,41 +438,41 @@ void Adaptation::Icap::Xaction::schedule
+ {
+     Must(haveConnection());
+     Must(!reader);
+     Must(readBuf.length() < SQUID_TCP_SO_RCVBUF); // will expand later if needed
+ 
+     typedef CommCbMemFunT<Adaptation::Icap::Xaction, CommIoCbParams> Dialer;
+     reader = JobCallback(93, 3, Dialer, this, Adaptation::Icap::Xaction::noteCommRead);
+     Comm::Read(connection, reader);
+     updateTimeout();
+ }
+ 
+ // comm module read a portion of the ICAP response for us
+ void Adaptation::Icap::Xaction::noteCommRead(const CommIoCbParams &io)
+ {
+     Must(reader != NULL);
+     reader = NULL;
+ 
+     Must(io.flag == Comm::OK);
+ 
+     // TODO: tune this better to expected message sizes
+-    readBuf.reserveCapacity(SQUID_TCP_SO_RCVBUF);
++    readBuf.reserve(SQUID_TCP_SO_RCVBUF);
+     // we are not asked to grow beyond the allowed maximum
+     Must(readBuf.length() < SQUID_TCP_SO_RCVBUF);
+     // now we can ensure that there is space to read new data,
+     // even if readBuf.spaceSize() currently returns zero.
+     readBuf.rawSpace(1);
+ 
+     CommIoCbParams rd(this); // will be expanded with ReadNow results
+     rd.conn = io.conn;
+ 
+     switch (Comm::ReadNow(rd, readBuf)) {
+     case Comm::INPROGRESS:
+         if (readBuf.isEmpty())
+             debugs(33, 2, io.conn << ": no data to process, " << xstrerr(rd.xerrno));
+         scheduleRead();
+         return;
+ 
+     case Comm::OK:
+         al.icap.bytesRead += rd.size;
+ 
+         updateTimeout();
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2015-12-22 10:57:16 +0000
++++ src/http.cc	2015-12-30 14:56:59 +0000
+@@ -1548,41 +1548,41 @@ HttpStateData::maybeMakeSpaceAvailable(b
+         debugs(11, 7, "wont read up to " << limitBuffer << ". buffer has (" << inBuf.length() << "/" << inBuf.spaceSize() << ") from " << serverConnection);
+         debugs(11, DBG_DATA, "buffer has {" << inBuf << "}");
+         // Process next response from buffer
+         processReply();
+         return false;
+     }
+ 
+     // how much we want to read
+     const size_t read_size = calcBufferSpaceToReserve(inBuf.spaceSize(), (limitBuffer - inBuf.length()));
+ 
+     if (!read_size) {
+         debugs(11, 7, "wont read up to " << read_size << " into buffer (" << inBuf.length() << "/" << inBuf.spaceSize() << ") from " << serverConnection);
+         return false;
+     }
+ 
+     // just report whether we could grow or not, dont actually do it
+     if (doGrow)
+         return (read_size >= 2);
+ 
+     // we may need to grow the buffer
+-    inBuf.reserveSpace(read_size);
++    inBuf.reserve(inBuf.length() + read_size);
+     debugs(11, 8, (!flags.do_next_read ? "wont" : "may") <<
+            " read up to " << read_size << " bytes info buf(" << inBuf.length() << "/" << inBuf.spaceSize() <<
+            ") from " << serverConnection);
+ 
+     return (inBuf.spaceSize() >= 2); // only read if there is 1+ bytes of space available
+ }
+ 
+ /// called after writing the very last request byte (body, last-chunk, etc)
+ void
+ HttpStateData::wroteLast(const CommIoCbParams &io)
+ {
+     debugs(11, 5, HERE << serverConnection << ": size " << io.size << ": errflag " << io.flag << ".");
+ #if URL_CHECKSUM_DEBUG
+ 
+     entry->mem_obj->checkUrlChecksum();
+ #endif
+ 
+     if (io.size > 0) {
+         fd_bytes(io.fd, io.size, FD_WRITE);
+         statCounter.server.all.kbytes_out += io.size;
+
+=== modified file 'src/servers/Server.cc'
+--- src/servers/Server.cc	2015-12-08 18:47:25 +0000
++++ src/servers/Server.cc	2015-12-30 14:56:59 +0000
+@@ -55,44 +55,44 @@ void
+ Server::stopReading()
+ {
+     if (reading()) {
+         Comm::ReadCancel(clientConnection->fd, reader);
+         reader = NULL;
+     }
+ }
+ 
+ bool
+ Server::maybeMakeSpaceAvailable()
+ {
+     if (inBuf.spaceSize() < 2) {
+         const SBuf::size_type haveCapacity = inBuf.length() + inBuf.spaceSize();
+         if (haveCapacity >= Config.maxRequestBufferSize) {
+             debugs(33, 4, "request buffer full: client_request_buffer_max_size=" << Config.maxRequestBufferSize);
+             return false;
+         }
+         if (haveCapacity == 0) {
+             // haveCapacity is based on the SBuf visible window of the MemBlob buffer, which may fill up.
+             // at which point bump the buffer back to default. This allocates a new MemBlob with any un-parsed bytes.
+-            inBuf.reserveCapacity(CLIENT_REQ_BUF_SZ);
++            inBuf.reserve(CLIENT_REQ_BUF_SZ);
+         } else {
+             const SBuf::size_type wantCapacity = min(static_cast<SBuf::size_type>(Config.maxRequestBufferSize), haveCapacity*2);
+-            inBuf.reserveCapacity(wantCapacity);
++            inBuf.reserve(wantCapacity);
+         }
+         debugs(33, 2, "growing request buffer: available=" << inBuf.spaceSize() << " used=" << inBuf.length());
+     }
+     return (inBuf.spaceSize() >= 2);
+ }
+ 
+ void
+ Server::readSomeData()
+ {
+     if (reading())
+         return;
+ 
+     debugs(33, 4, clientConnection << ": reading request...");
+ 
+     // we can only read if there is more than 1 byte of space free
+     if (Config.maxRequestBufferSize - inBuf.length() < 2)
+         return;
+ 
+     typedef CommCbMemFunT<Server, CommIoCbParams> Dialer;
+     reader = JobCallback(33, 5, Dialer, this, Server::doClientRead);
+
+=== modified file 'src/tests/SBufFindTest.cc'
+--- src/tests/SBufFindTest.cc	2015-08-25 14:36:54 +0000
++++ src/tests/SBufFindTest.cc	2015-12-30 14:56:59 +0000
+@@ -371,43 +371,43 @@ SBufFindTest::handleFailure(const char *
+     ++reportCount;
+ }
+ 
+ /// generates a random string of the specified length
+ SBuf
+ SBufFindTest::RandomSBuf(const int length)
+ {
+     static const char characters[] =
+         "0123456789"
+         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+         "abcdefghijklomnpqrstuvwxyz";
+ 
+     static std::mt19937 mt(time(0));
+ 
+     // sizeof() counts the terminating zero at the end of characters
+     // and the distribution is an 'inclusive' value range, so -2
+     // TODO: add \0 character (needs reporting adjustments to print it as \0)
+     static xuniform_int_distribution<uint8_t> dist(0, sizeof(characters)-2);
+ 
+     SBuf buf;
+-    buf.reserveCapacity(length);
++    buf.reserve(length);
+     for (int i = 0; i < length; ++i)
+-        buf.append(characters[dist(mt)]);
++        buf.push_back(characters[dist(mt)]);
+     return buf;
+ }
+ 
+ /// increments len to quickly cover [0, max] range, slowing down in risky areas
+ /// jumps to max+1 if caseLimit is reached
+ void
+ SBufFindTest::nextLen(SBuf::size_type &len, const SBuf::size_type max)
+ {
+     assert(len <= max);
+ 
+     if (caseCount >= caseLimit)
+         len = max+1; // avoid future test cases
+     else if (len <= 10)
+         ++len; // move slowly at the beginning of the [0,max] range
+     else if (len >= max - 10)
+         ++len; // move slowly at the end of the [0,max] range
+     else {
+         // move fast in the middle of the [0,max] range
+         len += len/10 + 1;
+ 
+
+=== modified file 'src/tests/stub_SBuf.cc'
+--- src/tests/stub_SBuf.cc	2015-02-19 21:30:25 +0000
++++ src/tests/stub_SBuf.cc	2015-12-30 14:56:59 +0000
+@@ -36,35 +36,35 @@ void clear() STUB
+ SBuf& SBuf::append(const SBuf & S) STUB_RETVAL(*this)
+ SBuf& SBuf::append(const char * S, size_type Ssize) STUB_RETVAL(*this)
+ SBuf& Printf(const char *fmt, ...);
+ SBuf& SBuf::appendf(const char *fmt, ...) STUB_RETVAL(*this)
+ SBuf& SBuf::vappendf(const char *fmt, va_list vargs) STUB_RETVAL(*this)
+ std::ostream& SBuf::print(std::ostream &os) const STUB_RETVAL(os)
+ std::ostream& SBuf::dump(std::ostream &os) const STUB_RETVAL(os)
+ void SBuf::setAt(size_type pos, char toset) STUB
+ int SBuf::compare(const SBuf &S, const SBufCaseSensitive isCaseSensitive, const size_type n) const STUB_RETVAL(-1)
+ int SBuf::compare(const char *s, const SBufCaseSensitive isCaseSensitive, const size_type n) const STUB_RETVAL(-1)
+ bool SBuf::startsWith(const SBuf &S, const SBufCaseSensitive isCaseSensitive) const STUB_RETVAL(false)
+ bool SBuf::operator ==(const SBuf & S) const STUB_RETVAL(false)
+ bool SBuf::operator !=(const SBuf & S) const STUB_RETVAL(false)
+ SBuf SBuf::consume(size_type n) STUB_RETVAL(*this)
+ const SBufStats& SBuf::GetStats() STUB_RETVAL(SBuf::stats)
+ SBuf::size_type SBuf::copy(char *dest, size_type n) const STUB_RETVAL(0)
+ const char* SBuf::rawContent() const STUB_RETVAL(NULL)
+ char *SBuf::rawSpace(size_type minSize) STUB_RETVAL(NULL)
+ void SBuf::forceSize(size_type newSize) STUB
+ const char* SBuf::c_str() STUB_RETVAL("")
+-void SBuf::reserveCapacity(size_type minCapacity) STUB
++void SBuf::reserve(size_type minCapacity) STUB
+ SBuf& SBuf::chop(size_type pos, size_type n) STUB_RETVAL(*this)
+ SBuf& SBuf::trim(const SBuf &toRemove, bool atBeginning, bool atEnd) STUB_RETVAL(*this)
+ SBuf SBuf::substr(size_type pos, size_type n) const STUB_RETVAL(*this)
+ SBuf::size_type SBuf::find(char c, size_type startPos) const STUB_RETVAL(SBuf::npos)
+ SBuf::size_type SBuf::find(const SBuf & str, size_type startPos) const STUB_RETVAL(SBuf::npos)
+ SBuf::size_type SBuf::rfind(char c, size_type endPos) const STUB_RETVAL(SBuf::npos)
+ SBuf::size_type SBuf::rfind(const SBuf &str, size_type endPos) const STUB_RETVAL(SBuf::npos)
+ SBuf::size_type SBuf::findFirstOf(const CharacterSet &set, size_type startPos) const STUB_RETVAL(SBuf::npos)
+ SBuf::size_type SBuf::findFirstNotOf(const CharacterSet &set, size_type startPos) const STUB_RETVAL(SBuf::npos)
+ int SBuf::scanf(const char *format, ...) STUB_RETVAL(-1)
+ void SBuf::toLower() STUB
+ void SBuf::toUpper() STUB
+ String SBuf::toString() const STUB_RETVAL(String(""))
+ 
+
+=== modified file 'src/tests/testSBuf.cc'
+--- src/tests/testSBuf.cc	2015-07-29 18:12:16 +0000
++++ src/tests/testSBuf.cc	2015-12-30 14:56:59 +0000
+@@ -794,41 +794,41 @@ testSBuf::testCopy()
+ void
+ testSBuf::testStringOps()
+ {
+     SBuf sng(ToLower(literal)),
+          ref("the quick brown fox jumped over the lazy dog");
+     CPPUNIT_ASSERT_EQUAL(ref,sng);
+     sng=literal;
+     CPPUNIT_ASSERT_EQUAL(0,sng.compare(ref,caseInsensitive));
+     // max-size comparison
+     CPPUNIT_ASSERT_EQUAL(0,ref.compare(SBuf("THE"),caseInsensitive,3));
+     CPPUNIT_ASSERT_EQUAL(1,ref.compare(SBuf("THE"),caseInsensitive,6));
+     CPPUNIT_ASSERT_EQUAL(0,SBuf("the").compare(SBuf("THE"),caseInsensitive,6));
+ }
+ 
+ void
+ testSBuf::testGrow()
+ {
+     SBuf t;
+     t.assign("foo");
+     const char *ref=t.rawContent();
+-    t.reserveCapacity(10240);
++    t.reserve(10240);
+     const char *match=t.rawContent();
+     CPPUNIT_ASSERT(match!=ref);
+     ref=match;
+     t.append(literal).append(literal).append(literal).append(literal).append(literal);
+     t.append(t).append(t).append(t).append(t).append(t);
+     CPPUNIT_ASSERT_EQUAL(ref,match);
+ }
+ 
+ void
+ testSBuf::testStartsWith()
+ {
+     static SBuf casebuf("THE QUICK");
+     CPPUNIT_ASSERT(literal.startsWith(SBuf(fox1)));
+     CPPUNIT_ASSERT(!SBuf("The quick brown").startsWith(SBuf(fox1))); //too short
+     CPPUNIT_ASSERT(!literal.startsWith(SBuf(fox2))); //different contents
+ 
+     // case-insensitive checks
+     CPPUNIT_ASSERT(literal.startsWith(casebuf,caseInsensitive));
+     casebuf=ToUpper(SBuf(fox1));
+     CPPUNIT_ASSERT(literal.startsWith(casebuf,caseInsensitive));
+
+=== modified file 'src/url.cc'
+--- src/url.cc	2015-08-24 18:12:00 +0000
++++ src/url.cc	2015-12-30 14:56:59 +0000
+@@ -475,41 +475,41 @@ URL::authority(bool requirePort) const
+     if (authorityHttp_.isEmpty()) {
+ 
+         // both formats contain Host/IP
+         authorityWithPort_.append(host());
+         authorityHttp_ = authorityWithPort_;
+ 
+         // authorityForm_ only has :port if it is non-default
+         authorityWithPort_.appendf(":%u",port());
+         if (port() != getScheme().defaultPort())
+             authorityHttp_ = authorityWithPort_;
+     }
+ 
+     return requirePort ? authorityWithPort_ : authorityHttp_;
+ }
+ 
+ SBuf &
+ URL::absolute() const
+ {
+     if (absolute_.isEmpty()) {
+         // TODO: most URL will be much shorter, avoid allocating this much
+-        absolute_.reserveCapacity(MAX_URL);
++        absolute_.reserve(MAX_URL);
+ 
+         absolute_.appendf("%s:", getScheme().c_str());
+         if (getScheme() != AnyP::PROTO_URN) {
+             absolute_.append("//", 2);
+             const bool omitUserInfo = getScheme() == AnyP::PROTO_HTTP ||
+                                       getScheme() != AnyP::PROTO_HTTPS ||
+                                       userInfo().isEmpty();
+             if (!omitUserInfo) {
+                 absolute_.append(userInfo());
+                 absolute_.append("@", 1);
+             }
+             absolute_.append(authority());
+         }
+         absolute_.append(path());
+     }
+ 
+     return absolute_;
+ }
+ 
+ /** \todo AYJ: Performance: This is an *almost* duplicate of HttpRequest::effectiveRequestUri(). But elides the query-string.
+

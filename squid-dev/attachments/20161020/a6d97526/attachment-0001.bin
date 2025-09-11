@@ -1,0 +1,289 @@
+ssl::server_name ACL badly broken since inception (trunk r14008).
+
+The original server_name code mishandled all SNI checks and some rare
+host checks:
+
+* The SNI-derived value was pointing to an already freed memory storage.
+* Missing host-derived values were not detected (host() is never nil).
+* Mismatches were re-checked with an undocumented "none" value
+  instead of being treated as mismatches.
+
+Same for ssl::server_name_regex.
+
+Also set SNI for more server-first and client-first transactions.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/acl/ServerName.cc'
+--- src/acl/ServerName.cc	2016-09-06 08:12:10 +0000
++++ src/acl/ServerName.cc	2016-10-20 16:12:42 +0000
+@@ -74,51 +74,53 @@
+ 
+     char *s = reinterpret_cast<char *>(cn_data->data);
+     char *d = cn;
+     for (int i = 0; i < cn_data->length; ++i, ++d, ++s) {
+         if (*s == '\0')
+             return 1; // always a domain mismatch. contains 0x00
+         *d = *s;
+     }
+     cn[cn_data->length] = '\0';
+     debugs(28, 4, "Verifying certificate name/subjectAltName " << cn);
+     if (data->match(cn))
+         return 0;
+     return 1;
+ }
+ 
+ int
+ ACLServerNameStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &flags)
+ {
+     assert(checklist != NULL && checklist->request != NULL);
+ 
+-    if (checklist->conn() && checklist->conn()->serverBump()) {
+-        if (X509 *peer_cert = checklist->conn()->serverBump()->serverCert.get()) {
+-            if (Ssl::matchX509CommonNames(peer_cert, (void *)data, check_cert_domain<MatchType>))
+-                return 1;
++    const char *serverName = nullptr;
++    SBuf serverNameKeeper; // because c_str() is not constant
++    if (ConnStateData *conn = checklist->conn()) {
++
++        if (conn->serverBump()) {
++            if (X509 *peer_cert = conn->serverBump()->serverCert.get())
++                return Ssl::matchX509CommonNames(peer_cert, (void *)data, check_cert_domain<MatchType>);
+         }
+-    }
+ 
+-    const char *serverName = NULL;
+-    if (checklist->conn() && !checklist->conn()->sslCommonName().isEmpty()) {
+-        SBuf scn = checklist->conn()->sslCommonName();
+-        serverName = scn.c_str();
++        if (conn->sslCommonName().isEmpty()) {
++            const char *host = checklist->request->url.host();
++            if (host && *host) // paranoid first condition: host() is never nil
++                serverName = host;
++        } else {
++            serverNameKeeper = conn->sslCommonName();
++            serverName = serverNameKeeper.c_str();
++        }
+     }
+ 
+-    if (serverName == NULL)
+-        serverName = checklist->request->url.host();
+-
+-    if (serverName && data->match(serverName)) {
+-        return 1;
+-    }
++    if (!serverName)
++        serverName = "none";
+ 
+-    return data->match("none");
++    return data->match(serverName);
+ }
+ 
+ ACLServerNameStrategy *
+ ACLServerNameStrategy::Instance()
+ {
+     return &Instance_;
+ }
+ 
+ ACLServerNameStrategy ACLServerNameStrategy::Instance_;
+ 
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2016-09-13 17:30:03 +0000
++++ src/cf.data.pre	2016-10-20 16:11:25 +0000
+@@ -1275,40 +1275,43 @@
+ 
+ 	acl aclname at_step step
+ 	  # match against the current step during ssl_bump evaluation [fast]
+ 	  # Never matches and should not be used outside the ssl_bump context.
+ 	  #
+ 	  # At each SslBump step, Squid evaluates ssl_bump directives to find
+ 	  # the next bumping action (e.g., peek or splice). Valid SslBump step
+ 	  # values and the corresponding ssl_bump evaluation moments are:
+ 	  #   SslBump1: After getting TCP-level and HTTP CONNECT info.
+ 	  #   SslBump2: After getting SSL Client Hello info.
+ 	  #   SslBump3: After getting SSL Server Hello info.
+ 
+ 	acl aclname ssl::server_name .foo.com ...
+ 	  # matches server name obtained from various sources [fast]
+ 	  #
+ 	  # The server name is obtained during Ssl-Bump steps from such sources
+ 	  # as CONNECT request URI, client SNI, and SSL server certificate CN.
+ 	  # During each Ssl-Bump step, Squid may improve its understanding of a
+ 	  # "true server name". Unlike dstdomain, this ACL does not perform
+ 	  # DNS lookups.
++	  # The "none" name can be used to match transactions where Squid
++	  # could not compute the server name using any information source
++	  # already available at the ACL evaluation time.
+ 
+ 	acl aclname ssl::server_name_regex [-i] \.foo\.com ...
+ 	  # regex matches server name obtained from various sources [fast]
+ 
+ 	acl aclname connections_encrypted
+ 	  # matches transactions with all HTTP messages received over TLS
+ 	  # transport connections. [fast]
+ 	  #
+ 	  # The master transaction deals with HTTP messages received from
+ 	  # various sources. All sources used by the master transaction in the
+ 	  # past are considered by the ACL. The following rules define whether
+ 	  # a given message source taints the entire master transaction,
+ 	  # resulting in ACL mismatches:
+ 	  #
+ 	  #  * The HTTP client transport connection is not TLS.
+ 	  #  * An adaptation service connection-encryption flag is off.
+ 	  #  * The peer or origin server transport connection is not TLS.
+ 	  #
+ 	  # Caching currently does not affect these rules. This cache ignorance
+ 	  # implies that only the current HTTP client transport and REQMOD
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-09-22 14:21:12 +0000
++++ src/client_side.cc	2016-10-20 16:11:25 +0000
+@@ -2702,48 +2702,40 @@
+                fd_table[fd].remote_port << ")");
+     }
+ 
+     // Connection established. Retrieve TLS connection parameters for logging.
+     conn->clientConnection->tlsNegotiations()->retrieveNegotiatedInfo(session);
+ 
+     X509 *client_cert = SSL_get_peer_certificate(session.get());
+ 
+     if (client_cert) {
+         debugs(83, 3, "FD " << fd << " client certificate: subject: " <<
+                X509_NAME_oneline(X509_get_subject_name(client_cert), 0, 0));
+ 
+         debugs(83, 3, "FD " << fd << " client certificate: issuer: " <<
+                X509_NAME_oneline(X509_get_issuer_name(client_cert), 0, 0));
+ 
+         X509_free(client_cert);
+     } else {
+         debugs(83, 5, "FD " << fd << " has no certificate.");
+     }
+ 
+-#if defined(TLSEXT_NAMETYPE_host_name)
+-    if (!conn->serverBump()) {
+-        // when in bumpClientFirst mode, get the server name from SNI
+-        if (const char *server = SSL_get_servername(session.get(), TLSEXT_NAMETYPE_host_name))
+-            conn->resetSslCommonName(server);
+-    }
+-#endif
+-
+     conn->readSomeData();
+ }
+ 
+ /**
+  * If Security::ContextPointer is given, starts reading the TLS handshake.
+  * Otherwise, calls switchToHttps to generate a dynamic Security::ContextPointer.
+  */
+ static void
+ httpsEstablish(ConnStateData *connState, const Security::ContextPointer &ctx)
+ {
+     assert(connState);
+     const Comm::ConnectionPointer &details = connState->clientConnection;
+ 
+     if (!ctx || !httpsCreate(details, ctx))
+         return;
+ 
+     typedef CommCbMemFunT<ConnStateData, CommTimeoutCbParams> TimeoutDialer;
+     AsyncCall::Pointer timeoutCall = JobCallback(33, 5, TimeoutDialer,
+                                      connState, ConnStateData::requestTimeout);
+     commSetConnTimeout(details, Config.Timeout.request, timeoutCall);
+@@ -3169,41 +3161,47 @@
+     receivedFirstByte();
+     fd_note(clientConnection->fd, "Parsing TLS handshake");
+ 
+     bool unsupportedProtocol = false;
+     try {
+         if (!tlsParser.parseHello(inBuf)) {
+             // need more data to finish parsing
+             readSomeData();
+             return;
+         }
+     }
+     catch (const std::exception &ex) {
+         debugs(83, 2, "error on FD " << clientConnection->fd << ": " << ex.what());
+         unsupportedProtocol = true;
+     }
+ 
+     parsingTlsHandshake = false;
+ 
+     // Even if the parser failed, each TLS detail should either be set
+     // correctly or still be "unknown"; copying unknown detail is a no-op.
+-    clientConnection->tlsNegotiations()->retrieveParsedInfo(tlsParser.details);
++    Security::TlsDetails::Pointer const &details = tlsParser.details;
++    clientConnection->tlsNegotiations()->retrieveParsedInfo(details);
++    if (details && !details->serverName.isEmpty()) {
++        resetSslCommonName(details->serverName.c_str());
++        if (sslServerBump)
++            sslServerBump->clientSni = details->serverName;
++    }
+ 
+     // We should disable read/write handlers
+     Comm::SetSelect(clientConnection->fd, COMM_SELECT_READ, NULL, NULL, 0);
+     Comm::SetSelect(clientConnection->fd, COMM_SELECT_WRITE, NULL, NULL, 0);
+ 
+     if (!sslServerBump) { // BumpClientFirst mode does not use this member
+         getSslContextStart();
+         return;
+     } else if (sslServerBump->act.step1 == Ssl::bumpServerFirst) {
+         // will call httpsPeeked() with certificate and connection, eventually
+         FwdState::fwdStart(clientConnection, sslServerBump->entry, sslServerBump->request.getRaw());
+     } else {
+         Must(sslServerBump->act.step1 == Ssl::bumpPeek || sslServerBump->act.step1 == Ssl::bumpStare);
+         startPeekAndSplice(unsupportedProtocol);
+     }
+ }
+ 
+ bool
+ ConnStateData::spliceOnError(const err_type err)
+ {
+@@ -3212,48 +3210,40 @@
+         ACLFilledChecklist checklist(Config.accessList.on_unsupported_protocol, serverBump()->request.getRaw(), NULL);
+         checklist.requestErrorType = err;
+         checklist.conn(this);
+         allow_t answer = checklist.fastCheck();
+         if (answer == ACCESS_ALLOWED && answer.kind == 1) {
+             return splice();
+         }
+     }
+     return false;
+ }
+ 
+ void
+ ConnStateData::startPeekAndSplice(const bool unsupportedProtocol)
+ {
+     if (unsupportedProtocol) {
+         if (!spliceOnError(ERR_PROTOCOL_UNKNOWN))
+             clientConnection->close();
+         return;
+     }
+ 
+-    if (serverBump()) {
+-        Security::TlsDetails::Pointer const &details = tlsParser.details;
+-        if (details && !details->serverName.isEmpty()) {
+-            serverBump()->clientSni = details->serverName;
+-            resetSslCommonName(details->serverName.c_str());
+-        }
+-    }
+-
+     startPeekAndSpliceDone();
+ }
+ 
+ void httpsSslBumpStep2AccessCheckDone(allow_t answer, void *data)
+ {
+     ConnStateData *connState = (ConnStateData *) data;
+ 
+     // if the connection is closed or closing, just return.
+     if (!connState->isOpen())
+         return;
+ 
+     debugs(33, 5, "Answer: " << answer << " kind:" << answer.kind);
+     assert(connState->serverBump());
+     Ssl::BumpMode bumpAction;
+     if (answer == ACCESS_ALLOWED) {
+         bumpAction = (Ssl::BumpMode)answer.kind;
+     } else
+         bumpAction = Ssl::bumpSplice;
+ 
+     connState->serverBump()->act.step2 = bumpAction;
+

@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Revalidate without Last-Modified
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Revalidate%20without%20Last-Modified&In-Reply-To=%3C0ee0af07-94c6-7577-1eca-53557d8601a7%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006628.html">
+   <LINK REL="Next"  HREF="006632.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Revalidate without Last-Modified</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Revalidate%20without%20Last-Modified&In-Reply-To=%3C0ee0af07-94c6-7577-1eca-53557d8601a7%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] Revalidate without Last-Modified">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Thu Aug 25 15:52:41 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006628.html">[squid-dev] [PATCH] Revalidate without Last-Modified
+</A></li>
+        <LI>Next message: <A HREF="006632.html">[squid-dev] [PATCH] Revalidate without Last-Modified
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6630">[ date ]</a>
+              <a href="thread.html#6630">[ thread ]</a>
+              <a href="subject.html#6630">[ subject ]</a>
+              <a href="author.html#6630">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 08/25/2016 04:04 AM, Eduard Bagdasaryan wrote:
+
+&gt;<i> Therefore, we could use the timestamp if Last-Modified is unavailable.
+</I>
+I do not understand why the patch hides the lastmod field behind a basic
+getter. If we assert that a timestamp-based last modification value
+should be used in many cases, then we need to force the calling code to
+make an important choice between a raw lastmod and a timestamp-based
+last modification value.
+
+The patch does not force the caller to make that choice because
+developers will naturally call lastModified() getter instead of
+effectiveModificationTime(). If calling lastModified() produces more
+problems like the one you are trying to fix (with reviewers not being
+able to guess that the wrong method was called), then renaming lastmod_
+accomplished nothing. Similarly, if calling lastModified() produces no
+new problems (because the lastmod usage case you were fixing happened to
+be exceptional rather than the norm), then renaming lastmod_ also
+accomplished nothing.
+
+The patch does use effectiveModificationTime() in several places already
+so I suspect its usage is not that exceptional -- many, possibly even
+most contexts should use effectiveModificationTime(). If you agree, then
+we should make using lastmod_ getter more difficult -- the developer and
+the reviewer should be forced to pay attention to such use because it is
+likely to indicate a bug in new code (i.e., the new code should have
+called effectiveModificationTime() instead).
+
+Moreover, these raw lastmod abuse problems might be already surfacing in
+your own patch! I see several raw lastmod value uses there:
+
+
+1. Misleading debugging:
+
+&gt;<i> +    const time_t lastmod = http-&gt;storeEntry()-&gt;effectiveModificationTime();
+</I>&gt;<i> +    http-&gt;request-&gt;lastmod = lastmod;
+</I>...
+&gt;<i> -    debugs(88, 5, &quot;clientReplyContext::processExpired : lastmod &quot; &lt;&lt; entry-&gt;lastmod );
+</I>&gt;<i> +    debugs(88, 5, &quot;lastmod &quot; &lt;&lt; entry-&gt;lastModified());
+</I>
+In other words, Squid is going to use the effective modification time,
+but we are logging raw time to make triage harder.
+
+
+2. Writing -1 to cache store metadata:
+
+&gt;<i>      currentEntry(sd-&gt;addDiskRestore(key,
+</I>&gt;<i>                                      tmpe.timestamp,
+</I>...
+&gt;<i> -                                    tmpe.lastmod,
+</I>&gt;<i> +                                    tmpe.lastModified(),
+</I>
+and
+
+&gt;<i>      StoreSwapLogData s;
+</I>&gt;<i>      s.timestamp = e.timestamp;
+</I>...
+&gt;<i> -    s.lastmod = e.lastmod;
+</I>&gt;<i> +    s.lastmod = e.lastModified();
+</I>
+and
+
+&gt;<i> -    basics.lastmod = from.lastmod;
+</I>&gt;<i> +    basics.lastmod = from.lastModified();
+</I>
+Does a store need raw lastmod or effective modification time? I suspect
+it is the latter, but perhaps I am missing some valid use cases for the
+former. This needs a careful consideration.
+
+If we are lucky, there is a relatively simple way to answer this
+question: If the stored lastmod value is only used to re-initialize some
+future StoreEntry::lastmod_ value _and_ all non-debugging uses of
+StoreEntry::lastmod_ are going to be via effectiveModificationTime(),
+then we can store effective modification time instead of -1!
+
+
+3. Sending an HTCP message to another service.
+
+&gt;<i> -            hdr.putTime(Http::HdrType::LAST_MODIFIED, e-&gt;lastmod);
+</I>&gt;<i> +        if (e &amp;&amp; e-&gt;lastModified() &gt; -1)
+</I>&gt;<i> +            hdr.putTime(Http::HdrType::LAST_MODIFIED, e-&gt;lastModified());
+</I>
+Is this a conditional/revalidation request? If yes, then should we use
+an effective modification time instead, like we do in use case #1?
+
+
+4. StoreEntry state reporting.
+
+&gt;<i>  describeTimestamps(const StoreEntry * entry)
+</I>...
+&gt;<i>               (int) entry-&gt;timestamp,
+</I>...
+&gt;<i> -             (int) entry-&gt;lastmod,
+</I>&gt;<i> +             (int) entry-&gt;lastModified(),
+</I>
+The debugging should reflect the true value so this is fine. However, we
+can make this function a StoreEntry method to avoid the need for getter
+_if_ this is the only place where the getter is needed.
+
+
+If I did not miss any use cases, then #3 appears to be critical here. If
+we should be using effective modification time in #3, then there appears
+to be no need to store -1 in StoreEntry and your patch can be greatly
+simplified. If #3 does need a raw value from StoreEntry, then we will
+need a better way to force developers to think about the right method to
+use.
+
+Please double check what is going on in #3, and we will go from there.
+
+
+Thank you,
+
+Alex.
+
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006628.html">[squid-dev] [PATCH] Revalidate without Last-Modified
+</A></li>
+	<LI>Next message: <A HREF="006632.html">[squid-dev] [PATCH] Revalidate without Last-Modified
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6630">[ date ]</a>
+              <a href="thread.html#6630">[ thread ]</a>
+              <a href="subject.html#6630">[ subject ]</a>
+              <a href="author.html#6630">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

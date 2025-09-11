@@ -1,0 +1,379 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Bug 2907: high CPU usage on CONNECT when using	delay pools
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Bug%202907%3A%20high%20CPU%20usage%20on%20CONNECT%20when%20using%0A%09delay%20pools&In-Reply-To=%3C54E823B9.3040106%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="001723.html">
+   <LINK REL="Next"  HREF="001745.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Bug 2907: high CPU usage on CONNECT when using	delay pools</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Bug%202907%3A%20high%20CPU%20usage%20on%20CONNECT%20when%20using%0A%09delay%20pools&In-Reply-To=%3C54E823B9.3040106%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] Bug 2907: high CPU usage on CONNECT when using	delay pools">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Sat Feb 21 06:20:41 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001723.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » clang,d-debian-wheezy #108
+</A></li>
+        <LI>Next message: <A HREF="001745.html">[squid-dev] [PATCH] Bug 2907: high CPU usage on CONNECT when using delay pools
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1732">[ date ]</a>
+              <a href="thread.html#1732">[ thread ]</a>
+              <a href="subject.html#1732">[ subject ]</a>
+              <a href="author.html#1732">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>When delay pools are active on a CONNECT tunnel and the pool is drained
+the I/O loop cycles very often transferring 1 byte until the pool is
+topped-up at the end of the second.
+
+Instead of looping constantly trying to read 1 byte at a time, add an
+asynchronous event to wait for a few I/O cycles or until more bytes can
+be read.
+
+To protect against infinite loops of waiting when many tunnels are
+competing for the pool allowance we only delay for a limited number of
+loops before allowing at least 1 byte through. Also, the amount of time
+waited is an odd fraction of 1 second so re-tries naturally spread
+across any given second fairly, with connections rotating closer or
+further from the time when pool topup happens.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/tunnel.cc'
+--- src/tunnel.cc	2015-01-16 16:18:05 +0000
++++ src/tunnel.cc	2015-02-21 03:30:27 +0000
+@@ -1,34 +1,35 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 26    Secure Sockets Layer Proxy */
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;acl/FilledChecklist.h&quot;
+ #include &quot;base/CbcPointer.h&quot;
+ #include &quot;CachePeer.h&quot;
++#include &quot;cbdata.h&quot;
+ #include &quot;client_side.h&quot;
+ #include &quot;client_side_request.h&quot;
+ #include &quot;comm.h&quot;
+ #include &quot;comm/Connection.h&quot;
+ #include &quot;comm/ConnOpener.h&quot;
+ #include &quot;comm/Read.h&quot;
+ #include &quot;comm/Write.h&quot;
+ #include &quot;errorpage.h&quot;
+ #include &quot;fde.h&quot;
+ #include &quot;FwdState.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;http.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;HttpStateFlags.h&quot;
+ #include &quot;ip/QosConfig.h&quot;
+ #include &quot;LogTags.h&quot;
+ #include &quot;MemBuf.h&quot;
+ #include &quot;PeerSelectState.h&quot;
+ #include &quot;SBuf.h&quot;
+ #include &quot;SquidConfig.h&quot;
+@@ -98,63 +99,63 @@
+     /// Whether we are reading a CONNECT response from a peer.
+     bool waitingForConnectResponse() const { return connectRespBuf; }
+     /// Whether we are waiting for the CONNECT request/response exchange with the peer.
+     bool waitingForConnectExchange() const { return waitingForConnectRequest() || waitingForConnectResponse(); }
+ 
+     /// Whether the client sent a CONNECT request to us.
+     bool clientExpectsConnectResponse() const {
+ #if USE_OPENSSL
+         // We are bumping and we had already send &quot;OK CONNECTED&quot;
+         if (http.valid() &amp;&amp; http-&gt;getConn() &amp;&amp; http-&gt;getConn()-&gt;serverBump() &amp;&amp; http-&gt;getConn()-&gt;serverBump()-&gt;step &gt; Ssl::bumpStep1)
+             return false;
+ #endif
+         return !(request != NULL &amp;&amp;
+                  (request-&gt;flags.interceptTproxy || request-&gt;flags.intercepted));
+     }
+ 
+     class Connection
+     {
+ 
+     public:
+-        Connection() : len (0), buf ((char *)xmalloc(SQUID_TCP_SO_RCVBUF)), size_ptr(NULL) {}
++        Connection() : len (0), buf ((char *)xmalloc(SQUID_TCP_SO_RCVBUF)), size_ptr(NULL), delayedLoops(0) {}
+ 
+         ~Connection();
+ 
+         int bytesWanted(int lower=0, int upper = INT_MAX) const;
+         void bytesIn(int const &amp;);
+ #if USE_DELAY_POOLS
+ 
+         void setDelayId(DelayId const &amp;);
+ #endif
+ 
+         void error(int const xerrno);
+         int debugLevelForError(int const xerrno) const;
+         /// handles a non-I/O error associated with this Connection
+         void logicError(const char *errMsg);
+         void closeIfOpen();
+         void dataSent (size_t amount);
+         int len;
+         char *buf;
+         int64_t *size_ptr;      /* pointer to size in an ConnStateData for logging */
+ 
+         Comm::ConnectionPointer conn;    ///&lt; The currently connected connection.
+-
++        uint8_t delayedLoops; ///&lt; how many times a read on this connection has been postponed.
+     private:
+ #if USE_DELAY_POOLS
+ 
+         DelayId delayId;
+ #endif
+ 
+     };
+ 
+     Connection client, server;
+     int *status_ptr;        ///&lt; pointer for logging HTTP status
+     LogTags *logTag_ptr;    ///&lt; pointer for logging Squid processing code
+     MemBuf *connectRespBuf; ///&lt; accumulates peer CONNECT response when we need it
+     bool connectReqWriting; ///&lt; whether we are writing a CONNECT request to a peer
+     SBuf preReadClientData;
+ 
+     void copyRead(Connection &amp;from, IOCB *completion);
+ 
+     /// continue to set up connection to a peer, going async for SSL peers
+     void connectToPeer();
+ 
+@@ -314,40 +315,41 @@
+         return 3;
+ 
+     return 1;
+ }
+ 
+ /* Read from server side and queue it for writing to the client */
+ void
+ TunnelStateData::ReadServer(const Comm::ConnectionPointer &amp;c, char *buf, size_t len, Comm::Flag errcode, int xerrno, void *data)
+ {
+     TunnelStateData *tunnelState = (TunnelStateData *)data;
+     assert(cbdataReferenceValid(tunnelState));
+     debugs(26, 3, HERE &lt;&lt; c);
+ 
+     tunnelState-&gt;readServer(buf, len, errcode, xerrno);
+ }
+ 
+ void
+ TunnelStateData::readServer(char *, size_t len, Comm::Flag errcode, int xerrno)
+ {
+     debugs(26, 3, HERE &lt;&lt; server.conn &lt;&lt; &quot;, read &quot; &lt;&lt; len &lt;&lt; &quot; bytes, err=&quot; &lt;&lt; errcode);
++    server.delayedLoops=0;
+ 
+     /*
+      * Bail out early on Comm::ERR_CLOSING
+      * - close handlers will tidy up for us
+      */
+ 
+     if (errcode == Comm::ERR_CLOSING)
+         return;
+ 
+     if (len &gt; 0) {
+         server.bytesIn(len);
+         kb_incr(&amp;(statCounter.server.all.kbytes_in), len);
+         kb_incr(&amp;(statCounter.server.other.kbytes_in), len);
+     }
+ 
+     if (keepGoingAfterRead(len, errcode, xerrno, server, client))
+         copy(len, server, client, WriteClientDone);
+ }
+ 
+ /// Called when we read [a part of] CONNECT response from the peer
+@@ -459,40 +461,41 @@
+     debugs(50, debugLevelForError(xerrno), HERE &lt;&lt; conn &lt;&lt; &quot;: read/write failure: &quot; &lt;&lt; xstrerror());
+ 
+     if (!ignoreErrno(xerrno))
+         conn-&gt;close();
+ }
+ 
+ /* Read from client side and queue it for writing to the server */
+ void
+ TunnelStateData::ReadClient(const Comm::ConnectionPointer &amp;, char *buf, size_t len, Comm::Flag errcode, int xerrno, void *data)
+ {
+     TunnelStateData *tunnelState = (TunnelStateData *)data;
+     assert (cbdataReferenceValid (tunnelState));
+ 
+     tunnelState-&gt;readClient(buf, len, errcode, xerrno);
+ }
+ 
+ void
+ TunnelStateData::readClient(char *, size_t len, Comm::Flag errcode, int xerrno)
+ {
+     debugs(26, 3, HERE &lt;&lt; client.conn &lt;&lt; &quot;, read &quot; &lt;&lt; len &lt;&lt; &quot; bytes, err=&quot; &lt;&lt; errcode);
++    client.delayedLoops=0;
+ 
+     /*
+      * Bail out early on Comm::ERR_CLOSING
+      * - close handlers will tidy up for us
+      */
+ 
+     if (errcode == Comm::ERR_CLOSING)
+         return;
+ 
+     if (len &gt; 0) {
+         client.bytesIn(len);
+         kb_incr(&amp;(statCounter.client_http.kbytes_in), len);
+     }
+ 
+     if (keepGoingAfterRead(len, errcode, xerrno, client, server))
+         copy(len, client, server, WriteServerDone);
+ }
+ 
+ /// Updates state after reading from client or server.
+ /// Returns whether the caller should use the data just read.
+@@ -659,47 +662,87 @@
+ 
+ static void
+ tunnelTimeout(const CommTimeoutCbParams &amp;io)
+ {
+     TunnelStateData *tunnelState = static_cast&lt;TunnelStateData *&gt;(io.data);
+     debugs(26, 3, HERE &lt;&lt; io.conn);
+     /* Temporary lock to protect our own feets (comm_close -&gt; tunnelClientClosed -&gt; Free) */
+     CbcPointer&lt;TunnelStateData&gt; safetyLock(tunnelState);
+ 
+     tunnelState-&gt;client.closeIfOpen();
+     tunnelState-&gt;server.closeIfOpen();
+ }
+ 
+ void
+ TunnelStateData::Connection::closeIfOpen()
+ {
+     if (Comm::IsConnOpen(conn))
+         conn-&gt;close();
+ }
+ 
++static void
++tunnelDelayedClientRead(void *data)
++{
++    if (!data)
++        return;
++    TunnelStateData *tunnel = NULL;
++    static_cast&lt;generic_cbdata*&gt;(data)-&gt;unwrap(&amp;tunnel);
++    if (!tunnel)
++        return;
++    static uint64_t counter=0;
++    debugs(26, 0, &quot;Client read(2) delayed &quot; &lt;&lt; ++counter &lt;&lt; &quot; times&quot;);
++    tunnel-&gt;copyRead(tunnel-&gt;client, TunnelStateData::ReadClient);
++}
++
++static void
++tunnelDelayedServerRead(void *data)
++{
++    if (!data)
++        return;
++    TunnelStateData *tunnel = NULL;
++    static_cast&lt;generic_cbdata*&gt;(data)-&gt;unwrap(&amp;tunnel);
++    if (!tunnel)
++        return;
++    static uint64_t counter=0;
++    debugs(26, 0, &quot;Server read(2) delayed &quot; &lt;&lt; ++counter &lt;&lt; &quot; times&quot;);
++    tunnel-&gt;copyRead(tunnel-&gt;server, TunnelStateData::ReadServer);
++}
++
+ void
+ TunnelStateData::copyRead(Connection &amp;from, IOCB *completion)
+ {
+     assert(from.len == 0);
++    // If only the minimum permitted read size is going to be attempted
++    // then we schedule an event to try again in a few I/O cycles.
++    // Allow at least 1 byte to be read every (0.3*10) seconds.
++    int bw = from.bytesWanted(1, SQUID_TCP_SO_RCVBUF);
++    if (bw == 1 &amp;&amp; ++from.delayedLoops &lt; 10) {
++        if (completion == TunnelStateData::ReadServer)
++            eventAdd(&quot;tunnelDelayedServerRead&quot;, &amp;tunnelDelayedServerRead, new generic_cbdata(this), 0.3, true);
++        else
++            eventAdd(&quot;tunnelDelayedClientRead&quot;, &amp;tunnelDelayedClientRead, new generic_cbdata(this), 0.3, true);
++        return;
++    }
++
+     AsyncCall::Pointer call = commCbCall(5,4, &quot;TunnelBlindCopyReadHandler&quot;,
+                                          CommIoCbPtrFun(completion, this));
+-    comm_read(from.conn, from.buf, from.bytesWanted(1, SQUID_TCP_SO_RCVBUF), call);
++    comm_read(from.conn, from.buf, bw, call);
+ }
+ 
+ void
+ TunnelStateData::readConnectResponse()
+ {
+     assert(waitingForConnectResponse());
+ 
+     AsyncCall::Pointer call = commCbCall(5,4, &quot;readConnectResponseDone&quot;,
+                                          CommIoCbPtrFun(ReadConnectResponseDone, this));
+     comm_read(server.conn, connectRespBuf-&gt;space(),
+               server.bytesWanted(1, connectRespBuf-&gt;spaceSize()), call);
+ }
+ 
+ void
+ TunnelStateData::copyClientBytes()
+ {
+     if (preReadClientData.length()) {
+         size_t copyBytes = preReadClientData.length() &gt; SQUID_TCP_SO_RCVBUF ? SQUID_TCP_SO_RCVBUF : preReadClientData.length();
+         memcpy(client.buf, preReadClientData.rawContent(), copyBytes);
+         preReadClientData.consume(copyBytes);
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001723.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » clang,d-debian-wheezy #108
+</A></li>
+	<LI>Next message: <A HREF="001745.html">[squid-dev] [PATCH] Bug 2907: high CPU usage on CONNECT when using delay pools
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1732">[ date ]</a>
+              <a href="thread.html#1732">[ thread ]</a>
+              <a href="subject.html#1732">[ subject ]</a>
+              <a href="author.html#1732">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

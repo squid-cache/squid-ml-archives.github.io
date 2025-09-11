@@ -1,0 +1,166 @@
+Fix bug 4378:
+assertion failed: DestinationIp.cc:60:
+"checklist->conn() && checklist->conn()->clientConnection != NULL"
+
+=== modified file 'src/acl/DestinationIp.cc'
+--- src/acl/DestinationIp.cc	2016-01-01 00:12:18 +0000
++++ src/acl/DestinationIp.cc	2016-01-13 08:52:20 +0000
+@@ -11,62 +11,63 @@
+ #include "squid.h"
+ #include "acl/DestinationIp.h"
+ #include "acl/FilledChecklist.h"
+ #include "client_side.h"
+ #include "comm/Connection.h"
+ #include "HttpRequest.h"
+ #include "SquidConfig.h"
+ 
+ ACLFlag ACLDestinationIP::SupportedFlags[] = {ACL_F_NO_LOOKUP, ACL_F_END};
+ 
+ char const *
+ ACLDestinationIP::typeString() const
+ {
+     return "dst";
+ }
+ 
+ int
+ ACLDestinationIP::match(ACLChecklist *cl)
+ {
+     ACLFilledChecklist *checklist = Filled(cl);
+ 
+     // if there is no HTTP request details fallback to the dst_addr
+     if (!checklist->request)
+         return ACLIP::match(checklist->dst_addr);
+ 
+     // Bug 3243: CVE 2009-0801
+     // Bypass of browser same-origin access control in intercepted communication
+     // To resolve this we will force DIRECT and only to the original client destination.
+     // In which case, we also need this ACL to accurately match the destination
+     if (Config.onoff.client_dst_passthru && (checklist->request->flags.intercepted || checklist->request->flags.interceptTproxy)) {
+-        assert(checklist->conn() && checklist->conn()->clientConnection != NULL);
+-        return ACLIP::match(checklist->conn()->clientConnection->local);
++        const auto conn = checklist->conn();
++        return (conn && conn->clientConnection) ?
++            ACLIP::match(conn->clientConnection->local) : -1;
+     }
+ 
+     if (flags.isSet(ACL_F_NO_LOOKUP)) {
+         if (!checklist->request->url.hostIsNumeric()) {
+             debugs(28, 3, "No-lookup DNS ACL '" << AclMatchedName << "' for " << checklist->request->url.host());
+             return 0;
+         }
+ 
+         if (ACLIP::match(checklist->request->url.hostIP()))
+             return 1;
+         return 0;
+     }
+ 
+     const ipcache_addrs *ia = ipcache_gethostbyname(checklist->request->url.host(), IP_LOOKUP_IF_MISS);
+ 
+     if (ia) {
+         /* Entry in cache found */
+ 
+         for (int k = 0; k < (int) ia->count; ++k) {
+             if (ACLIP::match(ia->in_addrs[k]))
+                 return 1;
+         }
+ 
+         return 0;
+     } else if (!checklist->request->flags.destinationIpLookedUp) {
+         /* No entry in cache, lookup not attempted */
+         debugs(28, 3, "can't yet compare '" << name << "' ACL for " << checklist->request->url.host());
+         if (checklist->goAsync(DestinationIPLookup::Instance()))
+             return -1;
+         // else fall through to mismatch, hiding the lookup failure (XXX)
+
+=== modified file 'src/acl/FilledChecklist.cc'
+--- src/acl/FilledChecklist.cc	2016-01-01 00:12:18 +0000
++++ src/acl/FilledChecklist.cc	2016-01-13 09:03:07 +0000
+@@ -98,82 +98,84 @@
+ 
+         if (!al->adapted_request) {
+             showDebugWarning("adapted HttpRequest object");
+             al->adapted_request = request;
+             HTTPMSGLOCK(al->adapted_request);
+         }
+ 
+         if (!al->url) {
+             showDebugWarning("URL");
+             al->url = xstrdup(request->url.absolute().c_str());
+         }
+     }
+ 
+     if (reply && !al->reply) {
+         showDebugWarning("HttpReply object");
+         al->reply = reply;
+         HTTPMSGLOCK(al->reply);
+     }
+ 
+ #if USE_IDENT
+     if (*rfc931 && !al->cache.rfc931) {
+         showDebugWarning("IDENT");
+         al->cache.rfc931 = xstrdup(rfc931);
+     }
+ #endif
+ }
+ 
+ ConnStateData *
+ ACLFilledChecklist::conn() const
+ {
+-    return  conn_;
++    return cbdataReferenceValid(conn_) ? conn_ : nullptr;
+ }
+ 
+ void
+ ACLFilledChecklist::conn(ConnStateData *aConn)
+ {
+     if (conn() == aConn)
+         return;
+     assert (conn() == NULL);
+     conn_ = cbdataReference(aConn);
+ }
+ 
+ int
+ ACLFilledChecklist::fd() const
+ {
+-    return (conn_ != NULL && conn_->clientConnection != NULL) ? conn_->clientConnection->fd : fd_;
++    const auto c = conn();
++    return (c && c->clientConnection) ? c->clientConnection->fd : fd_;
+ }
+ 
+ void
+ ACLFilledChecklist::fd(int aDescriptor)
+ {
+-    assert(!conn() || conn()->clientConnection == NULL || conn()->clientConnection->fd == aDescriptor);
++    const auto c = conn();
++    assert(!c || !c->clientConnection || c->clientConnection->fd == aDescriptor);
+     fd_ = aDescriptor;
+ }
+ 
+ bool
+ ACLFilledChecklist::destinationDomainChecked() const
+ {
+     return destinationDomainChecked_;
+ }
+ 
+ void
+ ACLFilledChecklist::markDestinationDomainChecked()
+ {
+     assert (!finished() && !destinationDomainChecked());
+     destinationDomainChecked_ = true;
+ }
+ 
+ bool
+ ACLFilledChecklist::sourceDomainChecked() const
+ {
+     return sourceDomainChecked_;
+ }
+ 
+ void
+ ACLFilledChecklist::markSourceDomainChecked()
+ {
+     assert (!finished() && !sourceDomainChecked());
+     sourceDomainChecked_ = true;
+ }
+ 
+ /*
+

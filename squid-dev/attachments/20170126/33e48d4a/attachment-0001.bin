@@ -1,0 +1,218 @@
+SSLv2 records force SslBump bumping despite a matching step2 peek rule.
+
+If Squid receives a valid TLS Hello encapsulated into ancient SSLv2
+records (observed on Solaris 10), the old code ignored the step2 peek
+decision and bumped the transaction instead.
+Now Squid peeks (or stares) at the origin server as configured, even
+after detecting (and parsing) SSLv2 records.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2017-01-01 00:16:45 +0000
++++ src/ssl/PeerConnector.cc	2017-01-26 16:27:32 +0000
+@@ -154,52 +154,49 @@
+             if (!features.serverName.isEmpty())
+                 hostName = new SBuf(features.serverName);
+         }
+ 
+         if (!hostName) {
+             // While we are peeking at the certificate, we may not know the server
+             // name that the client will request (after interception or CONNECT)
+             // unless it was the CONNECT request with a user-typed address.
+             const bool isConnectRequest = !csd->port->flags.isIntercepted();
+             if (!request->flags.sslPeek || isConnectRequest)
+                 hostName = new SBuf(request->GetHost());
+         }
+ 
+         if (hostName)
+             SSL_set_ex_data(ssl, ssl_ex_index_server, (void*)hostName);
+ 
+         Must(!csd->serverBump() || csd->serverBump()->step <= Ssl::bumpStep2);
+         if (csd->sslBumpMode == Ssl::bumpPeek || csd->sslBumpMode == Ssl::bumpStare) {
+             assert(cltBio);
+             const Ssl::Bio::sslFeatures &features = cltBio->getFeatures();
+-            if (features.sslVersion != -1) {
++            if (features.sslVersion != -1)
+                 features.applyToSSL(ssl, csd->sslBumpMode);
+-                // Should we allow it for all protocols?
+-                if (features.sslVersion >= 3) {
+-                    BIO *b = SSL_get_rbio(ssl);
+-                    Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
+-                    // Inherite client features, like SSL version, SNI and other
+-                    srvBio->setClientFeatures(features);
+-                    srvBio->recordInput(true);
+-                    srvBio->mode(csd->sslBumpMode);
+-                }
+-            }
++
++            BIO *b = SSL_get_rbio(ssl);
++            Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
++            // Inherite client features, like SSL version, SNI and other
++            srvBio->setClientFeatures(features);
++            srvBio->recordInput(true);
++            srvBio->mode(csd->sslBumpMode);
+         } else {
+             // Set client SSL options
+             SSL_set_options(ssl, ::Config.ssl_client.parsedOptions);
+ 
+             // Use SNI TLS extension only when we connect directly
+             // to the origin server and we know the server host name.
+             const char *sniServer = NULL;
+             const bool redirected = request->flags.redirected && ::Config.onoff.redir_rewrites_host;
+             if (!hostName || redirected)
+                 sniServer = !request->GetHostIsNumeric() ? request->GetHost() : NULL;
+             else
+                 sniServer = hostName->c_str();
+ 
+             if (sniServer)
+                 Ssl::setClientSNI(ssl, sniServer);
+         }
+ 
+         if (Ssl::ServerBump *serverBump = csd->serverBump())
+             serverBump->attachServerSSL(ssl);
+     }
+
+=== modified file 'src/ssl/bio.cc'
+--- src/ssl/bio.cc	2017-01-01 00:16:45 +0000
++++ src/ssl/bio.cc	2017-01-26 16:50:39 +0000
+@@ -286,40 +286,43 @@
+ };
+ 
+ int
+ Ssl::ServerBio::read(char *buf, int size, BIO *table)
+ {
+     return record_ ?
+            readAndBuffer(buf, size, table, "TLS server Hello") : Ssl::Bio::read(buf, size, table);
+ }
+ 
+ // This function makes the required checks to examine if the client hello
+ // message is compatible with the features provided by OpenSSL toolkit.
+ // If the features are compatible and can be supported it tries to rewrite SSL
+ // structure members, to replace the hello message created by openSSL, with the
+ // web client SSL hello message.
+ // This is mostly possible in the cases where the web client uses openSSL
+ // library similar with this one used by squid.
+ static bool
+ adjustSSL(SSL *ssl, Ssl::Bio::sslFeatures &features)
+ {
+ #if SQUID_USE_OPENSSL_HELLO_OVERWRITE_HACK
++    if (!features.initialized_)
++        return false;
++
+     if (!ssl->s3) {
+         debugs(83, 5, "No SSLv3 data found!");
+         return false;
+     }
+ 
+     // If the client supports compression but our context does not support
+     // we can not adjust.
+ #if !defined(OPENSSL_NO_COMP)
+     const bool requireCompression = (features.compressMethod && ssl->ctx->comp_methods == NULL);
+ #else
+     const bool requireCompression = features.compressMethod;
+ #endif
+     if (requireCompression) {
+         debugs(83, 5, "Client Hello Data supports compression, but we do not!");
+         return false;
+     }
+ 
+     // Check ciphers list
+     size_t token = 0;
+     size_t end = 0;
+@@ -418,67 +421,72 @@
+     ssl->init_num = mainHelloSize;
+     ssl->s3->wpend_ret = mainHelloSize;
+     ssl->s3->wpend_tot = mainHelloSize;
+     return true;
+ #else
+     return false;
+ #endif
+ }
+ 
+ int
+ Ssl::ServerBio::write(const char *buf, int size, BIO *table)
+ {
+ 
+     if (holdWrite_) {
+         debugs(83, 7,  "Hold write, for SSL connection on " << fd_ << "will not write bytes of size " << size);
+         BIO_set_retry_write(table);
+         return -1;
+     }
+ 
+     if (!helloBuild && (bumpMode_ == Ssl::bumpPeek || bumpMode_ == Ssl::bumpStare)) {
+-        if (
+-            buf[1] >= 3  //it is an SSL Version3 message
+-            && buf[0] == 0x16 // and it is a Handshake/Hello message
+-        ) {
+-
+-            //Hello message is the first message we write to server
+-            assert(helloMsg.isEmpty());
+-
+-            SSL *ssl = fd_table[fd_].ssl;
+-            if (clientFeatures.initialized_ && ssl) {
+-                if (bumpMode_ == Ssl::bumpPeek) {
+-                    if (adjustSSL(ssl, clientFeatures))
+-                        allowBump = true;
++        // buf contains OpenSSL-generated ClientHello. We assume it has a
++        // complete ClientHello and nothing else, but cannot fully verify
++        // that quickly. We only verify that buf starts with a v3+ record
++        // containing ClientHello.
++        Must(size >= 2); // enough for version and content_type checks below
++        Must(buf[1] >= 3); // record's version.major; determines buf[0] meaning
++        Must(buf[0] == 22); // TLSPlaintext.content_type == handshake in v3+
++
++        //Hello message is the first message we write to server
++        assert(helloMsg.isEmpty());
++
++        if (SSL *ssl = fd_table[fd_].ssl) {
++            if (bumpMode_ == Ssl::bumpPeek) {
++                // we should not be here if we failed to parse the client-sent ClientHello
++                Must(clientFeatures.initialized_);
++                if (adjustSSL(ssl, clientFeatures))
++                    allowBump = true;
++                allowSplice = true;
++                 // Replace OpenSSL-generated ClientHello with client-sent one.
++                helloMsg.append(clientFeatures.helloMessage);
++                debugs(83, 7,  "SSL HELLO message for FD " << fd_ << ": Random number is adjusted for peek mode");
++            } else { /*Ssl::bumpStare*/
++                allowBump = true;
++                if (clientFeatures.initialized_ && adjustSSL(ssl, clientFeatures)) {
+                     allowSplice = true;
+                     helloMsg.append(clientFeatures.helloMessage);
+-                    debugs(83, 7,  "SSL HELLO message for FD " << fd_ << ": Random number is adjusted for peek mode");
+-                } else { /*Ssl::bumpStare*/
+-                    allowBump = true;
+-                    if (adjustSSL(ssl, clientFeatures)) {
+-                        allowSplice = true;
+-                        helloMsg.append(clientFeatures.helloMessage);
+-                        debugs(83, 7,  "SSL HELLO message for FD " << fd_ << ": Random number is adjusted for stare mode");
+-                    }
++                    debugs(83, 7,  "SSL HELLO message for FD " << fd_ << ": Random number is adjusted for stare mode");
+                 }
+             }
+         }
+-        // If we do not build any hello message, copy the current
++
++        // if we did not use the client-sent ClientHello, then use the OpenSSL-generated one
+         if (helloMsg.isEmpty())
+             helloMsg.append(buf, size);
+ 
+         helloBuild = true;
+         helloMsgSize = helloMsg.length();
+         //allowBump = true;
+ 
+         if (allowSplice) {
+             // Do not write yet.....
+             BIO_set_retry_write(table);
+             return -1;
+         }
+     }
+ 
+     if (!helloMsg.isEmpty()) {
+         debugs(83, 7,  "buffered write for FD " << fd_);
+         int ret = Ssl::Bio::write(helloMsg.rawContent(), helloMsg.length(), table);
+         helloMsg.consume(ret);
+         if (!helloMsg.isEmpty()) {
+             // We need to retry sendind data.
+

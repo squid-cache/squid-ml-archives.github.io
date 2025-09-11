@@ -1,0 +1,866 @@
+Fix logged request size (%http::>st) and other size-related %codes.
+
+The %[http::]>st logformat code should log the actual number of
+[dechunked] bytes received from the client. However, for requests with
+Content-Length, Squid was logging the sum of the request header size and
+the Content-Length header field value instead. The logged value was
+wrong when the client sent fewer than Content-Length body bytes.
+
+Also:
+
+* Fixed %http::>h and %http::<h format codes for icap_log. The old code
+  was focusing on preserving the "request header" (i.e. not "response
+  header") meaning of the %http::>h logformat code, but since ICAP
+  services deal with (and log) both HTTP requests and responses, that
+  focus on the HTTP message kind actually complicates ICAP logging
+  configuration and will eventually require introduction of new %http
+  logformat codes that would be meaningless in access.log context.
+
+  - In ICAP context, %http::>h should log to-be-adapted HTTP message
+    headers embedded in an ICAP request (HTTP request headers in REQMOD;
+    HTTP response headers in RESPMOD). Before this change, %http::>h
+    logged constant/"FYI" HTTP request headers in RESPMOD.
+
+  - Similarly, %http::<h should log adapted HTTP message headers
+    embedded in an ICAP response (HTTP request headers in regular
+    REQMOD; HTTP response headers in RESPMOD and during request
+    satisfaction in REQMOD). Before this change, %http::<h logged "-" in
+    REQMOD.
+
+  In other words, in ICAP logging context, the ">" and "<" characters
+  should indicate ICAP message kind (where the being-logged HTTP message
+  is embedded), not HTTP message kind, even for %http codes.
+
+  TODO: %http::>h code logs "-" in RESPMOD because AccessLogEntry does
+  not store virgin HTTP response headers.
+
+* Correctly initialize ICAP ALE HTTP fields related to HTTP message
+  sizes for icap_log, including %http::>st, %http::<st, %http::>sh, and
+  %http::>sh format codes.
+
+* Initialize HttpMsg::hdr_sz in HTTP header parsing code. Among other
+  uses, this field is needed to initialize HTTP fields inside ICAP ALE.
+
+* Synced default icap_log format documentation with the current code.
+
+This is a v3.5 port of trunk r14838, r14839 and r14840.
+
+=== modified file 'src/adaptation/icap/ModXact.cc'
+--- src/adaptation/icap/ModXact.cc	2016-01-01 00:14:27 +0000
++++ src/adaptation/icap/ModXact.cc	2016-09-15 10:48:05 +0000
+@@ -1232,125 +1232,130 @@
+ }
+ 
+ Adaptation::Icap::ModXact::~ModXact()
+ {
+     delete bodyParser;
+ }
+ 
+ // internal cleanup
+ void Adaptation::Icap::ModXact::swanSong()
+ {
+     debugs(93, 5, HERE << "swan sings" << status());
+ 
+     stopWriting(false);
+     stopSending(false);
+ 
+     if (theInitiator.set()) // we have not sent the answer to the initiator
+         detailError(ERR_DETAIL_ICAP_XACT_OTHER);
+ 
+     // update adaptation history if start was called and we reserved a slot
+     Adaptation::History::Pointer ah = virginRequest().adaptLogHistory();
+     if (ah != NULL && adaptHistoryId >= 0)
+         ah->recordXactFinish(adaptHistoryId);
+ 
+     Adaptation::Icap::Xaction::swanSong();
+ }
+ 
+ void prepareLogWithRequestDetails(HttpRequest *, AccessLogEntry::Pointer &);
+ 
+ void Adaptation::Icap::ModXact::finalizeLogInfo()
+ {
+-    HttpRequest * request_ = NULL;
+-    HttpRequest * adapted_request_ = NULL;
+-    HttpReply * reply_ = NULL;
+-    request_ = (virgin.cause? virgin.cause: dynamic_cast<HttpRequest*>(virgin.header));
++    HttpRequest *adapted_request_ = nullptr;
++    HttpReply *adapted_reply_ = nullptr;
++    HttpRequest *virgin_request_ = (virgin.cause ? virgin.cause : dynamic_cast<HttpRequest*>(virgin.header));
+     if (!(adapted_request_ = dynamic_cast<HttpRequest*>(adapted.header))) {
+-        adapted_request_ = request_;
+-        reply_ = dynamic_cast<HttpReply*>(adapted.header);
++        // if the request was not adapted, use virgin request to simplify
++        // the code further below
++        adapted_request_ = virgin_request_;
++        adapted_reply_ = dynamic_cast<HttpReply*>(adapted.header);
+     }
+ 
+-    Adaptation::Icap::History::Pointer h = (request_ ? request_->icapHistory() : NULL);
++    Adaptation::Icap::History::Pointer h = (virgin_request_ ? virgin_request_->icapHistory() : NULL);
+     Must(h != NULL); // ICAPXaction::maybeLog calls only if there is a log
+     al.icp.opcode = ICP_INVALID;
+     al.url = h->log_uri.termedBuf();
+     const Adaptation::Icap::ServiceRep  &s = service();
+     al.icap.reqMethod = s.cfg().method;
+ 
+-    al.cache.caddr = request_->client_addr;
++    al.cache.caddr = virgin_request_->client_addr;
+ 
+-    al.request = request_;
++    al.request = virgin_request_;
+     HTTPMSGLOCK(al.request);
+     al.adapted_request = adapted_request_;
+     HTTPMSGLOCK(al.adapted_request);
+ 
+-    if (reply_) {
+-        al.reply = reply_;
++    if (adapted_reply_) {
++        al.reply = adapted_reply_;
+         HTTPMSGLOCK(al.reply);
+     } else
+         al.reply = NULL;
+ 
+     if (h->rfc931.size())
+         al.cache.rfc931 = h->rfc931.termedBuf();
+ 
+ #if USE_OPENSSL
+     if (h->ssluser.size())
+         al.cache.ssluser = h->ssluser.termedBuf();
+ #endif
+     al.cache.code = h->logType;
+-    // XXX: should use icap-specific counters instead ?
+-    al.http.clientRequestSz.payloadData = h->req_sz;
++
++    const HttpMsg *virgin_msg = dynamic_cast<HttpReply*>(virgin.header);
++    if (!virgin_msg)
++        virgin_msg = virgin_request_;
++    assert(virgin_msg != virgin.cause);
++    al.http.clientRequestSz.header = virgin_msg->hdr_sz;
++    al.http.clientRequestSz.payloadData = virgin_msg->body_pipe->producedSize();
+ 
+     // leave al.icap.bodyBytesRead negative if no body
+     if (replyHttpHeaderSize >= 0 || replyHttpBodySize >= 0) {
+         const int64_t zero = 0; // to make max() argument types the same
+-        al.icap.bodyBytesRead =
+-            max(zero, replyHttpHeaderSize) + max(zero, replyHttpBodySize);
++        const uint64_t headerSize = max(zero, replyHttpHeaderSize);
++        const uint64_t bodySize =  max(zero, replyHttpBodySize);
++        al.icap.bodyBytesRead = headerSize + bodySize;
++        al.http.clientReplySz.header = headerSize;
++        al.http.clientReplySz.payloadData = bodySize;
+     }
+ 
+-    if (reply_) {
+-        al.http.code = reply_->sline.status();
+-        al.http.content_type = reply_->content_type.termedBuf();
+-        if (replyHttpBodySize >= 0) {
+-            // XXX: should use icap-specific counters instead ?
+-            al.http.clientReplySz.payloadData = replyHttpBodySize;
+-            al.http.clientReplySz.header =  reply_->hdr_sz;
++    if (adapted_reply_) {
++        al.http.code = adapted_reply_->sline.status();
++        al.http.content_type = adapted_reply_->content_type.termedBuf();
++        if (replyHttpBodySize >= 0)
+             al.cache.highOffset = replyHttpBodySize;
+-        }
+         //don't set al.cache.objectSize because it hasn't exist yet
+ 
+         Packer p;
+         MemBuf mb;
+ 
+         mb.init();
+         packerToMemInit(&p, &mb);
+ 
+-        reply_->header.packInto(&p);
++        adapted_reply_->header.packInto(&p);
+         al.headers.reply = xstrdup(mb.buf);
+ 
+         packerClean(&p);
+         mb.clean();
+     }
+     prepareLogWithRequestDetails(adapted_request_, alep);
+     Xaction::finalizeLogInfo();
+ }
+ 
+ void Adaptation::Icap::ModXact::makeRequestHeaders(MemBuf &buf)
+ {
+     char ntoabuf[MAX_IPSTRLEN];
+     /*
+      * XXX These should use HttpHdr interfaces instead of Printfs
+      */
+     const Adaptation::ServiceConfig &s = service().cfg();
+     buf.Printf("%s " SQUIDSTRINGPH " ICAP/1.0\r\n", s.methodStr(), SQUIDSTRINGPRINT(s.uri));
+     buf.Printf("Host: " SQUIDSTRINGPH ":%d\r\n", SQUIDSTRINGPRINT(s.host), s.port);
+     buf.Printf("Date: %s\r\n", mkrfc1123(squid_curtime));
+ 
+     if (!TheConfig.reuse_connections)
+         buf.Printf("Connection: close\r\n");
+ 
+     const HttpRequest *request = &virginRequest();
+ 
+     // we must forward "Proxy-Authenticate" and "Proxy-Authorization"
+     // as ICAP headers.
+     if (virgin.header->header.has(HDR_PROXY_AUTHENTICATE)) {
+         String vh=virgin.header->header.getByName("Proxy-Authenticate");
+         buf.Printf("Proxy-Authenticate: " SQUIDSTRINGPH "\r\n",SQUIDSTRINGPRINT(vh));
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2016-05-06 06:36:08 +0000
++++ src/cf.data.pre	2016-09-14 14:29:48 +0000
+@@ -4400,125 +4400,144 @@
+ 		Lines may be accumulated before sending (see buffered_logs).
+ 		Place: The destination host name or IP and port.
+ 		Place Format:   //host:port
+ 
+ 	Default:
+ 		access_log daemon:@DEFAULT_ACCESS_LOG@ squid
+ DOC_END
+ 
+ NAME: icap_log
+ TYPE: access_log
+ IFDEF: ICAP_CLIENT
+ LOC: Config.Log.icaplogs
+ DEFAULT: none
+ DOC_START
+ 	ICAP log files record ICAP transaction summaries, one line per
+ 	transaction.
+ 
+ 	The icap_log option format is:
+ 	icap_log <filepath> [<logformat name> [acl acl ...]]
+ 	icap_log none [acl acl ...]]
+ 	
+ 	Please see access_log option documentation for details. The two
+ 	kinds of logs share the overall configuration approach and many
+ 	features.
+ 
+ 	ICAP processing of a single HTTP message or transaction may
+ 	require multiple ICAP transactions.  In such cases, multiple
+ 	ICAP transaction log lines will correspond to a single access
+ 	log line.
+ 
+-	ICAP log uses logformat codes that make sense for an ICAP
+-	transaction. Header-related codes are applied to the HTTP header
+-	embedded in an ICAP server response, with the following caveats:
+-	For REQMOD, there is no HTTP response header unless the ICAP
+-	server performed request satisfaction. For RESPMOD, the HTTP
+-	request header is the header sent to the ICAP server. For
+-	OPTIONS, there are no HTTP headers.
++	ICAP log supports many access.log logformat %codes. In ICAP context,
++	HTTP message-related %codes are applied to the HTTP message embedded
++	in an ICAP message. Logformat "%http::>..." codes are used for HTTP
++	messages embedded in ICAP requests while "%http::<..." codes are used
++	for HTTP messages embedded in ICAP responses. For example:
++
++		http::>h	To-be-adapted HTTP message headers sent by Squid to
++				the ICAP service. For REQMOD transactions, these are
++				HTTP request headers. For RESPMOD, these are HTTP
++				response headers, but Squid currently cannot log them
++				(i.e., %http::>h will expand to "-" for RESPMOD).
++
++		http::<h	Adapted HTTP message headers sent by the ICAP
++				service to Squid (i.e., HTTP request headers in regular
++				REQMOD; HTTP response headers in RESPMOD and during
++				request satisfaction in REQMOD).
++
++	ICAP OPTIONS transactions do not embed HTTP messages.
++
++	Several logformat codes below deal with ICAP message bodies. An ICAP
++	message body, if any, typically includes a complete HTTP message
++	(required HTTP headers plus optional HTTP message body). When
++	computing HTTP message body size for these logformat codes, Squid
++	either includes or excludes chunked encoding overheads; see
++	code-specific documentation for details.
++
++	For Secure ICAP services, all size-related information is currently
++	computed before/after TLS encryption/decryption, as if TLS was not
++	in use at all.
+ 
+ 	The following format codes are also available for ICAP logs:
+ 
+ 		icap::<A	ICAP server IP address. Similar to <A.
+ 
+ 		icap::<service_name	ICAP service name from the icap_service
+ 				option in Squid configuration file.
+ 
+ 		icap::ru	ICAP Request-URI. Similar to ru.
+ 
+ 		icap::rm	ICAP request method (REQMOD, RESPMOD, or 
+ 				OPTIONS). Similar to existing rm.
+ 
+-		icap::>st	Bytes sent to the ICAP server (TCP payload
+-				only; i.e., what Squid writes to the socket).
+-
+-		icap::<st	Bytes received from the ICAP server (TCP
+-				payload only; i.e., what Squid reads from
+-				the socket).
+-
+-		icap::<bs	Number of message body bytes received from the
+-				ICAP server. ICAP message body, if any, usually
+-				includes encapsulated HTTP message headers and
+-				possibly encapsulated HTTP message body. The
+-				HTTP body part is dechunked before its size is
+-				computed.
++		icap::>st	The total size of the ICAP request sent to the ICAP
++				server (ICAP headers + ICAP body), including chunking
++				metadata (if any).
++
++		icap::<st	The total size of the ICAP response received from the
++				ICAP server (ICAP headers + ICAP body), including
++				chunking metadata (if any).
++
++		icap::<bs	The size of the ICAP response body received from the
++				ICAP server, excluding chunking metadata (if any).
+ 
+ 		icap::tr 	Transaction response time (in
+ 				milliseconds).  The timer starts when
+ 				the ICAP transaction is created and
+ 				stops when the transaction is completed.
+ 				Similar to tr.
+ 
+ 		icap::tio	Transaction I/O time (in milliseconds). The
+ 				timer starts when the first ICAP request
+ 				byte is scheduled for sending. The timers
+ 				stops when the last byte of the ICAP response
+ 				is received.
+ 
+ 		icap::to 	Transaction outcome: ICAP_ERR* for all
+ 				transaction errors, ICAP_OPT for OPTION
+ 				transactions, ICAP_ECHO for 204
+ 				responses, ICAP_MOD for message
+ 				modification, and ICAP_SAT for request
+ 				satisfaction. Similar to Ss.
+ 
+ 		icap::Hs	ICAP response status code. Similar to Hs.
+ 
+ 		icap::>h	ICAP request header(s). Similar to >h.
+ 
+ 		icap::<h	ICAP response header(s). Similar to <h.
+ 
+ 	The default ICAP log format, which can be used without an explicit
+ 	definition, is called icap_squid:
+ 
+-logformat icap_squid %ts.%03tu %6icap::tr %>a %icap::to/%03icap::Hs %icap::<size %icap::rm %icap::ru% %un -/%icap::<A -
++logformat icap_squid %ts.%03tu %6icap::tr %>A %icap::to/%03icap::Hs %icap::<st %icap::rm %icap::ru %un -/%icap::<A -
+ 
+-	See also: logformat, log_icap, and %adapt::<last_h 
++	See also: logformat and %adapt::<last_h
+ DOC_END
+ 
+ NAME: logfile_daemon
+ TYPE: string
+ DEFAULT: @DEFAULT_LOGFILED@
+ LOC: Log::TheConfig.logfile_daemon
+ DOC_START
+ 	Specify the path to the logfile-writing daemon. This daemon is
+ 	used to write the access and store logs, if configured.
+ 
+ 	Squid sends a number of commands to the log daemon:
+ 	  L<data>\n - logfile data
+ 	  R\n - rotate file
+ 	  T\n - truncate file
+ 	  O\n - reopen file
+ 	  F\n - flush file
+ 	  r<n>\n - set rotate count to <n>
+ 	  b<n>\n - 1 = buffer output, 0 = don't buffer output
+ 
+ 	No responses is expected.
+ DOC_END
+ 
+ NAME: stats_collection
+ TYPE: acl_access
+ LOC: Config.accessList.stats_collection
+ DEFAULT: none
+ DEFAULT_DOC: Allow logging for all transactions.
+ COMMENT: allow|deny acl acl...
+ DOC_START
+ 	This options allows you to control which requests gets accounted
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-06-18 13:36:07 +0000
++++ src/client_side.cc	2016-09-15 08:14:26 +0000
+@@ -528,98 +528,99 @@
+             mb.reset();
+             packerToMemInit(&p, &mb);
+             aLogEntry->request->header.packInto(&p);
+             aLogEntry->headers.request = xstrdup(mb.buf);
+         }
+ 
+ #if USE_ADAPTATION
+         const Adaptation::History::Pointer ah = request->adaptLogHistory();
+         if (ah != NULL) {
+             packerClean(&p);
+             mb.reset();
+             packerToMemInit(&p, &mb);
+             ah->lastMeta.packInto(&p);
+             aLogEntry->adapt.last_meta = xstrdup(mb.buf);
+         }
+ #endif
+ 
+         packerClean(&p);
+         mb.clean();
+     }
+ 
+ #if ICAP_CLIENT
+     const Adaptation::Icap::History::Pointer ih = request->icapHistory();
+     if (ih != NULL)
+         aLogEntry->icap.processingTime = ih->processingTime();
+ #endif
+ 
+     aLogEntry->http.method = request->method;
+     aLogEntry->http.version = request->http_ver;
+     aLogEntry->hier = request->hier;
+-    if (request->content_length > 0) // negative when no body or unknown length
+-        aLogEntry->http.clientRequestSz.payloadData += request->content_length; // XXX: actually adaptedRequest payload size ??
+     aLogEntry->cache.extuser = request->extacl_user.termedBuf();
+ 
+     // Adapted request, if any, inherits and then collects all the stats, but
+     // the virgin request gets logged instead; copy the stats to log them.
+     // TODO: avoid losses by keeping these stats in a shared history object?
+     if (aLogEntry->request) {
+         aLogEntry->request->dnsWait = request->dnsWait;
+         aLogEntry->request->errType = request->errType;
+         aLogEntry->request->errDetail = request->errDetail;
+     }
+ }
+ 
+ void
+ ClientHttpRequest::logRequest()
+ {
+     if (!out.size && !logType)
+         debugs(33, 5, HERE << "logging half-baked transaction: " << log_uri);
+ 
+     al->icp.opcode = ICP_INVALID;
+     al->url = log_uri;
+     debugs(33, 9, "clientLogRequest: al.url='" << al->url << "'");
+ 
+     if (al->reply) {
+         al->http.code = al->reply->sline.status();
+         al->http.content_type = al->reply->content_type.termedBuf();
+     } else if (loggingEntry() && loggingEntry()->mem_obj) {
+         al->http.code = loggingEntry()->mem_obj->getReply()->sline.status();
+         al->http.content_type = loggingEntry()->mem_obj->getReply()->content_type.termedBuf();
+     }
+ 
+     debugs(33, 9, "clientLogRequest: http.code='" << al->http.code << "'");
+ 
+     if (loggingEntry() && loggingEntry()->mem_obj && loggingEntry()->objectLen() >= 0)
+         al->cache.objectSize = loggingEntry()->contentLen(); // payload duplicate ?? with or without TE ?
+ 
+     al->http.clientRequestSz.header = req_sz;
++    // the virgin request is saved to al->request
++    if (al->request && al->request->body_pipe != NULL)
++        al->http.clientRequestSz.payloadData = al->request->body_pipe->producedSize();
+     al->http.clientReplySz.header = out.headers_sz;
+     // XXX: calculate without payload encoding or headers !!
+     al->http.clientReplySz.payloadData = out.size - out.headers_sz; // pretend its all un-encoded data for now.
+ 
+     al->cache.highOffset = out.offset;
+ 
+     al->cache.code = logType;
+ 
+     al->cache.msec = tvSubMsec(al->cache.start_time, current_time);
+ 
+     if (request)
+         prepareLogWithRequestDetails(request, al);
+ 
+     if (getConn() != NULL && getConn()->clientConnection != NULL && getConn()->clientConnection->rfc931[0])
+         al->cache.rfc931 = getConn()->clientConnection->rfc931;
+ 
+ #if USE_OPENSSL && 0
+ 
+     /* This is broken. Fails if the connection has been closed. Needs
+      * to snarf the ssl details some place earlier..
+      */
+     if (getConn() != NULL)
+         al->cache.ssluser = sslGetUserEmail(fd_table[getConn()->fd].ssl);
+ 
+ #endif
+ 
+     /* Add notes (if we have a request to annotate) */
+     if (request) {
+         // The al->notes and request->notes must point to the same object.
+         (void)SyncNotes(*al, *request);
+@@ -2717,60 +2718,61 @@
+         if (internalHostnameIs(request->GetHost()) && request->port == getMyPort()) {
+             debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->GetHost() <<
+                    ':' << request->port);
+             http->flags.internal = true;
+         } else if (Config.onoff.global_internal_static && internalStaticCheck(request->urlpath.termedBuf())) {
+             debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->GetHost() <<
+                    ':' << request->port << " (global_internal_static on)");
+             request->url.setScheme(AnyP::PROTO_HTTP);
+             request->SetHost(internalHostname());
+             request->port = getMyPort();
+             http->flags.internal = true;
+         } else
+             debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->GetHost() <<
+                    ':' << request->port << " (not this proxy)");
+     }
+ 
+     if (http->flags.internal)
+         request->login[0] = '\0';
+ 
+     request->flags.internal = http->flags.internal;
+     setLogUri (http, urlCanonicalClean(request.getRaw()));
+     request->client_addr = conn->clientConnection->remote; // XXX: remove reuest->client_addr member.
+ #if FOLLOW_X_FORWARDED_FOR
+     // indirect client gets stored here because it is an HTTP header result (from X-Forwarded-For:)
+     // not a details about teh TCP connection itself
+     request->indirect_client_addr = conn->clientConnection->remote;
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+     request->my_addr = conn->clientConnection->local;
+     request->myportname = conn->port->name;
+     request->http_ver = http_ver;
++    request->hdr_sz = http->req_sz;
+ 
+     // Link this HttpRequest to ConnStateData relatively early so the following complex handling can use it
+     // TODO: this effectively obsoletes a lot of conn->FOO copying. That needs cleaning up later.
+     request->clientConnectionManager = conn;
+ 
+     if (request->header.chunked()) {
+         chunked = true;
+     } else if (request->header.has(HDR_TRANSFER_ENCODING)) {
+         const String te = request->header.getList(HDR_TRANSFER_ENCODING);
+         // HTTP/1.1 requires chunking to be the last encoding if there is one
+         unsupportedTe = te.size() && te != "identity";
+     } // else implied identity coding
+ 
+     mustReplyToOptions = (method == Http::METHOD_OPTIONS) &&
+                          (request->header.getInt64(HDR_MAX_FORWARDS) == 0);
+     if (!urlCheckRequest(request.getRaw()) || mustReplyToOptions || unsupportedTe) {
+         clientStreamNode *node = context->getClientReplyContext();
+         conn->quitAfterError(request.getRaw());
+         clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+         assert (repContext);
+         repContext->setReplyToError(ERR_UNSUP_REQ, Http::scNotImplemented, request->method, NULL,
+                                     conn->clientConnection->remote, request.getRaw(), NULL, NULL);
+         assert(context->http->out.offset == 0);
+         context->pullData();
+         connNoteUseOfBuffer(conn, http->req_sz);
+         clientProcessRequestFinished(conn, request);
+         return;
+     }
+ 
+     if (!chunked && !clientIsContentLengthValid(request.getRaw())) {
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2016-04-07 04:43:45 +0000
++++ src/format/Format.cc	2016-09-15 11:18:06 +0000
+@@ -282,60 +282,92 @@
+ 
+         case '\n':
+             *p = '\\';
+             ++p;
+             *p = 'n';
+             ++p;
+             ++str;
+             break;
+ 
+         case '\t':
+             *p = '\\';
+             ++p;
+             *p = 't';
+             ++p;
+             ++str;
+             break;
+ 
+         default:
+             *p = '\\';
+             ++p;
+             *p = *str;
+             ++p;
+             ++str;
+             break;
+         }
+     }
+ 
+     *p = '\0';
+ }
+ 
++/// XXX: Misnamed. TODO: Split <h (and this function) to distinguish received
++/// headers from sent headers rather than failing to distinguish requests from responses.
++/// \retval HttpReply sent to the HTTP client (access.log and default context).
++/// \retval HttpReply received (encapsulated) from the ICAP server (icap.log context).
++/// \retval HttpRequest received (encapsulated) from the ICAP server (icap.log context).
++static const HttpMsg *
++actualReplyHeader(const AccessLogEntry::Pointer &al)
++{
++    const HttpMsg *msg = al->reply;
++#if USE_ADAPTATION
++    // al->icap.reqMethod is methodNone in access.log context
++    if (!msg && al->icap.reqMethod == Adaptation::methodReqmod)
++        msg = al->adapted_request;
++#endif
++    return msg;
++}
++
++/// XXX: Misnamed. See actualReplyHeader().
++/// \return HttpRequest or HttpReply for %http::>h.
++static const HttpMsg *
++actualRequestHeader(const AccessLogEntry::Pointer &al)
++{
++#if USE_ADAPTATION
++    // al->icap.reqMethod is methodNone in access.log context
++    if (al->icap.reqMethod == Adaptation::methodRespmod) {
++        // XXX: for now AccessLogEntry lacks virgin response headers
++        return nullptr;
++    }
++#endif
++    return al->request;
++}
++
+ void
+ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logSequenceNumber) const
+ {
+     char tmp[1024];
+     String sb;
+ 
+     for (Token *fmt = format; fmt != NULL; fmt = fmt->next) {   /* for each token */
+         const char *out = NULL;
+         int quote = 0;
+         long int outint = 0;
+         int doint = 0;
+         int dofree = 0;
+         int64_t outoff = 0;
+         int dooff = 0;
+         int doSec = 0;
+ 
+         switch (fmt->type) {
+ 
+         case LFT_NONE:
+             out = "";
+             break;
+ 
+         case LFT_STRING:
+             out = fmt->data.string;
+             break;
+ 
+         case LFT_CLIENT_IP_ADDRESS:
+             al->getLogClientIp(tmp, sizeof(tmp));
+             out = tmp;
+             break;
+@@ -520,89 +552,89 @@
+ 
+         case LFT_PEER_RESPONSE_TIME:
+             if (al->hier.peer_response_time < 0) {
+                 out = "-";
+             } else {
+                 outoff = al->hier.peer_response_time;
+                 dooff = 1;
+             }
+             break;
+ 
+         case LFT_TOTAL_SERVER_SIDE_RESPONSE_TIME: {
+             const int64_t total_response_time = al->hier.totalResponseTime();
+             if (total_response_time < 0) {
+                 out = "-";
+             } else {
+                 outoff = total_response_time;
+                 dooff = 1;
+             }
+         }
+         break;
+ 
+         case LFT_DNS_WAIT_TIME:
+             if (al->request && al->request->dnsWait >= 0) {
+                 outint = al->request->dnsWait;
+                 doint = 1;
+             }
+             break;
+ 
+         case LFT_REQUEST_HEADER:
+ 
+-            if (al->request)
+-                sb = al->request->header.getByName(fmt->data.header.header);
++            if (const HttpMsg *msg = actualRequestHeader(al))
++                sb = msg->header.getByName(fmt->data.header.header);
+ 
+             out = sb.termedBuf();
+ 
+             quote = 1;
+ 
+             break;
+ 
+         case LFT_ADAPTED_REQUEST_HEADER:
+ 
+             if (al->adapted_request)
+                 sb = al->adapted_request->header.getByName(fmt->data.header.header);
+ 
+             out = sb.termedBuf();
+ 
+             quote = 1;
+ 
+             break;
+ 
+-        case LFT_REPLY_HEADER:
+-            if (al->reply)
+-                sb = al->reply->header.getByName(fmt->data.header.header);
++        case LFT_REPLY_HEADER: {
++            if (const HttpMsg *msg = actualReplyHeader(al))
++                sb = msg->header.getByName(fmt->data.header.header);
+ 
+             out = sb.termedBuf();
+ 
+             quote = 1;
+-
+-            break;
++        }
++        break;
+ 
+ #if USE_ADAPTATION
+         case LFT_ADAPTATION_SUM_XACT_TIMES:
+             if (al->request) {
+                 Adaptation::History::Pointer ah = al->request->adaptHistory();
+                 if (ah != NULL)
+                     ah->sumLogString(fmt->data.string, sb);
+                 out = sb.termedBuf();
+             }
+             break;
+ 
+         case LFT_ADAPTATION_ALL_XACT_TIMES:
+             if (al->request) {
+                 Adaptation::History::Pointer ah = al->request->adaptHistory();
+                 if (ah != NULL)
+                     ah->allLogString(fmt->data.string, sb);
+                 out = sb.termedBuf();
+             }
+             break;
+ 
+         case LFT_ADAPTATION_LAST_HEADER:
+             if (al->request) {
+                 const Adaptation::History::Pointer ah = al->request->adaptHistory();
+                 if (ah != NULL) // XXX: add adapt::<all_h but use lastMeta here
+                     sb = ah->allMeta.getByName(fmt->data.header.header);
+             }
+ 
+             // XXX: here and elsewhere: move such code inside the if guard
+             out = sb.termedBuf();
+ 
+@@ -730,105 +762,118 @@
+                 out = sb.termedBuf();
+                 quote = 1;
+             }
+             break;
+ 
+         case LFT_ICAP_TR_RESPONSE_TIME:
+             outint = al->icap.trTime;
+             doint = 1;
+             break;
+ 
+         case LFT_ICAP_IO_TIME:
+             outint = al->icap.ioTime;
+             doint = 1;
+             break;
+ 
+         case LFT_ICAP_STATUS_CODE:
+             outint = al->icap.resStatus;
+             doint  = 1;
+             break;
+ 
+         case LFT_ICAP_OUTCOME:
+             out = al->icap.outcome;
+             break;
+ 
+         case LFT_ICAP_TOTAL_TIME:
+             outint = al->icap.processingTime;
+             doint = 1;
+             break;
+ #endif
+         case LFT_REQUEST_HEADER_ELEM:
+-            if (al->request)
+-                sb = al->request->header.getByNameListMember(fmt->data.header.header, fmt->data.header.element, fmt->data.header.separator);
++            if (const HttpMsg *msg = actualRequestHeader(al))
++                sb = msg->header.getByNameListMember(fmt->data.header.header, fmt->data.header.element, fmt->data.header.separator);
+ 
+             out = sb.termedBuf();
+ 
+             quote = 1;
+ 
+             break;
+ 
+         case LFT_ADAPTED_REQUEST_HEADER_ELEM:
+             if (al->adapted_request)
+                 sb = al->adapted_request->header.getByNameListMember(fmt->data.header.header, fmt->data.header.element, fmt->data.header.separator);
+ 
+             out = sb.termedBuf();
+ 
+             quote = 1;
+ 
+             break;
+ 
+-        case LFT_REPLY_HEADER_ELEM:
+-            if (al->reply)
+-                sb = al->reply->header.getByNameListMember(fmt->data.header.header, fmt->data.header.element, fmt->data.header.separator);
++        case LFT_REPLY_HEADER_ELEM: {
++            if (const HttpMsg *msg = actualReplyHeader(al))
++                sb = msg->header.getByNameListMember(fmt->data.header.header, fmt->data.header.element, fmt->data.header.separator);
+ 
+             out = sb.termedBuf();
+ 
+             quote = 1;
+-
+-            break;
++        }
++        break;
+ 
+         case LFT_REQUEST_ALL_HEADERS:
+-            out = al->headers.request;
++#if USE_ADAPTATION
++            if (al->icap.reqMethod == Adaptation::methodRespmod) {
++                // XXX: since AccessLogEntry::Headers lacks virgin response
++                // headers, do nothing for now
++                out = nullptr;
++            } else
++#endif
++            {
++                out = al->headers.request;
++            }
+ 
+             quote = 1;
+ 
+             break;
+ 
+         case LFT_ADAPTED_REQUEST_ALL_HEADERS:
+             out = al->headers.adapted_request;
+ 
+             quote = 1;
+ 
+             break;
+ 
+         case LFT_REPLY_ALL_HEADERS:
+             out = al->headers.reply;
++#if USE_ADAPTATION
++            if (!out && al->icap.reqMethod == Adaptation::methodReqmod)
++                out = al->headers.adapted_request;
++#endif
+ 
+             quote = 1;
+ 
+             break;
+ 
+         case LFT_USER_NAME:
+ #if USE_AUTH
+             if (al->request && al->request->auth_user_request != NULL)
+                 out = strOrNull(al->request->auth_user_request->username());
+ #endif
+             if (!out && al->request && al->request->extacl_user.size()) {
+                 if (const char *t = al->request->extacl_user.termedBuf())
+                     out = t;
+             }
+ 
+             if (!out)
+                 out = strOrNull(al->cache.extuser);
+ 
+ #if USE_OPENSSL
+             if (!out)
+                 out = strOrNull(al->cache.ssluser);
+ #endif
+             if (!out)
+                 out = strOrNull(al->cache.rfc931);
+             break;
+ 
+         case LFT_USER_LOGIN:
+ #if USE_AUTH
+             if (al->request && al->request->auth_user_request != NULL)
+                 out = strOrNull(al->request->auth_user_request->username());
+

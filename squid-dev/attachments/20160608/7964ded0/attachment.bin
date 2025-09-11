@@ -1,0 +1,232 @@
+Fix for valgrind-discovered trunk errors.
+
+During start-up, Valgrind reported many errors with a similar
+message: "Use of uninitialised value of size 8...". These errors
+were caused by HttpRequestMethod& parameter during private
+key generation: it was used as a raw void* memory there. HttpRequestMethod
+is a non-POD type and has some "padding" bytes, which are not initialized
+by the constructor.
+The patch simplifies private key generation by using a simple counter for this,
+which is sufficient to create a unique key within a single Squid process.
+Except fixing Valgrind errors, this solution saves many CPU cycles wasted on
+generating MD5 hashes just to "guarantee" uniqueness within a single process.
+
+=== modified file 'src/store.cc'
+--- src/store.cc	2016-05-01 21:37:52 +0000
++++ src/store.cc	2016-06-08 10:29:45 +0000
+@@ -572,81 +572,76 @@
+     if (e == NULL && req->method == Http::METHOD_HEAD)
+         /* We can generate a HEAD reply from a cached GET object */
+         e = storeGetPublicByRequestMethod(req, Http::METHOD_GET);
+ 
+     return e;
+ }
+ 
+ static int
+ getKeyCounter(void)
+ {
+     static int key_counter = 0;
+ 
+     if (++key_counter < 0)
+         key_counter = 1;
+ 
+     return key_counter;
+ }
+ 
+ /* RBC 20050104 AFAICT this should become simpler:
+  * rather than reinserting with a special key it should be marked
+  * as 'released' and then cleaned up when refcounting indicates.
+  * the StoreHashIndex could well implement its 'released' in the
+  * current manner.
+  * Also, clean log writing should skip over ia,t
+  * Otherwise, we need a 'remove from the index but not the store
+  * concept'.
+  */
+ void
+ StoreEntry::setPrivateKey()
+ {
+-    const cache_key *newkey;
+-
+     if (key && EBIT_TEST(flags, KEY_PRIVATE))
+         return;                 /* is already private */
+ 
+     if (key) {
+         setReleaseFlag(); // will markForUnlink(); all caches/workers will know
+ 
+         // TODO: move into SwapDir::markForUnlink() already called by Root()
+         if (swap_filen > -1)
+             storeDirSwapLog(this, SWAP_LOG_DEL);
+ 
+         hashDelete();
+     }
+ 
+-    if (mem_obj && mem_obj->hasUris()) {
++    if (mem_obj && mem_obj->hasUris())
+         mem_obj->id = getKeyCounter();
+-        newkey = storeKeyPrivate(mem_obj->storeId(), mem_obj->method, mem_obj->id);
+-    } else {
+-        newkey = storeKeyPrivate("JUNK", Http::METHOD_NONE, getKeyCounter());
+-    }
++    const cache_key *newkey = storeKeyPrivate();
+ 
+     assert(hash_lookup(store_table, newkey) == NULL);
+     EBIT_SET(flags, KEY_PRIVATE);
+     hashInsert(newkey);
+ }
+ 
+ void
+ StoreEntry::setPublicKey()
+ {
+     const cache_key *newkey;
+ 
+     if (key && !EBIT_TEST(flags, KEY_PRIVATE))
+         return;                 /* is already public */
+ 
+     assert(mem_obj);
+ 
+     /*
+      * We can't make RELEASE_REQUEST objects public.  Depending on
+      * when RELEASE_REQUEST gets set, we might not be swapping out
+      * the object.  If we're not swapping out, then subsequent
+      * store clients won't be able to access object data which has
+      * been freed from memory.
+      *
+      * If RELEASE_REQUEST is set, setPublicKey() should not be called.
+      */
+ #if MORE_DEBUG_OUTPUT
+ 
+     if (EBIT_TEST(flags, RELEASE_REQUEST))
+         debugs(20, DBG_IMPORTANT, "assertion failed: RELEASE key " << key << ", url " << mem_obj->url);
+ 
+
+=== modified file 'src/store_key_md5.cc'
+--- src/store_key_md5.cc	2016-03-25 20:11:29 +0000
++++ src/store_key_md5.cc	2016-06-08 11:44:52 +0000
+@@ -53,72 +53,72 @@
+ storeKeyHashCmp(const void *a, const void *b)
+ {
+     const unsigned char *A = (const unsigned char *)a;
+     const unsigned char *B = (const unsigned char *)b;
+     int i;
+ 
+     for (i = 0; i < SQUID_MD5_DIGEST_LENGTH; ++i) {
+         if (A[i] < B[i])
+             return -1;
+ 
+         if (A[i] > B[i])
+             return 1;
+     }
+ 
+     return 0;
+ }
+ 
+ unsigned int
+ storeKeyHashHash(const void *key, unsigned int n)
+ {
+     /* note, n must be a power of 2! */
+     const unsigned char *digest = (const unsigned char *)key;
+     unsigned int i = digest[0]
+                      | digest[1] << 8
+                      | digest[2] << 16
+                      | digest[3] << 24;
+     return (i & (--n));
+ }
+ 
+ const cache_key *
+-storeKeyPrivate(const char *url, const HttpRequestMethod& method, int id)
++storeKeyPrivate()
+ {
+-    static cache_key digest[SQUID_MD5_DIGEST_LENGTH];
+-    SquidMD5_CTX M;
+-    assert(id > 0);
+-    debugs(20, 3, "storeKeyPrivate: " << method << " " << url);
+-    SquidMD5Init(&M);
+-    SquidMD5Update(&M, (unsigned char *) &id, sizeof(id));
+-    SquidMD5Update(&M, (unsigned char *) &method, sizeof(method));
+-    SquidMD5Update(&M, (unsigned char *) url, strlen(url));
+-    SquidMD5Final(digest, &M);
+-    return digest;
++    // only the count field is required
++    // others just simplify searching for keys in a multi-process cache.log
++    static struct {
++        uint64_t count;
++        pid_t pid;
++        int32_t kid;
++    } key = { 0, getpid(), KidIdentifier };
++    assert(sizeof(key) == SQUID_MD5_DIGEST_LENGTH);
++    ++key.count;
++    return reinterpret_cast<cache_key*>(&key);
+ }
+ 
+ const cache_key *
+ storeKeyPublic(const char *url, const HttpRequestMethod& method)
+ {
+     static cache_key digest[SQUID_MD5_DIGEST_LENGTH];
+     unsigned char m = (unsigned char) method.id();
+     SquidMD5_CTX M;
+     SquidMD5Init(&M);
+     SquidMD5Update(&M, &m, sizeof(m));
+     SquidMD5Update(&M, (unsigned char *) url, strlen(url));
+     SquidMD5Final(digest, &M);
+     return digest;
+ }
+ 
+ const cache_key *
+ storeKeyPublicByRequest(HttpRequest * request)
+ {
+     return storeKeyPublicByRequestMethod(request, request->method);
+ }
+ 
+ const cache_key *
+ storeKeyPublicByRequestMethod(HttpRequest * request, const HttpRequestMethod& method)
+ {
+     static cache_key digest[SQUID_MD5_DIGEST_LENGTH];
+     unsigned char m = (unsigned char) method.id();
+     const SBuf url = request->storeId(); /* returns the right storeID\URL for the MD5 calc */
+     SquidMD5_CTX M;
+     SquidMD5Init(&M);
+     SquidMD5Update(&M, &m, sizeof(m));
+
+=== modified file 'src/store_key_md5.h'
+--- src/store_key_md5.h	2016-01-01 00:12:18 +0000
++++ src/store_key_md5.h	2016-06-08 10:24:45 +0000
+@@ -1,37 +1,37 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 20    Storage Manager MD5 Cache Keys */
+ 
+ #ifndef SQUID_STORE_KEY_MD5_H_
+ #define SQUID_STORE_KEY_MD5_H_
+ 
+ #include "hash.h"
+ #include "store/forward.h"
+ 
+ class HttpRequestMethod;
+ class HttpRequest;
+ 
+ cache_key *storeKeyDup(const cache_key *);
+ cache_key *storeKeyCopy(cache_key *, const cache_key *);
+ void storeKeyFree(const cache_key *);
+ const cache_key *storeKeyScan(const char *);
+ const char *storeKeyText(const cache_key *);
+ const cache_key *storeKeyPublic(const char *, const HttpRequestMethod&);
+ const cache_key *storeKeyPublicByRequest(HttpRequest *);
+ const cache_key *storeKeyPublicByRequestMethod(HttpRequest *, const HttpRequestMethod&);
+-const cache_key *storeKeyPrivate(const char *, const HttpRequestMethod&, int);
++const cache_key *storeKeyPrivate();
+ int storeKeyHashBuckets(int);
+ int storeKeyNull(const cache_key *);
+ void storeKeyInit(void);
+ 
+ extern HASHHASH storeKeyHashHash;
+ extern HASHCMP storeKeyHashCmp;
+ 
+ #endif /* SQUID_STORE_KEY_MD5_H_ */
+ 
+

@@ -1,0 +1,639 @@
+Do not die silently when dying early.
+
+Report various problems (e.g., unhandled exceptions) that may occur very
+early in Squid lifetime, before proper logging is configured by the
+first _db_init() call.
+
+To enable such early reporting, we started with a trivial change:
+  -FILE *debug_log = NULL;
+  +FILE *debug_log = stderr;
+... but realized that debug_log may not be assigned early enough! The
+resulting (larger) changes ensure that we can log (to stderr if
+necessary) as soon as stderr itself is initialized. They also polish
+related logging code, including localization of stderr checks and
+elimination of double-closure during log rotation on Windows.
+
+These reporting changes do not bypass or eliminate any failures.
+
+=== modified file 'src/Debug.h'
+--- src/Debug.h	2017-01-01 00:12:22 +0000
++++ src/Debug.h	2017-05-19 21:41:38 +0000
+@@ -82,41 +82,51 @@ public:
+     static int override_X;
+     static int log_stderr;
+     static bool log_syslog;
+ 
+     static void parseOptions(char const *);
+ 
+     /// minimum level required by the current debugs() call
+     static int Level() { return Current ? Current->level : 1; }
+     /// maximum level currently allowed
+     static int SectionLevel() { return Current ? Current->sectionLevel : 1; }
+ 
+     /// opens debugging context and returns output buffer
+     static std::ostringstream &Start(const int section, const int level);
+     /// logs output buffer created in Start() and closes debugging context
+     static void Finish();
+ 
+ private:
+     static Context *Current; ///< deepest active context; nil outside debugs()
+ };
+ 
+-extern FILE *debug_log;
++/// cache.log FILE or, as the last resort, stderr stream;
++/// may be nil during static initialization and destruction!
++FILE *DebugStream();
++/// change-avoidance macro; new code should call DebugStream() instead
++#define debug_log DebugStream()
++
++/// start logging to stderr (instead of cache.log, if any)
++void StopUsingDebugLog();
++
++/// a hack for low-level file descriptor manipulations in ipcCreate()
++void ResyncDebugLog(FILE *newDestination);
+ 
+ size_t BuildPrefixInit();
+ const char * SkipBuildPrefix(const char* path);
+ 
+ /* Debug stream
+  *
+  * Unit tests can enable full debugging to stderr for one
+  * debug section; to enable this, #define ENABLE_DEBUG_SECTION to the
+  * section number before any header
+  */
+ #define debugs(SECTION, LEVEL, CONTENT) \
+    do { \
+         const int _dbg_level = (LEVEL); \
+         if (Debug::Enabled((SECTION), _dbg_level)) { \
+             std::ostream &_dbo = Debug::Start((SECTION), _dbg_level); \
+             if (_dbg_level > DBG_IMPORTANT) { \
+                 _dbo << (SECTION) << ',' << _dbg_level << "| " \
+                      << SkipBuildPrefix(__FILE__)<<"("<<__LINE__<<") "<<__FUNCTION__<<": "; \
+             } \
+             _dbo << CONTENT; \
+
+=== modified file 'src/debug.cc'
+--- src/debug.cc	2017-01-01 00:12:22 +0000
++++ src/debug.cc	2017-05-19 21:41:38 +0000
+@@ -9,60 +9,122 @@
+ /* DEBUG: section 00    Debug Routines */
+ 
+ #include "squid.h"
+ #include "Debug.h"
+ #include "ipc/Kids.h"
+ #include "SquidTime.h"
+ #include "util.h"
+ 
+ #include <algorithm>
+ 
+ /* for shutting_down flag in xassert() */
+ #include "globals.h"
+ 
+ char *Debug::debugOptions = NULL;
+ int Debug::override_X = 0;
+ int Debug::log_stderr = -1;
+ bool Debug::log_syslog = false;
+ int Debug::Levels[MAX_DEBUG_SECTIONS];
+ char *Debug::cache_log = NULL;
+ int Debug::rotateNumber = -1;
+-FILE *debug_log = NULL;
+-static char *debug_log_file = NULL;
+ static int Ctx_Lock = 0;
+ static const char *debugLogTime(void);
+ static const char *debugLogKid(void);
+ static void ctx_print(void);
+ #if HAVE_SYSLOG
+ #ifdef LOG_LOCAL4
+ static int syslog_facility = 0;
+ #endif
+ static void _db_print_syslog(const char *format, va_list args);
+ #endif
+ static void _db_print_stderr(const char *format, va_list args);
+ static void _db_print_file(const char *format, va_list args);
+ 
+ #if _SQUID_WINDOWS_
+ extern LPCRITICAL_SECTION dbg_mutex;
+ typedef BOOL (WINAPI * PFInitializeCriticalSectionAndSpinCount) (LPCRITICAL_SECTION, DWORD);
+ #endif
+ 
++/// a (FILE*, file name) pair that uses stderr FILE as the last resort
++class DebugFile
++{
++public:
++    DebugFile() {}
++    ~DebugFile() { clear(); }
++    DebugFile(DebugFile &&) = delete; // no copying or moving of any kind
++
++    /// switches to the new pair, absorbing FILE and duping the name
++    void reset(FILE *newFile, const char *newName);
++
++    /// go back to the initial state
++    void clear() { reset(nullptr, nullptr); }
++
++    /// logging stream; the only method that uses stderr as the last resort
++    FILE *file() { return file_ ? file_ : stderr; }
++
++    char *name = nullptr;
++
++private:
++    friend void ResyncDebugLog(FILE *newFile);
++
++    FILE *file_ = nullptr; ///< opened "real" file or nil; never stderr
++};
++
++/// configured cache.log file or stderr
++/// safe during static initialization, even if it has not been constructed yet
++static DebugFile TheLog;
++
++FILE *
++DebugStream() {
++    return TheLog.file();
++}
++
++void
++StopUsingDebugLog()
++{
++    TheLog.clear();
++}
++
++void
++ResyncDebugLog(FILE *newFile)
++{
++    TheLog.file_ = newFile;
++}
++
++void
++DebugFile::reset(FILE *newFile, const char *newName)
++{
++    // callers must use nullptr instead of the used-as-the-last-resort stderr
++    assert(newFile != stderr || !stderr);
++
++    if (file_)
++        fclose(file_);
++    file_ = newFile; // may be nil
++
++    xfree(name);
++    name = newName ? xstrdup(newName) : nullptr;
++
++    // all open files must have a name
++    // all cleared files must not have a name
++    assert(!file_ == !name);
++}
++
+ void
+ _db_print(const char *format,...)
+ {
+     char f[BUFSIZ];
+     f[0]='\0';
+     va_list args1;
+     va_list args2;
+     va_list args3;
+ 
+ #if _SQUID_WINDOWS_
+     /* Multiple WIN32 threads may call this simultaneously */
+ 
+     if (!dbg_mutex) {
+         HMODULE krnl_lib = GetModuleHandle("Kernel32");
+         PFInitializeCriticalSectionAndSpinCount InitializeCriticalSectionAndSpinCount = NULL;
+ 
+         if (krnl_lib)
+             InitializeCriticalSectionAndSpinCount =
+                 (PFInitializeCriticalSectionAndSpinCount) GetProcAddress(krnl_lib,
+                         "InitializeCriticalSectionAndSpinCount");
+@@ -193,72 +255,63 @@ debugArg(const char *arg)
+ 
+     if (l < 0)
+         l = 0;
+ 
+     if (l > 10)
+         l = 10;
+ 
+     if (s >= 0) {
+         Debug::Levels[s] = l;
+         return;
+     }
+ 
+     for (i = 0; i < MAX_DEBUG_SECTIONS; ++i)
+         Debug::Levels[i] = l;
+ }
+ 
+ static void
+ debugOpenLog(const char *logfile)
+ {
+     if (logfile == NULL) {
+-        debug_log = stderr;
++        TheLog.clear();
+         return;
+     }
+ 
+-    if (debug_log_file)
+-        xfree(debug_log_file);
+-
+-    debug_log_file = xstrdup(logfile);  /* keep a static copy */
+-
+-    if (debug_log && debug_log != stderr)
+-        fclose(debug_log);
+-
+     // Bug 4423: ignore the stdio: logging module name if present
+     const char *logfilename;
+     if (strncmp(logfile, "stdio:",6) == 0)
+         logfilename = logfile + 6;
+     else
+         logfilename = logfile;
+ 
+-    debug_log = fopen(logfilename, "a+");
+-
+-    if (!debug_log) {
++    if (auto log = fopen(logfilename, "a+")) {
++#if _SQUID_WINDOWS_
++        setmode(fileno(log), O_TEXT);
++#endif
++        TheLog.reset(log, logfilename);
++    } else {
+         fprintf(stderr, "WARNING: Cannot write log file: %s\n", logfile);
+         perror(logfile);
+         fprintf(stderr, "         messages will be sent to 'stderr'.\n");
+         fflush(stderr);
+-        debug_log = stderr;
++        TheLog.clear();
+     }
+-
+-#if _SQUID_WINDOWS_
+-    setmode(fileno(debug_log), O_TEXT);
+-#endif
+ }
+ 
+ #if HAVE_SYSLOG
+ #ifdef LOG_LOCAL4
+ 
+ static struct syslog_facility_name {
+     const char *name;
+     int facility;
+ }
+ 
+ syslog_facility_names[] = {
+ 
+ #ifdef LOG_AUTH
+     {
+         "auth", LOG_AUTH
+     },
+ #endif
+ #ifdef LOG_AUTHPRIV
+     {
+         "authpriv", LOG_AUTHPRIV
+@@ -428,107 +481,102 @@ void
+ _db_init(const char *logfile, const char *options)
+ {
+     Debug::parseOptions(options);
+ 
+     debugOpenLog(logfile);
+ 
+ #if HAVE_SYSLOG && defined(LOG_LOCAL4)
+ 
+     if (Debug::log_syslog)
+         openlog(APP_SHORTNAME, LOG_PID | LOG_NDELAY | LOG_CONS, syslog_facility);
+ 
+ #endif /* HAVE_SYSLOG */
+ 
+     /* Pre-Init TZ env, see bug #2656 */
+     tzset();
+ }
+ 
+ void
+ _db_rotate_log(void)
+ {
+-    if (debug_log_file == NULL)
++    if (!TheLog.name)
+         return;
+ 
+ #ifdef S_ISREG
+     struct stat sb;
+-    if (stat(debug_log_file, &sb) == 0)
++    if (stat(TheLog.name, &sb) == 0)
+         if (S_ISREG(sb.st_mode) == 0)
+             return;
+ #endif
+ 
+     char from[MAXPATHLEN];
+     from[0] = '\0';
+ 
+     char to[MAXPATHLEN];
+     to[0] = '\0';
+ 
+     /*
+      * NOTE: we cannot use xrename here without having it in a
+      * separate file -- tools.c has too many dependencies to be
+      * used everywhere debug.c is used.
+      */
+     /* Rotate numbers 0 through N up one */
+     for (int i = Debug::rotateNumber; i > 1;) {
+         --i;
+-        snprintf(from, MAXPATHLEN, "%s.%d", debug_log_file, i - 1);
+-        snprintf(to, MAXPATHLEN, "%s.%d", debug_log_file, i);
++        snprintf(from, MAXPATHLEN, "%s.%d", TheLog.name, i - 1);
++        snprintf(to, MAXPATHLEN, "%s.%d", TheLog.name, i);
+ #if _SQUID_WINDOWS_
+         remove
+         (to);
+ #endif
+         errno = 0;
+         if (rename(from, to) == -1) {
+             const auto saved_errno = errno;
+             debugs(0, DBG_IMPORTANT, "log rotation failed: " << xstrerr(saved_errno));
+         }
+     }
+ 
+-    /*
+-     * You can't rename open files on Microsoft "operating systems"
+-     * so we close before renaming.
+-     */
+-#if _SQUID_WINDOWS_
+-    if (debug_log != stderr)
+-        fclose(debug_log);
+-#endif
+     /* Rotate the current log to .0 */
+     if (Debug::rotateNumber > 0) {
+-        snprintf(to, MAXPATHLEN, "%s.%d", debug_log_file, 0);
++        // form file names before we may clear TheLog below
++        snprintf(from, MAXPATHLEN, "%s", TheLog.name);
++        snprintf(to, MAXPATHLEN, "%s.%d", TheLog.name, 0);
++
+ #if _SQUID_WINDOWS_
+         errno = 0;
+         if (remove(to) == -1) {
+             const auto saved_errno = errno;
+             debugs(0, DBG_IMPORTANT, "removal of log file " << to << " failed: " << xstrerr(saved_errno));
+         }
++        TheLog.clear(); // Windows cannot rename() open files
+ #endif
+         errno = 0;
+-        if (rename(debug_log_file, to) == -1) {
++        if (rename(from, to) == -1) {
+             const auto saved_errno = errno;
+-            debugs(0, DBG_IMPORTANT, "renaming file " << debug_log_file << " to "
++            debugs(0, DBG_IMPORTANT, "renaming file " << from << " to "
+                    << to << "failed: " << xstrerr(saved_errno));
+         }
+     }
+ 
+-    /* Close and reopen the log.  It may have been renamed "manually"
+-     * before HUP'ing us. */
+-    if (debug_log != stderr)
+-        debugOpenLog(Debug::cache_log);
++    // Close (if we have not already) and reopen the log because
++    // it may have been renamed "manually" before HUP'ing us.
++    debugOpenLog(Debug::cache_log);
+ }
+ 
+ static const char *
+ debugLogTime(void)
+ {
+ 
+     time_t t = getCurrentTime();
+ 
+     struct tm *tm;
+     static char buf[128];
+     static time_t last_t = 0;
+ 
+     if (Debug::Level() > 1) {
+         char buf2[128];
+         tm = localtime(&t);
+         strftime(buf2, 127, "%Y/%m/%d %H:%M:%S", tm);
+         buf2[127] = '\0';
+         snprintf(buf, 127, "%s.%03d", buf2, (int) current_time.tv_usec / 1000);
+         last_t = t;
+     } else if (t != last_t) {
+
+=== modified file 'src/ipc.cc'
+--- src/ipc.cc	2017-01-01 00:12:22 +0000
++++ src/ipc.cc	2017-05-19 21:41:38 +0000
+@@ -399,29 +399,29 @@ ipcCreate(int type, const char *prog, co
+     dup2(t3, 2);
+ 
+     close(t1);
+ 
+     close(t2);
+ 
+     close(t3);
+ 
+     /* Make sure all other filedescriptors are closed */
+     for (x = 3; x < SQUID_MAXFD; ++x)
+         close(x);
+ 
+ #if HAVE_SETSID
+     if (opt_no_daemon)
+         setsid();
+ #endif
+ 
+     execvp(prog, (char *const *) args);
+     xerrno = errno;
+ 
+-    debug_log = fdopen(2, "a+");
++    ResyncDebugLog(fdopen(2, "a+"));
+ 
+     debugs(54, DBG_CRITICAL, "ipcCreate: " << prog << ": " << xstrerr(xerrno));
+ 
+     _exit(1);
+ 
+     return 0;
+ }
+ 
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2017-03-03 23:18:25 +0000
++++ src/main.cc	2017-05-19 21:41:38 +0000
+@@ -1397,41 +1397,40 @@ ConfigureCurrentKid(const char *processN
+                 TheProcessKind = pkCoordinator;
+             else if (!strcmp(TheKidName, "squid"))
+                 TheProcessKind = pkWorker;
+             else if (!strcmp(TheKidName, "squid-disk"))
+                 TheProcessKind = pkDisker;
+             else
+                 TheProcessKind = pkOther; // including coordinator
+         }
+     } else {
+         xstrncpy(TheKidName, APP_SHORTNAME, sizeof(TheKidName));
+         KidIdentifier = 0;
+     }
+ }
+ 
+ int
+ SquidMain(int argc, char **argv)
+ {
+     ConfigureCurrentKid(argv[0]);
+ 
+     Debug::parseOptions(NULL);
+-    debug_log = stderr;
+ 
+ #if defined(SQUID_MAXFD_LIMIT)
+ 
+     if (SQUID_MAXFD_LIMIT < Squid_MaxFD)
+         Squid_MaxFD = SQUID_MAXFD_LIMIT;
+ 
+ #endif
+ 
+     /* NOP under non-windows */
+     int WIN32_init_err=0;
+     if ((WIN32_init_err = WIN32_Subsystem_Init(&argc, &argv)))
+         return WIN32_init_err;
+ 
+     /* call mallopt() before anything else */
+ #if HAVE_MALLOPT
+ #ifdef M_GRAIN
+     /* Round up all sizes to a multiple of this */
+     mallopt(M_GRAIN, 16);
+ 
+ #endif
+@@ -1650,41 +1649,41 @@ SquidMain(int argc, char **argv)
+ 
+     /* at this point we are finished the synchronous startup. */
+     starting_up = 0;
+ 
+     mainLoop.run();
+ 
+     if (mainLoop.errcount == 10)
+         fatal_dump("Event loop exited with failure.");
+ 
+     /* shutdown squid now */
+     SquidShutdown();
+ 
+     /* NOTREACHED */
+     return 0;
+ }
+ 
+ static void
+ sendSignal(void)
+ {
+     pid_t pid;
+-    debug_log = stderr;
++    StopUsingDebugLog();
+ 
+     if (strcmp(Config.pidFilename, "none") == 0) {
+         debugs(0, DBG_IMPORTANT, "No pid_filename specified. Trusting you know what you are doing.");
+     }
+ 
+     pid = readPidFile();
+ 
+     if (pid > 1) {
+ #if USE_WIN32_SERVICE
+         if (opt_signal_service) {
+             WIN32_sendSignal(opt_send_signal);
+             exit(0);
+         } else {
+             fprintf(stderr, "%s: ERROR: Could not send ", APP_SHORTNAME);
+             fprintf(stderr, "signal to Squid Service:\n");
+             fprintf(stderr, "missing -n command line switch.\n");
+             exit(1);
+         }
+         /* NOTREACHED */
+ #endif
+@@ -1741,44 +1740,40 @@ mainStartScript(const char *prog)
+         execl(script, squid_start_script, (char *)NULL);
+         _exit(-1);
+     } else {
+         do {
+             PidStatus status;
+             rpid = WaitForOnePid(cpid, status, 0);
+         } while (rpid != cpid);
+     }
+ }
+ 
+ #endif /* _SQUID_WINDOWS_ */
+ 
+ static int
+ checkRunningPid(void)
+ {
+     // master process must start alone, but its kids processes may co-exist
+     if (!IamMasterProcess())
+         return 0;
+ 
+     pid_t pid;
+-
+-    if (!debug_log)
+-        debug_log = stderr;
+-
+     pid = readPidFile();
+ 
+     if (pid < 2)
+         return 0;
+ 
+     if (kill(pid, 0) < 0)
+         return 0;
+ 
+     debugs(0, DBG_CRITICAL, "Squid is already running!  Process ID " <<  pid);
+ 
+     return 1;
+ }
+ 
+ #if !_SQUID_WINDOWS_
+ static void
+ masterCheckAndBroadcastSignals()
+ {
+     // if (do_reconfigure)
+     //     TODO: hot-reconfiguration of the number of kids and PID file location
+ 
+
+=== modified file 'src/tests/stub_debug.cc'
+--- src/tests/stub_debug.cc	2017-01-01 00:12:22 +0000
++++ src/tests/stub_debug.cc	2017-05-19 21:41:38 +0000
+@@ -1,48 +1,58 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /*
+  * A stub implementation of the Debug.h API.
+  * For use by test binaries which do not need the full context debugging
+  *
+  * Note: it doesn't use the STUB API as the functions defined here must
+  * not abort the unit test.
+  */
+ #include "squid.h"
+ #include "Debug.h"
+ 
+-FILE *debug_log = NULL;
++#define STUB_API "debug.cc"
++#include "tests/STUB.h"
+ 
+ char *Debug::debugOptions;
+ char *Debug::cache_log= NULL;
+ int Debug::rotateNumber = 0;
+ int Debug::Levels[MAX_DEBUG_SECTIONS];
+ int Debug::override_X = 0;
+ int Debug::log_stderr = 1;
+ bool Debug::log_syslog = false;
+ 
++void StopUsingDebugLog() STUB
++void ResyncDebugLog(FILE *) STUB
++
++FILE *
++DebugStream()
++{
++    return stderr;
++}
++
+ Ctx
+ ctx_enter(const char *)
+ {
+     return -1;
+ }
+ 
+ void
+ ctx_exit(Ctx)
+ {}
+ 
+ void
+ _db_init(const char *, const char *)
+ {}
+ 
+ void
+ _db_set_syslog(const char *)
+ {}
+ 
+ void
+ _db_rotate_log(void)
+

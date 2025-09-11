@@ -1,0 +1,474 @@
+=== modified file 'src/Makefile.am'
+--- src/Makefile.am	2016-02-29 10:33:39 +0000
++++ src/Makefile.am	2016-03-15 09:32:30 +0000
+@@ -3683,6 +3683,30 @@
+ 	$(XTRA_LIBS)
+ tests_testYesNoNone_LDFLAGS = $(LIBADD_DL)
+ 
++check_PROGRAMS += tests/testRFC3986
++tests_testRFC3986_SOURCES= \
++	tests/stub_debug.cc \
++	tests/stub_libmem.cc \
++	tests/stub_SBufDetailedStats.cc \
++	tests/testRFC3986.h \
++	tests/testRFC3986.cc
++nodist_tests_testRFC3986_SOURCES= \
++	String.cc \
++	$(TESTSOURCES)
++tests_testRFC3986_LDADD= \
++	mem/libmem.la \
++	sbuf/libsbuf.la \
++	anyp/libanyp.la \
++	base/libbase.la \
++	$(top_builddir)/lib/libmisccontainers.la \
++	$(top_builddir)/lib/libmiscencoding.la \
++	$(top_builddir)/lib/libmiscutil.la \
++	$(COMPAT_LIB) \
++	$(SQUID_CPPUNIT_LA) \
++	$(SQUID_CPPUNIT_LIBS) \
++	$(XTRA_LIBS)
++tests_testRFC3986_LDFLAGS= $(LIBADD_DL)
++
+ TESTS += testHeaders
+ 
+ ## Special Universal .h dependency test script
+
+=== modified file 'src/anyp/Makefile.am'
+--- src/anyp/Makefile.am	2016-01-01 00:12:18 +0000
++++ src/anyp/Makefile.am	2016-02-08 17:14:06 +0000
+@@ -17,6 +17,8 @@
+ 	ProtocolType.cc \
+ 	ProtocolType.h \
+ 	ProtocolVersion.h \
++	Rfc3986.cc \
++	Rfc3986.h \
+ 	TrafficMode.h \
+ 	UriScheme.cc \
+ 	UriScheme.h
+
+=== added file 'src/anyp/Rfc3986.cc'
+--- src/anyp/Rfc3986.cc	1970-01-01 00:00:00 +0000
++++ src/anyp/Rfc3986.cc	2016-03-16 17:05:06 +0000
+@@ -0,0 +1,182 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "anyp/Rfc3986.h"
++#include "sbuf/SBuf.h"
++
++const CharacterSet Rfc1738::Unsafe("rfc1738:unsafe", "<>\"# %{}|\\^~[]`'");
++const CharacterSet Rfc1738::Ctrls("rfc1738:ctrls", {{0x00, 0x1f}, {0x7f,0xff}});
++const CharacterSet Rfc1738::Reserved("rfc1738:reserved", ";/?:@=&");
++const CharacterSet Rfc1738::UnsafeAndCtrls = Rfc1738::Unsafe + Rfc1738::Ctrls;
++const CharacterSet Rfc1738::Unescaped = (Rfc1738::UnsafeAndCtrls - CharacterSet(nullptr,"%") ).rename("rfc1738:unescaped");
++
++const CharacterSet Rfc3986::GenDelims("rfc3986:gen-delims",":/?#[]@");
++const CharacterSet Rfc3986::SubDelims("rfc3986:sub-delims","!$&'()*+,;=");
++const CharacterSet Rfc3986::Reserved = (Rfc3986::GenDelims + Rfc3986::SubDelims).rename("rfc3986:reserved");
++const CharacterSet Rfc3986::Unreserved = CharacterSet("rfc3986:unreserved","-._~") +
++                                       CharacterSet::ALPHA + CharacterSet::DIGIT;
++const CharacterSet Rfc3986::All = (Rfc1738::UnsafeAndCtrls + Rfc3986::Reserved).rename("rfc3986:all");
++
++static const char * const toHexTable[256] = {
++    "00", "01", "02", "03", "04", "05", "06", "07",
++    "08", "09", "0A", "0B", "0C", "0D", "0E", "0F",
++    "10", "11", "12", "13", "14", "15", "16", "17",
++    "18", "19", "1A", "1B", "1C", "1D", "1E", "1F",
++    "20", "21", "22", "23", "24", "25", "26", "27",
++    "28", "29", "2A", "2B", "2C", "2D", "2E", "2F",
++    "30", "31", "32", "33", "34", "35", "36", "37",
++    "38", "39", "3A", "3B", "3C", "3D", "3E", "3F",
++    "40", "41", "42", "43", "44", "45", "46", "47",
++    "48", "49", "4A", "4B", "4C", "4D", "4E", "4F",
++    "50", "51", "52", "53", "54", "55", "56", "57",
++    "58", "59", "5A", "5B", "5C", "5D", "5E", "5F",
++    "60", "61", "62", "63", "64", "65", "66", "67",
++    "68", "69", "6A", "6B", "6C", "6D", "6E", "6F",
++    "70", "71", "72", "73", "74", "75", "76", "77",
++    "78", "79", "7A", "7B", "7C", "7D", "7E", "7F",
++    "80", "81", "82", "83", "84", "85", "86", "87",
++    "88", "89", "8A", "8B", "8C", "8D", "8E", "8F",
++    "90", "91", "92", "93", "94", "95", "96", "97",
++    "98", "99", "9A", "9B", "9C", "9D", "9E", "9F",
++    "A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7",
++    "A8", "A9", "AA", "AB", "AC", "AD", "AE", "AF",
++    "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7",
++    "B8", "B9", "BA", "BB", "BC", "BD", "BE", "BF",
++    "C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7",
++    "C8", "C9", "CA", "CB", "CC", "CD", "CE", "CF",
++    "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7",
++    "D8", "D9", "DA", "DB", "DC", "DD", "DE", "DF",
++    "E0", "E1", "E2", "E3", "E4", "E5", "E6", "E7",
++    "E8", "E9", "EA", "EB", "EC", "ED", "EE", "EF",
++    "F0", "F1", "F2", "F3", "F4", "F5", "F6", "F7",
++    "F8", "F9", "FA", "FB", "FC", "FD", "FE", "FF"
++};
++
++static constexpr const int16_t fromHexTable[256] = {
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, -1, -1, -1, -1, -1, -1,
++    -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
++};
++
++/// \return the numeric representation of the HEXDIG argument ch, or -1 if invalid.
++static inline const int16_t
++FromHex(unsigned char ch)
++{
++    // no need to check bounds, the lookup table has 256 entries
++    return fromHexTable[ch];
++}
++
++/// \return a static 2-char zero-terminated buffer with a HEXDIG
++///         representation of argument c
++static inline const char*
++ToHex(const unsigned char c)
++{
++    // no need to check bounds, the lookup table has 256 entries
++    return toHexTable[c];
++}
++
++SBuf
++Rfc3986::Escape(const SBuf &s, const CharacterSet &escapeChars)
++{
++    SBuf rv;
++    bool didEscape = false;
++    rv.reserveSpace(s.length()*2); //TODO: optimize arbitrary constant
++    for (const auto c : s) {
++        if (escapeChars[c]) {
++            rv.push_back('%');
++            const char *hex = ToHex(c);
++            rv.push_back(hex[0]);
++            rv.push_back(hex[1]);
++            didEscape = true;
++        } else {
++            rv.push_back(c);
++        }
++    }
++    if (didEscape)
++        return rv;
++    else
++        return s;
++}
++
++SBuf
++Rfc3986::Unescape(const SBuf &s)
++{
++    const auto pos = s.find('%');
++    if (pos == SBuf::npos)
++        return s;
++    SBuf rv;
++    rv.reserveSpace(s.length());
++    const auto e = s.end();
++    for (auto in = s.begin(); in != e; ++in) {
++        if (*in != '%') { // normal case, copy and continue
++            rv.push_back(*in);
++            continue;
++        }
++        auto ti = in;
++        ++ti;
++        if (ti == e) { // String ends in %
++            rv.push_back(*in);
++            break;
++        }
++        if (*ti == '%') { //double '%' escaping
++            rv.push_back(*in);
++            ++in;
++            continue;
++        }
++        const int v1 = FromHex(*ti);
++        if (v1 < 0) { // decoding failed at first hextdigit
++            rv.push_back(*in);
++            continue;
++        }
++        ++ti;
++        if (ti == e) { // String ends in '%[[:hexdigit:]]'
++            rv.push_back(*in);
++            continue;
++        }
++        const int v2 = FromHex(*ti);
++        if (v2 < 0) { // decoding failed at second hextdigit
++            rv.push_back(*in);
++            continue;
++        }
++        const int x = v1 << 4 | v2;
++        if (x > 0 && x <= 255) {
++            rv.push_back(static_cast<char>(x));
++            ++in;
++            ++in;
++            continue;
++        }
++        rv.push_back(*in);
++    }
++    return rv;
++}
++
++std::string
++Rfc3986::Escape(const std::string &s, const CharacterSet &escapeChars)
++{
++    return Rfc3986::Escape(SBuf(s), escapeChars).toStdString();
++}
++
++std::string
++Rfc3986::Unescape(const std::string &s)
++{
++    return Rfc3986::Unescape(SBuf(s)).toStdString();
++}
+
+=== added file 'src/anyp/Rfc3986.h'
+--- src/anyp/Rfc3986.h	1970-01-01 00:00:00 +0000
++++ src/anyp/Rfc3986.h	2016-03-16 17:06:13 +0000
+@@ -0,0 +1,54 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SRC_ANYP_RFC3986_H
++#define SQUID_SRC_ANYP_RFC3986_H
++
++#include "base/CharacterSet.h"
++#include "sbuf/forward.h"
++
++/// RFC 1738 symbol and charset definitions
++namespace Rfc1738
++{
++
++extern const CharacterSet Unsafe;         // RFC 1738 unsafe set
++extern const CharacterSet Ctrls;          // CTL characters (\0x00 to \0x1f)
++extern const CharacterSet UnsafeAndCtrls; // RFC 1738 Unsafe and Ctrls
++extern const CharacterSet Unescaped;      // ctrls and unsafe (except for percent symbol)
++extern const CharacterSet Reserved;       // RFC 1738 Reserved set
++
++} // namespace Rfc1738
++
++/// RFC 3986 symbol and charset definitions
++namespace Rfc3986
++{
++
++extern const CharacterSet GenDelims;  // RFC 3986 gen-delims set
++extern const CharacterSet SubDelims;  // RFC 3986 sub-delims set
++extern const CharacterSet Reserved;   // RFC 3986 reserved characters set
++extern const CharacterSet Unreserved; // RFC 3986 unreserved characters set
++extern const CharacterSet All;
++
++SBuf
++Escape(const SBuf &s, const CharacterSet &escapeChars = Rfc1738::UnsafeAndCtrls);
++
++std::string
++Escape(const std::string &s, const CharacterSet &escapeChars = Rfc1738::UnsafeAndCtrls);
++
++/** unescape a percent-encoded string
++ */
++SBuf
++Unescape(const SBuf &s);
++
++std::string
++Unescape(const std::string &s);
++
++} // namespace Rfc3986
++
++#endif /* SQUID_SRC_ANYP_RFC3986_H */
++
+
+=== modified file 'src/sbuf/SBuf.h'
+--- src/sbuf/SBuf.h	2016-03-01 10:25:13 +0000
++++ src/sbuf/SBuf.h	2016-03-15 08:53:24 +0000
+@@ -186,6 +186,7 @@
+ 
+     /// Append a single character. The character may be NUL (\0).
+     SBuf& append(const char c);
++    SBuf& push_back(const char c) {return append(c);}
+ 
+     /** Append operation for C-style strings.
+      *
+
+=== added file 'src/tests/testRFC3986.cc'
+--- src/tests/testRFC3986.cc	1970-01-01 00:00:00 +0000
++++ src/tests/testRFC3986.cc	2016-03-15 09:25:12 +0000
+@@ -0,0 +1,124 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "anyp/Rfc3986.h"
++#include "rfc1738.h"
++#include "sbuf/SBuf.h"
++#include "testRFC3986.h"
++#include "unitTestMain.h"
++
++#include <cassert>
++
++CPPUNIT_TEST_SUITE_REGISTRATION( testRFC3986 );
++
++static void
++performDecodingTest(const std::string &encoded_str, const std::string &plaintext_str)
++{
++    std::string decoded_str = Rfc3986::Unescape(encoded_str);
++    CPPUNIT_ASSERT_EQUAL(plaintext_str, decoded_str);
++
++    SBuf encoded_sbuf(encoded_str);
++    SBuf plaintext_sbuf(plaintext_str);
++    SBuf decoded_sbuf = Rfc3986::Unescape(encoded_sbuf);
++    CPPUNIT_ASSERT_EQUAL(plaintext_sbuf, decoded_sbuf);
++}
++
++/* Regular Format de-coding tests */
++void testRFC3986::testUrlDecode()
++{
++    performDecodingTest("%2Fdata%2Fsource%2Fpath","/data/source/path");
++    performDecodingTest("http://foo.invalid%2Fdata%2Fsource%2Fpath",
++                        "http://foo.invalid/data/source/path");
++    // TODO query string
++
++    performDecodingTest("1 w%0Ard","1 w\nrd"); // Newline %0A encoded
++    performDecodingTest("2 w%rd","2 w%rd"); // Un-encoded %
++    performDecodingTest("3 w%%rd","3 w%rd"); // encoded %
++    performDecodingTest("5 Bad String %1","5 Bad String %1"); // corrupt string
++    performDecodingTest("6 Bad String %1A%3","6 Bad String \032%3"); //partly corrupt string
++    performDecodingTest("7 Good String %1A","7 Good String \032"); // non corrupt string
++    //test various endings
++    performDecodingTest("8 word%","8 word%");
++    performDecodingTest("9 word%z","9 word%z");
++    performDecodingTest("10 word%1","10 word%1");
++    performDecodingTest("11 word%1q","11 word%1q");
++    performDecodingTest("12 word%1a","12 word\032");
++}
++
++// perform a test for std::string, SBuf and if rfc1738flag is != 0 compare
++//  against rfc1738 implementation
++static void
++performEncodingTest(const char *plaintext_str, const char *encoded_str, int rfc1738flag, const CharacterSet  &rfc3986CSet)
++{
++    CPPUNIT_ASSERT_EQUAL(std::string(encoded_str), Rfc3986::Escape(std::string(plaintext_str), rfc3986CSet));
++    CPPUNIT_ASSERT_EQUAL(SBuf(encoded_str), Rfc3986::Escape(SBuf(plaintext_str), rfc3986CSet));
++    if (!rfc1738flag)
++        return;
++    char *result = rfc1738_do_escape(plaintext_str, rfc1738flag);
++    CPPUNIT_ASSERT_EQUAL(std::string(encoded_str), std::string(result));
++}
++
++void testRFC3986::testUrlEncode()
++{
++    /* TEST: Escaping only unsafe characters */
++    performEncodingTest("http://foo.invalid/data/source/path",
++                        "http://foo.invalid/data/source/path",
++                        RFC1738_ESCAPE_UNSAFE, Rfc1738::Unsafe);
++
++    /* regular URL (no encoding needed) */
++    performEncodingTest("http://foo.invalid/data/source/path",
++                        "http://foo.invalid/data/source/path",
++                        RFC1738_ESCAPE_UNSAFE, Rfc1738::Unsafe);
++
++    /* long string of unsafe # characters */
++    performEncodingTest("################ ################ ################ ################ ################ ################ ################ ################",
++                        "%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%20%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%20%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%20%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%20%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%20%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%20%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%20%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23%23",
++                        RFC1738_ESCAPE_UNSAFE, Rfc1738::Unsafe);
++
++    /* TEST: escaping only reserved characters */
++
++    /* regular URL (full encoding requested) */
++    performEncodingTest("http://foo.invalid/data/source/path",
++                        "http%3A%2F%2Ffoo.invalid%2Fdata%2Fsource%2Fpath",
++                        RFC1738_ESCAPE_RESERVED, Rfc3986::Reserved);
++
++    /* regular path (encoding wanted for ALL special chars) */
++    performEncodingTest("/data/source/path",
++                        "%2Fdata%2Fsource%2Fpath",
++                        RFC1738_ESCAPE_RESERVED, Rfc3986::Reserved);
++
++    /* TEST: safety-escaping a string already partially escaped */
++
++    /* escaping of dangerous characters in a partially escaped string */
++    performEncodingTest("http://foo.invalid/data%2Fsource[]",
++                        "http://foo.invalid/data%2Fsource%5B%5D",
++                        RFC1738_ESCAPE_UNESCAPED, Rfc1738::Unescaped);
++
++    /* escaping of hexadecimal 0xFF characters in a partially escaped string */
++    performEncodingTest("http://foo.invalid/data%2Fsource\xFF\xFF",
++                        "http://foo.invalid/data%2Fsource%FF%FF",
++                        RFC1738_ESCAPE_UNESCAPED, Rfc1738::Unescaped);
++}
++
++/** SECURITY BUG TESTS: avoid null truncation attacks by skipping %00 bytes */
++void testRFC3986::PercentZeroNullDecoding()
++{
++    /* Attack with %00 encoded NULL */
++    performDecodingTest("w%00rd", "w%00rd");
++
++    /* Attack with %0 encoded NULL */
++    performDecodingTest("w%0rd", "w%0rd");
++
++    /* Handle '0' bytes embeded in encoded % */
++    performDecodingTest("w%%00%rd", "w%00%rd");
++
++    /* Handle NULL bytes with encoded % */
++    performDecodingTest("w%%%00%rd", "w%%00%rd");
++}
++
+
+=== added file 'src/tests/testRFC3986.h'
+--- src/tests/testRFC3986.h	1970-01-01 00:00:00 +0000
++++ src/tests/testRFC3986.h	2016-02-11 19:15:30 +0000
+@@ -0,0 +1,34 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_LIB_TEST_RFC3986_H
++#define SQUID_LIB_TEST_RFC3986_H
++
++#include <cppunit/extensions/HelperMacros.h>
++
++/**
++ * Test the URL coder RFC 3986 Engine
++ */
++class testRFC3986 : public CPPUNIT_NS::TestFixture
++{
++    CPPUNIT_TEST_SUITE( testRFC3986 );
++    CPPUNIT_TEST( testUrlDecode );
++    CPPUNIT_TEST( testUrlEncode );
++    CPPUNIT_TEST( PercentZeroNullDecoding );
++    CPPUNIT_TEST_SUITE_END();
++
++protected:
++    void testUrlDecode();
++    void testUrlEncode();
++
++    // bugs.
++    void PercentZeroNullDecoding();
++};
++
++#endif /* SQUID_LIB_TEST_RFC3986_H */
++
+

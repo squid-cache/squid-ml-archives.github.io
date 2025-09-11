@@ -1,0 +1,177 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Temporary fix to restore compatibility with Amazon
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Temporary%20fix%20to%20restore%20compatibility%20with%0A%20Amazon&In-Reply-To=%3C558C5CC9.2070306%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="002459.html">
+   <LINK REL="Next"  HREF="002466.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Temporary fix to restore compatibility with Amazon</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Temporary%20fix%20to%20restore%20compatibility%20with%0A%20Amazon&In-Reply-To=%3C558C5CC9.2070306%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] Temporary fix to restore compatibility with Amazon">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Thu Jun 25 19:55:53 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002459.html">[squid-dev] [PATCH] Temporary fix to restore compatibility with Amazon
+</A></li>
+        <LI>Next message: <A HREF="002466.html">[squid-dev] [PATCH] Temporary fix to restore compatibility with Amazon
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2464">[ date ]</a>
+              <a href="thread.html#2464">[ thread ]</a>
+              <a href="subject.html#2464">[ subject ]</a>
+              <a href="author.html#2464">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 06/25/2015 08:13 AM, Amos Jeffries wrote:
+&gt;<i> Which is why I want to go the route of HTTP/0.9 handling. Its
+</I>&gt;<i> clear when products encounter it and cause themselves problems.
+</I>
+Sigh. You are repeating essentially the same argument as before. Any
+&quot;let's create problems for something that appears to work without Squid&quot;
+approach often results in *us* wasting time on workarounds for those
+problems.
+
+You may be convinced that creating short-term problems for others will
+make the world a better place long-term, but there is no way to prove or
+disprove that assumption, and there is no objective way to even compare
+the possible long-term gain with the likely short-term pain (especially
+when it is somebody else who is hurting).
+
+The history is full of examples where the &quot;future happiness justifies
+short-term suffering&quot; approach either works great or fails miserably. I
+doubt we can come up with a formula that predicts the outcome.
+
+
+&gt;<i> Was the '|' character
+</I>&gt;<i> non-compliance bug reported against the product?
+</I>
+Unknown to me, but I suspect folks suffering from this do not report
+bugs to companies they have no relationship with (and may not even know
+what the &quot;product&quot; is!).
+
+
+&gt;<i> Anyhow. I've thrown the URI you mentioned through my test copy of trunk
+</I>&gt;<i> and its not hanging looking for the end of mime headers like you said.
+</I>&gt;<i> Its waiting for the end of the URI:
+</I>
+&gt;<i> parseHttpRequest: Incomplete request, waiting for end of request line
+</I>
+Please forgive me for misinterpreting the Squid log line that lies about
+an &quot;Incomplete request&quot; and &quot;waiting for end of request line&quot;.
+
+If you prefer the &quot;waiting for the end of the URI&quot; description of the
+broken state (where the complete URI, the complete request line, and the
+complete request are all available), I am not going to argue that it is
+also inaccurate.
+
+
+&gt;<i> Attached is a patch that replaces the hang behaviour with an
+</I>&gt;<i> invalid-request error page on standards compliant builds. But, when
+</I>&gt;<i> --enable-http-violations is used it accepts the invalid characters we
+</I>&gt;<i> know are in use and passes the request through as HTTP/0.9.
+</I>
+
+... which does not work because the request does not actually use the
+HTTP/0.9 format. You end up with:
+
+
+&gt;<i> Forwarding client request ... url=<A HREF="http://localhost:8080/path|with|unwise|charactersHTTP/1.1">http://localhost:8080/path|with|unwise|charactersHTTP/1.1</A>
+</I>
+&gt;<i> GET /path|with|unwise|charactersHTTP/1.1 HTTP/1.1
+</I>&gt;<i> Via: 0.9 protofroot (squid/4.0.0-BZR)
+</I>
+
+The trailing &quot; HTTP/1.1&quot; part of the request line is not a part of the
+URI but your changes make it so.
+
+Tokenizer cannot handle URIs with whitespaces directly, like your patch
+attempts to do: Tokenizer alone cannot handle ambiguous grammars. To
+handle such URIs well, you have two options IMO:
+
+A. The old &quot;do it by hand&quot; way:
+
+  0. Trim request line to remove trailing whitespace and CR*LF.
+  1. Find the *last* whitespace on the trimmed request line.
+  2. To get the request method and URI, apply the tokenizer to the
+     request line prefix before that last whitespace.
+  3. To get the protocol parts, apply the tokenizer to the
+     request line suffix after that last whitespace.
+  4. Make the code even messier to handle HTTP/0.9 cases if needed.
+
+
+B. The new optimized and simplified &quot;optimistic Tokenizer&quot; way:
+
+Here is a sketch:
+
+    SBuf uri; // accumulates request URI characters
+    if (!tok.prefix(uri, StrictUriChars))
+        return false; // URI does not start with a valid character
+
+    // in the order of correctness (and popularity!):
+    const bool parsedSuffix =
+        // canonical HTTP/1 format
+        parseCanonicalReqLineTail(uri, tok) ||
+        // HTTP/1 format but with bad characters in URI
+        parseBadUriReqLineTail(uri, tok) ||
+        // HTTP/1 format but with bad characters and spaces in URI
+        parseSpacedReqLineTail(uri, tok) ||
+        // HTTP/0 format (without the protocol part at all)
+        parseHttpZeroReqLineTail(uri, tok);
+
+    Assert(parsedSuffix); // parseHttpZeroReqLineTail() cannot fail
+    ...
+
+where, for example, parseCanonicalReqLineTail() expects whitespace
+followed by protocol info while parseBadUriReqLineTail() expects a URI
+suffix (using RelaxedUriChars which do not include whitepsace) followed
+by a call to parseCanonicalReqLineTail().
+
+If any of the helper functions returns false, it should not change its
+uri and tok parameters, of course.
+
+
+HTH,
+
+Alex.
+
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002459.html">[squid-dev] [PATCH] Temporary fix to restore compatibility with Amazon
+</A></li>
+	<LI>Next message: <A HREF="002466.html">[squid-dev] [PATCH] Temporary fix to restore compatibility with Amazon
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2464">[ date ]</a>
+              <a href="thread.html#2464">[ thread ]</a>
+              <a href="subject.html#2464">[ subject ]</a>
+              <a href="author.html#2464">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

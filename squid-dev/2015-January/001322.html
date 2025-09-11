@@ -1,0 +1,322 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] HTTP Response Parser upgrade
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20HTTP%20Response%20Parser%20upgrade&In-Reply-To=%3C54C137C3.3060106%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="001296.html">
+   <LINK REL="Next"  HREF="001323.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] HTTP Response Parser upgrade</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20HTTP%20Response%20Parser%20upgrade&In-Reply-To=%3C54C137C3.3060106%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] HTTP Response Parser upgrade">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Thu Jan 22 17:47:47 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001296.html">[squid-dev] [PATCH] HTTP Response Parser upgrade
+</A></li>
+        <LI>Next message: <A HREF="001323.html">[squid-dev] [PATCH] HTTP Response Parser upgrade
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1322">[ date ]</a>
+              <a href="thread.html#1322">[ thread ]</a>
+              <a href="subject.html#1322">[ subject ]</a>
+              <a href="author.html#1322">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 01/20/2015 06:58 AM, Amos Jeffries wrote:
+
+&gt;<i> Updated patch attached resolving the issues found by coadvisor in the
+</I>&gt;<i> original.
+</I>
+
+&gt;<i> +size_t
+</I>&gt;<i> +Client::needBufferSpace(const SBuf &amp;readBuf, const size_t minSpace) const
+</I>&gt;<i> +{
+</I>&gt;<i> +    size_t space = readBuf.spaceSize(); // available space w/o heroic measures
+</I>
+If the above line is the only readBuf usage in this method, pass
+readBuf.spaceSize() as a parameter instead of the whole buffer.
+
+
+&gt;<i> +    if (space &lt; minSpace) {
+</I>&gt;<i> +        const size_t maxSpace = SBuf::maxSize; // absolute best
+</I>&gt;<i> +        space = min(minSpace, maxSpace); // do not promise more than asked
+</I>&gt;<i> +    }
+</I>
+Here and elsewhere in Client::needBufferSpace(), the returned space size
+may be lower than minSpace. s/minSpace/wantedSpace/ or something like that.
+
+&gt;<i> +         * If the pipe is totally full, don't register the read handler.
+</I>&gt;<i> +         * The BodyPipe will call our noteMoreBodySpaceAvailable() method
+</I>&gt;<i> +         * when it has free space again.
+</I>
+The above comment does not match the code. The code does not deal with
+read handler registration, only size calculations.
+
+
+&gt;<i> +        size_t adaptation_space =
+</I>&gt;<i> +            virginBodyDestination-&gt;buf().potentialSpaceSize();
+</I>
+Make const if possible.
+
+
+&gt;<i> +    /// determine how much space the buffer needs to reserve
+</I>&gt;<i> +    size_t needBufferSpace(const SBuf &amp;readBuf, const size_t minSpace) const;
+</I>
+need+something implies a notification or state changing method, which is
+not what this method is about. Based on the caller, I suggest to
+
+s/needBufferSpace/calcReadSize/ or
+s/needBufferSpace/readSize/
+
+
+
+
+&gt;<i>  void
+</I>&gt;<i>  HttpStateData::readReply(const CommIoCbParams &amp;io)
+</I>&gt;<i>  {
+</I>...
+&gt;<i> +    assert(!flags.do_next_read); // XXX: should have been set false by mayReadVirginBody()
+</I>...
+&gt;<i> +    assert(Comm::IsConnOpen(serverConnection));
+</I>&gt;<i> +    assert(io.conn-&gt;fd == serverConnection-&gt;fd);
+</I>
+These are all new asserts in an async job callback. Should we use
+Must()s instead to avoid crashing the whole Squid process when dealing
+with what seems to be a transaction-specific problem?
+
+
+&gt;<i> +    // how much we want to read
+</I>&gt;<i> +    const int read_size = needBufferSpace(inBuf, (limitBuffer - inBuf.length()));
+</I>
+Unsigned-&gt;signed conversion. Can you use size_t for read_size?
+
+&gt;<i> +    if (read_size &lt; 1) {
+</I>
+... and then convert this to !read_size or (read_size == 0) for clarity?
+
+
+&gt;<i> +    /// amount of message payload/body received so far.
+</I>&gt;<i> +    int64_t payloadSeen;
+</I>&gt;<i> +    /// positive when we read more than we wanted
+</I>&gt;<i> +    int64_t payloadTruncated;
+</I>
+Have you considered making these unsigned?
+
+
+&gt;<i> +    /// parse scan to find the mime headers block for current message
+</I>&gt;<i> +    bool findMimeBlock(const char *which, size_t limit);
+</I>
+Find is a usually a const method. This method does a lot more than just
+finding MIME headers. To fix that and to supply information that the
+method name does not already reveal, I would do:
+
+/// returns whether the header was successfully parsed
+bool parseMimeHeader(const char *headerKind, const size_t sizeLimit);
+
+Note that the limit parameter is const.
+
+
+&gt;<i> +        int64_t mimeHeaderBytes = 0;
+</I>&gt;<i> +        // XXX: c_str() reallocates. performance regression.
+</I>&gt;<i> +        if ((mimeHeaderBytes = headersEnd(buf_.c_str(), buf_.length())) == 0) {
+</I>&gt;<i> +            if (buf_.length()+firstLineSize() &gt;= limit) {
+</I>&gt;<i> +                debugs(33, 5, &quot;Too large &quot; &lt;&lt; which);
+</I>&gt;<i> +                parseStatusCode = Http::scHeaderTooLarge;
+</I>&gt;<i> +                parsingStage_ = HTTP_PARSE_DONE;
+</I>&gt;<i> +            } else
+</I>&gt;<i> +                debugs(33, 5, &quot;Incomplete &quot; &lt;&lt; which &lt;&lt; &quot;, waiting for end of headers&quot;);
+</I>&gt;<i> +            return false;
+</I>&gt;<i> +        }
+</I>&gt;<i> +        mimeHeaderBlock_ = buf_.consume(mimeHeaderBytes);
+</I>&gt;<i> +        debugs(74, 5, &quot;mime header (0-&quot; &lt;&lt; mimeHeaderBytes &lt;&lt; &quot;) {&quot; &lt;&lt; mimeHeaderBlock_ &lt;&lt; &quot;}&quot;);
+</I>
+
+The above is better written as
+
+// XXX: c_str() reallocates. performance regression.
+if (const int64_t mimeHeaderBytes = ...) {
+   mimeHeaderBlock_ = buf_.consume(mimeHeaderBytes);
+   debugs(...);
+} else {
+   ...
+   return false;
+}
+
+but there is more that needs to be done in the above code:
+
+&gt;<i> +    // Squid could handle these headers, but admin does not want to
+</I>&gt;<i> +    if (messageHeaderSize() &gt;= limit) {
+</I>&gt;<i> +        debugs(33, 5, &quot;Too large &quot; &lt;&lt; which);
+</I>&gt;<i> +        parseStatusCode = Http::scHeaderTooLarge;
+</I>&gt;<i> +        return false;
+</I>&gt;<i> +    }
+</I>
+This should be rewritten to go before we initialize mimeHeaderBlock_
+IMO. Otherwise, the damage of keeping the admin-prohibited header is
+already done.
+
+&gt;<i> +const int
+</I>&gt;<i> +Http::One::ResponseParser::parseResponseStatusAndReason()
+</I>&gt;<i> +{
+</I>&gt;<i> +    if (buf_.isEmpty())
+</I>&gt;<i> +        return 0;
+</I>&gt;<i> +
+</I>
+Remove this check (and fix the tokenizer if it cannot handle empty buffers).
+
+&gt;<i> +        // NP: search space is &gt;3 to get terminator character)
+</I>&gt;<i> +        if(!tok.prefix(status, CharacterSet::DIGIT, 4))
+</I>&gt;<i> +            return -1; // invalid status
+</I>&gt;<i> +        // NOTE: multiple SP or non-SP bytes between version and status code are invalid.
+</I>&gt;<i> +        if (tok.atEnd())
+</I>&gt;<i> +            return 0; // need more to be sure we have it all
+</I>&gt;<i> +        if(!tok.skip(' '))
+</I>&gt;<i> +            return -1; // invalid status, a single SP terminator required
+</I>&gt;<i> +
+</I>&gt;<i> +        debugs(74, 6, &quot;found string status-code=&quot; &lt;&lt; status);
+</I>&gt;<i> +
+</I>&gt;<i> +        // get the actual numeric value of the 0-3 digits we found
+</I>&gt;<i> +        ::Parser::Tokenizer t2(status);
+</I>&gt;<i> +        int64_t statusValue;
+</I>&gt;<i> +        if (!t2.int64(statusValue))
+</I>&gt;<i> +            return -1; // ouch. digits not forming a valid number?
+</I>&gt;<i> +        debugs(74, 6, &quot;found int64 status-code=&quot; &lt;&lt; statusValue);
+</I>&gt;<i> +        if (statusValue &lt; 0 || statusValue &gt; 999)
+</I>&gt;<i> +            return -1; // ouch. digits not within valid status code range.
+</I>
+This sequence does not make sense to me: Incomplete status should be
+treated the same as early atEnd(), but the former is treated as an
+invalid status. 4-digit status should be considered as invalid but it is
+not. Numeric value of 0 digits?! Etc., etc. It feels like you are still
+parsing using low-level C function calls, not a Tokenizer that we worked
+so hard to build!
+
+The correct sequence should be similar to these lines:
+
+    if (tok.prefix(status, CharacterSet::DIGIT, 3) &amp;&amp; tok.skip(' '))
+        debugs(74, 6, &quot;found string status-code=&quot; &lt;&lt; status);
+    else
+    if (tok.atEnd())
+        return 0; // good so far but need more to finish
+    else
+        return -1; // invalid status
+
+    // get the actual numeric value of the digits we found
+    ::Parser::Tokenizer t2(status);
+    int64_t statusValue;
+    if (!t2.int64(statusValue))
+        return -1; // ouch. digits not forming a valid number?
+    if (status &lt; 0 || status &gt; 999)
+        return -1; // ouch. digits not within valid status code range.
+
+
+However, if Tokenizer integer parsing interface were written correctly,
+the above would have actually looked close to this:
+
+    uint64_t status;
+    if (tok.uint64(status, base10) &amp;&amp; tok.skip(' '))
+        debugs(74, 6, &quot;found status-code=&quot; &lt;&lt; status);
+    else
+    if (tok.atEnd())
+        return 0; // good so far but need more to finish
+    else
+        return -1; // invalid status
+
+    if (status &gt; 999)
+        return -1; // status exceeds valid status code range
+
+or even
+
+    uint64_t status;
+    if (tok.uint64(status, 3, base10) &amp;&amp; tok.skip(' '))
+        debugs(74, 6, &quot;found status-code=&quot; &lt;&lt; status);
+    else
+    if (tok.atEnd())
+        return 0; // good so far but need more to finish
+    else
+        return -1; // invalid status
+
+
+The last form (with a size limit for uint64) allows the Tokenizer caller
+to terminate parsing earlier, without waiting for the end of all-digit
+input, but I am not sure that is a common need.
+
+I urge you to fix Tokenizer integer parsing and rewrite the parsing code.
+
+That is all I had time for today. I would have to come back to this
+later. Sorry.
+
+
+&gt;<i> * This has now had several hours of regular web browsing by myself
+</I>&gt;<i> (YouTube, Facebook, some news sites, and the Squid sites) with nothing
+</I>&gt;<i> noticably going wrong.
+</I>
+Any ICAP tests? The HTTP-ICAP interaction has been a source of many bugs
+before and your patch changes the relevant code. If you have not tested
+it, please do (or ask others to do it).
+
+
+&gt;<i> * Polygraph shows a 7 RPS performance loss (0.36%), with trunk having
+</I>&gt;<i> +/-2 RPS (0.1%) normal fluctuation. I believe this is from the
+</I>&gt;<i> transitional regression to data-copy into MemBuf for chunked coding.
+</I>
+Did Polygraph actually use chunked responses in these tests?
+
+
+Thank you,
+
+Alex.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001296.html">[squid-dev] [PATCH] HTTP Response Parser upgrade
+</A></li>
+	<LI>Next message: <A HREF="001323.html">[squid-dev] [PATCH] HTTP Response Parser upgrade
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1322">[ date ]</a>
+              <a href="thread.html#1322">[ thread ]</a>
+              <a href="subject.html#1322">[ subject ]</a>
+              <a href="author.html#1322">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

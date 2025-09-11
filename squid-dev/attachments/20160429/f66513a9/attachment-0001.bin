@@ -1,0 +1,297 @@
+Prevent Squid forcing -b 2048 into the arguments for sslcrtd_program.
+
+Previously Squid assumed it was running with the default sslcrtd_program, which
+takes an argument for the FS block size. This causes issues for administrators
+that use their own helpers that happen to take a -b argument that means
+something else entirely, causing confusion and preventing them from removing
+this argument.
+
+A summary of the changes:
+
+    * Move the block size retrieval from Squid into security_file_certgen. It
+      does not use fsBlockSize as that introduces a lot of dependencies on
+      unrelated Squid code, e.g. fde, Debug, MemBuf.
+
+    * Make the -b argument mostly redundant, but leave it there so
+      administrators can overrule xstatvfs.
+
+    * Fix a small typo.
+
+This work is submitted on behalf of Bloomberg L.P.
+
+=== modified file 'src/security/cert_generators/file/security_file_certgen.cc'
+--- src/security/cert_generators/file/security_file_certgen.cc	2016-02-13 16:10:26 +0000
++++ src/security/cert_generators/file/security_file_certgen.cc	2016-04-28 23:22:42 +0000
+@@ -8,41 +8,41 @@
+ 
+ #include "squid.h"
+ #include "helper/protocol_defines.h"
+ #include "security/cert_generators/file/certificate_db.h"
+ #include "ssl/crtd_message.h"
+ 
+ #include <cstring>
+ #include <iostream>
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
+ #if HAVE_GETOPT_H
+ #include <getopt.h>
+ #endif
+ 
+ /**
+  \defgroup ssl_crtd security_file_certgen
+  \ingroup ExternalPrograms
+  \par
+     Because the standard generation of SSL certificates for
+-    sslBump feature, Squid must use external proccess to
++    sslBump feature, Squid must use external process to
+     actually make these calls. This process generate new ssl
+     certificates and worked with ssl certificates disk cache.
+     Typically there will be five certificate generator processes
+     spawned from Squid. Communication occurs via TCP sockets
+     bound to the loopback interface. The class in helper.h are
+     primally concerned with starting and stopping the helpers.
+     Reading and writing to and from the helpers occurs in the
+     \link IPCacheAPI IP\endlink and the dnsservers occurs in
+     the \link IPCacheAPI IP\endlink and \link FQDNCacheAPI
+     FQDN\endlink cache modules.
+ 
+  \section ssl_crtdInterface Command Line Interface
+  \verbatim
+ usage: security_file_certgen -hv -s ssl_storage_path -M storage_max_size
+     -h                   Help
+     -v                   Version
+     -s ssl_storage_path  Path to specific disk storage of ssl server
+                          certificates.
+     -M storage_max_size  max size of ssl certificates storage.
+     -b fs_block_size     File system block size in bytes. Need for processing
+@@ -161,42 +161,42 @@ static void usage()
+         "\n"
+         "After running write requests in the next format:\n"
+         "<request code><whitespace><body_len><whitespace><body>\n"
+         "There are two kind of request now:\n"
+         + Ssl::CrtdMessage::code_new_certificate + " " + request_string_size_stream.str() + " " + request_string + "\n" +
+         "\tCreate new private key and selfsigned certificate for \"host.dom\".\n"
+         + Ssl::CrtdMessage::code_new_certificate + " xxx " + request_string + "\n" +
+         "-----BEGIN CERTIFICATE-----\n"
+         "...\n"
+         "-----END CERTIFICATE-----\n"
+         "-----BEGIN RSA PRIVATE KEY-----\n"
+         "...\n"
+         "-----END RSA PRIVATE KEY-----\n"
+         "\tCreate new private key and certificate request for \"host.dom\"\n"
+         "\tSign new request by received certificate and private key.\n"
+         "usage: security_file_certgen -c -s ssl_store_path\n"
+         "\t-c                   Init ssl db directories and exit.\n";
+     std::cerr << help_string << std::endl;
+ }
+ 
+-/// Proccess new request message.
+-static bool proccessNewRequest(Ssl::CrtdMessage & request_message, std::string const & db_path, size_t max_db_size, size_t fs_block_size)
++/// Process new request message.
++static bool processNewRequest(Ssl::CrtdMessage & request_message, std::string const & db_path, size_t max_db_size, size_t fs_block_size)
+ {
+     Ssl::CertificateProperties certProperties;
+     std::string error;
+     if (!request_message.parseRequest(certProperties, error))
+         throw std::runtime_error("Error while parsing the crtd request: " + error);
+ 
+     Ssl::CertificateDb db(db_path, max_db_size, fs_block_size);
+ 
+     Security::CertPointer cert;
+     Ssl::EVP_PKEY_Pointer pkey;
+     std::string &cert_subject = certProperties.dbKey();
+ 
+     bool dbFailed = false;
+     try {
+         db.find(cert_subject, cert, pkey);
+     } catch (std::runtime_error &err) {
+         dbFailed = true;
+         error = err.what();
+     }
+ 
+@@ -232,100 +232,113 @@ static bool proccessNewRequest(Ssl::Crtd
+ 
+     std::string bufferToWrite;
+     if (!Ssl::writeCertAndPrivateKeyToMemory(cert, pkey, bufferToWrite))
+         throw std::runtime_error("Cannot write ssl certificate or/and private key to memory.");
+ 
+     Ssl::CrtdMessage response_message(Ssl::CrtdMessage::REPLY);
+     response_message.setCode("OK");
+     response_message.setBody(bufferToWrite);
+ 
+     // Use the '\1' char as end-of-message character
+     std::cout << response_message.compose() << '\1' << std::flush;
+ 
+     return true;
+ }
+ 
+ /// This is the external security_file_certgen process.
+ int main(int argc, char *argv[])
+ {
+     try {
+         size_t max_db_size = 0;
+-        size_t fs_block_size = 2048;
++        size_t fs_block_size = 0;
+         int8_t c;
+         bool create_new_db = false;
+         std::string db_path;
+-        // proccess options.
++        // process options.
+         while ((c = getopt(argc, argv, "dcghvs:M:b:n:")) != -1) {
+             switch (c) {
+             case 'd':
+                 debug_enabled = 1;
+                 break;
+             case 'b':
+                 if (!parseBytesOptionValue(&fs_block_size, optarg)) {
+                     throw std::runtime_error("Error when parsing -b options value");
+                 }
+                 break;
+             case 's':
+                 db_path = optarg;
+                 break;
+             case 'M':
+                 if (!parseBytesOptionValue(&max_db_size, optarg)) {
+                     throw std::runtime_error("Error when parsing -M options value");
+                 }
+                 break;
+             case 'v':
+                 std::cout << "security_file_certgen version " << VERSION << std::endl;
+                 exit(0);
+                 break;
+             case 'c':
+                 create_new_db = true;
+                 break;
+             case 'h':
+                 usage();
+                 exit(0);
+             default:
+                 exit(0);
+             }
+         }
+ 
+         if (create_new_db) {
+             std::cout << "Initialization SSL db..." << std::endl;
+             Ssl::CertificateDb::create(db_path);
+             std::cout << "Done" << std::endl;
+             exit(0);
+         }
+ 
++        if (fs_block_size == 0) {
++            struct statvfs sfs;
++
++            if (xstatvfs(db_path.c_str(), &sfs)) {
++                fs_block_size = 2048;
++            } else {
++                fs_block_size = sfs.f_frsize;
++                // Sanity check; make sure we have a meaningful value.
++                if (fs_block_size < 512)
++                    fs_block_size = 2048;
++            }
++        }
++
+         {
+             Ssl::CertificateDb::check(db_path, max_db_size, fs_block_size);
+         }
+         // Initialize SSL subsystem
+         SSL_load_error_strings();
+         SSLeay_add_ssl_algorithms();
+-        // proccess request.
++        // process request.
+         for (;;) {
+             char request[HELPER_INPUT_BUFFER];
+             Ssl::CrtdMessage request_message(Ssl::CrtdMessage::REQUEST);
+             Ssl::CrtdMessage::ParseResult parse_result = Ssl::CrtdMessage::INCOMPLETE;
+ 
+             while (parse_result == Ssl::CrtdMessage::INCOMPLETE) {
+                 if (fgets(request, HELPER_INPUT_BUFFER, stdin) == NULL)
+                     return 1;
+                 size_t gcount = strlen(request);
+                 parse_result = request_message.parse(request, gcount);
+             }
+ 
+             if (parse_result == Ssl::CrtdMessage::ERROR) {
+                 throw std::runtime_error("Cannot parse request message.");
+             } else if (request_message.getCode() == Ssl::CrtdMessage::code_new_certificate) {
+-                proccessNewRequest(request_message, db_path, max_db_size, fs_block_size);
++                processNewRequest(request_message, db_path, max_db_size, fs_block_size);
+             } else {
+                 throw std::runtime_error("Unknown request code: \"" + request_message.getCode() + "\".");
+             }
+             std::cout.flush();
+         }
+     } catch (std::runtime_error & error) {
+         std::cerr << argv[0] << ": " << error.what() << std::endl;
+         return 0;
+     }
+     return 0;
+ }
+ 
+
+=== modified file 'src/ssl/helper.cc'
+--- src/ssl/helper.cc	2016-02-22 18:01:23 +0000
++++ src/ssl/helper.cc	2016-04-28 23:22:42 +0000
+@@ -42,60 +42,43 @@ void Ssl::Helper::Init()
+     assert(ssl_crtd == NULL);
+ 
+     // we need to start ssl_crtd only if some port(s) need to bump SSL *and* generate certificates
+     // TODO: generate host certificates for SNI enabled accel ports
+     bool found = false;
+     for (AnyP::PortCfgPointer s = HttpPortList; !found && s != NULL; s = s->next)
+         found = s->flags.tunnelSslBumping && s->generateHostCertificates;
+     if (!found)
+         return;
+ 
+     ssl_crtd = new helper(Ssl::TheConfig.ssl_crtd);
+     ssl_crtd->childs.updateLimits(Ssl::TheConfig.ssl_crtdChildren);
+     ssl_crtd->ipc_type = IPC_STREAM;
+     // The crtd messages may contain the eol ('\n') character. We are
+     // going to use the '\1' char as the end-of-message mark.
+     ssl_crtd->eom = '\1';
+     assert(ssl_crtd->cmdline == NULL);
+     {
+         char *tmp = xstrdup(Ssl::TheConfig.ssl_crtd);
+         char *tmp_begin = tmp;
+-        char * token = NULL;
+-        bool db_path_was_found = false;
+-        bool block_size_was_found = false;
+-        char buffer[20] = "2048";
++        char *token = NULL;
+         while ((token = strwordtok(NULL, &tmp))) {
+             wordlistAdd(&ssl_crtd->cmdline, token);
+-            if (!strcmp(token, "-b"))
+-                block_size_was_found = true;
+-            if (!strcmp(token, "-s")) {
+-                db_path_was_found = true;
+-            } else if (db_path_was_found) {
+-                db_path_was_found = false;
+-                int fs_block_size = 0;
+-                fsBlockSize(token, &fs_block_size);
+-                snprintf(buffer, sizeof(buffer), "%i", fs_block_size);
+-            }
+-        }
+-        if (!block_size_was_found) {
+-            wordlistAdd(&ssl_crtd->cmdline, "-b");
+-            wordlistAdd(&ssl_crtd->cmdline, buffer);
+         }
+         safe_free(tmp_begin);
+     }
+     helperOpenServers(ssl_crtd);
+ }
+ 
+ void Ssl::Helper::Shutdown()
+ {
+     if (!ssl_crtd)
+         return;
+     helperShutdown(ssl_crtd);
+     wordlistDestroy(&ssl_crtd->cmdline);
+     delete ssl_crtd;
+     ssl_crtd = NULL;
+ }
+ 
+ void Ssl::Helper::sslSubmit(CrtdMessage const & message, HLPCB * callback, void * data)
+ {
+     assert(ssl_crtd);
+ 
+

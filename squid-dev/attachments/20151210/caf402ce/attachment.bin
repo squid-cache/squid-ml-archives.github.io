@@ -1,0 +1,108 @@
+FwdState should retry connect to the next ip after a Ssl::PeerConnector failure
+
+When the Ssl::PeerConnector fails to establish an SSL connection FwdState does
+not retry to connect to the next destination server ip address, but instead
+returns an error.
+
+This is a Measurement Factory project
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2015-11-30 10:53:23 +0000
++++ src/FwdState.cc	2015-12-10 15:37:09 +0000
+@@ -663,42 +663,40 @@
+ void
+ FwdState::connectDone(const Comm::ConnectionPointer &conn, Comm::Flag status, int xerrno)
+ {
+     if (status != Comm::OK) {
+         ErrorState *const anErr = makeConnectingError(ERR_CONNECT_FAIL);
+         anErr->xerrno = xerrno;
+         fail(anErr);
+ 
+         /* it might have been a timeout with a partially open link */
+         if (conn != NULL) {
+             if (conn->getPeer())
+                 peerConnectFailed(conn->getPeer());
+ 
+             conn->close();
+         }
+         retryOrBail();
+         return;
+     }
+ 
+     serverConn = conn;
+-    flags.connected_okay = true;
+-
+     debugs(17, 3, HERE << serverConnection() << ": '" << entry->url() << "'" );
+ 
+     comm_add_close_handler(serverConnection()->fd, fwdServerClosedWrapper, this);
+ 
+     if (serverConnection()->getPeer())
+         peerConnectSucceded(serverConnection()->getPeer());
+ 
+ #if USE_OPENSSL
+     if (!request->flags.pinned) {
+         const CachePeer *p = serverConnection()->getPeer();
+         const bool peerWantsTls = p && p->secure.encryptTransport;
+         // userWillTlsToPeerForUs assumes CONNECT == HTTPS
+         const bool userWillTlsToPeerForUs = p && p->options.originserver &&
+                                             request->method == Http::METHOD_CONNECT;
+         const bool needTlsToPeer = peerWantsTls && !userWillTlsToPeerForUs;
+         const bool needTlsToOrigin = !p && request->url.getScheme() == AnyP::PROTO_HTTPS;
+         if (needTlsToPeer || needTlsToOrigin || request->flags.sslPeek) {
+             HttpRequest::Pointer requestPointer = request;
+             AsyncCall::Pointer callback = asyncCall(17,4,
+                                                     "FwdState::ConnectedToPeer",
+@@ -710,48 +708,51 @@
+                 connector = new Ssl::PeekingPeerConnector(requestPointer, serverConnection(), clientConn, callback, sslNegotiationTimeout);
+             else
+                 connector = new Ssl::BlindPeerConnector(requestPointer, serverConnection(), callback, sslNegotiationTimeout);
+             AsyncJob::Start(connector); // will call our callback
+             return;
+         }
+     }
+ #endif
+ 
+     // if not encrypting just run the post-connect actions
+     Security::EncryptorAnswer nil;
+     connectedToPeer(nil);
+ }
+ 
+ void
+ FwdState::connectedToPeer(Security::EncryptorAnswer &answer)
+ {
+     if (ErrorState *error = answer.error.get()) {
+         fail(error);
+         answer.error.clear(); // preserve error for errorSendComplete()
+-        self = NULL;
++        if (CachePeer *p = serverConnection()->getPeer())
++            peerConnectFailed(p);
++        retryOrBail();
+         return;
+     }
+ 
+     // should reach ConnStateData before the dispatched Client job starts
+     CallJobHere1(17, 4, request->clientConnectionManager, ConnStateData,
+                  ConnStateData::notePeerConnection, serverConnection());
+ 
++    flags.connected_okay = true;
+     dispatch();
+ }
+ 
+ void
+ FwdState::connectTimeout(int fd)
+ {
+     debugs(17, 2, "fwdConnectTimeout: FD " << fd << ": '" << entry->url() << "'" );
+     assert(serverDestinations[0] != NULL);
+     assert(fd == serverDestinations[0]->fd);
+ 
+     if (entry->isEmpty()) {
+         ErrorState *anErr = new ErrorState(ERR_CONNECT_FAIL, Http::scGatewayTimeout, request);
+         anErr->xerrno = ETIMEDOUT;
+         fail(anErr);
+ 
+         /* This marks the peer DOWN ... */
+         if (serverDestinations[0]->getPeer())
+             peerConnectFailed(serverDestinations[0]->getPeer());
+     }
+ 
+

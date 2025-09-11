@@ -1,0 +1,539 @@
+=== modified file 'acinclude/krb5.m4'
+--- acinclude/krb5.m4	2014-09-17 13:21:07 +0000
++++ acinclude/krb5.m4	2014-12-13 00:36:44 +0000
+@@ -114,6 +114,33 @@
+   ])
+ ])
+ 
++dnl check whether the kerberos context has a memory keytab. Sets
++dnl squid_cv_memory_keytab if that's the case.
++AC_DEFUN([SQUID_CHECK_KRB5_CONTEXT_MEMORY_KEYTAB],[
++  AC_CACHE_CHECK([for memory keytab], squid_cv_memory_keytab, [
++    AC_RUN_IFELSE([
++      AC_LANG_SOURCE([[
++#if HAVE_BROKEN_SOLARIS_KRB5_H
++#if defined(__cplusplus)
++#define KRB5INT_BEGIN_DECLS     extern "C" {
++#define KRB5INT_END_DECLS
++KRB5INT_BEGIN_DECLS
++#endif
++#endif
++#include <krb5.h>
++int main(int argc, char *argv[])
++{
++    krb5_context context;
++    krb5_keytab kt;
++
++    krb5_init_context(&context);
++    return krb5_kt_resolve(context, "MEMORY:test_keytab", &kt);
++}
++      ]])
++    ], [ squid_cv_memory_keytab=yes ], [ squid_cv_memory_keytab=no ], [:])
++  ])
++])
++
+ 
+ dnl checks that gssapi is ok, and sets squid_cv_working_gssapi accordingly
+ AC_DEFUN([SQUID_CHECK_WORKING_GSSAPI], [
+@@ -331,6 +358,10 @@
+   SQUID_DEFINE_BOOL(HAVE_KRB5_MEMORY_CACHE,$squid_cv_memory_cache,
+        [Define if kerberos has MEMORY: cache support])
+ 
++  SQUID_CHECK_KRB5_CONTEXT_MEMORY_KEYTAB
++  SQUID_DEFINE_BOOL(HAVE_KRB5_MEMORY_KEYTAB,$squid_cv_memory_keytab,
++       [Define if kerberos has MEMORY: keytab support])
++
+   SQUID_CHECK_WORKING_GSSAPI
+   SQUID_DEFINE_BOOL(HAVE_GSSAPI,$squid_cv_working_gssapi,[GSSAPI support])
+ 
+
+=== modified file 'helpers/negotiate_auth/kerberos/negotiate_kerberos_auth.8'
+--- helpers/negotiate_auth/kerberos/negotiate_kerberos_auth.8	2014-10-31 08:02:57 +0000
++++ helpers/negotiate_auth/kerberos/negotiate_kerberos_auth.8	2014-12-14 14:58:50 +0000
+@@ -7,7 +7,7 @@
+ .
+ .SH SYNOPSIS
+ .if !'po4a'hide' .B negotiate_kerberos_auth
+-.if !'po4a'hide' .B [\-h] [\-d] [\-i] [\-r] [\-s Service-Principal-Name] 
++.if !'po4a'hide' .B [\-h] [\-d] [\-i] [\-r] [\-s Service-Principal-Name] [\-k Keytab-Name] [\-c Replay-Cache-Directory] [\-t Replay-Cache-Type] 
+ .
+ .SH DESCRIPTION
+ .B negotiate_kerberos_auth
+@@ -30,6 +30,15 @@
+ .if !'po4a'hide' .TP 12
+ .if !'po4a'hide' .B \-s Service-Principal-name
+ Provide Service Principal Name.
++.if !'po4a'hide' .TP 12
++.if !'po4a'hide' .B \-k Keytab-Name
++Provide Kerberos Keytab Name (Default: /etc/krb5.keytab)
++.if !'po4a'hide' .TP 12
++.if !'po4a'hide' .B \-c Replay-Cache-Directory
++Provide Replay Cache Directory (Default: /var/tmp)
++.if !'po4a'hide' .TP 12
++.if !'po4a'hide' .B \-t Replay-Cache-Type
++Provide Replay Cache Type (Default: dfl) 
+ .
+ .SH CONFIGURATION
+ .PP
+@@ -52,8 +61,9 @@
+ The following squid startup file modification may be required:
+ 
+ Add the following lines to the squid startup script to point squid to a keytab file which
+-contains the HTTP/fqdn service principal for the default Kerberos domain. The fqdn must be
+-the proxy name set in IE or firefox. You can not use an IP address.
++contains the HTTP/fqdn service principal for the default Kerberos domain. The keytab name can
++alos be provided by the -k <keytab name> option. The fqdn must be the proxy name set in IE
++ or firefox. You can not use an IP address.
+ 
+ KRB5_KTNAME=/etc/squid/HTTP.keytab
+ export KRB5_KTNAME
+@@ -69,7 +79,7 @@
+ in a 5 minute window) . If squid is under high load with Negotiate(Kerberos) proxy authentication 
+ requests the replay cache checks can create high CPU load. If the environment does not require 
+ high security the replay cache check can be disabled for MIT based Kerberos implementations by 
+-adding the following to the startup script 
++adding the below to the startup script or use the -t none option.
+ 
+ KRB5RCACHETYPE=none
+ export KRB5RCACHETYPE
+
+=== modified file 'helpers/negotiate_auth/kerberos/negotiate_kerberos_auth.cc'
+--- helpers/negotiate_auth/kerberos/negotiate_kerberos_auth.cc	2014-10-29 04:26:36 +0000
++++ helpers/negotiate_auth/kerberos/negotiate_kerberos_auth.cc	2014-12-14 19:13:31 +0000
+@@ -44,6 +44,44 @@
+ 
+ #include "negotiate_kerberos.h"
+ 
++#if HAVE_KRB5_MEMORY_KEYTAB
++typedef struct _krb5_kt_list {
++    struct _krb5_kt_list *next;
++    krb5_keytab_entry *entry;
++} *krb5_kt_list;
++krb5_kt_list ktlist = NULL;
++
++krb5_error_code krb5_free_kt_list(krb5_context context, krb5_kt_list kt_list);
++krb5_error_code krb5_write_keytab(krb5_context context,
++                                  krb5_kt_list kt_list,
++                                  char *name);
++krb5_error_code krb5_read_keytab(krb5_context context,
++                                 char *name,
++                                 krb5_kt_list *kt_list);
++#endif /* HAVE_KRB5_MEMORY_KEYTAB */
++
++#if HAVE_PAC_SUPPORT || HAVE_KRB5_MEMORY_KEYTAB
++int
++check_k5_err(krb5_context context, const char *function, krb5_error_code code)
++{
++    const char *errmsg;
++
++    if (code) {
++        errmsg = krb5_get_error_message(context, code);
++        debug((char *) "%s| %s: ERROR: %s failed: %s\n", LogTime(), PROGRAM, function, errmsg);
++        fprintf(stderr, "%s| %s: ERROR: %s: %s\n", LogTime(), PROGRAM, function, errmsg);
++#if HAVE_KRB5_FREE_ERROR_MESSAGE
++        krb5_free_error_message(context, errmsg);
++#elif HAVE_KRB5_FREE_ERROR_STRING
++        krb5_free_error_string(context, (char *)errmsg);
++#else
++        xfree(errmsg);
++#endif
++    }
++    return code;
++}
++#endif
++
+ char *
+ gethost_name(void)
+ {
+@@ -142,6 +180,125 @@
+     return (0);
+ }
+ 
++#if HAVE_KRB5_MEMORY_KEYTAB
++/*
++ * Free a kt_list
++ */
++krb5_error_code krb5_free_kt_list(krb5_context context, krb5_kt_list list)
++{
++    krb5_kt_list lp, prev;
++    krb5_error_code retval = 0;
++
++    for (lp = list; lp;) {
++        retval = krb5_kt_free_entry(context, lp->entry);
++        free(lp->entry);
++        if (retval)
++            break;
++        prev = lp;
++        lp = lp->next;
++        free(prev);
++    }
++    return retval;
++}
++/*
++ * Read in a keytab and append it to list.  If list starts as NULL,
++ * allocate a new one if necessary.
++ */
++krb5_error_code krb5_read_keytab(krb5_context context, char *name, krb5_kt_list *list)
++{
++    krb5_kt_list lp = NULL, tail = NULL, back = NULL;
++    krb5_keytab kt;
++    krb5_keytab_entry *entry;
++    krb5_kt_cursor cursor;
++    krb5_error_code retval = 0;
++
++    if (*list) {
++        /* point lp at the tail of the list */
++        for (lp = *list; lp->next; lp = lp->next);
++        back = lp;
++    }
++    retval = krb5_kt_resolve(context, name, &kt);
++    if (retval)
++        return retval;
++    retval = krb5_kt_start_seq_get(context, kt, &cursor);
++    if (retval)
++        goto close_kt;
++    for (;;) {
++        entry = (krb5_keytab_entry *)malloc(sizeof (krb5_keytab_entry));
++        if (!entry) {
++            retval = ENOMEM;
++            break;
++        }
++        memset(entry, 0, sizeof (*entry));
++        retval = krb5_kt_next_entry(context, kt, entry, &cursor);
++        if (retval)
++            break;
++
++        if (!lp) {              /* if list is empty, start one */
++            lp = (krb5_kt_list)malloc(sizeof (*lp));
++            if (!lp) {
++                retval = ENOMEM;
++                break;
++            }
++        } else {
++            lp->next = (krb5_kt_list)malloc(sizeof (*lp));
++            if (!lp->next) {
++                retval = ENOMEM;
++                break;
++            }
++            lp = lp->next;
++        }
++        if (!tail)
++            tail = lp;
++        lp->next = NULL;
++        lp->entry = entry;
++    }
++    if (entry)
++        free(entry);
++    if (retval) {
++        if (retval == KRB5_KT_END)
++            retval = 0;
++        else {
++            krb5_free_kt_list(context, tail);
++            tail = NULL;
++            if (back)
++                back->next = NULL;
++        }
++    }
++    if (!*list)
++        *list = tail;
++    krb5_kt_end_seq_get(context, kt, &cursor);
++close_kt:
++    krb5_kt_close(context, kt);
++    return retval;
++}
++
++/*
++ * Takes a kt_list and writes it to the named keytab.
++ */
++krb5_error_code krb5_write_keytab(krb5_context context, krb5_kt_list list, char *name)
++{
++    krb5_kt_list lp;
++    krb5_keytab kt;
++    char ktname[MAXPATHLEN+sizeof("MEMORY:")+1];
++    krb5_error_code retval = 0;
++
++    snprintf(ktname, sizeof(ktname), "%s", name);
++    retval = krb5_kt_resolve(context, ktname, &kt);
++    if (retval)
++        return retval;
++    for (lp = list; lp; lp = lp->next) {
++        retval = krb5_kt_add_entry(context, kt, lp->entry);
++        if (retval)
++            break;
++    }
++    /*
++     *     krb5_kt_close(context, kt);
++     */
++    return retval;
++}
++#endif /* HAVE_KRB5_MEMORY_KEYTAB */
++
+ int
+ main(int argc, char *const argv[])
+ {
+@@ -152,8 +309,6 @@
+ #if HAVE_PAC_SUPPORT
+     char ad_groups[MAX_PAC_GROUP_SIZE];
+     char *ag=NULL;
+-    krb5_context context = NULL;
+-    krb5_error_code ret;
+     krb5_pac pac;
+ #if USE_HEIMDAL_KRB5
+     gss_buffer_desc data_set = GSS_C_EMPTY_BUFFER;
+@@ -161,6 +316,10 @@
+     gss_buffer_desc type_id = GSS_C_EMPTY_BUFFER;
+ #endif
+ #endif
++#if HAVE_PAC_SUPPORT || HAVE_KRB5_MEMORY_KEYTAB
++    krb5_context context = NULL;
++    krb5_error_code ret;
++#endif
+     long length = 0;
+     static int err = 0;
+     int opt, log = 0, norealm = 0;
+@@ -168,6 +327,15 @@
+     char *service_name = (char *) "HTTP", *host_name = NULL;
+     char *token = NULL;
+     char *service_principal = NULL;
++    char *keytab_name = NULL;
++    char *keytab_name_env = NULL;
++#if HAVE_KRB5_MEMORY_KEYTAB
++    char *memory_keytab_name = NULL;
++#endif
++    char *rcache_type = NULL;
++    char *rcache_type_env = NULL;
++    char *rcache_dir = NULL;
++    char *rcache_dir_env = NULL;
+     OM_uint32 major_status, minor_status;
+     gss_ctx_id_t gss_context = GSS_C_NO_CONTEXT;
+     gss_name_t client_name = GSS_C_NO_NAME;
+@@ -183,7 +351,7 @@
+     setbuf(stdout, NULL);
+     setbuf(stdin, NULL);
+ 
+-    while (-1 != (opt = getopt(argc, argv, "dirs:h"))) {
++    while (-1 != (opt = getopt(argc, argv, "dirs:k:c:t:"))) {
+         switch (opt) {
+         case 'd':
+             debug_enabled = 1;
+@@ -194,24 +362,32 @@
+         case 'r':
+             norealm = 1;
+             break;
++        case 'k':
++            keytab_name = xstrdup(optarg);
++            break;
++        case 'c':
++            rcache_dir = xstrdup(optarg);
++            break;
++        case 't':
++            rcache_type = xstrdup(optarg);
++            break;
+         case 's':
+             service_principal = xstrdup(optarg);
+             break;
+-        case 'h':
++        default:
+             fprintf(stderr, "Usage: \n");
+-            fprintf(stderr, "squid_kerb_auth [-d] [-i] [-s SPN] [-h]\n");
++            fprintf(stderr, "squid_kerb_auth [-d] [-i] [-s SPN] [-k keytab] [-c rcdir] [-t rctype]\n");
+             fprintf(stderr, "-d full debug\n");
+             fprintf(stderr, "-i informational messages\n");
+             fprintf(stderr, "-r remove realm from username\n");
+             fprintf(stderr, "-s service principal name\n");
+-            fprintf(stderr, "-h help\n");
++            fprintf(stderr, "-k keytab name\n");
++            fprintf(stderr, "-c replay cache directory\n");
++            fprintf(stderr, "-t replay cache type\n");
+             fprintf(stderr,
+                     "The SPN can be set to GSS_C_NO_NAME to allow any entry from keytab\n");
+             fprintf(stderr, "default SPN is HTTP/fqdn@DEFAULT_REALM\n");
+             exit(0);
+-        default:
+-            fprintf(stderr, "%s| %s: WARNING: unknown option: -%c.\n", LogTime(),
+-                    PROGRAM, opt);
+         }
+     }
+ 
+@@ -235,6 +411,64 @@
+         xfree(host_name);
+     }
+ 
++    if (rcache_type) {
++        rcache_type_env = (char *) xmalloc(strlen("KRB5RCACHETYPE=")+strlen(rcache_type)+1);
++        strcpy(rcache_type_env, "KRB5RCACHETYPE=");
++        strcat(rcache_type_env, rcache_type);
++        putenv(rcache_type_env);
++        debug((char *) "%s| %s: INFO: Setting replay cache type to %s\n", LogTime(), PROGRAM, rcache_type);
++    }
++
++    if (rcache_dir) {
++        rcache_dir_env = (char *) xmalloc(strlen("KRB5RCACHEDIR=")+strlen(rcache_dir)+1);
++        strcpy(rcache_dir_env, "KRB5RCACHEDIR=");
++        strcat(rcache_dir_env, rcache_dir);
++        putenv(rcache_dir_env);
++        debug((char *) "%s| %s: INFO: Setting replay cache directory to %s\n", LogTime(), PROGRAM, rcache_dir);
++    }
++
++    if (keytab_name) {
++        keytab_name_env = (char *) xmalloc(strlen("KRB5_KTNAME=")+strlen(keytab_name)+1);
++        strcpy(keytab_name_env, "KRB5_KTNAME=");
++        strcat(keytab_name_env, keytab_name);
++        putenv(keytab_name_env);
++    } else {
++        keytab_name_env = getenv("KRB5_KTNAME");
++        if (!keytab_name_env)
++            keytab_name = strdup("/etc/krb5.keytab");
++        else
++            keytab_name = strdup(keytab_name_env);
++    }
++    debug((char *) "%s| %s: INFO: Setting keytab to %s\n", LogTime(), PROGRAM, keytab_name);
++#if HAVE_KRB5_MEMORY_KEYTAB
++    ret = krb5_init_context(&context);
++    if (!check_k5_err(context, "krb5_init_context", ret)) {
++        memory_keytab_name = (char *)xmalloc(strlen("MEMORY:negotiate_kerberos_auth_")+16);
++        snprintf(memory_keytab_name, strlen("MEMORY:negotiate_kerberos_auth_")+16,
++                 "MEMORY:negotiate_kerberos_auth_%d", (unsigned int) getpid());
++        ret = krb5_read_keytab(context, keytab_name, &ktlist);
++        if (check_k5_err(context, "krb5_read_keytab", ret)) {
++            debug((char *) "%s| %s: ERROR: Reading keytab %s into list failed\n", LogTime(), PROGRAM, keytab_name);
++        } else {
++            ret = krb5_write_keytab(context, ktlist, memory_keytab_name);
++            if (check_k5_err(context, "krb5_write_keytab", ret)) {
++                debug((char *) "%s| %s: ERROR: Writing list into keytab %s\n", LogTime(), PROGRAM, memory_keytab_name);
++            } else {
++                keytab_name_env = (char *) xmalloc(strlen("KRB5_KTNAME=")+strlen(memory_keytab_name)+1);
++                strcpy(keytab_name_env, "KRB5_KTNAME=");
++                strcat(keytab_name_env, memory_keytab_name);
++                putenv(keytab_name_env);
++                xfree(keytab_name);
++                keytab_name = xstrdup(memory_keytab_name);
++                debug((char *) "%s| %s: INFO: Changed keytab to %s\n", LogTime(), PROGRAM, memory_keytab_name);
++            }
++        }
++    }
++    krb5_free_context(context);
++#endif
++#ifdef HAVE_HEIMDAL_KERBEROS
++    gsskrb5_register_acceptor_identity(keytab_name);
++#endif
+     while (1) {
+         if (fgets(buf, sizeof(buf) - 1, stdin) == NULL) {
+             if (ferror(stdin)) {
+@@ -478,7 +712,7 @@
+ #else
+             fprintf(stdout, "AF %s %s\n", "AA==", rfc_user);
+ #endif
+-	    debug((char *) "%s| %s: DEBUG: AF %s %s\n", LogTime(), PROGRAM, "AA==", rfc_user);
++            debug((char *) "%s| %s: DEBUG: AF %s %s\n", LogTime(), PROGRAM, "AA==", rfc_user);
+             if (log)
+                 fprintf(stderr, "%s| %s: INFO: User %s authenticated\n", LogTime(),
+                         PROGRAM, rfc_user);
+
+=== modified file 'helpers/negotiate_auth/kerberos/negotiate_kerberos_pac.cc'
+--- helpers/negotiate_auth/kerberos/negotiate_kerberos_pac.cc	2014-10-29 04:26:36 +0000
++++ helpers/negotiate_auth/kerberos/negotiate_kerberos_pac.cc	2014-12-14 19:13:31 +0000
+@@ -48,25 +48,8 @@
+ static krb5_data *ad_data;
+ static unsigned char *p;
+ 
+-int
+-check_k5_err(krb5_context context, const char *function, krb5_error_code code)
+-{
+-    const char *errmsg;
+-
+-    if (code) {
+-        errmsg = krb5_get_error_message(context, code);
+-        debug((char *) "%s| %s: ERROR: %s failed: %s\n", LogTime(), PROGRAM, function, errmsg);
+-        fprintf(stderr, "%s| %s: ERROR: %s: %s\n", LogTime(), PROGRAM, function, errmsg);
+-#if HAVE_KRB5_FREE_ERROR_MESSAGE
+-        krb5_free_error_message(context, errmsg);
+-#elif HAVE_KRB5_FREE_ERROR_STRING
+-        krb5_free_error_string(context, (char *)errmsg);
+-#else
+-        xfree(errmsg);
+-#endif
+-    }
+-    return code;
+-}
++extern int
++check_k5_err(krb5_context context, const char *function, krb5_error_code code);
+ 
+ void
+ align(int n)
+@@ -134,7 +117,7 @@
+ }
+ 
+ char *
+-xstrcpy( char *src, const char *dst)
++pstrcpy( char *src, const char *dst)
+ {
+     if (dst) {
+         if (strlen(dst)>MAX_PAC_GROUP_SIZE)
+@@ -146,7 +129,7 @@
+ }
+ 
+ char *
+-xstrcat( char *src, const char *dst)
++pstrcat( char *src, const char *dst)
+ {
+     if (dst) {
+         if (strlen(src)+strlen(dst)+1>MAX_PAC_GROUP_SIZE)
+@@ -239,17 +222,17 @@
+             memcpy((void *)&ag[2],(const void*)&p[bpos+2],6+nauth*4);
+             memcpy((void *)&ag[length],(const void*)Rids[l],4);
+             if (l==0) {
+-                if (!xstrcpy(ad_groups,"group=")) {
++                if (!pstrcpy(ad_groups,"group=")) {
+                     debug((char *) "%s| %s: WARN: Too many groups ! size > %d : %s\n",
+                           LogTime(), PROGRAM, MAX_PAC_GROUP_SIZE, ad_groups);
+                 }
+             } else {
+-                if (!xstrcat(ad_groups," group=")) {
++                if (!pstrcat(ad_groups," group=")) {
+                     debug((char *) "%s| %s: WARN: Too many groups ! size > %d : %s\n",
+                           LogTime(), PROGRAM, MAX_PAC_GROUP_SIZE, ad_groups);
+                 }
+             }
+-            if (!xstrcat(ad_groups,base64_encode_bin(ag, (int)(length+4)))) {
++            if (!pstrcat(ad_groups,base64_encode_bin(ag, (int)(length+4)))) {
+                 debug((char *) "%s| %s: WARN: Too many groups ! size > %d : %s\n",
+                       LogTime(), PROGRAM, MAX_PAC_GROUP_SIZE, ad_groups);
+             }
+@@ -311,17 +294,17 @@
+                 ag = (char *)xcalloc((length)*sizeof(char),1);
+                 memcpy((void *)ag,(const void*)&p[bpos],length);
+                 if (!ad_groups) {
+-                    if (!xstrcpy(ad_groups,"group=")) {
++                    if (!pstrcpy(ad_groups,"group=")) {
+                         debug((char *) "%s| %s: WARN: Too many groups ! size > %d : %s\n",
+                               LogTime(), PROGRAM, MAX_PAC_GROUP_SIZE, ad_groups);
+                     }
+                 } else {
+-                    if (!xstrcat(ad_groups," group=")) {
++                    if (!pstrcat(ad_groups," group=")) {
+                         debug((char *) "%s| %s: WARN: Too many groups ! size > %d : %s\n",
+                               LogTime(), PROGRAM, MAX_PAC_GROUP_SIZE, ad_groups);
+                     }
+                 }
+-                if (!xstrcat(ad_groups,base64_encode_bin(ag, (int)length))) {
++                if (!pstrcat(ad_groups,base64_encode_bin(ag, (int)length))) {
+                     debug((char *) "%s| %s: WARN: Too many groups ! size > %d : %s\n",
+                           LogTime(), PROGRAM, MAX_PAC_GROUP_SIZE, ad_groups);
+                 }
+
+=== modified file 'helpers/negotiate_auth/kerberos/test_negotiate_auth.sh'
+--- helpers/negotiate_auth/kerberos/test_negotiate_auth.sh	2014-09-13 13:31:49 +0000
++++ helpers/negotiate_auth/kerberos/test_negotiate_auth.sh	2014-12-14 16:05:02 +0000
+@@ -12,4 +12,9 @@
+ 	exit 0
+ fi
+ dir=`dirname $0`
+-$dir/negotiate_kerberos_auth_test $1 | awk '{sub(/Token:/,"YR"); print $0}END{print "QQ"}' | $dir/negotiate_kerberos_auth -d
++if [[ ! -f $dir/squid.keytab ]]; then
++	echo "Expect $dir/squid.keytab"
++	exit 0
++fi
++# $dir/negotiate_kerberos_auth_test $1 3 | awk '{sub(/Token:/,"YR"); print $0}END{print "QQ"}' | valgrind --log-file=$dir/negotiate_kerberos_auth.val --leak-check=full --show-reachable=yes -v $dir/negotiate_kerberos_auth -d -t none -k squid.keytab
++$dir/negotiate_kerberos_auth_test $1 3 | awk '{sub(/Token:/,"YR"); print $0}END{print "QQ"}' | $dir/negotiate_kerberos_auth -d -t none -k $dir/squid.keytab -s GSS_C_NO_NAME
+

@@ -1,0 +1,198 @@
+Convert Http::Stream::reqbuf to a MemBlob, making it configurable at runtime.
+
+This also makes many other auxilary changes:
+
+ * Increases the size of Http::Stream::requestBuffer to match that of
+   read_ahead_gap. Previously this was a 4kb fixed size buffer. As a result,
+   the overhead for a single client connection has been increased by 12 KB in
+   the default configuration, but Squid will no longer artifically slow down
+   client responses in this situation by fragmenting the read(2)/write(2)
+   calls.
+
+ * Improves the performance of large uncacheable replies. This was achieved by
+   increasing the buffer size to 16 KB as mentioned above, but it is worth
+   mentioning separately. Specifically, for a server, client and proxy all
+   running on my local machine, this patch increases throughput on a 5 GB file
+   from ~110 MB/s to ~340 MB/s.
+
+ * Documents the influence that read_ahead_gap had on the size of read(2) calls
+   for HTTP, and now the size of write(2) calls.
+
+ * Prevent read_ahead_gap from being set to 0. Previously this would result in
+   hung requests.
+
+This work is submitted on behalf of Bloomberg L.P.
+
+diff --git a/src/cache_cf.cc b/src/cache_cf.cc
+--- a/src/cache_cf.cc
++++ b/src/cache_cf.cc
+@@ -946,6 +946,10 @@ configDoConfigure(void)
+         }
+     }
+ #endif
++
++    if (Config.readAheadGap <= 0) {
++        fatalf("read_ahead_gap must be greater than 0 bytes");
++    }
+ }
+ 
+ /** Parse a line containing an obsolete directive.
+diff --git a/src/cf.data.pre b/src/cf.data.pre
+--- a/src/cf.data.pre
++++ b/src/cf.data.pre
+@@ -5598,6 +5598,17 @@ DEFAULT: 16 KB
+ DOC_START
+ 	The amount of data the cache will buffer ahead of what has been
+ 	sent to the client when retrieving an object from another server.
++	
++	This also influences the maximum network read(2)/write(2) sizes in some
++	circumstances. Reducing the size of this buffer will decrease
++	per-connection memory usage at the cost of more read(2)/write(2) calls.
++	Conversely, increasing the size of this buffer will decrease the number of
++	read(2)/write(2) calls at the cost of memory usage, potentially improving
++	performance.
++
++	Squid does not slow does the response delivery to the client in order to
++	fill the buffer.
++
+ DOC_END
+ 
+ NAME: negative_ttl
+diff --git a/src/client_side.cc b/src/client_side.cc
+--- a/src/client_side.cc
++++ b/src/client_side.cc
+@@ -1011,12 +1011,9 @@ ConnStateData::abortRequestParsing(const
+     http->uri = xstrdup(uri);
+     setLogUri (http, uri);
+     auto *context = new Http::Stream(clientConnection, http);
+-    StoreIOBuffer tempBuffer;
+-    tempBuffer.data = context->reqbuf;
+-    tempBuffer.length = HTTP_REQBUF_SZ;
+     clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, new clientReplyContext(http), clientSocketRecipient,
+-                     clientSocketDetach, context, tempBuffer);
++                     clientSocketDetach, context, context->getClientStreamBuffer());
+     return context;
+ }
+ 
+@@ -1358,15 +1355,11 @@ parseHttpRequest(ConnStateData *csd, con
+     http->req_sz = hp->messageHeaderSize();
+     Http::Stream *result = new Http::Stream(csd->clientConnection, http);
+ 
+-    StoreIOBuffer tempBuffer;
+-    tempBuffer.data = result->reqbuf;
+-    tempBuffer.length = HTTP_REQBUF_SZ;
+-
+     ClientStreamData newServer = new clientReplyContext(http);
+     ClientStreamData newClient = result;
+     clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, newServer, clientSocketRecipient,
+-                     clientSocketDetach, newClient, tempBuffer);
++                     clientSocketDetach, newClient, result->getClientStreamBuffer());
+ 
+     /* set url */
+     debugs(33,5, "Prepare absolute URL from " <<
+diff --git a/src/http/Stream.cc b/src/http/Stream.cc
+--- a/src/http/Stream.cc
++++ b/src/http/Stream.cc
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "squid.h"
++#include "SquidConfig.h"
+ #include "client_side_request.h"
+ #include "http/Stream.h"
+ #include "HttpHdrContRange.h"
+@@ -20,10 +21,10 @@ Http::Stream::Stream(const Comm::Connect
+     reply(nullptr),
+     writtenToSocket(0),
+     mayUseConnection_(false),
+-    connRegistered_(false)
++    connRegistered_(false),
++    requestBuffer(nullptr)
+ {
+     assert(http != nullptr);
+-    memset(reqbuf, '\0', sizeof (reqbuf));
+     flags.deferred = 0;
+     flags.parsed_ok = 0;
+     deferredparams.node = nullptr;
+@@ -109,12 +110,10 @@ Http::Stream::pullData()
+     debugs(33, 5, reply << " written " << http->out.size << " into " << clientConnection);
+ 
+     /* More data will be coming from the stream. */
+-    StoreIOBuffer readBuffer;
++    StoreIOBuffer readBuffer = getClientStreamBuffer();
+     /* XXX: Next requested byte in the range sequence */
+     /* XXX: length = getmaximumrangelenfgth */
+     readBuffer.offset = getNextRangeOffset();
+-    readBuffer.length = HTTP_REQBUF_SZ;
+-    readBuffer.data = reqbuf;
+     /* we may note we have reached the end of the wanted ranges */
+     clientStreamRead(getTail(), http, readBuffer);
+ }
+@@ -568,6 +567,18 @@ Http::Stream::deferRecipientForLater(cli
+     deferredparams.queuedBuffer = receivedData;
+ }
+ 
++StoreIOBuffer
++Http::Stream::getClientStreamBuffer()
++{
++    if (!requestBuffer) {
++        requestBuffer = new MemBlob(Config.readAheadGap);
++    }
++    StoreIOBuffer tempBuffer;
++    tempBuffer.data = requestBuffer->mem;
++    tempBuffer.length = requestBuffer->spaceSize();
++    return tempBuffer;
++}
++
+ void
+ Http::Stream::prepareReply(HttpReply *rep)
+ {
+diff --git a/src/http/Stream.h b/src/http/Stream.h
+--- a/src/http/Stream.h
++++ b/src/http/Stream.h
+@@ -120,12 +120,13 @@ public:
+ 
+     void deferRecipientForLater(clientStreamNode *, HttpReply *, StoreIOBuffer receivedData);
+ 
++    StoreIOBuffer getClientStreamBuffer();
++
+ public: // HTTP/1.x state data
+ 
+     Comm::ConnectionPointer clientConnection; ///< details about the client connection socket
+     ClientHttpRequest *http;    /* we pretend to own that Job */
+     HttpReply *reply;
+-    char reqbuf[HTTP_REQBUF_SZ];
+     struct {
+         unsigned deferred:1; ///< This is a pipelined request waiting for the current object to complete
+         unsigned parsed_ok:1; ///< Was this parsed correctly?
+@@ -158,6 +159,8 @@ private:
+ 
+     bool mayUseConnection_; /* This request may use the connection. Don't read anymore requests for now */
+     bool connRegistered_;
++
++    MemBlob::Pointer requestBuffer;
+ };
+ 
+ } // namespace Http
+diff --git a/src/servers/FtpServer.cc b/src/servers/FtpServer.cc
+--- a/src/servers/FtpServer.cc
++++ b/src/servers/FtpServer.cc
+@@ -751,15 +751,11 @@ Ftp::Server::parseOneRequest()
+     Http::Stream *const result =
+         new Http::Stream(clientConnection, http);
+ 
+-    StoreIOBuffer tempBuffer;
+-    tempBuffer.data = result->reqbuf;
+-    tempBuffer.length = HTTP_REQBUF_SZ;
+-
+     ClientStreamData newServer = new clientReplyContext(http);
+     ClientStreamData newClient = result;
+     clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, newServer, clientSocketRecipient,
+-                     clientSocketDetach, newClient, tempBuffer);
++                     clientSocketDetach, newClient, result->getClientStreamBuffer());
+ 
+     result->flags.parsed_ok = 1;
+     return result;

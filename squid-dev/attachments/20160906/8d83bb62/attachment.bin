@@ -1,0 +1,117 @@
+Return 505 (Version Not Supported) error code for HTTP/2+ versions.
+
+Before this change, when a syntactically valid HTTP/1 request indicated
+HTTP major version 2, Squid mangled and forwarded the request as an
+HTTP/1 message. Since Squid does not and cannot correctly interpret an
+HTTP/1 request using HTTP/2 rules, returning an error and closing the
+connection appears to be the only correct action possible.
+
+Also: since HTTPbis prohibits HTTP versions with multi-digits, treat
+such requests as invalid.
+
+=== modified file 'src/http/one/RequestParser.cc'
+--- src/http/one/RequestParser.cc	2016-08-25 18:12:21 +0000
++++ src/http/one/RequestParser.cc	2016-09-05 19:25:22 +0000
+@@ -159,71 +159,94 @@
+      * have all been replaced with SBuf.
+      *
+      * Not that it matters but RFC 7230 section 3.1.1 requires (RECOMMENDED)
+      * at least 8000 octets for the whole line, including method and version.
+      */
+     const size_t maxUriLength = static_cast<size_t>((64*1024)-1);
+ 
+     SBuf uriFound;
+     if (!tok.prefix(uriFound, RequestTargetCharacters())) {
+         parseStatusCode = Http::scBadRequest;
+         debugs(33, ErrorLevel(), "invalid request-line: missing or malformed URI");
+         return false;
+     }
+ 
+     if (uriFound.length() > maxUriLength) {
+         // RFC 7230 section 3.1.1 mandatory (MUST) 414 response
+         parseStatusCode = Http::scUriTooLong;
+         debugs(33, ErrorLevel(), "invalid request-line: " << uriFound.length() <<
+                "-byte URI exceeds " << maxUriLength << "-byte limit");
+         return false;
+     }
+ 
+     uri_ = uriFound;
+     return true;
+ }
+ 
+ bool
+ Http::One::RequestParser::parseHttpVersionField(Http1::Tokenizer &tok)
+ {
+     const auto savedTok = tok;
++    static const SBuf http1p0("HTTP/1.0");
++    static const SBuf http1p1("HTTP/1.1");
++    SBuf majorDigit;
++    SBuf minorDigit;
++    bool multiDigits = false;
+ 
+-    SBuf digit;
+-    // Searching for Http1magic precludes detecting HTTP/2+ versions.
+-    // Rewrite if we ever _need_ to return 505 (Version Not Supported) errors.
+-    if (tok.suffix(digit, CharacterSet::DIGIT) && tok.skipSuffix(Http1magic)) {
+-        msgProtocol_ = Http::ProtocolVersion(1, (*digit.rawContent() - '0'));
+-        return true;
++    // Optimization: Expect (and quickly parse) HTTP/1.1 or HTTP/1.0 in
++    // the vast majority of cases.
++    if (tok.skipSuffix(http1p1)) {
++        msgProtocol_ = Http::ProtocolVersion(1, 1);
++        return true;
++    } else if (tok.skipSuffix(http1p0)) {
++        msgProtocol_ = Http::ProtocolVersion(1, 0);
++        return true;
++    } else {
++        // RFC 7230 section 2.6:
++        // HTTP-version  = HTTP-name "/" DIGIT "." DIGIT
++        static const CharacterSet period("Decimal point", ".");
++        static const SBuf proto("HTTP/");
++        if (tok.suffix(minorDigit, CharacterSet::DIGIT) &&
++                tok.skipOneTrailing(period) &&
++                tok.suffix(majorDigit, CharacterSet::DIGIT) &&
++                tok.skipSuffix(proto)) {
++            multiDigits = !(majorDigit.length() == 1 && minorDigit.length() == 1);
++            if (!multiDigits) {
++                msgProtocol_ = Http::ProtocolVersion((*majorDigit.rawContent() - '0'),
++                        (*minorDigit.rawContent() - '0'));
++                return true;
++            }
++        }
+     }
+ 
+     // A GET request might use HTTP/0.9 syntax
+-    if (method_ == Http::METHOD_GET) {
++    if (!multiDigits && method_ == Http::METHOD_GET) {
+         // RFC 1945 - no HTTP version field at all
+         tok = savedTok; // in case the URI ends with a digit
+         // report this assumption as an error if configured to triage parsing
+         debugs(33, ErrorLevel(), "assuming HTTP/0.9 request-line");
+         msgProtocol_ = Http::ProtocolVersion(0,9);
+         return true;
+     }
+ 
+     debugs(33, ErrorLevel(), "invalid request-line: not HTTP");
+     parseStatusCode = Http::scBadRequest;
+     return false;
+ }
+ 
+ /**
+  * Skip characters separating request-line fields.
+  * To handle bidirectional parsing, the caller does the actual skipping and
+  * we just check how many character the caller has skipped.
+  */
+ bool
+ Http::One::RequestParser::skipDelimiter(const size_t count, const char *where)
+ {
+     if (count <= 0) {
+         debugs(33, ErrorLevel(), "invalid request-line: missing delimiter " << where);
+         parseStatusCode = Http::scBadRequest;
+         return false;
+     }
+ 
+     // tolerant parser allows multiple whitespace characters between request-line fields
+     if (count > 1 && !Config.onoff.relaxed_header_parser) {
+         debugs(33, ErrorLevel(), "invalid request-line: too many delimiters " << where);
+

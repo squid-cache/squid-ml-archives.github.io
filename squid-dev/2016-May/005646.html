@@ -1,0 +1,166 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Retry cache peer DNS failures more	frequently
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Retry%20cache%20peer%20DNS%20failures%20more%0A%09frequently&In-Reply-To=%3C573195B8.8070605%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005669.html">
+   <LINK REL="Next"  HREF="005648.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Retry cache peer DNS failures more	frequently</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Retry%20cache%20peer%20DNS%20failures%20more%0A%09frequently&In-Reply-To=%3C573195B8.8070605%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] Retry cache peer DNS failures more	frequently">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Tue May 10 08:03:04 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005669.html">[squid-dev] [PATCH] Retry cache peer DNS failures more	frequently
+</A></li>
+        <LI>Next message: <A HREF="005648.html">[squid-dev] [PATCH] Anticipated connection closure disables chunking
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5646">[ date ]</a>
+              <a href="thread.html#5646">[ thread ]</a>
+              <a href="subject.html#5646">[ subject ]</a>
+              <a href="author.html#5646">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 05/09/2016 08:41 PM, Nathan Hoad wrote:
+&gt;<i> +NAME: cache_peer_negative_dns_ttl
+</I>&gt;<i> +COMMENT: time-units
+</I>&gt;<i> +TYPE: time_t
+</I>&gt;<i> +LOC: Config.cachePeerNegativeDnsTtl
+</I>&gt;<i> +DEFAULT: 1 minutes
+</I>&gt;<i> +DOC_START
+</I>&gt;<i> +	How often to retry failed DNS lookups for cache peers.
+</I>
+It is not actually clear what this means because a DNS lookup failure is
+defined for a single DNS query but the text above appears to be talking
+about a group of cache peers (multiple failed queries). Does &quot;How often&quot;
+refer to the frequency of retries for any given failing peer? I do not
+think so.
+
+AFAICT, the code actually matches this description:
+
+&quot;A delay before retrying a failed DNS lookup for a cache peer. The
+option support is currently unreliable if multiple peers experience DNS
+lookup failures: Some of those failed lookups may be retried much sooner
+or much later than the configured value&quot;.
+
+
+&gt;<i> +	It is not recommended to set this lower than negative_dns_ttl, as the
+</I>&gt;<i> +	cached negative responses will prevent prevent the DNS lookups from
+</I>&gt;<i> +	succeeding.
+</I>
+s/prevent prevent/prevent/
+
+A subtle problem here is that even if I set cache_peer_negative_dns_ttl
+to exceed negative_dns_ttl, Squid may retry the failed lookup much
+sooner (if there were lookup failures for another peer earlier), hitting
+that negative DNS cache for the just-failed peer lookup.
+
+
+&gt;<i> + eventAdd(&quot;peerRefreshFailedDNS&quot;, peerRefreshFailedDNS, NULL, Config.cachePeerNegativeDnsTtl, 1);
+</I>
+Nitpick: I know you are copying this code, but this is not a
+cbdata-protected event -- the last/missing parameter should be &quot;false&quot;
+instead of the default &quot;true&quot;, right?
+
+
+&gt;<i> +    for (p = Config.peers; p; p = p-&gt;next) {
+</I>&gt;<i> +        if (p-&gt;in_addr.isAnyAddr()) {
+</I>&gt;<i> +            ipcache_nbgethostbyname(p-&gt;host, peerDNSConfigure, p);
+</I>&gt;<i> +        }
+</I>&gt;<i> +    }
+</I>
+This creates two semi-competing event-based loops: The new
+peerRefreshFailedDNS() and the old peerRefreshDNS() that might fire in
+close proximity of each other, creating multiple peerDNSConfigure()
+calls with the same DNS lookup result. I hope Squid can handle this, but
+I see peerDNSConfigure scheduling more events and calling other global
+functions so the situation might become iffy in some cases...
+
+
+&gt;<i> +    if (eventFind(peerRefreshFailedDNS, NULL))
+</I>&gt;<i> +        eventDelete(peerRefreshFailedDNS, NULL);
+</I>
+IIRC, this code still allows an already scheduled/queued
+peerRefreshFailedDNS async call to fire, also causing multiple
+peerDNSConfigure() calls with the same DNS lookup result.
+
+
+Also, if the timing of various events is just right, I suspect the above
+eventDelete() may delete the peerRefreshFailedDNS event meant for a
+failed lookup that has been waiting for a while but not enough for the
+ipcache_nbgethostbyname() to succeed right away. AFAICT, this
+combination will lead to that peerRefreshFailedDNS event rescheduled,
+effectively increasing that peer wait time.
+
+
+Overall, I think the code suffers from applying the near-copy of the
+peerRefreshDNS() meant for all peers at once to _individual_ cache peer
+lookup failures. This misapplication leads to messy or uncertain
+situations. I would not be surprised if some of these problems exist in
+the current code as well, but they seem to be significantly more likely
+in the patched code.
+
+Is there a better way?
+
+
+Please note that this code quality matches that of a lot of other Squid
+code -- it works when &quot;things are OK&quot; and requires a growing set of
+hacks to avoid problems when external events do not go exactly as
+planned. If you insist, it can be accepted, I guess.
+
+
+Thank you,
+
+Alex.
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005669.html">[squid-dev] [PATCH] Retry cache peer DNS failures more	frequently
+</A></li>
+	<LI>Next message: <A HREF="005648.html">[squid-dev] [PATCH] Anticipated connection closure disables chunking
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5646">[ date ]</a>
+              <a href="thread.html#5646">[ thread ]</a>
+              <a href="subject.html#5646">[ subject ]</a>
+              <a href="author.html#5646">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

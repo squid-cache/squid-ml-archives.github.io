@@ -1,0 +1,1673 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] ICAP read buffer SBuf conversion
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20ICAP%20read%20buffer%20SBuf%20conversion&In-Reply-To=%3C54F140CE.1090001%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="001827.html">
+   <LINK REL="Next"  HREF="001829.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] ICAP read buffer SBuf conversion</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20ICAP%20read%20buffer%20SBuf%20conversion&In-Reply-To=%3C54F140CE.1090001%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] ICAP read buffer SBuf conversion">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Sat Feb 28 04:15:10 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001827.html">[squid-dev] Parser-NG TODO list
+</A></li>
+        <LI>Next message: <A HREF="001829.html">[squid-dev] [PATCH] ICAP read buffer SBuf conversion
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1828">[ date ]</a>
+              <a href="thread.html#1828">[ thread ]</a>
+              <a href="subject.html#1828">[ subject ]</a>
+              <a href="author.html#1828">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Contains three changes required before we can upgrade the ICAP message
+parser:
+
+* Convert the ICAP read buffer to an SBuf.
+
+* Remove the double-buffering hack used to comm_read() ICAP responses as
+c-string then convert to MemBuf for parsing.
+
+* Revert the HttpMsg parser API from MemBuf to c-string parameters.
+The internals did not make much use of the MemBuf abilities and it is
+simpler to retrieve c-string values directly from an SBuf than to go via
+a MemBuf conversion.
+
+I am seeking help testing that the ICAP I/O is still operational. If
+anyone has ICAP services and is willing to run a trunk/3.HEAD proxy with
+this patch applied please do.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/HttpMsg.cc'
+--- src/HttpMsg.cc	2015-01-13 07:25:36 +0000
++++ src/HttpMsg.cc	2015-01-25 10:33:14 +0000
+@@ -108,93 +108,89 @@
+ 
+     *blk_start = *parse_start;
+ 
+     *blk_end = *blk_start + slen;
+ 
+     while (**blk_end == '\r')   /* CR */
+         ++(*blk_end);
+ 
+     if (**blk_end == '\n')      /* LF */
+         ++(*blk_end);
+ 
+     *parse_start = *blk_end;
+ 
+     return 1;
+ }
+ 
+ // negative return is the negated Http::StatusCode error code
+ // zero return means need more data
+ // positive return is the size of parsed headers
+ bool
+-HttpMsg::parse(MemBuf *buf, bool eof, Http::StatusCode *error)
++HttpMsg::parse(const char *buf, const size_t sz, bool eof, Http::StatusCode *error)
+ {
+     assert(error);
+     *error = Http::scNone;
+ 
+-    // httpMsgParseStep() and debugging require 0-termination, unfortunately
+-    buf-&gt;terminate(); // does not affect content size
+-
+     // find the end of headers
+-    const size_t hdr_len = headersEnd(buf-&gt;content(), buf-&gt;contentSize());
++    const size_t hdr_len = headersEnd(buf, sz);
+ 
+     // sanity check the start line to see if this is in fact an HTTP message
+     if (!sanityCheckStartLine(buf, hdr_len, error)) {
+         // NP: sanityCheck sets *error and sends debug warnings on syntax errors.
+         // if we have seen the connection close, this is an error too
+         if (eof &amp;&amp; *error == Http::scNone)
+             *error = Http::scInvalidHeader;
+ 
+         return false;
+     }
+ 
+-    // TODO: move to httpReplyParseStep()
+-    if (hdr_len &gt; Config.maxReplyHeaderSize || (hdr_len &lt;= 0 &amp;&amp; (size_t)buf-&gt;contentSize() &gt; Config.maxReplyHeaderSize)) {
++    if (hdr_len &gt; Config.maxReplyHeaderSize || (hdr_len &lt;= 0 &amp;&amp; sz &gt; Config.maxReplyHeaderSize)) {
+         debugs(58, DBG_IMPORTANT, &quot;HttpMsg::parse: Too large reply header (&quot; &lt;&lt; hdr_len &lt;&lt; &quot; &gt; &quot; &lt;&lt; Config.maxReplyHeaderSize);
+         *error = Http::scHeaderTooLarge;
+         return false;
+     }
+ 
+     if (hdr_len &lt;= 0) {
+-        debugs(58, 3, &quot;HttpMsg::parse: failed to find end of headers (eof: &quot; &lt;&lt; eof &lt;&lt; &quot;) in '&quot; &lt;&lt; buf-&gt;content() &lt;&lt; &quot;'&quot;);
++        debugs(58, 3, &quot;HttpMsg::parse: failed to find end of headers (eof: &quot; &lt;&lt; eof &lt;&lt; &quot;) in '&quot; &lt;&lt; buf &lt;&lt; &quot;'&quot;);
+ 
+         if (eof) // iff we have seen the end, this is an error
+             *error = Http::scInvalidHeader;
+ 
+         return false;
+     }
+ 
+-    const int res = httpMsgParseStep(buf-&gt;content(), buf-&gt;contentSize(), eof);
++    const int res = httpMsgParseStep(buf, sz, eof);
+ 
+     if (res &lt; 0) { // error
+-        debugs(58, 3, &quot;HttpMsg::parse: cannot parse isolated headers in '&quot; &lt;&lt; buf-&gt;content() &lt;&lt; &quot;'&quot;);
++        debugs(58, 3, &quot;HttpMsg::parse: cannot parse isolated headers in '&quot; &lt;&lt; buf &lt;&lt; &quot;'&quot;);
+         *error = Http::scInvalidHeader;
+         return false;
+     }
+ 
+     if (res == 0) {
+-        debugs(58, 2, &quot;HttpMsg::parse: strange, need more data near '&quot; &lt;&lt; buf-&gt;content() &lt;&lt; &quot;'&quot;);
++        debugs(58, 2, &quot;HttpMsg::parse: strange, need more data near '&quot; &lt;&lt; buf &lt;&lt; &quot;'&quot;);
+         *error = Http::scInvalidHeader;
+         return false; // but this should not happen due to headersEnd() above
+     }
+ 
+     assert(res &gt; 0);
+-    debugs(58, 9, &quot;HttpMsg::parse success (&quot; &lt;&lt; hdr_len &lt;&lt; &quot; bytes) near '&quot; &lt;&lt; buf-&gt;content() &lt;&lt; &quot;'&quot;);
++    debugs(58, 9, &quot;HttpMsg::parse success (&quot; &lt;&lt; hdr_len &lt;&lt; &quot; bytes) near '&quot; &lt;&lt; buf &lt;&lt; &quot;'&quot;);
+ 
+     if (hdr_sz != (int)hdr_len) {
+         debugs(58, DBG_IMPORTANT, &quot;internal HttpMsg::parse vs. headersEnd error: &quot; &lt;&lt;
+                hdr_sz &lt;&lt; &quot; != &quot; &lt;&lt; hdr_len);
+         hdr_sz = (int)hdr_len; // because old http.cc code used hdr_len
+     }
+ 
+     return true;
+ }
+ 
+ /*
+  * parseCharBuf() takes character buffer of HTTP headers (buf),
+  * which may not be NULL-terminated, and fills in an HttpMsg
+  * structure.  The parameter 'end' specifies the offset to
+  * the end of the reply headers.  The caller may know where the
+  * end is, but is unable to NULL-terminate the buffer.  This function
+  * returns true on success.
+  */
+ bool
+ HttpMsg::parseCharBuf(const char *buf, ssize_t end)
+
+=== modified file 'src/HttpMsg.h'
+--- src/HttpMsg.h	2015-01-13 07:25:36 +0000
++++ src/HttpMsg.h	2015-01-25 09:56:54 +0000
+@@ -50,56 +50,56 @@
+     AnyP::ProtocolVersion http_ver;
+ 
+     HttpHeader header;
+ 
+     HttpHdrCc *cache_control;
+ 
+     /* Unsupported, writable, may disappear/change in the future
+      * For replies, sums _stored_ status-line, headers, and &lt;CRLF&gt;.
+      * Also used to report parsed header size if parse() is successful */
+     int hdr_sz;
+ 
+     int64_t content_length;
+ 
+     HttpMsgParseState pstate;   /* the current parsing state */
+ 
+     BodyPipe::Pointer body_pipe; // optional pipeline to receive message body
+ 
+     // returns true and sets hdr_sz on success
+     // returns false and sets *error to zero when needs more data
+     // returns false and sets *error to a positive Http::StatusCode on error
+-    bool parse(MemBuf *buf, bool eol, Http::StatusCode *error);
++    bool parse(const char *buf, const size_t sz, bool eol, Http::StatusCode *error);
+ 
+     bool parseCharBuf(const char *buf, ssize_t end);
+ 
+     int httpMsgParseStep(const char *buf, int len, int atEnd);
+ 
+     virtual int httpMsgParseError();
+ 
+     virtual bool expectingBody(const HttpRequestMethod&amp;, int64_t&amp;) const = 0;
+ 
+     void firstLineBuf(MemBuf&amp;);
+ 
+     virtual bool inheritProperties(const HttpMsg *aMsg) = 0;
+ 
+ protected:
+     /**
+      * Validate the message start line is syntactically correct.
+      * Set HTTP error status according to problems found.
+      *
+      * \retval true   Status line has no serious problems.
+      * \retval false  Status line has a serious problem. Correct response is indicated by error.
+      */
+-    virtual bool sanityCheckStartLine(MemBuf *buf, const size_t hdr_len, Http::StatusCode *error) = 0;
++    virtual bool sanityCheckStartLine(const char *buf, const size_t hdr_len, Http::StatusCode *error) = 0;
+ 
+     virtual void packFirstLineInto(Packer * p, bool full_uri) const = 0;
+ 
+     virtual bool parseFirstLine(const char *blk_start, const char *blk_end) = 0;
+ 
+     virtual void hdrCacheInit();
+ };
+ 
+ #define HTTPMSGUNLOCK(a) if (a) { if ((a)-&gt;unlock() == 0) delete (a); (a)=NULL; }
+ #define HTTPMSGLOCK(a) (a)-&gt;lock()
+ 
+ #endif /* SQUID_HTTPMSG_H */
+ 
+
+=== modified file 'src/HttpReply.cc'
+--- src/HttpReply.cc	2015-01-13 07:25:36 +0000
++++ src/HttpReply.cc	2015-01-25 10:40:11 +0000
+@@ -394,87 +394,87 @@
+         return 0;
+     else if (sline.status() == Http::scOkay)
+         (void) 0;       /* common case, continue */
+     else if (sline.status() == Http::scNoContent)
+         return 0;
+     else if (sline.status() == Http::scNotModified)
+         return 0;
+     else if (sline.status() &lt; Http::scOkay)
+         return 0;
+ 
+     return content_length;
+ }
+ 
+ /**
+  * Checks the first line of an HTTP Reply is valid.
+  * currently only checks &quot;HTTP/&quot; exists.
+  *
+  * NP: not all error cases are detected yet. Some are left for detection later in parse.
+  */
+ bool
+-HttpReply::sanityCheckStartLine(MemBuf *buf, const size_t hdr_len, Http::StatusCode *error)
++HttpReply::sanityCheckStartLine(const char *buf, const size_t hdr_len, Http::StatusCode *error)
+ {
+     // hack warning: using psize instead of size here due to type mismatches with MemBuf.
+ 
+     // content is long enough to possibly hold a reply
+     // 4 being magic size of a 3-digit number plus space delimiter
+-    if ( buf-&gt;contentSize() &lt; (protoPrefix.psize() + 4) ) {
++    if (hdr_len &lt; (size_t)(protoPrefix.psize() + 4)) {
+         if (hdr_len &gt; 0) {
+-            debugs(58, 3, HERE &lt;&lt; &quot;Too small reply header (&quot; &lt;&lt; hdr_len &lt;&lt; &quot; bytes)&quot;);
++            debugs(58, 3, &quot;Too small reply header (&quot; &lt;&lt; hdr_len &lt;&lt; &quot; bytes)&quot;);
+             *error = Http::scInvalidHeader;
+         }
+         return false;
+     }
+ 
+     int pos;
+     // catch missing or mismatched protocol identifier
+     // allow special-case for ICY protocol (non-HTTP identifier) in response to faked HTTP request.
+-    if (strncmp(buf-&gt;content(), &quot;ICY&quot;, 3) == 0) {
++    if (strncmp(buf, &quot;ICY&quot;, 3) == 0) {
+         protoPrefix = &quot;ICY&quot;;
+         pos = protoPrefix.psize();
+     } else {
+ 
+-        if (protoPrefix.cmp(buf-&gt;content(), protoPrefix.size()) != 0) {
+-            debugs(58, 3, &quot;HttpReply::sanityCheckStartLine: missing protocol prefix (&quot; &lt;&lt; protoPrefix &lt;&lt; &quot;) in '&quot; &lt;&lt; buf-&gt;content() &lt;&lt; &quot;'&quot;);
++        if (protoPrefix.cmp(buf, protoPrefix.size()) != 0) {
++            debugs(58, 3, &quot;missing protocol prefix (&quot; &lt;&lt; protoPrefix &lt;&lt; &quot;) in '&quot; &lt;&lt; buf &lt;&lt; &quot;'&quot;);
+             *error = Http::scInvalidHeader;
+             return false;
+         }
+ 
+         // catch missing or negative status value (negative '-' is not a digit)
+         pos = protoPrefix.psize();
+ 
+         // skip arbitrary number of digits and a dot in the verion portion
+-        while ( pos &lt;= buf-&gt;contentSize() &amp;&amp; (*(buf-&gt;content()+pos) == '.' || xisdigit(*(buf-&gt;content()+pos)) ) ) ++pos;
++        while ((size_t)pos &lt;= hdr_len &amp;&amp; (*(buf+pos) == '.' || xisdigit(*(buf+pos)) ) ) ++pos;
+ 
+         // catch missing version info
+         if (pos == protoPrefix.psize()) {
+-            debugs(58, 3, &quot;HttpReply::sanityCheckStartLine: missing protocol version numbers (ie. &quot; &lt;&lt; protoPrefix &lt;&lt; &quot;/1.0) in '&quot; &lt;&lt; buf-&gt;content() &lt;&lt; &quot;'&quot;);
++            debugs(58, 3, &quot;missing protocol version numbers (ie. &quot; &lt;&lt; protoPrefix &lt;&lt; &quot;/1.0) in '&quot; &lt;&lt; buf &lt;&lt; &quot;'&quot;);
+             *error = Http::scInvalidHeader;
+             return false;
+         }
+     }
+ 
+     // skip arbitrary number of spaces...
+-    while (pos &lt;= buf-&gt;contentSize() &amp;&amp; (char)*(buf-&gt;content()+pos) == ' ') ++pos;
++    while ((size_t)pos &lt;= hdr_len &amp;&amp; (char)*(buf+pos) == ' ') ++pos;
+ 
+-    if (pos &lt; buf-&gt;contentSize() &amp;&amp; !xisdigit(*(buf-&gt;content()+pos))) {
+-        debugs(58, 3, &quot;HttpReply::sanityCheckStartLine: missing or invalid status number in '&quot; &lt;&lt; buf-&gt;content() &lt;&lt; &quot;'&quot;);
++    if ((size_t)pos &lt; hdr_len &amp;&amp; !xisdigit(*(buf+pos))) {
++        debugs(58, 3, &quot;missing or invalid status number in '&quot; &lt;&lt; buf &lt;&lt; &quot;'&quot;);
+         *error = Http::scInvalidHeader;
+         return false;
+     }
+ 
+     return true;
+ }
+ 
+ bool
+ HttpReply::parseFirstLine(const char *blk_start, const char *blk_end)
+ {
+     return sline.parse(protoPrefix, blk_start, blk_end);
+ }
+ 
+ /* handy: resets and returns -1 */
+ int
+ HttpReply::httpMsgParseError()
+ {
+     int result(HttpMsg::httpMsgParseError());
+     /* indicate an error in the status line */
+     sline.set(Http::ProtocolVersion(), Http::scInvalidHeader);
+
+=== modified file 'src/HttpReply.h'
+--- src/HttpReply.h	2015-01-13 07:25:36 +0000
++++ src/HttpReply.h	2015-01-25 15:04:40 +0000
+@@ -22,41 +22,41 @@
+ 
+ class HttpHdrSc;
+ 
+ class HttpReply: public HttpMsg
+ {
+     MEMPROXY_CLASS(HttpReply);
+ 
+ public:
+     typedef RefCount&lt;HttpReply&gt; Pointer;
+ 
+     HttpReply();
+     ~HttpReply();
+ 
+     virtual void reset();
+ 
+     /**
+      \retval true on success
+      \retval false and sets *error to zero when needs more data
+      \retval false and sets *error to a positive Http::StatusCode on error
+      */
+-    virtual bool sanityCheckStartLine(MemBuf *buf, const size_t hdr_len, Http::StatusCode *error);
++    virtual bool sanityCheckStartLine(const char *buf, const size_t hdr_len, Http::StatusCode *error);
+ 
+     /** \par public, readable; never update these or their .hdr equivalents directly */
+     time_t date;
+ 
+     time_t last_modified;
+ 
+     time_t expires;
+ 
+     String content_type;
+ 
+     HttpHdrSc *surrogate_control;
+ 
+     HttpHdrContRange *content_range;
+ 
+     short int keep_alive;
+ 
+     /** \par public, writable, but use httpReply* interfaces when possible */
+     Http::StatusLine sline;
+ 
+     HttpBody body;      /**&lt; for small constant memory-resident text bodies only */
+
+=== modified file 'src/HttpRequest.cc'
+--- src/HttpRequest.cc	2015-01-29 16:09:11 +0000
++++ src/HttpRequest.cc	2015-02-09 14:04:37 +0000
+@@ -252,56 +252,56 @@
+ #endif
+ 
+     myportname = aReq-&gt;myportname;
+ 
+     forcedBodyContinuation = aReq-&gt;forcedBodyContinuation;
+ 
+     // main property is which connection the request was received on (if any)
+     clientConnectionManager = aReq-&gt;clientConnectionManager;
+ 
+     notes = aReq-&gt;notes;
+     return true;
+ }
+ 
+ /**
+  * Checks the first line of an HTTP request is valid
+  * currently just checks the request method is present.
+  *
+  * NP: Other errors are left for detection later in the parse.
+  */
+ bool
+-HttpRequest::sanityCheckStartLine(MemBuf *buf, const size_t hdr_len, Http::StatusCode *error)
++HttpRequest::sanityCheckStartLine(const char *buf, const size_t hdr_len, Http::StatusCode *error)
+ {
+     // content is long enough to possibly hold a reply
+     // 2 being magic size of a 1-byte request method plus space delimiter
+-    if ( buf-&gt;contentSize() &lt; 2 ) {
++    if (hdr_len &lt; 2) {
+         // this is ony a real error if the headers apparently complete.
+         if (hdr_len &gt; 0) {
+             debugs(58, 3, HERE &lt;&lt; &quot;Too large request header (&quot; &lt;&lt; hdr_len &lt;&lt; &quot; bytes)&quot;);
+             *error = Http::scInvalidHeader;
+         }
+         return false;
+     }
+ 
+     /* See if the request buffer starts with a non-whitespace HTTP request 'method'. */
+     HttpRequestMethod m;
+-    m.HttpRequestMethodXXX(buf-&gt;content());
++    m.HttpRequestMethodXXX(buf);
+     if (m == Http::METHOD_NONE) {
+         debugs(73, 3, &quot;HttpRequest::sanityCheckStartLine: did not find HTTP request method&quot;);
+         *error = Http::scInvalidHeader;
+         return false;
+     }
+ 
+     return true;
+ }
+ 
+ bool
+ HttpRequest::parseFirstLine(const char *start, const char *end)
+ {
+     method.HttpRequestMethodXXX(start);
+ 
+     if (method == Http::METHOD_NONE)
+         return false;
+ 
+     // XXX: performance regression, strcspn() over the method bytes a second time.
+     // cheaper than allocate+copy+deallocate cycle to SBuf convert a piece of start.
+     const char *t = start + strcspn(start, w_space);
+
+=== modified file 'src/HttpRequest.h'
+--- src/HttpRequest.h	2015-01-29 16:09:11 +0000
++++ src/HttpRequest.h	2015-02-09 14:04:37 +0000
+@@ -240,29 +240,29 @@
+ 
+     /**
+      * The client connection manager, if known;
+      * Used for any response actions needed directly to the client.
+      * ie 1xx forwarding or connection pinning state changes
+      */
+     CbcPointer&lt;ConnStateData&gt; clientConnectionManager;
+ 
+     /// forgets about the cached Range header (for a reason)
+     void ignoreRange(const char *reason);
+     int64_t getRangeOffsetLimit(); /* the result of this function gets cached in rangeOffsetLimit */
+ 
+ private:
+     const char *packableURI(bool full_uri) const;
+ 
+     mutable int64_t rangeOffsetLimit;  /* caches the result of getRangeOffsetLimit */
+ 
+ protected:
+     virtual void packFirstLineInto(Packer * p, bool full_uri) const;
+ 
+-    virtual bool sanityCheckStartLine(MemBuf *buf, const size_t hdr_len, Http::StatusCode *error);
++    virtual bool sanityCheckStartLine(const char *buf, const size_t hdr_len, Http::StatusCode *error);
+ 
+     virtual void hdrCacheInit();
+ 
+     virtual bool inheritProperties(const HttpMsg *aMsg);
+ };
+ 
+ #endif /* SQUID_HTTPREQUEST_H */
+ 
+
+=== modified file 'src/adaptation/icap/ModXact.cc'
+--- src/adaptation/icap/ModXact.cc	2015-01-13 07:25:36 +0000
++++ src/adaptation/icap/ModXact.cc	2015-01-24 14:50:13 +0000
+@@ -540,44 +540,44 @@
+     Must(!adapted.body_pipe);
+ 
+     // we use the same buffer for headers and body and then consume headers
+     readMore();
+ }
+ 
+ void Adaptation::Icap::ModXact::readMore()
+ {
+     if (reader != NULL || doneReading()) {
+         debugs(93,3,HERE &lt;&lt; &quot;returning from readMore because reader or doneReading()&quot;);
+         return;
+     }
+ 
+     // do not fill readBuf if we have no space to store the result
+     if (adapted.body_pipe != NULL &amp;&amp;
+             !adapted.body_pipe-&gt;buf().hasPotentialSpace()) {
+         debugs(93,3,HERE &lt;&lt; &quot;not reading because ICAP reply pipe is full&quot;);
+         return;
+     }
+ 
+-    if (readBuf.hasSpace())
++    if (readBuf.spaceSize())
+         scheduleRead();
+     else
+-        debugs(93,3,HERE &lt;&lt; &quot;nothing to do because !readBuf.hasSpace()&quot;);
++        debugs(93,3,HERE &lt;&lt; &quot;nothing to do because !readBuf.spaceSize()&quot;);
+ }
+ 
+ // comm module read a portion of the ICAP response for us
+ void Adaptation::Icap::ModXact::handleCommRead(size_t)
+ {
+     Must(!state.doneParsing());
+     icap_tio_finish = current_time;
+     parseMore();
+     readMore();
+ }
+ 
+ void Adaptation::Icap::ModXact::echoMore()
+ {
+     Must(state.sending == State::sendingVirgin);
+     Must(adapted.body_pipe != NULL);
+     Must(virginBodySending.active());
+ 
+     const size_t sizeMax = virginContentSize(virginBodySending);
+     debugs(93,5, HERE &lt;&lt; &quot;will echo up to &quot; &lt;&lt; sizeMax &lt;&lt; &quot; bytes from &quot; &lt;&lt;
+            virgin.body_pipe-&gt;status());
+@@ -632,43 +632,42 @@
+         Must(!adapted.body_pipe);
+     }
+ 
+     state.sending = State::sendingDone;
+     checkConsuming();
+ }
+ 
+ // should be called after certain state.writing or state.sending changes
+ void Adaptation::Icap::ModXact::checkConsuming()
+ {
+     // quit if we already stopped or are still using the pipe
+     if (!virgin.body_pipe || !state.doneConsumingVirgin())
+         return;
+ 
+     debugs(93, 7, HERE &lt;&lt; &quot;will stop consuming&quot; &lt;&lt; status());
+     stopConsumingFrom(virgin.body_pipe);
+ }
+ 
+ void Adaptation::Icap::ModXact::parseMore()
+ {
+-    debugs(93, 5, HERE &lt;&lt; &quot;have &quot; &lt;&lt; readBuf.contentSize() &lt;&lt; &quot; bytes to parse&quot; &lt;&lt;
+-           status());
+-    debugs(93, 5, HERE &lt;&lt; &quot;\n&quot; &lt;&lt; readBuf.content());
++    debugs(93, 5, &quot;have &quot; &lt;&lt; readBuf.length() &lt;&lt; &quot; bytes to parse&quot; &lt;&lt; status());
++    debugs(93, 5, &quot;\n&quot; &lt;&lt; readBuf);
+ 
+     if (state.parsingHeaders())
+         parseHeaders();
+ 
+     if (state.parsing == State::psBody)
+         parseBody();
+ }
+ 
+ void Adaptation::Icap::ModXact::callException(const std::exception &amp;e)
+ {
+     if (!canStartBypass || isRetriable) {
+         if (!isRetriable) {
+             if (const TextException *te = dynamic_cast&lt;const TextException *&gt;(&amp;e))
+                 detailError(ERR_DETAIL_EXCEPTION_START + te-&gt;id());
+             else
+                 detailError(ERR_DETAIL_EXCEPTION_OTHER);
+         }
+         Adaptation::Icap::Xaction::callException(e);
+         return;
+     }
+@@ -950,41 +949,42 @@
+ 
+     // allocate the adapted message and copy metainfo
+     Must(!adapted.header);
+     {
+         HttpMsg::Pointer newHead;
+         if (dynamic_cast&lt;const HttpRequest*&gt;(oldHead)) {
+             newHead = new HttpRequest;
+         } else if (dynamic_cast&lt;const HttpReply*&gt;(oldHead)) {
+             newHead = new HttpReply;
+         }
+         Must(newHead != NULL);
+ 
+         newHead-&gt;inheritProperties(oldHead);
+ 
+         adapted.setHeader(newHead.getRaw());
+     }
+ 
+     // parse the buffer back
+     Http::StatusCode error = Http::scNone;
+ 
+-    Must(adapted.header-&gt;parse(&amp;httpBuf, true, &amp;error));
++    httpBuf.terminate(); // HttpMsg::parse requires nil-terminated buffer
++    Must(adapted.header-&gt;parse(httpBuf.content(), httpBuf.contentSize(), true, &amp;error));
+ 
+     if (HttpRequest *r = dynamic_cast&lt;HttpRequest*&gt;(adapted.header))
+         urlCanonical(r); // parse does not set HttpRequest::canonical
+ 
+     Must(adapted.header-&gt;hdr_sz == httpBuf.contentSize()); // no leftovers
+ 
+     httpBuf.clean();
+ 
+     debugs(93, 7, HERE &lt;&lt; &quot;cloned virgin message &quot; &lt;&lt; oldHead &lt;&lt; &quot; to &quot; &lt;&lt;
+            adapted.header);
+ 
+     // setup adapted body pipe if needed
+     if (oldHead-&gt;body_pipe != NULL) {
+         debugs(93, 7, HERE &lt;&lt; &quot;will echo virgin body from &quot; &lt;&lt;
+                oldHead-&gt;body_pipe);
+         if (!virginBodySending.active())
+             virginBodySending.plan(); // will throw if not possible
+         state.sending = State::sendingVirgin;
+         checkConsuming();
+ 
+@@ -1058,91 +1058,100 @@
+             const HttpRequest *oldR = dynamic_cast&lt;const HttpRequest*&gt;(virgin.header);
+             Must(oldR);
+             // TODO: the adapted request did not really originate from the
+             // client; give proxy admin an option to prevent copying of
+             // sensitive client information here. See the following thread:
+             // <A HREF="http://www.squid-cache.org/mail-archive/squid-dev/200703/0040.html">http://www.squid-cache.org/mail-archive/squid-dev/200703/0040.html</A>
+         }
+ 
+         // Maybe adapted.header==NULL if HttpReply and have Http 0.9 ....
+         if (adapted.header)
+             adapted.header-&gt;inheritProperties(virgin.header);
+     }
+ 
+     decideOnParsingBody();
+ }
+ 
+ // parses both HTTP and ICAP headers
+ bool Adaptation::Icap::ModXact::parseHead(HttpMsg *head)
+ {
+     Must(head);
+-    debugs(93, 5, HERE &lt;&lt; &quot;have &quot; &lt;&lt; readBuf.contentSize() &lt;&lt; &quot; head bytes to parse&quot; &lt;&lt;
+-           &quot;; state: &quot; &lt;&lt; state.parsing);
++    debugs(93, 5, &quot;have &quot; &lt;&lt; readBuf.length() &lt;&lt; &quot; head bytes to parse; state: &quot; &lt;&lt; state.parsing);
+ 
+     Http::StatusCode error = Http::scNone;
+-    const bool parsed = head-&gt;parse(&amp;readBuf, commEof, &amp;error);
++    // XXX: performance regression. c_str() data copies
++    // XXX: HttpMsg::parse requires a terminated string buffer
++    const char *tmpBuf = readBuf.c_str();
++    const bool parsed = head-&gt;parse(tmpBuf, readBuf.length(), commEof, &amp;error);
+     Must(parsed || !error); // success or need more data
+ 
+     if (!parsed) { // need more data
+         debugs(93, 5, HERE &lt;&lt; &quot;parse failed, need more data, return false&quot;);
+         head-&gt;reset();
+         return false;
+     }
+ 
+     if (HttpRequest *r = dynamic_cast&lt;HttpRequest*&gt;(head))
+         urlCanonical(r); // parse does not set HttpRequest::canonical
+ 
+     debugs(93, 5, HERE &lt;&lt; &quot;parse success, consume &quot; &lt;&lt; head-&gt;hdr_sz &lt;&lt; &quot; bytes, return true&quot;);
+     readBuf.consume(head-&gt;hdr_sz);
+     return true;
+ }
+ 
+ void Adaptation::Icap::ModXact::decideOnParsingBody()
+ {
+     if (gotEncapsulated(&quot;res-body&quot;) || gotEncapsulated(&quot;req-body&quot;)) {
+         debugs(93, 5, HERE &lt;&lt; &quot;expecting a body&quot;);
+         state.parsing = State::psBody;
+         replyHttpBodySize = 0;
+         bodyParser = new ChunkedCodingParser;
+         makeAdaptedBodyPipe(&quot;adapted response from the ICAP server&quot;);
+         Must(state.sending == State::sendingAdapted);
+     } else {
+         debugs(93, 5, HERE &lt;&lt; &quot;not expecting a body&quot;);
+         stopParsing();
+         stopSending(true);
+     }
+ }
+ 
+ void Adaptation::Icap::ModXact::parseBody()
+ {
+     Must(state.parsing == State::psBody);
+     Must(bodyParser);
+ 
+-    debugs(93, 5, HERE &lt;&lt; &quot;have &quot; &lt;&lt; readBuf.contentSize() &lt;&lt; &quot; body bytes to parse&quot;);
++    debugs(93, 5, &quot;have &quot; &lt;&lt; readBuf.length() &lt;&lt; &quot; body bytes to parse&quot;);
+ 
+     // the parser will throw on errors
+     BodyPipeCheckout bpc(*adapted.body_pipe);
+-    const bool parsed = bodyParser-&gt;parse(&amp;readBuf, &amp;bpc.buf);
++    // XXX: performance regression. SBuf-convert (or Parser-convert?) the chunked decoder.
++    MemBuf encodedData;
++    encodedData.init();
++    // NP: we must do this instead of pointing encodedData at the SBuf::rawContent
++    // because chunked decoder uses MemBuf::consume, which shuffles buffer bytes around.
++    encodedData.append(readBuf.rawContent(), readBuf.length());
++    const bool parsed = bodyParser-&gt;parse(&amp;encodedData, &amp;bpc.buf);
++    // XXX: httpChunkDecoder has consumed from MemBuf.
++    readBuf.consume(readBuf.length() - encodedData.contentSize());
+     bpc.checkIn();
+ 
+-    debugs(93, 5, HERE &lt;&lt; &quot;have &quot; &lt;&lt; readBuf.contentSize() &lt;&lt; &quot; body bytes after &quot; &lt;&lt;
+-           &quot;parse; parsed all: &quot; &lt;&lt; parsed);
++    debugs(93, 5, &quot;have &quot; &lt;&lt; readBuf.length() &lt;&lt; &quot; body bytes after parsed all: &quot; &lt;&lt; parsed);
+     replyHttpBodySize += adapted.body_pipe-&gt;buf().contentSize();
+ 
+     // TODO: expose BodyPipe::putSize() to make this check simpler and clearer
+     // TODO: do we really need this if we disable when sending headers?
+     if (adapted.body_pipe-&gt;buf().contentSize() &gt; 0) { // parsed something sometime
+         disableRepeats(&quot;sent adapted content&quot;);
+         disableBypass(&quot;sent adapted content&quot;, true);
+     }
+ 
+     if (parsed) {
+         if (state.readyForUob &amp;&amp; bodyParser-&gt;useOriginBody &gt;= 0) {
+             prepPartialBodyEchoing(
+                 static_cast&lt;uint64_t&gt;(bodyParser-&gt;useOriginBody));
+             stopParsing();
+             return;
+         }
+ 
+         stopParsing();
+         stopSending(true); // the parser succeeds only if all parsed data fits
+         return;
+
+=== modified file 'src/adaptation/icap/OptXact.cc'
+--- src/adaptation/icap/OptXact.cc	2015-01-13 07:25:36 +0000
++++ src/adaptation/icap/OptXact.cc	2015-01-23 15:15:24 +0000
+@@ -50,75 +50,75 @@
+     scheduleWrite(requestBuf);
+ }
+ 
+ void Adaptation::Icap::OptXact::makeRequest(MemBuf &amp;buf)
+ {
+     const Adaptation::Service &amp;s = service();
+     const String uri = s.cfg().uri;
+     buf.Printf(&quot;OPTIONS &quot; SQUIDSTRINGPH &quot; ICAP/1.0\r\n&quot;, SQUIDSTRINGPRINT(uri));
+     const String host = s.cfg().host;
+     buf.Printf(&quot;Host: &quot; SQUIDSTRINGPH &quot;:%d\r\n&quot;, SQUIDSTRINGPRINT(host), s.cfg().port);
+ 
+     if (!TheConfig.reuse_connections)
+         buf.Printf(&quot;Connection: close\r\n&quot;);
+ 
+     if (TheConfig.allow206_enable)
+         buf.Printf(&quot;Allow: 206\r\n&quot;);
+     buf.append(ICAP::crlf, 2);
+ 
+     // XXX: HttpRequest cannot fully parse ICAP Request-Line
+     Http::StatusCode reqStatus;
+-    Must(icapRequest-&gt;parse(&amp;buf, true, &amp;reqStatus) &gt; 0);
++    buf.terminate(); // HttpMsg::parse requires terminated buffer
++    Must(icapRequest-&gt;parse(buf.content(), buf.contentSize(), true, &amp;reqStatus) &gt; 0);
+ }
+ 
+ void Adaptation::Icap::OptXact::handleCommWrote(size_t size)
+ {
+     debugs(93, 9, HERE &lt;&lt; &quot;finished writing &quot; &lt;&lt; size &lt;&lt;
+            &quot;-byte request &quot; &lt;&lt; status());
+ }
+ 
+ // comm module read a portion of the ICAP response for us
+ void Adaptation::Icap::OptXact::handleCommRead(size_t)
+ {
+     if (parseResponse()) {
+         Must(icapReply != NULL);
+         // We read everything if there is no response body. If there is a body,
+         // we cannot parse it because we do not support any opt-body-types, so
+         // we leave readAll false which forces connection closure.
+         readAll = !icapReply-&gt;header.getByNameListMember(&quot;Encapsulated&quot;,
+                   &quot;opt-body&quot;, ',').size();
+         debugs(93, 7, HERE &lt;&lt; &quot;readAll=&quot; &lt;&lt; readAll);
+         icap_tio_finish = current_time;
+         setOutcome(xoOpt);
+         sendAnswer(Answer::Forward(icapReply.getRaw()));
+         Must(done()); // there should be nothing else to do
+         return;
+     }
+ 
+     scheduleRead();
+ }
+ 
+ bool Adaptation::Icap::OptXact::parseResponse()
+ {
+-    debugs(93, 5, HERE &lt;&lt; &quot;have &quot; &lt;&lt; readBuf.contentSize() &lt;&lt; &quot; bytes to parse&quot; &lt;&lt;
+-           status());
+-    debugs(93, 5, HERE &lt;&lt; &quot;\n&quot; &lt;&lt; readBuf.content());
++    debugs(93, 5, &quot;have &quot; &lt;&lt; readBuf.length() &lt;&lt; &quot; bytes to parse&quot; &lt;&lt; status());
++    debugs(93, DBG_DATA, &quot;\n&quot; &lt;&lt; readBuf);
+ 
+     HttpReply::Pointer r(new HttpReply);
+     r-&gt;protoPrefix = &quot;ICAP/&quot;; // TODO: make an IcapReply class?
+ 
+     if (!parseHttpMsg(r.getRaw())) // throws on errors
+         return false;
+ 
+     if (httpHeaderHasConnDir(&amp;r-&gt;header, &quot;close&quot;))
+         reuseConnection = false;
+ 
+     icapReply = r;
+     return true;
+ }
+ 
+ void Adaptation::Icap::OptXact::swanSong()
+ {
+     Adaptation::Icap::Xaction::swanSong();
+ }
+ 
+ void Adaptation::Icap::OptXact::finalizeLogInfo()
+
+=== modified file 'src/adaptation/icap/Xaction.cc'
+--- src/adaptation/icap/Xaction.cc	2015-01-29 16:09:11 +0000
++++ src/adaptation/icap/Xaction.cc	2015-02-09 14:04:37 +0000
+@@ -22,42 +22,40 @@
+ #include &quot;err_detail_type.h&quot;
+ #include &quot;fde.h&quot;
+ #include &quot;FwdState.h&quot;
+ #include &quot;HttpMsg.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;icap_log.h&quot;
+ #include &quot;ipcache.h&quot;
+ #include &quot;pconn.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ #include &quot;SquidTime.h&quot;
+ 
+ Adaptation::Icap::Xaction::Xaction(const char *aTypeName, Adaptation::Icap::ServiceRep::Pointer &amp;aService):
+     AsyncJob(aTypeName),
+     Adaptation::Initiate(aTypeName),
+     icapRequest(NULL),
+     icapReply(NULL),
+     attempts(0),
+     connection(NULL),
+     theService(aService),
+-    commBuf(NULL),
+-    commBufSize(0),
+     commEof(false),
+     reuseConnection(true),
+     isRetriable(true),
+     isRepeatable(true),
+     ignoreLastWrite(false),
+     stopReason(NULL),
+     connector(NULL),
+     reader(NULL),
+     writer(NULL),
+     closer(NULL),
+     alep(new AccessLogEntry),
+     al(*alep),
+     cs(NULL)
+ {
+     debugs(93,3, typeName &lt;&lt; &quot; constructed, this=&quot; &lt;&lt; this &lt;&lt;
+            &quot; [icapx&quot; &lt;&lt; id &lt;&lt; ']'); // we should not call virtual status() here
+     icapRequest = new HttpRequest;
+     HTTPMSGLOCK(icapRequest);
+     icap_tr_start = current_time;
+     memset(&amp;icap_tio_start, 0, sizeof(icap_tio_start));
+@@ -78,45 +76,40 @@
+     return *theService;
+ }
+ 
+ void Adaptation::Icap::Xaction::disableRetries()
+ {
+     debugs(93,5, typeName &lt;&lt; (isRetriable ? &quot; from now on&quot; : &quot; still&quot;) &lt;&lt;
+            &quot; cannot be retried &quot; &lt;&lt; status());
+     isRetriable = false;
+ }
+ 
+ void Adaptation::Icap::Xaction::disableRepeats(const char *reason)
+ {
+     debugs(93,5, typeName &lt;&lt; (isRepeatable ? &quot; from now on&quot; : &quot; still&quot;) &lt;&lt;
+            &quot; cannot be repeated because &quot; &lt;&lt; reason &lt;&lt; status());
+     isRepeatable = false;
+ }
+ 
+ void Adaptation::Icap::Xaction::start()
+ {
+     Adaptation::Initiate::start();
+-
+-    readBuf.init(SQUID_TCP_SO_RCVBUF, SQUID_TCP_SO_RCVBUF);
+-    commBuf = (char*)memAllocBuf(SQUID_TCP_SO_RCVBUF, &amp;commBufSize);
+-    // make sure maximum readBuf space does not exceed commBuf size
+-    Must(static_cast&lt;size_t&gt;(readBuf.potentialSpaceSize()) &lt;= commBufSize);
+ }
+ 
+ static void
+ icapLookupDnsResults(const ipcache_addrs *ia, const Dns::LookupDetails &amp;, void *data)
+ {
+     Adaptation::Icap::Xaction *xa = static_cast&lt;Adaptation::Icap::Xaction *&gt;(data);
+     xa-&gt;dnsLookupDone(ia);
+ }
+ 
+ // TODO: obey service-specific, OPTIONS-reported connection limit
+ void
+ Adaptation::Icap::Xaction::openConnection()
+ {
+     Must(!haveConnection());
+ 
+     Adaptation::Icap::ServiceRep &amp;s = service();
+ 
+     if (!TheConfig.reuse_connections)
+         disableRetries(); // this will also safely drain pconn pool
+ 
+@@ -366,123 +359,138 @@
+     Must(haveConnection());
+ 
+     if (reader != NULL || writer != NULL) {
+         // restart the timeout before each I/O
+         // XXX: why does Config.Timeout lacks a write timeout?
+         // TODO: service bypass status may differ from that of a transaction
+         typedef CommCbMemFunT&lt;Adaptation::Icap::Xaction, CommTimeoutCbParams&gt; TimeoutDialer;
+         AsyncCall::Pointer call = JobCallback(93, 5, TimeoutDialer, this, Adaptation::Icap::Xaction::noteCommTimedout);
+         commSetConnTimeout(connection, TheConfig.io_timeout(service().cfg().bypass), call);
+     } else {
+         // clear timeout when there is no I/O
+         // Do we need a lifetime timeout?
+         commUnsetConnTimeout(connection);
+     }
+ }
+ 
+ void Adaptation::Icap::Xaction::scheduleRead()
+ {
+     Must(haveConnection());
+     Must(!reader);
+-    Must(readBuf.hasSpace());
+ 
+-    /*
+-     * See comments in Adaptation::Icap::Xaction.h about why we use commBuf
+-     * here instead of reading directly into readBuf.buf.
+-     */
+-    typedef CommCbMemFunT&lt;Adaptation::Icap::Xaction, CommIoCbParams&gt; Dialer;
+-    reader = JobCallback(93, 3,
+-                         Dialer, this, Adaptation::Icap::Xaction::noteCommRead);
++    // TODO: tune this better to expected message sizes
++    readBuf.reserveCapacity(SQUID_TCP_SO_RCVBUF);
++    Must(readBuf.spaceSize());
+ 
+-    comm_read(connection, commBuf, readBuf.spaceSize(), reader);
++    typedef CommCbMemFunT&lt;Adaptation::Icap::Xaction, CommIoCbParams&gt; Dialer;
++    reader = JobCallback(93, 3, Dialer, this, Adaptation::Icap::Xaction::noteCommRead);
++    Comm::Read(connection, reader);
+     updateTimeout();
+ }
+ 
+ // comm module read a portion of the ICAP response for us
+ void Adaptation::Icap::Xaction::noteCommRead(const CommIoCbParams &amp;io)
+ {
+     Must(reader != NULL);
+     reader = NULL;
+ 
+     Must(io.flag == Comm::OK);
+ 
+-    if (!io.size) {
++    CommIoCbParams rd(this); // will be expanded with ReadNow results
++    rd.conn = io.conn;
++    rd.size = readBuf.spaceSize();
++
++    switch (Comm::ReadNow(rd, readBuf)) { // XXX: SBuf convert readBuf
++    case Comm::INPROGRESS:
++        if (readBuf.isEmpty())
++            debugs(33, 2, io.conn &lt;&lt; &quot;: no data to process, &quot; &lt;&lt; xstrerr(rd.xerrno));
++        scheduleRead();
++        return;
++
++    case Comm::OK:
++        al.icap.bytesRead += rd.size;
++
++        updateTimeout();
++
++        debugs(93, 3, &quot;read &quot; &lt;&lt; rd.size &lt;&lt; &quot; bytes&quot;);
++
++        disableRetries(); // because pconn did not fail
++
++        /* Continue to process previously read data */
++        break;
++
++    case Comm::ENDFILE: // close detected by 0-byte read
+         commEof = true;
+         reuseConnection = false;
+ 
+         // detect a pconn race condition: eof on the first pconn read
+         if (!al.icap.bytesRead &amp;&amp; retriable()) {
+             setOutcome(xoRace);
+             mustStop(&quot;pconn race&quot;);
+             return;
+         }
+-    } else {
+-
+-        al.icap.bytesRead+=io.size;
+-
+-        updateTimeout();
+-
+-        debugs(93, 3, HERE &lt;&lt; &quot;read &quot; &lt;&lt; io.size &lt;&lt; &quot; bytes&quot;);
+ 
+-        /*
+-         * See comments in Adaptation::Icap::Xaction.h about why we use commBuf
+-         * here instead of reading directly into readBuf.buf.
+-         */
++        break;
+ 
+-        readBuf.append(commBuf, io.size);
+-        disableRetries(); // because pconn did not fail
++        // case Comm::COMM_ERROR:
++    default: // no other flags should ever occur
++        debugs(11, 2, io.conn &lt;&lt; &quot;: read failure: &quot; &lt;&lt; xstrerr(rd.xerrno));
++        mustStop(&quot;unknown ICAP I/O read error&quot;);
++        return;
+     }
+ 
+     handleCommRead(io.size);
+ }
+ 
+ void Adaptation::Icap::Xaction::cancelRead()
+ {
+     if (reader != NULL) {
+         Must(haveConnection());
+         Comm::ReadCancel(connection-&gt;fd, reader);
+         reader = NULL;
+     }
+ }
+ 
+ bool Adaptation::Icap::Xaction::parseHttpMsg(HttpMsg *msg)
+ {
+-    debugs(93, 5, HERE &lt;&lt; &quot;have &quot; &lt;&lt; readBuf.contentSize() &lt;&lt; &quot; head bytes to parse&quot;);
++    debugs(93, 5, &quot;have &quot; &lt;&lt; readBuf.length() &lt;&lt; &quot; head bytes to parse&quot;);
+ 
+     Http::StatusCode error = Http::scNone;
+-    const bool parsed = msg-&gt;parse(&amp;readBuf, commEof, &amp;error);
++    // XXX: performance regression c_str() data copies
++    const char *buf = readBuf.c_str();
++    const bool parsed = msg-&gt;parse(buf, readBuf.length(), commEof, &amp;error);
+     Must(parsed || !error); // success or need more data
+ 
+     if (!parsed) {  // need more data
+         Must(mayReadMore());
+         msg-&gt;reset();
+         return false;
+     }
+ 
+     readBuf.consume(msg-&gt;hdr_sz);
+     return true;
+ }
+ 
+ bool Adaptation::Icap::Xaction::mayReadMore() const
+ {
+     return !doneReading() &amp;&amp; // will read more data
+-           readBuf.hasSpace();  // have space for more data
++           readBuf.spaceSize();  // have space for more data
+ }
+ 
+ bool Adaptation::Icap::Xaction::doneReading() const
+ {
+     return commEof;
+ }
+ 
+ bool Adaptation::Icap::Xaction::doneWriting() const
+ {
+     return !writer;
+ }
+ 
+ bool Adaptation::Icap::Xaction::doneWithIo() const
+ {
+     return haveConnection() &amp;&amp;
+            !connector &amp;&amp; !reader &amp;&amp; !writer &amp;&amp; // fast checks, some redundant
+            doneReading() &amp;&amp; doneWriting();
+ }
+ 
+ bool Adaptation::Icap::Xaction::haveConnection() const
+@@ -513,45 +521,41 @@
+         debugs(93, 4, HERE &lt;&lt; xo);
+     }
+     al.icap.outcome = xo;
+ }
+ 
+ // This 'last chance' method is called before a 'done' transaction is deleted.
+ // It is wrong to call virtual methods from a destructor. Besides, this call
+ // indicates that the transaction will terminate as planned.
+ void Adaptation::Icap::Xaction::swanSong()
+ {
+     // kids should sing first and then call the parent method.
+     if (cs) {
+         debugs(93,6, HERE &lt;&lt; id &lt;&lt; &quot; about to notify ConnOpener!&quot;);
+         CallJobHere(93, 3, cs, Comm::ConnOpener, noteAbort);
+         cs = NULL;
+         service().noteConnectionFailed(&quot;abort&quot;);
+     }
+ 
+     closeConnection(); // TODO: rename because we do not always close
+ 
+-    if (!readBuf.isNull())
+-        readBuf.clean();
+-
+-    if (commBuf)
+-        memFreeBuf(commBufSize, commBuf);
++    readBuf.clear();
+ 
+     tellQueryAborted();
+ 
+     maybeLog();
+ 
+     Adaptation::Initiate::swanSong();
+ }
+ 
+ void Adaptation::Icap::Xaction::tellQueryAborted()
+ {
+     if (theInitiator.set()) {
+         Adaptation::Icap::XactAbortInfo abortInfo(icapRequest, icapReply.getRaw(),
+                 retriable(), repeatable());
+         Launcher *launcher = dynamic_cast&lt;Launcher*&gt;(theInitiator.get());
+         // launcher may be nil if initiator is invalid
+         CallJobHere1(91,5, CbcPointer&lt;Launcher&gt;(launcher),
+                      Launcher, noteXactAbort, abortInfo);
+         clearInitiator();
+     }
+ }
+
+=== modified file 'src/adaptation/icap/Xaction.h'
+--- src/adaptation/icap/Xaction.h	2015-01-13 07:25:36 +0000
++++ src/adaptation/icap/Xaction.h	2015-02-28 03:52:10 +0000
+@@ -1,39 +1,41 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ICAPXACTION_H
+ #define SQUID_ICAPXACTION_H
+ 
+ #include &quot;AccessLogEntry.h&quot;
+ #include &quot;adaptation/icap/ServiceRep.h&quot;
+ #include &quot;adaptation/Initiate.h&quot;
+ #include &quot;comm/forward.h&quot;
+ #include &quot;CommCalls.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;ipcache.h&quot;
+-#include &quot;MemBuf.h&quot;
++#include &quot;SBuf.h&quot;
++
++class MemBuf;
+ 
+ namespace Adaptation
+ {
+ namespace Icap
+ {
+ 
+ /*
+  * The ICAP Xaction implements common tasks for ICAP OPTIONS, REQMOD, and
+  * RESPMOD transactions. It is started by an Initiator. It terminates
+  * on its own, when done. Transactions communicate with Initiator using
+  * asynchronous messages because a transaction or Initiator may be gone at
+  * any time.
+  */
+ 
+ // Note: Xaction must be the first parent for object-unaware cbdata to work
+ 
+ class Xaction: public Adaptation::Initiate
+ {
+ 
+ public:
+@@ -110,54 +112,41 @@
+     /// clear stored error details, if any; used for retries/repeats
+     virtual void clearError() {}
+     void dnsLookupDone(const ipcache_addrs *ia);
+ 
+ protected:
+     // logging
+     void setOutcome(const XactOutcome &amp;xo);
+     virtual void finalizeLogInfo();
+ 
+ public:
+     ServiceRep &amp;service();
+ 
+ private:
+     void tellQueryAborted();
+     void maybeLog();
+ 
+ protected:
+     Comm::ConnectionPointer connection;     ///&lt; ICAP server connection
+     Adaptation::Icap::ServiceRep::Pointer theService;
+ 
+-    /*
+-     * We have two read buffers.   We would prefer to read directly
+-     * into the MemBuf, but since comm_read isn't MemBuf-aware, and
+-     * uses event-delayed callbacks, it leaves the MemBuf in an
+-     * inconsistent state.  There would be data in the buffer, but
+-     * MemBuf.size won't be updated until the (delayed) callback
+-     * occurs.   To avoid that situation we use a plain buffer
+-     * (commBuf) and then copy (append) its contents to readBuf in
+-     * the callback.  If comm_read ever becomes MemBuf-aware, we
+-     * can eliminate commBuf and this extra buffer copy.
+-     */
+-    MemBuf readBuf;
+-    char *commBuf;
+-    size_t commBufSize;
++    SBuf readBuf;
+     bool commEof;
+     bool reuseConnection;
+     bool isRetriable;  ///&lt; can retry on persistent connection failures
+     bool isRepeatable; ///&lt; can repeat if no or unsatisfactory response
+     bool ignoreLastWrite;
+ 
+     const char *stopReason;
+ 
+     // active (pending) comm callbacks for the ICAP server connection
+     AsyncCall::Pointer connector;
+     AsyncCall::Pointer reader;
+     AsyncCall::Pointer writer;
+     AsyncCall::Pointer closer;
+ 
+     AccessLogEntry::Pointer alep; ///&lt; icap.log entry
+     AccessLogEntry &al; ///&lt; short for *alep
+ 
+     timeval icap_tr_start;     /*time when the ICAP transaction was created */
+     timeval icap_tio_start;    /*time when the first ICAP request byte was scheduled for sending*/
+     timeval icap_tio_finish;   /*time when the last byte of the ICAP responsewas received*/
+
+=== modified file 'src/tests/stub_HttpReply.cc'
+--- src/tests/stub_HttpReply.cc	2015-01-13 07:25:36 +0000
++++ src/tests/stub_HttpReply.cc	2015-01-25 12:02:45 +0000
+@@ -4,29 +4,29 @@
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;HttpReply.h&quot;
+ 
+ #define STUB_API &quot;HttpReply.cc&quot;
+ #include &quot;tests/STUB.h&quot;
+ 
+ HttpReply::HttpReply() : HttpMsg(hoReply), date (0), last_modified (0),
+     expires (0), surrogate_control (NULL), content_range (NULL), keep_alive (0),
+     protoPrefix(&quot;HTTP/&quot;), do_clean(false), bodySizeMax(-2)
+     STUB_NOP
+     HttpReply::~HttpReply() STUB
+     void HttpReply::setHeaders(Http::StatusCode status, const char *reason, const char *ctype, int64_t clen, time_t lmt, time_t expires_) STUB
+     void HttpReply::packHeadersInto(Packer * p) const STUB
+     void HttpReply::reset() STUB
+     void httpBodyPackInto(const HttpBody * body, Packer * p) STUB
+-    bool HttpReply::sanityCheckStartLine(MemBuf *buf, const size_t hdr_len, Http::StatusCode *error) STUB_RETVAL(false)
++    bool HttpReply::sanityCheckStartLine(const char *buf, const size_t hdr_len, Http::StatusCode *error) STUB_RETVAL(false)
+     int HttpReply::httpMsgParseError() STUB_RETVAL(0)
+     bool HttpReply::expectingBody(const HttpRequestMethod&amp;, int64_t&amp;) const STUB_RETVAL(false)
+     bool HttpReply::parseFirstLine(const char *start, const char *end) STUB_RETVAL(false)
+     void HttpReply::hdrCacheInit() STUB
+     HttpReply * HttpReply::clone() const STUB_RETVAL(NULL)
+     bool HttpReply::inheritProperties(const HttpMsg *aMsg) STUB_RETVAL(false)
+     int64_t HttpReply::bodySize(const HttpRequestMethod&amp;) const STUB_RETVAL(0)
+ 
+
+=== modified file 'src/tests/stub_HttpRequest.cc'
+--- src/tests/stub_HttpRequest.cc	2015-01-13 07:25:36 +0000
++++ src/tests/stub_HttpRequest.cc	2015-01-25 10:59:54 +0000
+@@ -1,30 +1,30 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;AccessLogEntry.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ 
+ #define STUB_API &quot;HttpRequest.cc&quot;
+ #include &quot;tests/STUB.h&quot;
+ 
+ HttpRequest::HttpRequest() : HttpMsg(hoRequest) STUB
+     HttpRequest::HttpRequest(const HttpRequestMethod&amp; aMethod, AnyP::ProtocolType aProtocol, const char *aUrlpath) : HttpMsg(hoRequest) STUB
+     HttpRequest::~HttpRequest() STUB
+     void HttpRequest::packFirstLineInto(Packer * p, bool full_uri) const STUB
+-    bool HttpRequest::sanityCheckStartLine(MemBuf *buf, const size_t hdr_len, Http::StatusCode *error) STUB_RETVAL(false)
++    bool HttpRequest::sanityCheckStartLine(const char*buf, const size_t hdr_len, Http::StatusCode *error) STUB_RETVAL(false)
+     void HttpRequest::hdrCacheInit() STUB
+     void HttpRequest::reset() STUB
+     bool HttpRequest::expectingBody(const HttpRequestMethod&amp; unused, int64_t&amp;) const STUB_RETVAL(false)
+     void HttpRequest::initHTTP(const HttpRequestMethod&amp; aMethod, AnyP::ProtocolType aProtocol, const char *aUrlpath) STUB
+     bool HttpRequest::parseFirstLine(const char *start, const char *end) STUB_RETVAL(false)
+     HttpRequest * HttpRequest::clone() const STUB_RETVAL(NULL)
+     bool HttpRequest::inheritProperties(const HttpMsg *aMsg) STUB_RETVAL(false)
+     int64_t HttpRequest::getRangeOffsetLimit() STUB_RETVAL(0)
+     const char *HttpRequest::storeId() STUB_RETVAL(&quot;.&quot;)
+ 
+
+=== modified file 'src/tests/testHttpReply.cc'
+--- src/tests/testHttpReply.cc	2015-01-13 07:25:36 +0000
++++ src/tests/testHttpReply.cc	2015-01-25 14:39:02 +0000
+@@ -33,172 +33,172 @@
+ 
+ void
+ testHttpReply::setUp()
+ {
+     Mem::Init();
+     httpHeaderInitModule();
+ }
+ 
+ void
+ testHttpReply::testSanityCheckFirstLine()
+ {
+     MemBuf input;
+     HttpReply engine;
+     Http::StatusCode error = Http::scNone;
+     size_t hdr_len;
+     input.init();
+ 
+     // a valid status line
+     input.append(&quot;HTTP/1.1 200 Okay\n\n&quot;, 19);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT( 1 &amp;&amp; engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT( 1 &amp;&amp; engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;HTTP/1.1    200  Okay     \n\n&quot;, 28);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT( 2 &amp;&amp; engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT( 2 &amp;&amp; engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+ #if TODO // these cases are only checked after parse...
+     // invalid status line
+     input.append(&quot;HTTP/1.1 999 Okay\n\n&quot;, 19);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT( 3 &amp;&amp; !engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT( 3 &amp;&amp; !engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scInvalidHeader);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;HTTP/1.1    2000  Okay     \n\n&quot;, 29);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT( 4 &amp;&amp; engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT( 4 &amp;&amp; engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ #endif
+ 
+     // valid ICY protocol status line
+     input.append(&quot;ICY 200 Okay\n\n&quot;, 14);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT( engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT( engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+     /* NP: the engine saves details about the protocol. even when being reset :( */
+     engine.protoPrefix=&quot;HTTP/&quot;;
+     engine.reset();
+ 
+     // empty status line
+     input.append(&quot;\n\n&quot;, 2);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT( 5 &amp;&amp; !engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT( 5 &amp;&amp; !engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scInvalidHeader);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;      \n\n&quot;, 8);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT( 6 &amp;&amp; !engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT( 6 &amp;&amp; !engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scInvalidHeader);
+     input.reset();
+     error = Http::scNone;
+ 
+     // status line with no message
+     input.append(&quot;HTTP/1.1 200\n\n&quot;, 14); /* real case seen */
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;HTTP/1.1 200 \n\n&quot;, 15); /* real case seen */
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     // incomplete (short) status lines... not sane (yet), but no error either.
+     input.append(&quot;H&quot;, 1);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;HTTP/&quot;, 5);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;HTTP/1&quot;, 6);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;HTTP/1.1&quot;, 8);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;HTTP/1.1 &quot;, 9); /* real case seen */
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;HTTP/1.1    20&quot;, 14);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     // status line with no status
+     input.append(&quot;HTTP/1.1 \n\n&quot;, 11);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scInvalidHeader);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;HTTP/1.1     \n\n&quot;, 15);
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scInvalidHeader);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;HTTP/1.1  Okay\n\n&quot;, 16); /* real case seen */
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scInvalidHeader);
+     input.reset();
+     error = Http::scNone;
+ 
+     // status line with nul-byte
+     input.append(&quot;HTTP/1.1&quot; &quot;\0&quot; &quot;200 Okay\n\n&quot;, 19); /* real case seen */
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scInvalidHeader);
+     input.reset();
+     error = Http::scNone;
+ 
+     // status line with negative status
+     input.append(&quot;HTTP/1.1 -000\n\n&quot;, 15); /* real case seen */
+     hdr_len = headersEnd(input.content(),input.contentSize());
+-    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.sanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scInvalidHeader);
+     input.reset();
+     error = Http::scNone;
+ }
+ 
+
+=== modified file 'src/tests/testHttpRequest.cc'
+--- src/tests/testHttpRequest.cc	2015-01-13 07:25:36 +0000
++++ src/tests/testHttpRequest.cc	2015-01-25 12:17:15 +0000
+@@ -5,41 +5,41 @@
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include &quot;squid.h&quot;
+ 
+ #include &lt;cppunit/TestAssert.h&gt;
+ 
+ #include &quot;HttpHeader.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;mime_header.h&quot;
+ #include &quot;testHttpRequest.h&quot;
+ #include &quot;unitTestMain.h&quot;
+ 
+ CPPUNIT_TEST_SUITE_REGISTRATION( testHttpRequest );
+ 
+ /** wrapper for testing HttpRequest object private and protected functions */
+ class PrivateHttpRequest : public HttpRequest
+ {
+ public:
+-    bool doSanityCheckStartLine(MemBuf *b, const size_t h, Http::StatusCode *e) { return sanityCheckStartLine(b,h,e); };
++    bool doSanityCheckStartLine(const char *b, const size_t h, Http::StatusCode *e) { return sanityCheckStartLine(b,h,e); };
+ };
+ 
+ /* init memory pools */
+ 
+ void
+ testHttpRequest::setUp()
+ {
+     Mem::Init();
+     httpHeaderInitModule();
+ }
+ 
+ /*
+  * Test creating an HttpRequest object from a Url and method
+  */
+ void
+ testHttpRequest::testCreateFromUrlAndMethod()
+ {
+     /* vanilla url */
+     unsigned short expected_port;
+     char * url = xstrdup(&quot;<A HREF="http://foo:90/bar">http://foo:90/bar</A>&quot;);
+@@ -147,65 +147,65 @@
+     CPPUNIT_ASSERT(aRequest-&gt;method == Http::METHOD_GET);
+     CPPUNIT_ASSERT_EQUAL(String(&quot;[2000:800::45]&quot;), String(aRequest-&gt;GetHost()));
+     CPPUNIT_ASSERT_EQUAL(String(&quot;/foo&quot;), aRequest-&gt;urlpath);
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast&lt;AnyP::ProtocolType&gt;(aRequest-&gt;url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String(&quot;<A HREF="http://2000:800::45/foo">http://2000:800::45/foo</A>&quot;), String(url));
+     xfree(url);
+ }
+ 
+ void
+ testHttpRequest::testSanityCheckStartLine()
+ {
+     MemBuf input;
+     PrivateHttpRequest engine;
+     Http::StatusCode error = Http::scNone;
+     size_t hdr_len;
+     input.init();
+ 
+     // a valid request line
+     input.append(&quot;GET / HTTP/1.1\n\n&quot;, 16);
+     hdr_len = headersEnd(input.content(), input.contentSize());
+-    CPPUNIT_ASSERT(engine.doSanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(engine.doSanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;GET  /  HTTP/1.1\n\n&quot;, 18);
+     hdr_len = headersEnd(input.content(), input.contentSize());
+-    CPPUNIT_ASSERT(engine.doSanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(engine.doSanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     // strange but valid methods
+     input.append(&quot;. / HTTP/1.1\n\n&quot;, 14);
+     hdr_len = headersEnd(input.content(), input.contentSize());
+-    CPPUNIT_ASSERT(engine.doSanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(engine.doSanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+     input.append(&quot;OPTIONS * HTTP/1.1\n\n&quot;, 20);
+     hdr_len = headersEnd(input.content(), input.contentSize());
+-    CPPUNIT_ASSERT(engine.doSanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(engine.doSanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scNone);
+     input.reset();
+     error = Http::scNone;
+ 
+ // TODO no method
+ 
+ // TODO binary code in method
+ 
+ // TODO no URL
+ 
+ // TODO no status (okay)
+ 
+ // TODO non-HTTP protocol
+ 
+     input.append(&quot;      \n\n&quot;, 8);
+     hdr_len = headersEnd(input.content(), input.contentSize());
+-    CPPUNIT_ASSERT(!engine.doSanityCheckStartLine(&amp;input, hdr_len, &amp;error) );
++    CPPUNIT_ASSERT(!engine.doSanityCheckStartLine(input.content(), hdr_len, &amp;error) );
+     CPPUNIT_ASSERT_EQUAL(error, Http::scInvalidHeader);
+     input.reset();
+     error = Http::scNone;
+ }
+ 
+
+=== modified file 'src/tunnel.cc'
+--- src/tunnel.cc	2015-02-26 12:12:11 +0000
++++ src/tunnel.cc	2015-02-27 11:55:17 +0000
+@@ -396,41 +396,42 @@
+ }
+ 
+ /// Parses [possibly incomplete] CONNECT response and reacts to it.
+ /// If the tunnel is being closed or more response data is needed, returns false.
+ /// Otherwise, the caller should handle the remaining read data, if any.
+ void
+ TunnelStateData::handleConnectResponse(const size_t chunkSize)
+ {
+     assert(waitingForConnectResponse());
+ 
+     // Ideally, client and server should use MemBuf or better, but current code
+     // never accumulates more than one read when shoveling data (XXX) so it does
+     // not need to deal with MemBuf complexity. To keep it simple, we use a
+     // dedicated MemBuf for accumulating CONNECT responses. TODO: When shoveling
+     // is optimized, reuse server.buf for CONNEC response accumulation instead.
+ 
+     /* mimic the basic parts of HttpStateData::processReplyHeader() */
+     HttpReply rep;
+     Http::StatusCode parseErr = Http::scNone;
+     const bool eof = !chunkSize;
+-    const bool parsed = rep.parse(connectRespBuf, eof, &amp;parseErr);
++    connectRespBuf-&gt;terminate(); // HttpMsg::parse requires terminated string
++    const bool parsed = rep.parse(connectRespBuf-&gt;content(), connectRespBuf-&gt;contentSize(), eof, &amp;parseErr);
+     if (!parsed) {
+         if (parseErr &gt; 0) { // unrecoverable parsing error
+             server.logicError(&quot;malformed CONNECT response from peer&quot;);
+             return;
+         }
+ 
+         // need more data
+         assert(!eof);
+         assert(!parseErr);
+ 
+         if (!connectRespBuf-&gt;hasSpace()) {
+             server.logicError(&quot;huge CONNECT response from peer&quot;);
+             return;
+         }
+ 
+         // keep reading
+         readConnectResponse();
+         return;
+     }
+ 
+
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001827.html">[squid-dev] Parser-NG TODO list
+</A></li>
+	<LI>Next message: <A HREF="001829.html">[squid-dev] [PATCH] ICAP read buffer SBuf conversion
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1828">[ date ]</a>
+              <a href="thread.html#1828">[ thread ]</a>
+              <a href="subject.html#1828">[ subject ]</a>
+              <a href="author.html#1828">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

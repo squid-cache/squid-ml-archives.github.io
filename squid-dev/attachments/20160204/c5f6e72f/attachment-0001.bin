@@ -1,0 +1,353 @@
+Fixed step3 splicing.
+
+The information about PeekingPeerConnector splicing the connections
+was lost in some cases, resulting in two different bugs:
+
+ - With a certificate validator, the PeekingPeerConnector class calls
+   back FwdState, which calls the ConnStateData class, which then tries
+   secure the connection with the already tunneled SSL client and
+   closes the connection on negotiating errors.
+
+ - Without a certificate validator, the PeekingPeerConnector class
+   never calls FwdState class, and both PeekingPeerConnector and
+   FwdState objects stall until finishing tunnelState closes server
+   and client connections.
+
+Now, PeerConnector always calls FwdState back, marking spliced
+connections as such. This has the following positive side-effects:
+
+ - When FwdState learns about spliced connections, it does not call
+   ConnStateData back. Instead, it terminates and gets destroyed.
+   The tunnel continues uninterrupted.
+
+ - The PeekingPeerConnector job ends and is destroyed instead of
+   waiting to call FwdState.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2016-02-02 15:39:23 +0000
++++ src/FwdState.cc	2016-02-04 16:04:10 +0000
+@@ -716,40 +716,50 @@
+     }
+ #endif
+ 
+     // if not encrypting just run the post-connect actions
+     Security::EncryptorAnswer nil;
+     connectedToPeer(nil);
+ }
+ 
+ void
+ FwdState::connectedToPeer(Security::EncryptorAnswer &answer)
+ {
+     if (ErrorState *error = answer.error.get()) {
+         fail(error);
+         answer.error.clear(); // preserve error for errorSendComplete()
+         if (CachePeer *p = serverConnection()->getPeer())
+             peerConnectFailed(p);
+         retryOrBail();
+         return;
+     }
+ 
++    if (answer.tunneled) {
++        // TODO: When ConnStateData establishes tunnels, its state changes
++        // [in ways that may affect logging?]. Consider informing
++        // ConnStateData about our tunnel or otherwise unifying tunnel
++        // establishment [side effects].
++        unregister(serverConn); // async call owns it now
++        complete(); // destroys us
++        return;
++    }
++
+     // should reach ConnStateData before the dispatched Client job starts
+     CallJobHere1(17, 4, request->clientConnectionManager, ConnStateData,
+                  ConnStateData::notePeerConnection, serverConnection());
+ 
+     if (serverConnection()->getPeer())
+         peerConnectSucceded(serverConnection()->getPeer());
+ 
+     flags.connected_okay = true;
+     dispatch();
+ }
+ 
+ void
+ FwdState::connectTimeout(int fd)
+ {
+     debugs(17, 2, "fwdConnectTimeout: FD " << fd << ": '" << entry->url() << "'" );
+     assert(serverDestinations[0] != NULL);
+     assert(fd == serverDestinations[0]->fd);
+ 
+     if (entry->isEmpty()) {
+         ErrorState *anErr = new ErrorState(ERR_CONNECT_FAIL, Http::scGatewayTimeout, request);
+
+=== modified file 'src/security/EncryptorAnswer.h'
+--- src/security/EncryptorAnswer.h	2016-01-01 00:12:18 +0000
++++ src/security/EncryptorAnswer.h	2016-02-03 18:10:10 +0000
+@@ -4,34 +4,38 @@
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SECURITY_ENCRYPTORANSWER_H
+ #define SQUID_SECURITY_ENCRYPTORANSWER_H
+ 
+ #include "base/CbcPointer.h"
+ #include "comm/forward.h"
+ 
+ class ErrorState;
+ 
+ namespace Security {
+ 
+ /// Peer encrypted connection setup results (supplied via a callback).
+ /// The connection to peer was secured if and only if the error member is nil.
+ class EncryptorAnswer
+ {
+ public:
++    EncryptorAnswer(): tunneled(false) {}
+     ~EncryptorAnswer(); ///< deletes error if it is still set
+     Comm::ConnectionPointer conn; ///< peer connection (secured on success)
+ 
+     /// answer recepients must clear the error member in order to keep its info
+     /// XXX: We should refcount ErrorState instead of cbdata-protecting it.
+     CbcPointer<ErrorState> error; ///< problem details (nil on success)
++
++    /// whether we spliced the connections instead of negotiating encryption
++    bool tunneled;
+ };
+ 
+ std::ostream &operator <<(std::ostream &, const Security::EncryptorAnswer &);
+ 
+ } // namepace Security
+ 
+ #endif /* SQUID_SECURITY_ENCRYPTORANSWER_H */
+ 
+
+=== modified file 'src/ssl/PeekingPeerConnector.cc'
+--- src/ssl/PeekingPeerConnector.cc	2016-02-02 15:39:23 +0000
++++ src/ssl/PeekingPeerConnector.cc	2016-02-03 18:15:42 +0000
+@@ -87,40 +87,41 @@
+     if (request->clientConnectionManager.valid()) {
+         request->clientConnectionManager->sslBumpMode = finalAction;
+         request->clientConnectionManager->serverBump()->act.step3 = finalAction;
+     }
+ 
+     if (finalAction == Ssl::bumpTerminate) {
+         serverConn->close();
+         clientConn->close();
+     } else if (finalAction != Ssl::bumpSplice) {
+         //Allow write, proceed with the connection
+         srvBio->holdWrite(false);
+         srvBio->recordInput(false);
+         debugs(83,5, "Retry the fwdNegotiateSSL on FD " << serverConn->fd);
+         Ssl::PeerConnector::noteWantWrite();
+     } else {
+         splice = true;
+         // Ssl Negotiation stops here. Last SSL checks for valid certificates
+         // and if done, switch to tunnel mode
+         if (sslFinalized()) {
+             debugs(83,5, "Abort NegotiateSSL on FD " << serverConn->fd << " and splice the connection");
++            callBack();
+         }
+     }
+ }
+ 
+ Ssl::BumpMode
+ Ssl::PeekingPeerConnector::checkForPeekAndSpliceGuess() const
+ {
+     if (const ConnStateData *csd = request->clientConnectionManager.valid()) {
+         const Ssl::BumpMode currentMode = csd->sslBumpMode;
+         if (currentMode == Ssl::bumpStare) {
+             debugs(83,5, "default to bumping after staring");
+             return Ssl::bumpBump;
+         }
+         debugs(83,5, "default to splicing after " << currentMode);
+     } else {
+         debugs(83,3, "default to splicing due to missing info");
+     }
+ 
+     return Ssl::bumpSplice;
+ }
+@@ -251,40 +252,41 @@
+             if (request->flags.sslPeek && !isConnectRequest) {
+                 if (X509 *srvX509 = serverBump->serverCert.get()) {
+                     if (const char *name = Ssl::CommonHostName(srvX509)) {
+                         request->url.host(name);
+                         debugs(83, 3, "reset request host: " << name);
+                     }
+                 }
+             }
+         }
+     }
+ 
+     // retrieve TLS server information if any
+     serverConnection()->tlsNegotiations()->fillWith(ssl);
+     if (!error) {
+         serverCertificateVerified();
+         if (splice) {
+             //retrieved received TLS client informations
+             auto clientSsl = fd_table[clientConn->fd].ssl.get();
+             clientConn->tlsNegotiations()->fillWith(clientSsl);
+             switchToTunnel(request.getRaw(), clientConn, serverConn);
++            tunnelInsteadOfNegotiating();
+         }
+     }
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::noteWantWrite()
+ {
+     const int fd = serverConnection()->fd;
+     Security::SessionPtr ssl = fd_table[fd].ssl.get();
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
+ 
+     if ((srvBio->bumpMode() == Ssl::bumpPeek || srvBio->bumpMode() == Ssl::bumpStare) && srvBio->holdWrite()) {
+         debugs(81, DBG_IMPORTANT, "hold write on SSL connection on FD " << fd);
+         checkForPeekAndSplice();
+         return;
+     }
+ 
+     Ssl::PeerConnector::noteWantWrite();
+ }
+@@ -359,20 +361,31 @@
+ void
+ Ssl::PeekingPeerConnector::serverCertificateVerified()
+ {
+     if (ConnStateData *csd = request->clientConnectionManager.valid()) {
+         Security::CertPointer serverCert;
+         if(Ssl::ServerBump *serverBump = csd->serverBump())
+             serverCert.resetAndLock(serverBump->serverCert.get());
+         else {
+             const int fd = serverConnection()->fd;
+             Security::SessionPtr ssl = fd_table[fd].ssl.get();
+             serverCert.reset(SSL_get_peer_certificate(ssl));
+         }
+         if (serverCert.get()) {
+             csd->resetSslCommonName(Ssl::CommonHostName(serverCert.get()));
+             debugs(83, 5, "HTTPS server CN: " << csd->sslCommonName() <<
+                    " bumped: " << *serverConnection());
+         }
+     }
+ }
+ 
++void
++Ssl::PeekingPeerConnector::tunnelInsteadOfNegotiating()
++{
++    Must(callback != NULL);
++    CbDialer *dialer = dynamic_cast<CbDialer*>(callback->getDialer());
++    Must(dialer);
++    dialer->answer().tunneled = true;
++    debugs(83, 5, "The SSL negotiation with server aborted");
++}
++
++
+
+=== modified file 'src/ssl/PeekingPeerConnector.h'
+--- src/ssl/PeekingPeerConnector.h	2016-02-02 15:39:23 +0000
++++ src/ssl/PeekingPeerConnector.h	2016-02-03 18:12:18 +0000
+@@ -51,33 +51,37 @@
+     /// about bumping, splicing or terminating the connection.
+     void checkForPeekAndSplice();
+ 
+     /// Callback function for ssl_bump acl check in step3  SSL bump step.
+     void checkForPeekAndSpliceDone(allow_t answer);
+ 
+     /// Handles the final bumping decision.
+     void checkForPeekAndSpliceMatched(const Ssl::BumpMode finalMode);
+ 
+     /// Guesses the final bumping decision when no ssl_bump rules match.
+     Ssl::BumpMode checkForPeekAndSpliceGuess() const;
+ 
+     /// Runs after the server certificate verified to update client
+     /// connection manager members
+     void serverCertificateVerified();
+ 
+     /// A wrapper function for checkForPeekAndSpliceDone for use with acl
+     static void cbCheckForPeekAndSpliceDone(allow_t answer, void *data);
+ 
+ private:
++
++    /// Inform caller class that the SSL negotiation aborted
++    void tunnelInsteadOfNegotiating();
++
+     Comm::ConnectionPointer clientConn; ///< TCP connection to the client
+     AsyncCall::Pointer callback; ///< we call this with the results
+     AsyncCall::Pointer closeHandler; ///< we call this when the connection closed
+     bool splice; ///< whether we are going to splice or not
+     bool resumingSession; ///< whether it is an SSL resuming session connection
+     bool serverCertificateHandled; ///< whether handleServerCertificate() succeeded
+ };
+ 
+ } // namespace Ssl
+ 
+ #endif /* USE_OPENSSL */
+ #endif /* SQUID_SRC_SSL_PEEKINGPEERCONNECTOR_H */
+ 
+
+=== modified file 'src/ssl/PeerConnector.h'
+--- src/ssl/PeerConnector.h	2016-02-02 15:39:23 +0000
++++ src/ssl/PeerConnector.h	2016-02-03 18:11:03 +0000
+@@ -131,57 +131,57 @@
+     /// Called when the SSL_connect function aborts with an SSL negotiation error
+     /// \param result the SSL_connect return code
+     /// \param ssl_error the error code returned from the SSL_get_error function
+     /// \param ssl_lib_error the error returned from the ERR_Get_Error function
+     virtual void noteSslNegotiationError(const int result, const int ssl_error, const int ssl_lib_error);
+ 
+     /// Called when the SSL negotiation to the server completed and the certificates
+     /// validated using the cert validator.
+     /// \param error if not NULL the SSL negotiation was aborted with an error
+     virtual void noteNegotiationDone(ErrorState *error) {}
+ 
+     /// Must implemented by the kid classes to return the Security::ContextPtr object to use
+     /// for building the SSL objects.
+     virtual Security::ContextPtr getSslContext() = 0;
+ 
+     /// mimics FwdState to minimize changes to FwdState::initiate/negotiateSsl
+     Comm::ConnectionPointer const &serverConnection() const { return serverConn; }
+ 
+     void bail(ErrorState *error); ///< Return an error to the PeerConnector caller
+ 
++    /// Callback the caller class, and pass the ready to communicate secure
++    /// connection or an error if PeerConnector failed.
++    void callBack();
++
+     /// If called the certificates validator will not used
+     void bypassCertValidator() {useCertValidator_ = false;}
+ 
+     HttpRequestPointer request; ///< peer connection trigger or cause
+     Comm::ConnectionPointer serverConn; ///< TCP connection to the peer
+     /// Certificate errors found from SSL validation procedure or from cert
+     /// validator
+     Ssl::CertErrors *certErrors;
+     AccessLogEntryPointer al; ///< info for the future access.log entry
+ private:
+     PeerConnector(const PeerConnector &); // not implemented
+     PeerConnector &operator =(const PeerConnector &); // not implemented
+ 
+-    /// Callback the caller class, and pass the ready to communicate secure
+-    /// connection or an error if PeerConnector failed.
+-    void callBack();
+-
+     /// Process response from cert validator helper
+     void sslCrtvdHandleReply(Ssl::CertValidationResponsePointer);
+ 
+     /// Check SSL errors returned from cert validator against sslproxy_cert_error access list
+     Ssl::CertErrors *sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &, Ssl::ErrorDetail *&);
+ 
+     /// A wrapper function for negotiateSsl for use with Comm::SetSelect
+     static void NegotiateSsl(int fd, void *data);
+     AsyncCall::Pointer callback; ///< we call this with the results
+     AsyncCall::Pointer closeHandler; ///< we call this when the connection closed
+     time_t negotiationTimeout; ///< the SSL connection timeout to use
+     time_t startTime; ///< when the peer connector negotiation started
+     bool useCertValidator_; ///< whether the certificate validator should bypassed
+ };
+ 
+ } // namespace Ssl
+ 
+ #endif /* USE_OPENSSL */
+ #endif /* SQUID_SRC_SSL_PEERCONNECTOR_H */
+ 
+

@@ -1,0 +1,210 @@
+Make %<a and %<p details available to [eCAP] RESPMOD
+services via adaptation_meta.
+
+This patch fills access log entry with server connection
+details as soon as possible. Previously, ALE was updated
+only in prepareLogWithRequestDetails()
+when adaptation process has already finished.
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2016-01-01 00:14:27 +0000
++++ src/FwdState.cc	2016-01-05 23:04:16 +0000
+@@ -365,61 +365,61 @@
+         FwdState::Pointer fwd = new FwdState(clientConn, entry, request, al);
+         fwd->start(fwd);
+         return;
+     }
+ 
+     /* NOTREACHED */
+ }
+ 
+ void
+ FwdState::fwdStart(const Comm::ConnectionPointer &clientConn, StoreEntry *entry, HttpRequest *request)
+ {
+     // Hides AccessLogEntry.h from code that does not supply ALE anyway.
+     Start(clientConn, entry, request, NULL);
+ }
+ 
+ void
+ FwdState::startConnectionOrFail()
+ {
+     debugs(17, 3, HERE << entry->url());
+ 
+     if (serverDestinations.size() > 0) {
+         // Ditch error page if it was created before.
+         // A new one will be created if there's another problem
+         delete err;
+         err = NULL;
+ 
+         // Update the logging information about this new server connection.
+         // Done here before anything else so the errors get logged for
+         // this server link regardless of what happens when connecting to it.
+         // IF sucessfuly connected this top destination will become the serverConnection().
+-        request->hier.note(serverDestinations[0], request->GetHost());
++        syncHierNote(serverDestinations[0], request->GetHost());
+         request->clearError();
+ 
+         connectStart();
+     } else {
+         debugs(17, 3, HERE << "Connection failed: " << entry->url());
+         if (!err) {
+             ErrorState *anErr = new ErrorState(ERR_CANNOT_FORWARD, Http::scInternalServerError, request);
+             fail(anErr);
+         } // else use actual error from last connection attempt
+         self = NULL;       // refcounted
+     }
+ }
+ 
+ void
+ FwdState::fail(ErrorState * errorState)
+ {
+     debugs(17, 3, err_type_str[errorState->type] << " \"" << Http::StatusCodeString(errorState->httpStatus) << "\"\n\t" << entry->url());
+ 
+     delete err;
+     err = errorState;
+ 
+     if (!errorState->request) {
+         errorState->request = request;
+         HTTPMSGLOCK(errorState->request);
+     }
+ 
+     if (err->type != ERR_ZERO_SIZE_OBJECT)
+         return;
+ 
+     if (pconnRace == racePossible) {
+@@ -758,61 +758,68 @@
+     if (serverDestinations[0]->getPeer()) {
+         ctimeout = serverDestinations[0]->getPeer()->connect_timeout > 0 ?
+                    serverDestinations[0]->getPeer()->connect_timeout : Config.Timeout.peer_connect;
+     } else {
+         ctimeout = Config.Timeout.connect;
+     }
+ 
+     /* calculate total forwarding timeout ??? */
+     int ftimeout = Config.Timeout.forward - (squid_curtime - start_t);
+     if (ftimeout < 0)
+         ftimeout = 5;
+ 
+     if (ftimeout < ctimeout)
+         return (time_t)ftimeout;
+     else
+         return (time_t)ctimeout;
+ }
+ 
+ /// called when serverConn is set to an _open_ to-peer connection
+ void
+ FwdState::syncWithServerConn(const char *host)
+ {
+     if (Ip::Qos::TheConfig.isAclTosActive())
+         Ip::Qos::setSockTos(serverConn, GetTosToServer(request));
+ 
+ #if SO_MARK
+     if (Ip::Qos::TheConfig.isAclNfmarkActive())
+         Ip::Qos::setSockNfmark(serverConn, GetNfmarkToServer(request));
+ #endif
+ 
+-    request->hier.note(serverConn, host);
++    syncHierNote(serverConn, host);
++}
++
++void
++FwdState::syncHierNote(const Comm::ConnectionPointer &server, const char *host)
++{
++    request->hier.note(server, host);
++    al->hier.note(server, host);
+ }
+ 
+ /**
+  * Called after forwarding path selection (via peer select) has taken place
+  * and whenever forwarding needs to attempt a new connection (routing failover).
+  * We have a vector of possible localIP->remoteIP paths now ready to start being connected.
+  */
+ void
+ FwdState::connectStart()
+ {
+     assert(serverDestinations.size() > 0);
+ 
+     debugs(17, 3, "fwdConnectStart: " << entry->url());
+ 
+     request->hier.startPeerClock();
+ 
+     // Do not fowrward bumped connections to parent proxy unless it is an
+     // origin server
+     if (serverDestinations[0]->getPeer() && !serverDestinations[0]->getPeer()->options.originserver && request->flags.sslBumped) {
+         debugs(50, 4, "fwdConnectStart: Ssl bumped connections through parent proxy are not allowed");
+         ErrorState *anErr = new ErrorState(ERR_CANNOT_FORWARD, Http::scServiceUnavailable, request);
+         fail(anErr);
+         self = NULL; // refcounted
+         return;
+     }
+ 
+     request->flags.pinned = false; // XXX: what if the ConnStateData set this to flag existing credentials?
+     // XXX: answer: the peer selection *should* catch it and give us only the pinned peer. so we reverse the =0 step below.
+     // XXX: also, logs will now lie if pinning is broken and leads to an error message.
+     if (serverDestinations[0]->peerType == PINNED) {
+
+=== modified file 'src/FwdState.h'
+--- src/FwdState.h	2016-01-01 00:14:27 +0000
++++ src/FwdState.h	2016-01-05 23:00:02 +0000
+@@ -94,60 +94,61 @@
+ 
+     bool dontRetry() { return flags.dont_retry; }
+ 
+     void dontRetry(bool val) { flags.dont_retry = val; }
+ 
+     /** return a ConnectionPointer to the current server connection (may or may not be open) */
+     Comm::ConnectionPointer const & serverConnection() const { return serverConn; };
+ 
+ private:
+     // hidden for safer management of self; use static fwdStart
+     FwdState(const Comm::ConnectionPointer &client, StoreEntry *, HttpRequest *, const AccessLogEntryPointer &alp);
+     void start(Pointer aSelf);
+ 
+ #if STRICT_ORIGINAL_DST
+     void selectPeerForIntercepted();
+ #endif
+     static void logReplyStatus(int tries, const Http::StatusCode status);
+     void doneWithRetries();
+     void completed();
+     void retryOrBail();
+     ErrorState *makeConnectingError(const err_type type) const;
+ #if USE_OPENSSL
+     void connectedToPeer(Ssl::PeerConnectorAnswer &answer);
+ #endif
+     static void RegisterWithCacheManager(void);
+ 
+     /// stops monitoring server connection for closure and updates pconn stats
+     void closeServerConnection(const char *reason);
+ 
+     void syncWithServerConn(const char *host);
++    void syncHierNote(const Comm::ConnectionPointer &server, const char *host);
+ 
+ public:
+     StoreEntry *entry;
+     HttpRequest *request;
+     AccessLogEntryPointer al; ///< info for the future access.log entry
+ 
+     static void abort(void*);
+ 
+ private:
+     Pointer self;
+     ErrorState *err;
+     Comm::ConnectionPointer clientConn;        ///< a possibly open connection to the client.
+     time_t start_t;
+     int n_tries;
+ 
+     // AsyncCalls which we set and may need cancelling.
+     struct {
+         AsyncCall::Pointer connector;  ///< a call linking us to the ConnOpener producing serverConn.
+     } calls;
+ 
+     struct {
+         bool connected_okay; ///< TCP link ever opened properly. This affects retry of POST,PUT,CONNECT,etc
+         bool dont_retry;
+         bool forward_completed;
+     } flags;
+ 
+     /** connections to open, in order, until successful */
+     Comm::ConnectionList serverDestinations;
+ 
+     Comm::ConnectionPointer serverConn; ///< a successfully opened connection to a server.
+

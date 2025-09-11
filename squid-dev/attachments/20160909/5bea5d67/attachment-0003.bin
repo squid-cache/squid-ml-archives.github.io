@@ -1,0 +1,2163 @@
+Bug 4471: revalidation doesn't work when expired cached object lacks Last-Modified.
+
+The bug was caused by the fact that Squid used only Last-Modified header
+value for evaluating entry's last modification time while making an
+internal revalidation request. So, without Last-Modified it was not
+possible to correctly fill If-Modified-Since header value. As a result,
+the revalidation request was not initiated when it should be.
+
+To fix this problem, we should generate If-Modified-Since based on other
+data, showing how "old" the cached response is, such as Date and Age
+header values. Both Date and Age header values are utilized while
+calculating entry's timestamp. Therefore, we should use the timestamp if
+Last-Modified is unavailable.
+
+TODO: HttpRequest::imslen support looks broken/deprecated. Using this
+field inside StoreEntry::modifiedSince() leads to several useless checks
+and probably may cause other [hidden] problems.
+
+=== modified file 'src/MemStore.cc'
+--- src/MemStore.cc	2016-04-01 06:15:31 +0000
++++ src/MemStore.cc	2016-09-08 18:24:18 +0000
+@@ -254,61 +254,61 @@
+     // already disconnected from the cache, no need to update
+     if (index < 0)
+         return true;
+ 
+     if (!map)
+         return false;
+ 
+     const Ipc::StoreMapAnchor &anchor = map->readableEntry(index);
+     return updateCollapsedWith(collapsed, index, anchor);
+ }
+ 
+ /// updates collapsed entry after its anchor has been located
+ bool
+ MemStore::updateCollapsedWith(StoreEntry &collapsed, const sfileno index, const Ipc::StoreMapAnchor &anchor)
+ {
+     collapsed.swap_file_sz = anchor.basics.swap_file_sz;
+     const bool copied = copyFromShm(collapsed, index, anchor);
+     return copied;
+ }
+ 
+ /// anchors StoreEntry to an already locked map entry
+ void
+ MemStore::anchorEntry(StoreEntry &e, const sfileno index, const Ipc::StoreMapAnchor &anchor)
+ {
+     const Ipc::StoreMapAnchor::Basics &basics = anchor.basics;
+ 
+     e.swap_file_sz = basics.swap_file_sz;
+     e.lastref = basics.lastref;
+     e.timestamp = basics.timestamp;
+     e.expires = basics.expires;
+-    e.lastmod = basics.lastmod;
++    e.lastModified(basics.lastmod);
+     e.refcount = basics.refcount;
+     e.flags = basics.flags;
+ 
+     assert(e.mem_obj);
+     if (anchor.complete()) {
+         e.store_status = STORE_OK;
+         e.mem_obj->object_sz = e.swap_file_sz;
+         e.setMemStatus(IN_MEMORY);
+     } else {
+         e.store_status = STORE_PENDING;
+         assert(e.mem_obj->object_sz < 0);
+         e.setMemStatus(NOT_IN_MEMORY);
+     }
+     assert(e.swap_status == SWAPOUT_NONE); // set in StoreEntry constructor
+     e.ping_status = PING_NONE;
+ 
+     EBIT_CLR(e.flags, RELEASE_REQUEST);
+     EBIT_CLR(e.flags, KEY_PRIVATE);
+     EBIT_SET(e.flags, ENTRY_VALIDATED);
+ 
+     MemObject::MemCache &mc = e.mem_obj->memCache;
+     mc.index = index;
+     mc.io = MemObject::ioReading;
+ }
+ 
+ /// copies the entire entry from shared to local memory
+ bool
+ MemStore::copyFromShm(StoreEntry &e, const sfileno index, const Ipc::StoreMapAnchor &anchor)
+ {
+     debugs(20, 7, "mem-loading entry " << index << " from " << anchor.start);
+
+=== modified file 'src/Store.h'
+--- src/Store.h	2016-01-01 00:14:27 +0000
++++ src/Store.h	2016-09-08 22:26:49 +0000
+@@ -111,78 +111,89 @@
+     const char *url() const;
+     /// Satisfies cachability requirements shared among disk and RAM caches.
+     /// Encapsulates common checks of mayStartSwapOut() and memoryCachable().
+     /// TODO: Rename and make private so only those two methods can call this.
+     bool checkCachable();
+     int checkNegativeHit() const;
+     int locked() const;
+     int validToSend() const;
+     bool memoryCachable(); ///< checkCachable() and can be cached in memory
+ 
+     /// if needed, initialize mem_obj member w/o URI-related information
+     MemObject *makeMemObject();
+ 
+     /// initialize mem_obj member (if needed) and supply URI-related info
+     void createMemObject(const char *storeId, const char *logUri, const HttpRequestMethod &aMethod);
+ 
+     void dump(int debug_lvl) const;
+     void hashDelete();
+     void hashInsert(const cache_key *);
+     void registerAbort(STABH * cb, void *);
+     void reset();
+     void setMemStatus(mem_status_t);
+     void timestampsSet();
+     void unregisterAbort();
+     void destroyMemObject();
+     int checkTooSmall();
+ 
+     void delayAwareRead(const Comm::ConnectionPointer &conn, char *buf, int len, AsyncCall::Pointer callback);
+ 
+     void setNoDelay (bool const);
+-    bool modifiedSince(HttpRequest * request) const;
++    void lastModified(const time_t when) { lastModified_ = when; }
++    /// \returns entry's 'effective' modification time
++    time_t lastModified() const {
++        // may still return -1 if timestamp is not set
++        return lastModified_ < 0 ? timestamp : lastModified_;
++    }
++    /// \returns a formatted string with entry's timestamps
++    const char *describeTimestamps() const;
++    // TODO: consider removing currently unsupported imslen parameter
++    bool modifiedSince(const time_t ims, const int imslen = -1) const;
+     /// has ETag matching at least one of the If-Match etags
+     bool hasIfMatchEtag(const HttpRequest &request) const;
+     /// has ETag matching at least one of the If-None-Match etags
+     bool hasIfNoneMatchEtag(const HttpRequest &request) const;
+     /// whether this entry has an ETag; if yes, puts ETag value into parameter
+     bool hasEtag(ETag &etag) const;
+ 
+     /** What store does this entry belong too ? */
+     virtual RefCount<SwapDir> store() const;
+ 
+     MemObject *mem_obj;
+     RemovalPolicyNode repl;
+     /* START OF ON-DISK STORE_META_STD TLV field */
+     time_t timestamp;
+     time_t lastref;
+     time_t expires;
+-    time_t lastmod;
++private:
++    time_t lastModified_; ///< received Last-Modified value or -1; use lastModified()
++public:
+     uint64_t swap_file_sz;
+     uint16_t refcount;
+     uint16_t flags;
+     /* END OF ON-DISK STORE_META_STD */
+ 
+     /// unique ID inside a cache_dir for swapped out entries; -1 for others
+     sfileno swap_filen:25; // keep in sync with SwapFilenMax
+ 
+     sdirno swap_dirn:7;
+ 
+     mem_status_t mem_status:3;
+ 
+     ping_status_t ping_status:3;
+ 
+     store_status_t store_status:3;
+ 
+     swap_status_t swap_status:3;
+ 
+ public:
+     static size_t inUseCount();
+     static void getPublicByRequestMethod(StoreClient * aClient, HttpRequest * request, const HttpRequestMethod& method);
+     static void getPublicByRequest(StoreClient * aClient, HttpRequest * request);
+     static void getPublic(StoreClient * aClient, const char *uri, const HttpRequestMethod& method);
+ 
+     virtual bool isNull() {
+         return false;
+     };
+ 
+     void *operator new(size_t byteCount);
+     void operator delete(void *address);
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-06-18 13:36:07 +0000
++++ src/client_side.cc	2016-09-08 22:15:27 +0000
+@@ -1209,61 +1209,61 @@
+  * returns true if If-Range specs match reply, false otherwise
+  */
+ static int
+ clientIfRangeMatch(ClientHttpRequest * http, HttpReply * rep)
+ {
+     const TimeOrTag spec = http->request->header.getTimeOrTag(HDR_IF_RANGE);
+     /* check for parsing falure */
+ 
+     if (!spec.valid)
+         return 0;
+ 
+     /* got an ETag? */
+     if (spec.tag.str) {
+         ETag rep_tag = rep->header.getETag(HDR_ETAG);
+         debugs(33, 3, "clientIfRangeMatch: ETags: " << spec.tag.str << " and " <<
+                (rep_tag.str ? rep_tag.str : "<none>"));
+ 
+         if (!rep_tag.str)
+             return 0;       /* entity has no etag to compare with! */
+ 
+         if (spec.tag.weak || rep_tag.weak) {
+             debugs(33, DBG_IMPORTANT, "clientIfRangeMatch: Weak ETags are not allowed in If-Range: " << spec.tag.str << " ? " << rep_tag.str);
+             return 0;       /* must use strong validator for sub-range requests */
+         }
+ 
+         return etagIsStrongEqual(rep_tag, spec.tag);
+     }
+ 
+     /* got modification time? */
+     if (spec.time >= 0) {
+-        return http->storeEntry()->lastmod <= spec.time;
++        return !http->storeEntry()->modifiedSince(spec.time);
+     }
+ 
+     assert(0);          /* should not happen */
+     return 0;
+ }
+ 
+ /**
+  * generates a "unique" boundary string for multipart responses
+  * the caller is responsible for cleaning the string */
+ String
+ ClientHttpRequest::rangeBoundaryStr() const
+ {
+     const char *key;
+     String b(APP_FULLNAME);
+     b.append(":",1);
+     key = storeEntry()->getMD5Text();
+     b.append(key, strlen(key));
+     return b;
+ }
+ 
+ /** adds appropriate Range headers if needed */
+ void
+ ClientSocketContext::buildRangeHeader(HttpReply * rep)
+ {
+     HttpHeader *hdr = rep ? &rep->header : 0;
+     const char *range_err = NULL;
+     HttpRequest *request = http->request;
+     assert(request->range);
+     /* check if we still want to do ranges */
+ 
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2016-08-17 05:48:29 +0000
++++ src/client_side_reply.cc	2016-09-08 18:29:05 +0000
+@@ -220,98 +220,99 @@
+ 
+ clientStreamNode *
+ clientReplyContext::getNextNode() const
+ {
+     return (clientStreamNode *)ourNode->node.next->data;
+ }
+ 
+ /* This function is wrong - the client parameters don't include the
+  * header offset
+  */
+ void
+ clientReplyContext::triggerInitialStoreRead()
+ {
+     /* when confident, 0 becomes reqofs, and then this factors into
+      * startSendProcess
+      */
+     assert(reqofs == 0);
+     StoreIOBuffer localTempBuffer (next()->readBuffer.length, 0, next()->readBuffer.data);
+     storeClientCopy(sc, http->storeEntry(), localTempBuffer, SendMoreData, this);
+ }
+ 
+ /* there is an expired entry in the store.
+  * setup a temporary buffer area and perform an IMS to the origin
+  */
+ void
+ clientReplyContext::processExpired()
+ {
+     const char *url = storeId();
+     StoreEntry *entry = NULL;
+     debugs(88, 3, "clientReplyContext::processExpired: '" << http->uri << "'");
+-    assert(http->storeEntry()->lastmod >= 0);
++    const time_t lastmod = http->storeEntry()->lastModified();
++    assert(lastmod >= 0);
+     /*
+      * check if we are allowed to contact other servers
+      * @?@: Instead of a 504 (Gateway Timeout) reply, we may want to return
+      *      a stale entry *if* it matches client requirements
+      */
+ 
+     if (http->onlyIfCached()) {
+         processOnlyIfCachedMiss();
+         return;
+     }
+ 
+     http->request->flags.refresh = true;
+ #if STORE_CLIENT_LIST_DEBUG
+     /* Prevent a race with the store client memory free routines
+      */
+     assert(storeClientIsThisAClient(sc, this));
+ #endif
+     /* Prepare to make a new temporary request */
+     saveState();
+     entry = storeCreateEntry(url,
+                              http->log_uri, http->request->flags, http->request->method);
+     /* NOTE, don't call StoreEntry->lock(), storeCreateEntry() does it */
+     sc = storeClientListAdd(entry, this);
+ #if USE_DELAY_POOLS
+     /* delay_id is already set on original store client */
+     sc->setDelayId(DelayId::DelayClient(http));
+ #endif
+ 
+-    http->request->lastmod = old_entry->lastmod;
++    http->request->lastmod = lastmod;
+ 
+     if (!http->request->header.has(HDR_IF_NONE_MATCH)) {
+         ETag etag = {NULL, -1}; // TODO: make that a default ETag constructor
+         if (old_entry->hasEtag(etag) && !etag.weak)
+             http->request->etag = etag.str;
+     }
+ 
+-    debugs(88, 5, "clientReplyContext::processExpired : lastmod " << entry->lastmod );
++    debugs(88, 5, "lastmod " << entry->lastModified());
+     http->storeEntry(entry);
+     assert(http->out.offset == 0);
+     assert(http->request->clientConnectionManager == http->getConn());
+ 
+     /*
+      * A refcounted pointer so that FwdState stays around as long as
+      * this clientReplyContext does
+      */
+     Comm::ConnectionPointer conn = http->getConn() != NULL ? http->getConn()->clientConnection : NULL;
+     FwdState::Start(conn, http->storeEntry(), http->request, http->al);
+ 
+     /* Register with storage manager to receive updates when data comes in. */
+ 
+     if (EBIT_TEST(entry->flags, ENTRY_ABORTED))
+         debugs(88, DBG_CRITICAL, "clientReplyContext::processExpired: Found ENTRY_ABORTED object");
+ 
+     {
+         /* start counting the length from 0 */
+         StoreIOBuffer localTempBuffer(HTTP_REQBUF_SZ, 0, tempbuf);
+         storeClientCopy(sc, entry, localTempBuffer, HandleIMSReply, this);
+     }
+ }
+ 
+ void
+ clientReplyContext::sendClientUpstreamResponse()
+ {
+     StoreIOBuffer tempresult;
+     removeStoreReference(&old_sc, &old_entry);
+     /* here the data to send is the data we just received */
+     tempBuffer.offset = 0;
+@@ -364,61 +365,61 @@
+         return;
+ 
+     if (result.flags.error && !EBIT_TEST(http->storeEntry()->flags, ENTRY_ABORTED))
+         return;
+ 
+     /* update size of the request */
+     reqsize = result.length + reqofs;
+ 
+     const Http::StatusCode status = http->storeEntry()->getReply()->sline.status();
+ 
+     // request to origin was aborted
+     if (EBIT_TEST(http->storeEntry()->flags, ENTRY_ABORTED)) {
+         debugs(88, 3, "handleIMSReply: request to origin aborted '" << http->storeEntry()->url() << "', sending old entry to client" );
+         http->logType = LOG_TCP_REFRESH_FAIL_OLD;
+         sendClientOldEntry();
+     }
+ 
+     HttpReply *old_rep = (HttpReply *) old_entry->getReply();
+ 
+     // origin replied 304
+     if (status == Http::scNotModified) {
+         http->logType = LOG_TCP_REFRESH_UNMODIFIED;
+         http->request->flags.staleIfHit = false; // old_entry is no longer stale
+ 
+         // update headers on existing entry
+         old_rep->updateOnNotModified(http->storeEntry()->getReply());
+         old_entry->timestampsSet();
+ 
+         // if client sent IMS
+ 
+-        if (http->request->flags.ims && !old_entry->modifiedSince(http->request)) {
++        if (http->request->flags.ims && !old_entry->modifiedSince(http->request->ims, http->request->imslen)) {
+             // forward the 304 from origin
+             debugs(88, 3, "handleIMSReply: origin replied 304, revalidating existing entry and forwarding 304 to client");
+             sendClientUpstreamResponse();
+         } else {
+             // send existing entry, it's still valid
+             debugs(88, 3, "handleIMSReply: origin replied 304, revalidating existing entry and sending " <<
+                    old_rep->sline.status() << " to client");
+             sendClientOldEntry();
+         }
+     }
+ 
+     // origin replied with a non-error code
+     else if (status > Http::scNone && status < Http::scInternalServerError) {
+         // forward response from origin
+         http->logType = LOG_TCP_REFRESH_MODIFIED;
+         debugs(88, 3, "handleIMSReply: origin replied " << status << ", replacing existing entry and forwarding to client");
+         sendClientUpstreamResponse();
+     }
+ 
+     // origin replied with an error
+     else if (http->request->flags.failOnValidationError) {
+         http->logType = LOG_TCP_REFRESH_FAIL_ERR;
+         debugs(88, 3, "handleIMSReply: origin replied with error " << status <<
+                ", forwarding to client due to fail_on_validation_err");
+         sendClientUpstreamResponse();
+     } else {
+         // ignore and let client have old entry
+         http->logType = LOG_TCP_REFRESH_FAIL_OLD;
+         debugs(88, 3, "handleIMSReply: origin replied with error " <<
+                status << ", sending old entry (" << old_rep->sline.status() << ") to client");
+@@ -536,65 +537,66 @@
+         debugs(88, 5, "PURGE gets a HIT");
+         removeClientStoreReference(&sc, http);
+         e = NULL;
+         purgeRequest();
+         return;
+     }
+ 
+     if (e->checkNegativeHit() && !r->flags.noCacheHack()) {
+         debugs(88, 5, "negative-HIT");
+         http->logType = LOG_TCP_NEGATIVE_HIT;
+         sendMoreData(result);
+     } else if (blockedHit()) {
+         debugs(88, 5, "send_hit forces a MISS");
+         http->logType = LOG_TCP_MISS;
+         processMiss();
+         return;
+     } else if (!http->flags.internal && refreshCheckHTTP(e, r)) {
+         debugs(88, 5, "clientCacheHit: in refreshCheck() block");
+         /*
+          * We hold a stale copy; it needs to be validated
+          */
+         /*
+          * The 'needValidation' flag is used to prevent forwarding
+          * loops between siblings.  If our copy of the object is stale,
+          * then we should probably only use parents for the validation
+          * request.  Otherwise two siblings could generate a loop if
+          * both have a stale version of the object.
+          */
+         r->flags.needValidation = true;
+ 
+-        if (e->lastmod < 0) {
+-            debugs(88, 3, "validate HIT object? NO. Missing Last-Modified header. Do MISS.");
++        if (e->lastModified() < 0) {
++            debugs(88, 3, "validate HIT object? NO. Can't calculate entry modification time. Do MISS.");
+             /*
+-             * Previous reply didn't have a Last-Modified header,
+-             * we cannot revalidate it.
++             * We cannot revalidate entries without knowing their
++             * modification time.
++             * XXX: BUG 1890 objects without Date do not get one added.
+              */
+             http->logType = LOG_TCP_MISS;
+             processMiss();
+         } else if (r->flags.noCache) {
+             debugs(88, 3, "validate HIT object? NO. Client sent CC:no-cache. Do CLIENT_REFRESH_MISS");
+             /*
+              * This did not match a refresh pattern that overrides no-cache
+              * we should honour the client no-cache header.
+              */
+             http->logType = LOG_TCP_CLIENT_REFRESH_MISS;
+             processMiss();
+         } else if (r->url.getScheme() == AnyP::PROTO_HTTP) {
+             debugs(88, 3, "validate HIT object? YES.");
+             /*
+              * Object needs to be revalidated
+              * XXX This could apply to FTP as well, if Last-Modified is known.
+              */
+             processExpired();
+         } else {
+             debugs(88, 3, "validate HIT object? NO. Client protocol non-HTTP. Do MISS.");
+             /*
+              * We don't know how to re-validate other protocols. Handle
+              * them as if the object has expired.
+              */
+             http->logType = LOG_TCP_MISS;
+             processMiss();
+         }
+     } else if (r->conditional()) {
+         debugs(88, 5, "conditional HIT");
+         processConditional(result);
+@@ -729,61 +731,61 @@
+         sendPreconditionFailedError();
+         return;
+     }
+ 
+     bool matchedIfNoneMatch = false;
+     if (r.header.has(HDR_IF_NONE_MATCH)) {
+         if (!e->hasIfNoneMatchEtag(r)) {
+             // RFC 2616: ignore IMS if If-None-Match did not match
+             r.flags.ims = false;
+             r.ims = -1;
+             r.imslen = 0;
+             r.header.delById(HDR_IF_MODIFIED_SINCE);
+             http->logType = LOG_TCP_MISS;
+             sendMoreData(result);
+             return;
+         }
+ 
+         if (!r.flags.ims) {
+             // RFC 2616: if If-None-Match matched and there is no IMS,
+             // reply with 304 Not Modified or 412 Precondition Failed
+             sendNotModifiedOrPreconditionFailedError();
+             return;
+         }
+ 
+         // otherwise check IMS below to decide if we reply with 304 or 412
+         matchedIfNoneMatch = true;
+     }
+ 
+     if (r.flags.ims) {
+         // handle If-Modified-Since requests from the client
+-        if (e->modifiedSince(&r)) {
++        if (e->modifiedSince(r.ims, r.imslen)) {
+             http->logType = LOG_TCP_IMS_HIT;
+             sendMoreData(result);
+             return;
+         }
+ 
+         if (matchedIfNoneMatch) {
+             // If-None-Match matched, reply with 304 Not Modified or
+             // 412 Precondition Failed
+             sendNotModifiedOrPreconditionFailedError();
+             return;
+         }
+ 
+         // otherwise reply with 304 Not Modified
+         sendNotModified();
+     }
+ }
+ 
+ /// whether squid.conf send_hit prevents us from serving this hit
+ bool
+ clientReplyContext::blockedHit() const
+ {
+     if (!Config.accessList.sendHit)
+         return false; // hits are not blocked by default
+ 
+     if (http->flags.internal)
+         return false; // internal content "hits" cannot be blocked
+ 
+     if (const HttpReply *rep = http->storeEntry()->getReply()) {
+         std::unique_ptr<ACLFilledChecklist> chl(clientAclChecklistCreate(Config.accessList.sendHit, http));
+         chl->reply = const_cast<HttpReply*>(rep); // ACLChecklist API bug
+
+=== modified file 'src/fs/rock/RockSwapDir.cc'
+--- src/fs/rock/RockSwapDir.cc	2016-01-01 00:14:27 +0000
++++ src/fs/rock/RockSwapDir.cc	2016-09-08 18:29:46 +0000
+@@ -107,61 +107,61 @@
+ bool
+ Rock::SwapDir::updateCollapsed(StoreEntry &collapsed)
+ {
+     if (!map || !theFile || !theFile->canRead())
+         return false;
+ 
+     if (collapsed.swap_filen < 0) // no longer using a disk cache
+         return true;
+     assert(collapsed.swap_dirn == index);
+ 
+     const Ipc::StoreMapAnchor &s = map->readableEntry(collapsed.swap_filen);
+     return updateCollapsedWith(collapsed, s);
+ }
+ 
+ bool
+ Rock::SwapDir::updateCollapsedWith(StoreEntry &collapsed, const Ipc::StoreMapAnchor &anchor)
+ {
+     collapsed.swap_file_sz = anchor.basics.swap_file_sz;
+     return true;
+ }
+ 
+ void
+ Rock::SwapDir::anchorEntry(StoreEntry &e, const sfileno filen, const Ipc::StoreMapAnchor &anchor)
+ {
+     const Ipc::StoreMapAnchor::Basics &basics = anchor.basics;
+ 
+     e.swap_file_sz = basics.swap_file_sz;
+     e.lastref = basics.lastref;
+     e.timestamp = basics.timestamp;
+     e.expires = basics.expires;
+-    e.lastmod = basics.lastmod;
++    e.lastModified(basics.lastmod);
+     e.refcount = basics.refcount;
+     e.flags = basics.flags;
+ 
+     if (anchor.complete()) {
+         e.store_status = STORE_OK;
+         e.swap_status = SWAPOUT_DONE;
+     } else {
+         e.store_status = STORE_PENDING;
+         e.swap_status = SWAPOUT_WRITING; // even though another worker writes?
+     }
+ 
+     e.ping_status = PING_NONE;
+ 
+     EBIT_CLR(e.flags, RELEASE_REQUEST);
+     EBIT_CLR(e.flags, KEY_PRIVATE);
+     EBIT_SET(e.flags, ENTRY_VALIDATED);
+ 
+     e.swap_dirn = index;
+     e.swap_filen = filen;
+ }
+ 
+ void Rock::SwapDir::disconnect(StoreEntry &e)
+ {
+     assert(e.swap_dirn == index);
+     assert(e.swap_filen >= 0);
+     // cannot have SWAPOUT_NONE entry with swap_filen >= 0
+     assert(e.swap_status != SWAPOUT_NONE);
+ 
+     // do not rely on e.swap_status here because there is an async delay
+     // before it switches from SWAPOUT_WRITING to SWAPOUT_DONE.
+
+=== modified file 'src/fs/ufs/RebuildState.cc'
+--- src/fs/ufs/RebuildState.cc	2016-01-01 00:14:27 +0000
++++ src/fs/ufs/RebuildState.cc	2016-09-08 18:30:40 +0000
+@@ -172,61 +172,61 @@
+                         expectedSize);
+ 
+     file_close(fd);
+     --store_open_disk_fd;
+     fd = -1;
+ 
+     bool accepted = parsed && tmpe.swap_file_sz > 0;
+     if (parsed && !accepted) {
+         debugs(47, DBG_IMPORTANT, "WARNING: Ignoring ufs cache entry with " <<
+                "unknown size: " << tmpe);
+         accepted = false;
+     }
+ 
+     if (!accepted) {
+         // XXX: shouldn't this be a call to commonUfsUnlink?
+         sd->unlinkFile(filn); // should we unlink in all failure cases?
+         return;
+     }
+ 
+     if (!storeRebuildKeepEntry(tmpe, key, counts))
+         return;
+ 
+     ++counts.objcount;
+     // tmpe.dump(5);
+     currentEntry(sd->addDiskRestore(key,
+                                     filn,
+                                     tmpe.swap_file_sz,
+                                     tmpe.expires,
+                                     tmpe.timestamp,
+                                     tmpe.lastref,
+-                                    tmpe.lastmod,
++                                    tmpe.lastModified(),
+                                     tmpe.refcount,  /* refcount */
+                                     tmpe.flags,     /* flags */
+                                     (int) flags.clean));
+     storeDirSwapLog(currentEntry(), SWAP_LOG_ADD);
+ }
+ 
+ StoreEntry *
+ Fs::Ufs::RebuildState::currentEntry() const
+ {
+     return e;
+ }
+ 
+ void
+ Fs::Ufs::RebuildState::currentEntry(StoreEntry *newValue)
+ {
+     e = newValue;
+ }
+ 
+ /// process one swap log entry
+ void
+ Fs::Ufs::RebuildState::rebuildFromSwapLog()
+ {
+     StoreSwapLogData swapData;
+ 
+     if (LogParser->ReadRecord(swapData) != 1) {
+         debugs(47, DBG_IMPORTANT, "Done reading " << sd->path << " swaplog (" << n_read << " entries)");
+         LogParser->Close();
+         delete LogParser;
+         LogParser = NULL;
+         _done = true;
+@@ -299,61 +299,61 @@
+ 
+     /* this needs to become
+      * 1) unpack url
+      * 2) make synthetic request with headers ?? or otherwise search
+      * for a matching object in the store
+      * TODO FIXME change to new async api
+      */
+     currentEntry (Store::Root().get(swapData.key));
+ 
+     int used;           /* is swapfile already in use? */
+ 
+     used = sd->mapBitTest(swapData.swap_filen);
+ 
+     /* If this URL already exists in the cache, does the swap log
+      * appear to have a newer entry?  Compare 'lastref' from the
+      * swap log to e->lastref. */
+     /* is the log entry newer than current entry? */
+     int disk_entry_newer = currentEntry() ? (swapData.lastref > currentEntry()->lastref ? 1 : 0) : 0;
+ 
+     if (used && !disk_entry_newer) {
+         /* log entry is old, ignore it */
+         ++counts.clashcount;
+         return;
+     } else if (used && currentEntry() && currentEntry()->swap_filen == swapData.swap_filen && currentEntry()->swap_dirn == sd->index) {
+         /* swapfile taken, same URL, newer, update meta */
+ 
+         if (currentEntry()->store_status == STORE_OK) {
+             currentEntry()->lastref = swapData.timestamp;
+             currentEntry()->timestamp = swapData.timestamp;
+             currentEntry()->expires = swapData.expires;
+-            currentEntry()->lastmod = swapData.lastmod;
++            currentEntry()->lastModified(swapData.lastmod);
+             currentEntry()->flags = swapData.flags;
+             currentEntry()->refcount += swapData.refcount;
+             sd->dereference(*currentEntry(), false);
+         } else {
+             debug_trap("commonUfsDirRebuildFromSwapLog: bad condition");
+             debugs(47, DBG_IMPORTANT, HERE << "bad condition");
+         }
+         return;
+     } else if (used) {
+         /* swapfile in use, not by this URL, log entry is newer */
+         /* This is sorta bad: the log entry should NOT be newer at this
+          * point.  If the log is dirty, the filesize check should have
+          * caught this.  If the log is clean, there should never be a
+          * newer entry. */
+         debugs(47, DBG_IMPORTANT, "WARNING: newer swaplog entry for dirno " <<
+                sd->index  << ", fileno "<< std::setfill('0') << std::hex <<
+                std::uppercase << std::setw(8) << swapData.swap_filen);
+ 
+         /* I'm tempted to remove the swapfile here just to be safe,
+          * but there is a bad race condition in the NOVM version if
+          * the swapfile has recently been opened for writing, but
+          * not yet opened for reading.  Because we can't map
+          * swapfiles back to StoreEntrys, we don't know the state
+          * of the entry using that file.  */
+         /* We'll assume the existing entry is valid, probably because
+          * were in a slow rebuild and the the swap file number got taken
+          * and the validation procedure hasn't run. */
+         assert(flags.need_to_validate);
+         ++counts.clashcount;
+         return;
+
+=== modified file 'src/fs/ufs/UFSSwapDir.cc'
+--- src/fs/ufs/UFSSwapDir.cc	2016-01-01 00:14:27 +0000
++++ src/fs/ufs/UFSSwapDir.cc	2016-09-08 18:33:08 +0000
+@@ -60,61 +60,61 @@
+     RemovalPolicyWalker *walker;
+     SwapDir *sd;
+ };
+ 
+ UFSCleanLog::UFSCleanLog(SwapDir *aSwapDir) :
+     cur(NULL), newLog(NULL), cln(NULL), outbuf(NULL),
+     outbuf_offset(0), fd(-1),walker(NULL), sd(aSwapDir)
+ {}
+ 
+ const StoreEntry *
+ UFSCleanLog::nextEntry()
+ {
+     const StoreEntry *entry = NULL;
+ 
+     if (walker)
+         entry = walker->Next(walker);
+ 
+     return entry;
+ }
+ 
+ void
+ UFSCleanLog::write(StoreEntry const &e)
+ {
+     StoreSwapLogData s;
+     static size_t ss = sizeof(StoreSwapLogData);
+     s.op = (char) SWAP_LOG_ADD;
+     s.swap_filen = e.swap_filen;
+     s.timestamp = e.timestamp;
+     s.lastref = e.lastref;
+     s.expires = e.expires;
+-    s.lastmod = e.lastmod;
++    s.lastmod = e.lastModified();
+     s.swap_file_sz = e.swap_file_sz;
+     s.refcount = e.refcount;
+     s.flags = e.flags;
+     memcpy(&s.key, e.key, SQUID_MD5_DIGEST_LENGTH);
+     s.finalize();
+     memcpy(outbuf + outbuf_offset, &s, ss);
+     outbuf_offset += ss;
+     /* buffered write */
+ 
+     if (outbuf_offset + ss >= CLEAN_BUF_SZ) {
+         if (FD_WRITE_METHOD(fd, outbuf, outbuf_offset) < 0) {
+             /* XXX This error handling should probably move up to the caller */
+             debugs(50, DBG_CRITICAL, HERE << newLog << ": write: " << xstrerror());
+             debugs(50, DBG_CRITICAL, HERE << "Current swap logfile not replaced.");
+             file_close(fd);
+             fd = -1;
+             unlink(newLog);
+             sd->cleanLog = NULL;
+             delete this;
+             return;
+         }
+ 
+         outbuf_offset = 0;
+     }
+ }
+ 
+ bool
+ Fs::Ufs::UFSSwapDir::canStore(const StoreEntry &e, int64_t diskSpaceNeeded, int &load) const
+ {
+     if (!SwapDir::canStore(e, diskSpaceNeeded, load))
+@@ -774,61 +774,61 @@
+     return anInt < l2;
+ }
+ 
+ StoreEntry *
+ Fs::Ufs::UFSSwapDir::addDiskRestore(const cache_key * key,
+                                     sfileno file_number,
+                                     uint64_t swap_file_sz,
+                                     time_t expires,
+                                     time_t timestamp,
+                                     time_t lastref,
+                                     time_t lastmod,
+                                     uint32_t refcount,
+                                     uint16_t newFlags,
+                                     int clean)
+ {
+     StoreEntry *e = NULL;
+     debugs(47, 5, HERE << storeKeyText(key)  <<
+            ", fileno="<< std::setfill('0') << std::hex << std::uppercase << std::setw(8) << file_number);
+     /* if you call this you'd better be sure file_number is not
+      * already in use! */
+     e = new StoreEntry();
+     e->store_status = STORE_OK;
+     e->setMemStatus(NOT_IN_MEMORY);
+     e->swap_status = SWAPOUT_DONE;
+     e->swap_filen = file_number;
+     e->swap_dirn = index;
+     e->swap_file_sz = swap_file_sz;
+     e->lastref = lastref;
+     e->timestamp = timestamp;
+     e->expires = expires;
+-    e->lastmod = lastmod;
++    e->lastModified(lastmod);
+     e->refcount = refcount;
+     e->flags = newFlags;
+     EBIT_CLR(e->flags, RELEASE_REQUEST);
+     EBIT_CLR(e->flags, KEY_PRIVATE);
+     e->ping_status = PING_NONE;
+     EBIT_CLR(e->flags, ENTRY_VALIDATED);
+     mapBitSet(e->swap_filen);
+     cur_size += fs.blksize * sizeInBlocks(e->swap_file_sz);
+     ++n_disk_objects;
+     e->hashInsert(key); /* do it after we clear KEY_PRIVATE */
+     replacementAdd (e);
+     return e;
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::undoAddDiskRestore(StoreEntry *e)
+ {
+     debugs(47, 5, HERE << *e);
+     replacementRemove(e); // checks swap_dirn so do it before we invalidate it
+     // Do not unlink the file as it might be used by a subsequent entry.
+     mapBitReset(e->swap_filen);
+     e->swap_filen = -1;
+     e->swap_dirn = -1;
+     cur_size -= fs.blksize * sizeInBlocks(e->swap_file_sz);
+     --n_disk_objects;
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::rebuild()
+ {
+@@ -1262,61 +1262,61 @@
+ Fs::Ufs::UFSSwapDir::sync()
+ {
+     IO->sync();
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::swappedOut(const StoreEntry &e)
+ {
+     cur_size += fs.blksize * sizeInBlocks(e.swap_file_sz);
+     ++n_disk_objects;
+ }
+ 
+ StoreSearch *
+ Fs::Ufs::UFSSwapDir::search(String const url, HttpRequest *request)
+ {
+     if (url.size())
+         fatal ("Cannot search by url yet\n");
+ 
+     return new Fs::Ufs::StoreSearchUFS (this);
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::logEntry(const StoreEntry & e, int op) const
+ {
+     StoreSwapLogData *s = new StoreSwapLogData;
+     s->op = (char) op;
+     s->swap_filen = e.swap_filen;
+     s->timestamp = e.timestamp;
+     s->lastref = e.lastref;
+     s->expires = e.expires;
+-    s->lastmod = e.lastmod;
++    s->lastmod = e.lastModified();
+     s->swap_file_sz = e.swap_file_sz;
+     s->refcount = e.refcount;
+     s->flags = e.flags;
+     memcpy(s->key, e.key, SQUID_MD5_DIGEST_LENGTH);
+     s->finalize();
+     file_write(swaplog_fd,
+                -1,
+                s,
+                sizeof(StoreSwapLogData),
+                NULL,
+                NULL,
+                FreeObject);
+ }
+ 
+ int
+ Fs::Ufs::UFSSwapDir::DirClean(int swap_index)
+ {
+     DIR *dir_pointer = NULL;
+ 
+     LOCAL_ARRAY(char, p1, MAXPATHLEN + 1);
+     LOCAL_ARRAY(char, p2, MAXPATHLEN + 1);
+ 
+     int files[20];
+     int swapfileno;
+     int fn;         /* same as swapfileno, but with dirn bits set */
+     int n = 0;
+     int k = 0;
+     int N0, N1, N2;
+     int D0, D1, D2;
+     UFSSwapDir *SD;
+
+=== modified file 'src/htcp.cc'
+--- src/htcp.cc	2016-01-01 00:14:27 +0000
++++ src/htcp.cc	2016-09-08 19:00:20 +0000
+@@ -859,62 +859,62 @@
+     static char pkt[8192];
+     HttpHeader hdr(hoHtcpReply);
+     MemBuf mb;
+     Packer p;
+     ssize_t pktlen;
+ 
+     htcpStuff stuff(dhdr->msg_id, HTCP_TST, RR_RESPONSE, 0);
+     stuff.response = e ? 0 : 1;
+     debugs(31, 3, "htcpTstReply: response = " << stuff.response);
+ 
+     if (spec) {
+         mb.init();
+         packerToMemInit(&p, &mb);
+         stuff.S.method = spec->method;
+         stuff.S.uri = spec->uri;
+         stuff.S.version = spec->version;
+         stuff.S.req_hdrs = spec->req_hdrs;
+         if (e)
+             hdr.putInt(HDR_AGE, (e->timestamp <= squid_curtime ? (squid_curtime - e->timestamp) : 0) );
+         else
+             hdr.putInt(HDR_AGE, 0);
+         hdr.packInto(&p);
+         stuff.D.resp_hdrs = xstrdup(mb.buf);
+         debugs(31, 3, "htcpTstReply: resp_hdrs = {" << stuff.D.resp_hdrs << "}");
+         mb.reset();
+         hdr.reset();
+ 
+         if (e && e->expires > -1)
+             hdr.putTime(HDR_EXPIRES, e->expires);
+ 
+-        if (e && e->lastmod > -1)
+-            hdr.putTime(HDR_LAST_MODIFIED, e->lastmod);
++        if (e && e->lastModified() > -1)
++            hdr.putTime(HDR_LAST_MODIFIED, e->lastModified());
+ 
+         hdr.packInto(&p);
+ 
+         stuff.D.entity_hdrs = xstrdup(mb.buf);
+ 
+         debugs(31, 3, "htcpTstReply: entity_hdrs = {" << stuff.D.entity_hdrs << "}");
+ 
+         mb.reset();
+ 
+         hdr.reset();
+ 
+ #if USE_ICMP
+         if (char *host = urlHostname(spec->uri)) {
+             int rtt = 0;
+             int hops = 0;
+             int samp = 0;
+             netdbHostData(host, &samp, &rtt, &hops);
+ 
+             if (rtt || hops) {
+                 char cto_buf[128];
+                 snprintf(cto_buf, 128, "%s %d %f %d",
+                          host, samp, 0.001 * rtt, hops);
+                 hdr.putExt("Cache-to-Origin", cto_buf);
+             }
+         }
+ #endif /* USE_ICMP */
+ 
+         hdr.packInto(&p);
+         stuff.D.cache_hdrs = xstrdup(mb.buf);
+         debugs(31, 3, "htcpTstReply: cache_hdrs = {" << stuff.D.cache_hdrs << "}");
+
+=== modified file 'src/ipc/StoreMap.cc'
+--- src/ipc/StoreMap.cc	2016-01-01 00:14:27 +0000
++++ src/ipc/StoreMap.cc	2016-09-08 19:01:04 +0000
+@@ -464,61 +464,61 @@
+ /* Ipc::StoreMapAnchor */
+ 
+ Ipc::StoreMapAnchor::StoreMapAnchor(): start(0)
+ {
+     memset(&key, 0, sizeof(key));
+     memset(&basics, 0, sizeof(basics));
+     // keep in sync with rewind()
+ }
+ 
+ void
+ Ipc::StoreMapAnchor::setKey(const cache_key *const aKey)
+ {
+     memcpy(key, aKey, sizeof(key));
+ }
+ 
+ bool
+ Ipc::StoreMapAnchor::sameKey(const cache_key *const aKey) const
+ {
+     const uint64_t *const k = reinterpret_cast<const uint64_t *>(aKey);
+     return k[0] == key[0] && k[1] == key[1];
+ }
+ 
+ void
+ Ipc::StoreMapAnchor::set(const StoreEntry &from)
+ {
+     assert(writing() && !reading());
+     memcpy(key, from.key, sizeof(key));
+     basics.timestamp = from.timestamp;
+     basics.lastref = from.lastref;
+     basics.expires = from.expires;
+-    basics.lastmod = from.lastmod;
++    basics.lastmod = from.lastModified();
+     basics.swap_file_sz = from.swap_file_sz;
+     basics.refcount = from.refcount;
+     basics.flags = from.flags;
+ }
+ 
+ void
+ Ipc::StoreMapAnchor::rewind()
+ {
+     assert(writing());
+     start = 0;
+     memset(&key, 0, sizeof(key));
+     memset(&basics, 0, sizeof(basics));
+     // but keep the lock
+ }
+ 
+ Ipc::StoreMap::Owner::Owner(): anchors(NULL), slices(NULL)
+ {
+ }
+ 
+ Ipc::StoreMap::Owner::~Owner()
+ {
+     delete anchors;
+     delete slices;
+ }
+ 
+ /* Ipc::StoreMapAnchors */
+ 
+ Ipc::StoreMapAnchors::StoreMapAnchors(const int aCapacity):
+     count(0),
+     victim(0),
+
+=== modified file 'src/peer_digest.cc'
+--- src/peer_digest.cc	2016-07-23 07:16:20 +0000
++++ src/peer_digest.cc	2016-09-09 07:36:17 +0000
+@@ -332,61 +332,61 @@
+ 
+     /* update timestamps */
+     fetch->start_time = squid_curtime;
+ 
+     pd->times.requested = squid_curtime;
+ 
+     pd_last_req_time = squid_curtime;
+ 
+     req->flags.cachable = true;
+ 
+     /* the rest is based on clientProcessExpired() */
+     req->flags.refresh = true;
+ 
+     old_e = fetch->old_entry = Store::Root().get(key);
+ 
+     if (old_e) {
+         debugs(72, 5, "peerDigestRequest: found old entry");
+ 
+         old_e->lock("peerDigestRequest");
+         old_e->createMemObject(url, url, req->method);
+ 
+         fetch->old_sc = storeClientListAdd(old_e, fetch);
+     }
+ 
+     e = fetch->entry = storeCreateEntry(url, url, req->flags, req->method);
+     assert(EBIT_TEST(e->flags, KEY_PRIVATE));
+     fetch->sc = storeClientListAdd(e, fetch);
+     /* set lastmod to trigger IMS request if possible */
+ 
+     if (old_e)
+-        e->lastmod = old_e->lastmod;
++        e->lastModified(old_e->lastModified());
+ 
+     /* push towards peer cache */
+     debugs(72, 3, "peerDigestRequest: forwarding to fwdStart...");
+ 
+     FwdState::fwdStart(Comm::ConnectionPointer(), e, req);
+ 
+     tempBuffer.offset = 0;
+ 
+     tempBuffer.length = SM_PAGE_SIZE;
+ 
+     tempBuffer.data = fetch->buf;
+ 
+     storeClientCopy(fetch->sc, e, tempBuffer,
+                     peerDigestHandleReply, fetch);
+ 
+     safe_free(url);
+ }
+ 
+ /* Handle the data copying .. */
+ 
+ /*
+  * This routine handles the copy data and then redirects the
+  * copy to a bunch of subfunctions depending upon the copy state.
+  * It also tracks the buffer offset and "seen", since I'm actually
+  * not interested in rewriting everything to suit my little idea.
+  */
+ static void
+ peerDigestHandleReply(void *data, StoreIOBuffer receivedData)
+ {
+     DigestFetchState *fetch = (DigestFetchState *)data;
+@@ -915,62 +915,62 @@
+     cbdataFree(fetch);
+ }
+ 
+ /* calculate fetch stats after completion */
+ static void
+ peerDigestFetchSetStats(DigestFetchState * fetch)
+ {
+     MemObject *mem;
+     assert(fetch->entry && fetch->request);
+ 
+     mem = fetch->entry->mem_obj;
+     assert(mem);
+ 
+     /* XXX: outgoing numbers are not precise */
+     /* XXX: we must distinguish between 304 hits and misses here */
+     fetch->sent.bytes = fetch->request->prefixLen();
+     /* XXX: this is slightly wrong: we don't KNOW that the entire memobject
+      * was fetched. We only know how big it is
+      */
+     fetch->recv.bytes = mem->size();
+     fetch->sent.msg = fetch->recv.msg = 1;
+     fetch->expires = fetch->entry->expires;
+     fetch->resp_time = squid_curtime - fetch->start_time;
+ 
+     debugs(72, 3, "peerDigestFetchFinish: recv " << fetch->recv.bytes <<
+            " bytes in " << (int) fetch->resp_time << " secs");
+ 
+     debugs(72, 3, "peerDigestFetchFinish: expires: " <<
+            (long int) fetch->expires << " (" << std::showpos <<
+            (int) (fetch->expires - squid_curtime) << "), lmt: " <<
+-           std::noshowpos << (long int) fetch->entry->lastmod << " (" <<
+-           std::showpos << (int) (fetch->entry->lastmod - squid_curtime) <<
++           std::noshowpos << (long int) fetch->entry->lastModified() << " (" <<
++           std::showpos << (int) (fetch->entry->lastModified() - squid_curtime) <<
+            ")");
+ 
+ }
+ 
+ static int
+ peerDigestSetCBlock(PeerDigest * pd, const char *buf)
+ {
+     StoreDigestCBlock cblock;
+     int freed_size = 0;
+     const char *host = pd->host.termedBuf();
+ 
+     memcpy(&cblock, buf, sizeof(cblock));
+     /* network -> host conversions */
+     cblock.ver.current = ntohs(cblock.ver.current);
+     cblock.ver.required = ntohs(cblock.ver.required);
+     cblock.capacity = ntohl(cblock.capacity);
+     cblock.count = ntohl(cblock.count);
+     cblock.del_count = ntohl(cblock.del_count);
+     cblock.mask_size = ntohl(cblock.mask_size);
+     debugs(72, 2, "got digest cblock from " << host << "; ver: " <<
+            (int) cblock.ver.current << " (req: " << (int) cblock.ver.required <<
+            ")");
+ 
+     debugs(72, 2, "\t size: " <<
+            cblock.mask_size << " bytes, e-cnt: " <<
+            cblock.count << ", e-util: " <<
+            xpercentInt(cblock.count, cblock.capacity) << "%" );
+     /* check version requirements (both ways) */
+ 
+     if (cblock.ver.required > CacheDigestVer.current) {
+
+=== modified file 'src/refresh.cc'
+--- src/refresh.cc	2016-09-07 18:14:33 +0000
++++ src/refresh.cc	2016-09-08 22:26:34 +0000
+@@ -159,67 +159,62 @@
+ refreshStaleness(const StoreEntry * entry, time_t check_time, const time_t age, const RefreshPattern * R, stale_flags * sf)
+ {
+     // 1. If the cached object has an explicit expiration time, then we rely on this and
+     //    completely ignore the Min, Percent and Max values in the refresh_pattern.
+     if (entry->expires > -1) {
+         sf->expires = true;
+ 
+         if (entry->expires > check_time) {
+             debugs(22, 3, "FRESH: expires " << entry->expires <<
+                    " >= check_time " << check_time << " ");
+ 
+             return -1;
+         } else {
+             debugs(22, 3, "STALE: expires " << entry->expires <<
+                    " < check_time " << check_time << " ");
+ 
+             return (check_time - entry->expires);
+         }
+     }
+ 
+     debugs(22, 3, "No explicit expiry given, using heuristics to determine freshness");
+ 
+     // 2. If the entry is older than the maximum age in the refresh_pattern, it is STALE.
+     if (age > R->max) {
+         debugs(22, 3, "STALE: age " << age << " > max " << R->max << " ");
+         sf->max = true;
+         return (age - R->max);
+     }
+ 
+     // 3. If there is a Last-Modified header, try the last-modified factor algorithm.
+-    if (entry->lastmod > -1 && entry->timestamp > entry->lastmod) {
+-
+-        /* lastmod_delta is the difference between the last-modified date of the response
+-         * and the time we cached it. It's how "old" the response was when we got it.
+-         */
+-        time_t lastmod_delta = entry->timestamp - entry->lastmod;
+-
++    const time_t lastmod_delta = entry->timestamp - entry->lastModified();
++    if (lastmod_delta > 0) {
+         /* stale_age is the age of the response when it became/becomes stale according to
+          * the last-modified factor algorithm. It's how long we can consider the response
+          * fresh from the time we cached it.
+          */
+         time_t stale_age = static_cast<time_t>(lastmod_delta * R->pct);
+ 
+         debugs(22,3, "Last modified " << lastmod_delta << " sec before we cached it, L-M factor " <<
+                (100.0 * R->pct) << "% = " << stale_age << " sec freshness lifetime");
+         sf->lmfactor = true;
+ 
+         if (age >= stale_age) {
+             debugs(22, 3, "STALE: age " << age << " > stale_age " << stale_age);
+             return (age - stale_age);
+         } else {
+             debugs(22, 3, "FRESH: age " << age << " <= stale_age " << stale_age);
+             return -1;
+         }
+     }
+ 
+     // 4. If the entry is not as old as the minimum age in the refresh_pattern, it is FRESH.
+     if (age < R->min) {
+         debugs(22, 3, "FRESH: age (" << age << " sec) is less than configured minimum (" << R->min << " sec)");
+         sf->min = true;
+         return -1;
+     }
+ 
+     // 5. default is stale, by the amount we missed the minimum by
+     debugs(22, 3, "STALE: No explicit expiry, no last modified, and older than configured minimum.");
+     return (age - R->min);
+ }
+@@ -526,62 +521,62 @@
+ }
+ 
+ /**
+  * This is called by http.cc once it has received and parsed the origin server's
+  * response headers. It uses the result as part of its algorithm to decide whether a
+  * response should be cached.
+  *
+  * \retval true if the entry is cacheable, regardless of whether FRESH or STALE
+  * \retval false if the entry is not cacheable
+  *
+  * TODO: this algorithm seems a bit odd and might not be quite right. Verify against HTTPbis.
+  */
+ bool
+ refreshIsCachable(const StoreEntry * entry)
+ {
+     /*
+      * Don't look at the request to avoid no-cache and other nuisances.
+      * the object should have a mem_obj so the URL will be found there.
+      * minimum_expiry_time seconds delta (defaults to 60 seconds), to
+      * avoid objects which expire almost immediately, and which can't
+      * be refreshed.
+      */
+     int reason = refreshCheck(entry, NULL, Config.minimum_expiry_time);
+     ++ refreshCounts[rcStore].total;
+     ++ refreshCounts[rcStore].status[reason];
+ 
+     if (reason < STALE_MUST_REVALIDATE)
+         /* Does not need refresh. This is certainly cachable */
+         return true;
+ 
+-    if (entry->lastmod < 0)
+-        /* Last modified is needed to do a refresh */
++    if (entry->lastModified() < 0)
++        /* We should know entry's modification time to do a refresh */
+         return false;
+ 
+     if (entry->mem_obj == NULL)
+         /* no mem_obj? */
+         return true;
+ 
+     if (entry->getReply() == NULL)
+         /* no reply? */
+         return true;
+ 
+     if (entry->getReply()->content_length == 0)
+         /* No use refreshing (caching?) 0 byte objects */
+         return false;
+ 
+     /* This seems to be refreshable. Cache it */
+     return true;
+ }
+ 
+ /// whether reply is stale if it is a hit
+ static bool
+ refreshIsStaleIfHit(const int reason)
+ {
+     switch (reason) {
+     case FRESH_MIN_RULE:
+     case FRESH_LMFACTOR_RULE:
+     case FRESH_EXPIRES:
+         return false;
+     default:
+         return true;
+     }
+
+=== modified file 'src/stat.cc'
+--- src/stat.cc	2016-09-07 15:58:59 +0000
++++ src/stat.cc	2016-09-08 19:04:22 +0000
+@@ -50,61 +50,60 @@
+ #endif
+ #if USE_OPENSSL
+ #include "ssl/support.h"
+ #endif
+ 
+ /* these are included because they expose stats calls */
+ /* TODO: provide a self registration mechanism for those classes
+  * to use during static construction
+  */
+ #include "comm.h"
+ #include "StoreSearch.h"
+ 
+ #define DEBUG_OPENFD 1
+ 
+ typedef int STOBJFLT(const StoreEntry *);
+ 
+ class StatObjectsState
+ {
+ 
+ public:
+     StoreEntry *sentry;
+     STOBJFLT *filter;
+     StoreSearchPointer theSearch;
+ 
+ private:
+     CBDATA_CLASS2(StatObjectsState);
+ };
+ 
+ /* LOCALS */
+ static const char *describeStatuses(const StoreEntry *);
+-static const char *describeTimestamps(const StoreEntry *);
+ static void statAvgTick(void *notused);
+ static void statAvgDump(StoreEntry *, int minutes, int hours);
+ #if STAT_GRAPHS
+ static void statGraphDump(StoreEntry *);
+ #endif
+ static void statCountersInit(StatCounters *);
+ static void statCountersInitSpecial(StatCounters *);
+ static void statCountersClean(StatCounters *);
+ static void statCountersCopy(StatCounters * dest, const StatCounters * orig);
+ static double statPctileSvc(double, int, int);
+ static void statStoreEntry(MemBuf * mb, StoreEntry * e);
+ static double statCPUUsage(int minutes);
+ static OBJH stat_objects_get;
+ static OBJH stat_vmobjects_get;
+ #if DEBUG_OPENFD
+ static OBJH statOpenfdObj;
+ #endif
+ static EVH statObjects;
+ static OBJH statCountersDump;
+ static OBJH statPeerSelect;
+ static OBJH statDigestBlob;
+ static OBJH statUtilization;
+ static OBJH statCountersHistograms;
+ static OBJH statClientRequests;
+ void GetAvgStat(Mgr::IntervalActionData& stats, int minutes, int hours);
+ void DumpAvgStat(Mgr::IntervalActionData& stats, StoreEntry* sentry);
+ void GetInfo(Mgr::InfoActionData& stats);
+ void DumpInfo(Mgr::InfoActionData& stats, StoreEntry* sentry);
+ void DumpMallocStatistics(StoreEntry* sentry);
+ void GetCountersStats(Mgr::CountersActionData& stats);
+@@ -301,80 +300,68 @@
+     if (EBIT_TEST(flags, ENTRY_REVALIDATE_STALE))
+         strcat(buf, "REVALIDATE_STALE,");
+ 
+     if (EBIT_TEST(flags, ENTRY_DISPATCHED))
+         strcat(buf, "DISPATCHED,");
+ 
+     if (EBIT_TEST(flags, KEY_PRIVATE))
+         strcat(buf, "PRIVATE,");
+ 
+     if (EBIT_TEST(flags, ENTRY_FWD_HDR_WAIT))
+         strcat(buf, "FWD_HDR_WAIT,");
+ 
+     if (EBIT_TEST(flags, ENTRY_NEGCACHED))
+         strcat(buf, "NEGCACHED,");
+ 
+     if (EBIT_TEST(flags, ENTRY_VALIDATED))
+         strcat(buf, "VALIDATED,");
+ 
+     if (EBIT_TEST(flags, ENTRY_BAD_LENGTH))
+         strcat(buf, "BAD_LENGTH,");
+ 
+     if (EBIT_TEST(flags, ENTRY_ABORTED))
+         strcat(buf, "ABORTED,");
+ 
+     if ((t = strrchr(buf, ',')))
+         *t = '\0';
+ 
+     return buf;
+ }
+ 
+-static const char *
+-describeTimestamps(const StoreEntry * entry)
+-{
+-    LOCAL_ARRAY(char, buf, 256);
+-    snprintf(buf, 256, "LV:%-9d LU:%-9d LM:%-9d EX:%-9d",
+-             (int) entry->timestamp,
+-             (int) entry->lastref,
+-             (int) entry->lastmod,
+-             (int) entry->expires);
+-    return buf;
+-}
+-
+ static void
+ statStoreEntry(MemBuf * mb, StoreEntry * e)
+ {
+     MemObject *mem = e->mem_obj;
+     mb->Printf("KEY %s\n", e->getMD5Text());
+     mb->Printf("\t%s\n", describeStatuses(e));
+     mb->Printf("\t%s\n", storeEntryFlags(e));
+-    mb->Printf("\t%s\n", describeTimestamps(e));
++    mb->Printf("\t%s\n", e->describeTimestamps());
+     mb->Printf("\t%d locks, %d clients, %d refs\n",
+                (int) e->locks(),
+                storePendingNClients(e),
+                (int) e->refcount);
+     mb->Printf("\tSwap Dir %d, File %#08X\n",
+                e->swap_dirn, e->swap_filen);
+ 
+     if (mem != NULL)
+         mem->stat (mb);
+ 
+     mb->Printf("\n");
+ }
+ 
+ /* process objects list */
+ static void
+ statObjects(void *data)
+ {
+     StatObjectsState *state = static_cast<StatObjectsState *>(data);
+     StoreEntry *e;
+ 
+     if (state->theSearch->isDone()) {
+         if (UsingSmp())
+             storeAppendPrintf(state->sentry, "} by kid%d\n\n", KidIdentifier);
+         state->sentry->complete();
+         state->sentry->unlock("statObjects+isDone");
+         delete state;
+         return;
+     } else if (EBIT_TEST(state->sentry->flags, ENTRY_ABORTED)) {
+         state->sentry->unlock("statObjects+aborted");
+         delete state;
+
+=== modified file 'src/store.cc'
+--- src/store.cc	2016-09-07 15:58:59 +0000
++++ src/store.cc	2016-09-08 19:18:02 +0000
+@@ -328,61 +328,61 @@
+     }
+ 
+     /* here and past, entry is STORE_PENDING */
+     /*
+      * If this is the first client, let it be the mem client
+      */
+     if (mem_obj->nclients == 1)
+         return STORE_MEM_CLIENT;
+ 
+     /*
+      * If there is no disk file to open yet, we must make this a
+      * mem client.  If we can't open the swapin file before writing
+      * to the client, there is no guarantee that we will be able
+      * to open it later when we really need it.
+      */
+     if (swap_status == SWAPOUT_NONE)
+         return STORE_MEM_CLIENT;
+ 
+     /*
+      * otherwise, make subsequent clients read from disk so they
+      * can not delay the first, and vice-versa.
+      */
+     return STORE_DISK_CLIENT;
+ }
+ 
+ StoreEntry::StoreEntry() :
+     mem_obj(NULL),
+     timestamp(-1),
+     lastref(-1),
+     expires(-1),
+-    lastmod(-1),
++    lastModified_(-1),
+     swap_file_sz(0),
+     refcount(0),
+     flags(0),
+     swap_filen(-1),
+     swap_dirn(-1),
+     mem_status(NOT_IN_MEMORY),
+     ping_status(PING_NONE),
+     store_status(STORE_PENDING),
+     swap_status(SWAPOUT_NONE),
+     lock_count(0)
+ {
+     debugs(20, 5, "StoreEntry constructed, this=" << this);
+ }
+ 
+ StoreEntry::~StoreEntry()
+ {
+     debugs(20, 5, "StoreEntry destructed, this=" << this);
+ }
+ 
+ #if USE_ADAPTATION
+ void
+ StoreEntry::deferProducer(const AsyncCall::Pointer &producer)
+ {
+     if (!deferredProducer)
+         deferredProducer = producer;
+     else
+         debugs(20, 5, HERE << "Deferred producer call is allready set to: " <<
+                *deferredProducer << ", requested call: " << *producer);
+ }
+ 
+@@ -1565,94 +1565,94 @@
+      * If the returned Date: is more than 24 hours older than
+      * the squid_curtime, then one of us needs to use NTP to set our
+      * clock.  We'll pretend that our clock is right.
+      */
+     else if (served_date < (squid_curtime - 24 * 60 * 60) )
+         served_date = squid_curtime;
+ 
+     /*
+      * Compensate with Age header if origin server clock is ahead
+      * of us and there is a cache in between us and the origin
+      * server.  But DONT compensate if the age value is larger than
+      * squid_curtime because it results in a negative served_date.
+      */
+     if (age > squid_curtime - served_date)
+         if (squid_curtime > age)
+             served_date = squid_curtime - age;
+ 
+     // compensate for Squid-to-server and server-to-Squid delays
+     if (mem_obj && mem_obj->request) {
+         const time_t request_sent =
+             mem_obj->request->hier.peer_http_request_sent.tv_sec;
+         if (0 < request_sent && request_sent < squid_curtime)
+             served_date -= (squid_curtime - request_sent);
+     }
+ 
+     if (reply->expires > 0 && reply->date > -1)
+         expires = served_date + (reply->expires - reply->date);
+     else
+         expires = reply->expires;
+ 
+-    lastmod = reply->last_modified;
++    lastModified_ = reply->last_modified;
+ 
+     timestamp = served_date;
+ }
+ 
+ void
+ StoreEntry::registerAbort(STABH * cb, void *data)
+ {
+     assert(mem_obj);
+     assert(mem_obj->abort.callback == NULL);
+     mem_obj->abort.callback = cb;
+     mem_obj->abort.data = cbdataReference(data);
+ }
+ 
+ void
+ StoreEntry::unregisterAbort()
+ {
+     assert(mem_obj);
+     if (mem_obj->abort.callback) {
+         mem_obj->abort.callback = NULL;
+         cbdataReferenceDone(mem_obj->abort.data);
+     }
+ }
+ 
+ void
+ StoreEntry::dump(int l) const
+ {
+     debugs(20, l, "StoreEntry->key: " << getMD5Text());
+     debugs(20, l, "StoreEntry->next: " << next);
+     debugs(20, l, "StoreEntry->mem_obj: " << mem_obj);
+     debugs(20, l, "StoreEntry->timestamp: " << timestamp);
+     debugs(20, l, "StoreEntry->lastref: " << lastref);
+     debugs(20, l, "StoreEntry->expires: " << expires);
+-    debugs(20, l, "StoreEntry->lastmod: " << lastmod);
++    debugs(20, l, "StoreEntry->lastModified_: " << lastModified_);
+     debugs(20, l, "StoreEntry->swap_file_sz: " << swap_file_sz);
+     debugs(20, l, "StoreEntry->refcount: " << refcount);
+     debugs(20, l, "StoreEntry->flags: " << storeEntryFlags(this));
+     debugs(20, l, "StoreEntry->swap_dirn: " << swap_dirn);
+     debugs(20, l, "StoreEntry->swap_filen: " << swap_filen);
+     debugs(20, l, "StoreEntry->lock_count: " << lock_count);
+     debugs(20, l, "StoreEntry->mem_status: " << mem_status);
+     debugs(20, l, "StoreEntry->ping_status: " << ping_status);
+     debugs(20, l, "StoreEntry->store_status: " << store_status);
+     debugs(20, l, "StoreEntry->swap_status: " << swap_status);
+ }
+ 
+ /*
+  * NOTE, this function assumes only two mem states
+  */
+ void
+ StoreEntry::setMemStatus(mem_status_t new_status)
+ {
+     if (new_status == mem_status)
+         return;
+ 
+     // are we using a shared memory cache?
+     if (Config.memShared && IamWorkerProcess()) {
+         // This method was designed to update replacement policy, not to
+         // actually purge something from the memory cache (TODO: rename?).
+         // Shared memory cache does not have a policy that needs updates.
+         mem_status = new_status;
+         return;
+     }
+ 
+@@ -1729,61 +1729,61 @@
+ {
+     assert(mem_obj != NULL);
+     return mem_obj->object_sz;
+ }
+ 
+ int64_t
+ StoreEntry::contentLen() const
+ {
+     assert(mem_obj != NULL);
+     assert(getReply() != NULL);
+     return objectLen() - getReply()->hdr_sz;
+ }
+ 
+ HttpReply const *
+ StoreEntry::getReply () const
+ {
+     if (NULL == mem_obj)
+         return NULL;
+ 
+     return mem_obj->getReply();
+ }
+ 
+ void
+ StoreEntry::reset()
+ {
+     assert (mem_obj);
+     debugs(20, 3, "StoreEntry::reset: " << url());
+     mem_obj->reset();
+     HttpReply *rep = (HttpReply *) getReply();       // bypass const
+     rep->reset();
+-    expires = lastmod = timestamp = -1;
++    expires = lastModified_ = timestamp = -1;
+ }
+ 
+ /*
+  * storeFsInit
+  *
+  * This routine calls the SETUP routine for each fs type.
+  * I don't know where the best place for this is, and I'm not going to shuffle
+  * around large chunks of code right now (that can be done once its working.)
+  */
+ void
+ storeFsInit(void)
+ {
+     storeReplSetup();
+ }
+ 
+ /*
+  * called to add another store removal policy module
+  */
+ void
+ storeReplAdd(const char *type, REMOVALPOLICYCREATE * create)
+ {
+     int i;
+ 
+     /* find the number of currently known repl types */
+     for (i = 0; storerepl_list && storerepl_list[i].typestr; ++i) {
+         if (strcmp(storerepl_list[i].typestr, type) == 0) {
+             debugs(20, DBG_IMPORTANT, "WARNING: Trying to load store replacement policy " << type << " twice.");
+             return;
+         }
+     }
+@@ -1939,91 +1939,88 @@
+ {
+     // Abandon our transient entry if neither shared memory nor disk wants it.
+     assert(mem_obj);
+     mem_obj->swapout.decision = decision;
+     transientsAbandonmentCheck();
+ }
+ 
+ void
+ StoreEntry::trimMemory(const bool preserveSwappable)
+ {
+     /*
+      * DPW 2007-05-09
+      * Bug #1943.  We must not let go any data for IN_MEMORY
+      * objects.  We have to wait until the mem_status changes.
+      */
+     if (mem_status == IN_MEMORY)
+         return;
+ 
+     if (EBIT_TEST(flags, ENTRY_SPECIAL))
+         return; // cannot trim because we do not load them again
+ 
+     if (preserveSwappable)
+         mem_obj->trimSwappable();
+     else
+         mem_obj->trimUnSwappable();
+ 
+     debugs(88, 7, *this << " inmem_lo=" << mem_obj->inmem_lo);
+ }
+ 
+ bool
+-StoreEntry::modifiedSince(HttpRequest * request) const
++StoreEntry::modifiedSince(const time_t ims, const int imslen) const
+ {
+     int object_length;
+-    time_t mod_time = lastmod;
+-
+-    if (mod_time < 0)
+-        mod_time = timestamp;
++    const time_t mod_time = lastModified();
+ 
+     debugs(88, 3, "modifiedSince: '" << url() << "'");
+ 
+     debugs(88, 3, "modifiedSince: mod_time = " << mod_time);
+ 
+     if (mod_time < 0)
+         return true;
+ 
+     /* Find size of the object */
+     object_length = getReply()->content_length;
+ 
+     if (object_length < 0)
+         object_length = contentLen();
+ 
+-    if (mod_time > request->ims) {
++    if (mod_time > ims) {
+         debugs(88, 3, "--> YES: entry newer than client");
+         return true;
+-    } else if (mod_time < request->ims) {
++    } else if (mod_time < ims) {
+         debugs(88, 3, "-->  NO: entry older than client");
+         return false;
+-    } else if (request->imslen < 0) {
++    } else if (imslen < 0) {
+         debugs(88, 3, "-->  NO: same LMT, no client length");
+         return false;
+-    } else if (request->imslen == object_length) {
++    } else if (imslen == object_length) {
+         debugs(88, 3, "-->  NO: same LMT, same length");
+         return false;
+     } else {
+         debugs(88, 3, "--> YES: same LMT, different length");
+         return true;
+     }
+ }
+ 
+ bool
+ StoreEntry::hasEtag(ETag &etag) const
+ {
+     if (const HttpReply *reply = getReply()) {
+         etag = reply->header.getETag(HDR_ETAG);
+         if (etag.str)
+             return true;
+     }
+     return false;
+ }
+ 
+ bool
+ StoreEntry::hasIfMatchEtag(const HttpRequest &request) const
+ {
+     const String reqETags = request.header.getList(HDR_IF_MATCH);
+     return hasOneOfEtags(reqETags, false);
+ }
+ 
+ bool
+ StoreEntry::hasIfNoneMatchEtag(const HttpRequest &request) const
+ {
+     const String reqETags = request.header.getList(HDR_IF_NONE_MATCH);
+@@ -2066,60 +2063,72 @@
+ {
+     assert(0 <= swap_dirn && swap_dirn < Config.cacheSwap.n_configured);
+     return INDEXSD(swap_dirn);
+ }
+ 
+ void
+ StoreEntry::unlink()
+ {
+     store()->unlink(*this); // implies disconnect()
+     swap_filen = -1;
+     swap_dirn = -1;
+     swap_status = SWAPOUT_NONE;
+ }
+ 
+ /*
+  * return true if the entry is in a state where
+  * it can accept more data (ie with write() method)
+  */
+ bool
+ StoreEntry::isAccepting() const
+ {
+     if (STORE_PENDING != store_status)
+         return false;
+ 
+     if (EBIT_TEST(flags, ENTRY_ABORTED))
+         return false;
+ 
+     return true;
+ }
+ 
++const char *
++StoreEntry::describeTimestamps() const
++{
++    LOCAL_ARRAY(char, buf, 256);
++    snprintf(buf, 256, "LV:%-9d LU:%-9d LM:%-9d EX:%-9d",
++             static_cast<int>(timestamp),
++             static_cast<int>(lastref),
++             static_cast<int>(lastModified_),
++             static_cast<int>(expires));
++    return buf;
++}
++
+ std::ostream &operator <<(std::ostream &os, const StoreEntry &e)
+ {
+     os << "e:";
+ 
+     if (e.mem_obj) {
+         if (e.mem_obj->xitTable.index > -1)
+             os << 't' << e.mem_obj->xitTable.index;
+         if (e.mem_obj->memCache.index > -1)
+             os << 'm' << e.mem_obj->memCache.index;
+     }
+     if (e.swap_filen > -1 || e.swap_dirn > -1)
+         os << 'd' << e.swap_filen << '@' << e.swap_dirn;
+ 
+     os << '=';
+ 
+     // print only non-default status values, using unique letters
+     if (e.mem_status != NOT_IN_MEMORY ||
+             e.store_status != STORE_PENDING ||
+             e.swap_status != SWAPOUT_NONE ||
+             e.ping_status != PING_NONE) {
+         if (e.mem_status != NOT_IN_MEMORY) os << 'm';
+         if (e.store_status != STORE_PENDING) os << 's';
+         if (e.swap_status != SWAPOUT_NONE) os << 'w' << e.swap_status;
+         if (e.ping_status != PING_NONE) os << 'p' << e.ping_status;
+     }
+ 
+     // print only set flags, using unique letters
+     if (e.flags) {
+         if (EBIT_TEST(e.flags, ENTRY_SPECIAL)) os << 'S';
+         if (EBIT_TEST(e.flags, ENTRY_REVALIDATE_ALWAYS)) os << 'R';
+
+=== modified file 'src/store_rebuild.cc'
+--- src/store_rebuild.cc	2016-01-01 00:14:27 +0000
++++ src/store_rebuild.cc	2016-09-08 19:19:17 +0000
+@@ -227,61 +227,61 @@
+ #include "Generic.h"
+ #include "StoreMeta.h"
+ #include "StoreMetaUnpacker.h"
+ 
+ struct InitStoreEntry : public unary_function<StoreMeta, void> {
+     InitStoreEntry(StoreEntry *anEntry, cache_key *aKey):what(anEntry),index(aKey) {}
+ 
+     void operator()(StoreMeta const &x) {
+         switch (x.getType()) {
+ 
+         case STORE_META_KEY:
+             assert(x.length == SQUID_MD5_DIGEST_LENGTH);
+             memcpy(index, x.value, SQUID_MD5_DIGEST_LENGTH);
+             break;
+ 
+         case STORE_META_STD:
+             struct old_metahdr {
+                 time_t timestamp;
+                 time_t lastref;
+                 time_t expires;
+                 time_t lastmod;
+                 size_t swap_file_sz;
+                 uint16_t refcount;
+                 uint16_t flags;
+             } *tmp;
+             tmp = (struct old_metahdr *)x.value;
+             assert(x.length == STORE_HDR_METASIZE_OLD);
+             what->timestamp = tmp->timestamp;
+             what->lastref = tmp->lastref;
+             what->expires = tmp->expires;
+-            what->lastmod = tmp->lastmod;
++            what->lastModified(tmp->lastmod);
+             what->swap_file_sz = tmp->swap_file_sz;
+             what->refcount = tmp->refcount;
+             what->flags = tmp->flags;
+             break;
+ 
+         case STORE_META_STD_LFS:
+             assert(x.length == STORE_HDR_METASIZE);
+             memcpy(&what->timestamp, x.value, STORE_HDR_METASIZE);
+             break;
+ 
+         default:
+             break;
+         }
+     }
+ 
+     StoreEntry *what;
+     cache_key *index;
+ };
+ 
+ bool
+ storeRebuildLoadEntry(int fd, int diskIndex, MemBuf &buf, StoreRebuildData &)
+ {
+     if (fd < 0)
+         return false;
+ 
+     assert(buf.hasSpace()); // caller must allocate
+ 
+     const int len = FD_READ_METHOD(fd, buf.space(), buf.spaceSize());
+     ++ statCounter.syscalls.disk.reads;
+     if (len < 0) {
+
+=== modified file 'src/tests/stub_store.cc'
+--- src/tests/stub_store.cc	2016-01-01 00:14:27 +0000
++++ src/tests/stub_store.cc	2016-09-09 06:47:38 +0000
+@@ -46,61 +46,61 @@
+ void StoreEntry::makePrivate() STUB
+ void StoreEntry::setPublicKey() STUB
+ void StoreEntry::setPrivateKey() STUB
+ void StoreEntry::expireNow() STUB
+ void StoreEntry::releaseRequest() STUB
+ void StoreEntry::negativeCache() STUB
+ void StoreEntry::cacheNegatively() STUB
+ void StoreEntry::purgeMem() STUB
+ void StoreEntry::swapOut() STUB
+ void StoreEntry::swapOutFileClose(int how) STUB
+ const char *StoreEntry::url() const STUB_RETVAL(NULL)
+ bool StoreEntry::checkCachable() STUB_RETVAL(false)
+ int StoreEntry::checkNegativeHit() const STUB_RETVAL(0)
+ int StoreEntry::locked() const STUB_RETVAL(0)
+ int StoreEntry::validToSend() const STUB_RETVAL(0)
+ bool StoreEntry::memoryCachable() STUB_RETVAL(false)
+ MemObject *StoreEntry::makeMemObject() STUB_RETVAL(NULL)
+ void StoreEntry::createMemObject(const char *, const char *, const HttpRequestMethod &aMethod) STUB
+ void StoreEntry::dump(int debug_lvl) const STUB
+ void StoreEntry::hashDelete() STUB
+ void StoreEntry::hashInsert(const cache_key *) STUB
+ void StoreEntry::registerAbort(STABH * cb, void *) STUB
+ void StoreEntry::reset() STUB
+ void StoreEntry::setMemStatus(mem_status_t) STUB
+ void StoreEntry::timestampsSet() STUB
+ void StoreEntry::unregisterAbort() STUB
+ void StoreEntry::destroyMemObject() STUB
+ int StoreEntry::checkTooSmall() STUB_RETVAL(0)
+ void StoreEntry::delayAwareRead(const Comm::ConnectionPointer&, char *buf, int len, AsyncCall::Pointer callback) STUB
+ void StoreEntry::setNoDelay (bool const) STUB
+-bool StoreEntry::modifiedSince(HttpRequest * request) const STUB_RETVAL(false)
++bool StoreEntry::modifiedSince(const time_t ims, const int imslen) const STUB_RETVAL(false);
+ bool StoreEntry::hasIfMatchEtag(const HttpRequest &request) const STUB_RETVAL(false)
+ bool StoreEntry::hasIfNoneMatchEtag(const HttpRequest &request) const STUB_RETVAL(false)
+ RefCount<SwapDir> StoreEntry::store() const STUB_RETVAL(NULL)
+ size_t StoreEntry::inUseCount() STUB_RETVAL(0)
+ void StoreEntry::getPublicByRequestMethod(StoreClient * aClient, HttpRequest * request, const HttpRequestMethod& method) STUB
+ void StoreEntry::getPublicByRequest(StoreClient * aClient, HttpRequest * request) STUB
+ void StoreEntry::getPublic(StoreClient * aClient, const char *uri, const HttpRequestMethod& method) STUB
+ void *StoreEntry::operator new(size_t byteCount)
+ {
+     STUB
+     return new StoreEntry();
+ }
+ void StoreEntry::operator delete(void *address) STUB
+ void StoreEntry::setReleaseFlag() STUB
+ //#if USE_SQUID_ESI
+ //ESIElement::Pointer StoreEntry::cachedESITree STUB_RETVAL(NULL)
+ //#endif
+ void StoreEntry::append(char const *, int len) STUB
+ void StoreEntry::buffer() STUB
+ void StoreEntry::flush() STUB
+ int StoreEntry::unlock(const char *) STUB_RETVAL(0)
+ int64_t StoreEntry::objectLen() const STUB_RETVAL(0)
+ int64_t StoreEntry::contentLen() const STUB_RETVAL(0)
+ void StoreEntry::lock(const char *) STUB
+ void StoreEntry::touch() STUB
+ void StoreEntry::release() STUB
+ 
+ NullStoreEntry *NullStoreEntry::getInstance() STUB_RETVAL(NULL)
+ const char *NullStoreEntry::getMD5Text() const STUB_RETVAL(NULL)
+ void NullStoreEntry::operator delete(void *address) STUB
+
+=== modified file 'src/tests/testStoreController.cc'
+--- src/tests/testStoreController.cc	2016-01-01 00:14:27 +0000
++++ src/tests/testStoreController.cc	2016-09-08 19:19:54 +0000
+@@ -86,61 +86,61 @@
+     free_cachedir(&Config.cacheSwap);
+     Store::Root(NULL);
+ }
+ 
+ static StoreEntry *
+ addedEntry(StorePointer hashStore,
+            StorePointer aStore,
+            String name,
+            String varySpec,
+            String varyKey
+ 
+           )
+ {
+     StoreEntry *e = new StoreEntry();
+     e->store_status = STORE_OK;
+     e->setMemStatus(NOT_IN_MEMORY);
+     e->swap_status = SWAPOUT_DONE; /* bogus haha */
+     e->swap_filen = 0; /* garh - lower level*/
+     e->swap_dirn = -1;
+ 
+     for (int i=0; i < Config.cacheSwap.n_configured; ++i) {
+         if (INDEXSD (i) == aStore.getRaw())
+             e->swap_dirn = i;
+     }
+ 
+     CPPUNIT_ASSERT (e->swap_dirn != -1);
+     e->swap_file_sz = 0; /* garh lower level */
+     e->lastref = squid_curtime;
+     e->timestamp = squid_curtime;
+     e->expires = squid_curtime;
+-    e->lastmod = squid_curtime;
++    e->lastModified(squid_curtime);
+     e->refcount = 1;
+     EBIT_CLR(e->flags, RELEASE_REQUEST);
+     EBIT_CLR(e->flags, KEY_PRIVATE);
+     e->ping_status = PING_NONE;
+     EBIT_CLR(e->flags, ENTRY_VALIDATED);
+     e->hashInsert((const cache_key *)name.termedBuf()); /* do it after we clear KEY_PRIVATE */
+     return e;
+ }
+ 
+ /* TODO make this a cbdata class */
+ 
+ static bool cbcalled;
+ 
+ static void
+ searchCallback(void *cbdata)
+ {
+     cbcalled = true;
+ }
+ 
+ void
+ testStoreController::testSearch()
+ {
+     commonInit();
+     StorePointer aRoot (new StoreController());
+     Store::Root(aRoot);
+     TestSwapDirPointer aStore (new TestSwapDir);
+     TestSwapDirPointer aStore2 (new TestSwapDir);
+     addSwapDir(aStore);
+     addSwapDir(aStore2);
+     Store::Root().init();
+
+=== modified file 'src/tests/testStoreHashIndex.cc'
+--- src/tests/testStoreHashIndex.cc	2016-01-01 00:14:27 +0000
++++ src/tests/testStoreHashIndex.cc	2016-09-08 19:21:45 +0000
+@@ -67,61 +67,61 @@
+     free_cachedir(&Config.cacheSwap);
+     Store::Root(NULL);
+ }
+ 
+ StoreEntry *
+ addedEntry(StorePointer hashStore,
+            StorePointer aStore,
+            String name,
+            String varySpec,
+            String varyKey
+ 
+           )
+ {
+     StoreEntry *e = new StoreEntry();
+     e->store_status = STORE_OK;
+     e->setMemStatus(NOT_IN_MEMORY);
+     e->swap_status = SWAPOUT_DONE; /* bogus haha */
+     e->swap_filen = 0; /* garh - lower level*/
+     e->swap_dirn = -1;
+ 
+     for (int i=0; i < Config.cacheSwap.n_configured; ++i) {
+         if (INDEXSD (i) == aStore.getRaw())
+             e->swap_dirn = i;
+     }
+ 
+     CPPUNIT_ASSERT (e->swap_dirn != -1);
+     e->swap_file_sz = 0; /* garh lower level */
+     e->lastref = squid_curtime;
+     e->timestamp = squid_curtime;
+     e->expires = squid_curtime;
+-    e->lastmod = squid_curtime;
++    e->lastModified(squid_curtime);
+     e->refcount = 1;
+     EBIT_CLR(e->flags, RELEASE_REQUEST);
+     EBIT_CLR(e->flags, KEY_PRIVATE);
+     e->ping_status = PING_NONE;
+     EBIT_CLR(e->flags, ENTRY_VALIDATED);
+     e->hashInsert((const cache_key *)name.termedBuf()); /* do it after we clear KEY_PRIVATE */
+     return e;
+ }
+ 
+ void commonInit()
+ {
+     static bool inited = false;
+ 
+     if (inited)
+         return;
+ 
+     Mem::Init();
+ 
+     Config.Store.avgObjectSize = 1024;
+ 
+     Config.Store.objectsPerBucket = 20;
+ 
+     Config.Store.maxObjectSize = 2048;
+ }
+ 
+ /* TODO make this a cbdata class */
+ 
+ static bool cbcalled;
+ 
+ static void
+

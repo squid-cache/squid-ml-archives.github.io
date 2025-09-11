@@ -1,0 +1,135 @@
+ssl::server_name ACL badly broken since inception (trunk r14008).
+
+The original server_name code mishandled all SNI checks and some rare
+host checks:
+
+* The SNI-derived value was pointing to an already freed memory storage.
+* Missing host-derived values were not detected (GetHost() is never nil).
+* Mismatches were re-checked with an undocumented "none" value
+  instead of being treated as mismatches.
+
+Same for ssl::server_name_regex.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/acl/ServerName.cc'
+--- src/acl/ServerName.cc	2016-09-08 12:27:06 +0000
++++ src/acl/ServerName.cc	2016-10-28 08:24:45 +0000
+@@ -73,51 +73,52 @@
+ 
+     char *s = reinterpret_cast<char *>(cn_data->data);
+     char *d = cn;
+     for (int i = 0; i < cn_data->length; ++i, ++d, ++s) {
+         if (*s == '\0')
+             return 1; // always a domain mismatch. contains 0x00
+         *d = *s;
+     }
+     cn[cn_data->length] = '\0';
+     debugs(28, 4, "Verifying certificate name/subjectAltName " << cn);
+     if (data->match(cn))
+         return 0;
+     return 1;
+ }
+ 
+ int
+ ACLServerNameStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &flags)
+ {
+     assert(checklist != NULL && checklist->request != NULL);
+ 
+-    if (checklist->conn() && checklist->conn()->serverBump()) {
+-        if (X509 *peer_cert = checklist->conn()->serverBump()->serverCert.get()) {
+-            if (Ssl::matchX509CommonNames(peer_cert, (void *)data, check_cert_domain<MatchType>))
+-                return 1;
++    const char *serverName = NULL;
++    SBuf serverNameKeeper; // because c_str() is not constant
++    if (ConnStateData *conn = checklist->conn()) {
++        if (conn->serverBump()) {
++            if (X509 *peer_cert = conn->serverBump()->serverCert.get())
++                return Ssl::matchX509CommonNames(peer_cert, (void *)data, check_cert_domain<MatchType>);
+         }
+-    }
+ 
+-    const char *serverName = NULL;
+-    if (checklist->conn() && !checklist->conn()->sslCommonName().isEmpty()) {
+-        SBuf scn = checklist->conn()->sslCommonName();
+-        serverName = scn.c_str();
++        if (conn->sslCommonName().isEmpty()) {
++            const char *host = checklist->request->GetHost();
++            if (host && *host) // paranoid first condition: host() is never nil
++                serverName = host;
++        } else {
++            serverNameKeeper = conn->sslCommonName();
++            serverName = serverNameKeeper.c_str();
++        }
+     }
+ 
+-    if (serverName == NULL)
+-        serverName = checklist->request->GetHost();
+-
+-    if (serverName && data->match(serverName)) {
+-        return 1;
+-    }
++    if (!serverName)
++        serverName = "none";
+ 
+-    return data->match("none");
++    return data->match(serverName);
+ }
+ 
+ ACLServerNameStrategy *
+ ACLServerNameStrategy::Instance()
+ {
+     return &Instance_;
+ }
+ 
+ ACLServerNameStrategy ACLServerNameStrategy::Instance_;
+ 
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2016-10-25 08:23:49 +0000
++++ src/cf.data.pre	2016-10-28 08:25:46 +0000
+@@ -1150,40 +1150,43 @@
+ 
+ 	acl aclname at_step step
+ 	  # match against the current step during ssl_bump evaluation [fast]
+ 	  # Never matches and should not be used outside the ssl_bump context.
+ 	  #
+ 	  # At each SslBump step, Squid evaluates ssl_bump directives to find
+ 	  # the next bumping action (e.g., peek or splice). Valid SslBump step
+ 	  # values and the corresponding ssl_bump evaluation moments are:
+ 	  #   SslBump1: After getting TCP-level and HTTP CONNECT info.
+ 	  #   SslBump2: After getting SSL Client Hello info.
+ 	  #   SslBump3: After getting SSL Server Hello info.
+ 
+ 	acl aclname ssl::server_name .foo.com ...
+ 	  # matches server name obtained from various sources [fast]
+ 	  #
+ 	  # The server name is obtained during Ssl-Bump steps from such sources
+ 	  # as CONNECT request URI, client SNI, and SSL server certificate CN.
+ 	  # During each Ssl-Bump step, Squid may improve its understanding of a
+ 	  # "true server name". Unlike dstdomain, this ACL does not perform
+ 	  # DNS lookups.
++	  # The "none" name can be used to match transactions where Squid
++	  # could not compute the server name using any information source
++	  # already available at the ACL evaluation time.
+ 
+ 	acl aclname ssl::server_name_regex [-i] \.foo\.com ...
+ 	  # regex matches server name obtained from various sources [fast]
+ ENDIF
+ 	acl aclname any-of acl1 acl2 ...
+ 	  # match any one of the acls [fast or slow]
+ 	  # The first matching ACL stops further ACL evaluation.
+ 	  #
+ 	  # ACLs from multiple any-of lines with the same name are ORed.
+ 	  # For example, A = (a1 or a2) or (a3 or a4) can be written as
+ 	  #   acl A any-of a1 a2
+ 	  #   acl A any-of a3 a4
+ 	  #
+ 	  # This group ACL is fast if all evaluated ACLs in the group are fast
+ 	  # and slow otherwise.
+ 
+ 	acl aclname all-of acl1 acl2 ... 
+ 	  # match all of the acls [fast or slow]
+ 	  # The first mismatching ACL stops further ACL evaluation.
+ 	  #
+

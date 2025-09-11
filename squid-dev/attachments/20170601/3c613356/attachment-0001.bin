@@ -1,0 +1,4809 @@
+SMP Squid with SMP-aware caches sometimes does not purge cache entries.
+
+Fixes bug 4505.
+
+When Squid finds a requested entry in the memory cache, it does not
+check whether the same entry is also stored in a cache_dir. The
+StoreEntry object may become associated with its store entry in the
+memory cache but not with its store entry on disk. This inconsistency
+causes two known problems:
+
+1. Squid may needlessly swap out the memory hit to disk, either
+   overwriting an existing (and identical) disk entry or, worse,
+   creating a duplicate entry on another disk. In the second case, the
+   two disk entries are not synchronized and may eventually start to
+   differ if one of them is removed or updated.
+
+2. Squid may not delete a stale disk entry when needed, violating
+   various HTTP MUSTs, and eventually serving stale [disk] cache entries
+   to clients.
+
+Another purging problem is not caused by the above inconsistency:
+
+3. A DELETE request or equivalent may come for the entry which is still
+   locked for writing. Squid fails to get a lock for such an entry (in
+   order to purge it) and the entry remains in disk and/or memory cache.
+
+To solve the first two problems:
+
+* StoreEntry::mayStartSwapout() now avoids needless swapouts by checking
+  whether StoreEntry was fully loaded, is being loaded, or could have
+  been loaded from disk.
+
+To fix problem #3:
+
+* A new Store::Controller::unlinkByKey() method purges (or marks for
+  deletion if purging is impossible) all the matching store entries,
+  without loading the StoreEntry information from stores. The lack of
+  StoreEntry creation reduces waste of resources (the StoreEntry object
+  would have to be deleted anyway) _and_ allows us to mark being-created
+  entries (that are locked for writing and, hence, cannot be loaded into
+  a StoreEntry object).
+
+Note that even if Squid properly avoids storing duplicate disk entries,
+some cache_dir manipulations by humans and Squid crashes may lead to
+such duplicates being present.  This patch leaves dealing with potential
+duplicates out of scope except it guarantees that if an entry is
+deleted, then all [possible] duplicates are deleted as well.
+
+Also added StoreEntry helper methods to prevent direct manipulation of
+individual disk-related data members (swap_dirn, swap_filen, and
+swap_status). These methods help keep these related data members in a
+coherent state and minimize code duplication.
+
+Also tightened rules around several Storage methods: A storage method
+must not be given a StoreEntry object unless that object belongs to that
+storage.
+
+Also do not mark Transients entry as "waitingToBeFreed" when the entry
+is simply closed for writing. This flag is used to mark locked entries
+for deletion and should not be used for "completed" transient entries to
+avoid confusion.
+
+XXX: SMP cache purges may continue to malfunction when the Transients
+table is missing. Currently, Transients are created only when the
+collapsed_forwarding is on. After Squid bug 4579 is fixed, every public
+StoreEntry will have the corresponding Transients entry and vice versa,
+extending these fixes to all SMP environments.
+
+=== modified file 'src/MemStore.cc'
+--- src/MemStore.cc	2017-01-01 00:14:42 +0000
++++ src/MemStore.cc	2017-05-31 19:00:34 +0000
+@@ -399,105 +399,101 @@ MemStore::updateHeadersOrThrow(Ipc::Stor
+     update.fresh.anchor->basics.swap_file_sz -= staleHdrSz;
+     update.fresh.anchor->basics.swap_file_sz += freshHdrSz;
+ 
+     map->closeForUpdating(update);
+ }
+ 
+ bool
+ MemStore::anchorCollapsed(StoreEntry &collapsed, bool &inSync)
+ {
+     if (!map)
+         return false;
+ 
+     sfileno index;
+     const Ipc::StoreMapAnchor *const slot = map->openForReading(
+             reinterpret_cast<cache_key*>(collapsed.key), index);
+     if (!slot)
+         return false;
+ 
+     anchorEntry(collapsed, index, *slot);
+     inSync = updateCollapsedWith(collapsed, index, *slot);
+     return true; // even if inSync is false
+ }
+ 
+ bool
+ MemStore::updateCollapsed(StoreEntry &collapsed)
+ {
+     assert(collapsed.mem_obj);
+ 
+     const sfileno index = collapsed.mem_obj->memCache.index;
+ 
+-    // already disconnected from the cache, no need to update
+-    if (index < 0)
+-        return true;
+-
+     if (!map)
+         return false;
+ 
+     const Ipc::StoreMapAnchor &anchor = map->readableEntry(index);
+     return updateCollapsedWith(collapsed, index, anchor);
+ }
+ 
+ /// updates collapsed entry after its anchor has been located
+ bool
+ MemStore::updateCollapsedWith(StoreEntry &collapsed, const sfileno index, const Ipc::StoreMapAnchor &anchor)
+ {
+     collapsed.swap_file_sz = anchor.basics.swap_file_sz;
+     const bool copied = copyFromShm(collapsed, index, anchor);
+     return copied;
+ }
+ 
+ /// anchors StoreEntry to an already locked map entry
+ void
+ MemStore::anchorEntry(StoreEntry &e, const sfileno index, const Ipc::StoreMapAnchor &anchor)
+ {
+     const Ipc::StoreMapAnchor::Basics &basics = anchor.basics;
+ 
+     e.swap_file_sz = basics.swap_file_sz;
+     e.lastref = basics.lastref;
+     e.timestamp = basics.timestamp;
+     e.expires = basics.expires;
+     e.lastModified(basics.lastmod);
+     e.refcount = basics.refcount;
+     e.flags = basics.flags;
+ 
+     assert(e.mem_obj);
+     if (anchor.complete()) {
+         e.store_status = STORE_OK;
+         e.mem_obj->object_sz = e.swap_file_sz;
+         e.setMemStatus(IN_MEMORY);
+     } else {
+         e.store_status = STORE_PENDING;
+         assert(e.mem_obj->object_sz < 0);
+         e.setMemStatus(NOT_IN_MEMORY);
+     }
+-    assert(e.swap_status == SWAPOUT_NONE); // set in StoreEntry constructor
++    assert(!e.hasDisk()); // set in StoreEntry constructor
+     e.ping_status = PING_NONE;
+ 
+     EBIT_CLR(e.flags, RELEASE_REQUEST);
+     EBIT_CLR(e.flags, KEY_PRIVATE);
+     EBIT_SET(e.flags, ENTRY_VALIDATED);
+ 
+     MemObject::MemCache &mc = e.mem_obj->memCache;
+     mc.index = index;
+     mc.io = MemObject::ioReading;
+ }
+ 
+ /// copies the entire entry from shared to local memory
+ bool
+ MemStore::copyFromShm(StoreEntry &e, const sfileno index, const Ipc::StoreMapAnchor &anchor)
+ {
+     debugs(20, 7, "mem-loading entry " << index << " from " << anchor.start);
+     assert(e.mem_obj);
+ 
+     // emulate the usual Store code but w/o inapplicable checks and callbacks:
+ 
+     Ipc::StoreMapSliceId sid = anchor.start; // optimize: remember the last sid
+     bool wasEof = anchor.complete() && sid < 0;
+     int64_t sliceOffset = 0;
+     while (sid >= 0) {
+         const Ipc::StoreMapSlice &slice = map->readableSlice(index, sid);
+         // slice state may change during copying; take snapshots now
+         wasEof = anchor.complete() && slice.next < 0;
+         const Ipc::StoreMapSlice::Size wasSize = slice.size;
+ 
+         debugs(20, 9, "entry " << index << " slice " << sid << " eof " <<
+@@ -891,60 +887,66 @@ MemStore::write(StoreEntry &e)
+     disconnect(e);
+ }
+ 
+ void
+ MemStore::completeWriting(StoreEntry &e)
+ {
+     assert(e.mem_obj);
+     const int32_t index = e.mem_obj->memCache.index;
+     assert(index >= 0);
+     assert(map);
+ 
+     debugs(20, 5, "mem-cached all " << e.mem_obj->memCache.offset << " bytes of " << e);
+ 
+     e.mem_obj->memCache.index = -1;
+     e.mem_obj->memCache.io = MemObject::ioDone;
+     map->closeForWriting(index, false);
+ 
+     CollapsedForwarding::Broadcast(e); // before we close our transient entry!
+     Store::Root().transientsCompleteWriting(e);
+ }
+ 
+ void
+ MemStore::markForUnlink(StoreEntry &e)
+ {
+     assert(e.mem_obj);
+     if (e.mem_obj->memCache.index >= 0)
+         map->freeEntry(e.mem_obj->memCache.index);
+ }
+ 
+ void
++MemStore::unlinkByKeyIfFound(const cache_key *key)
++{
++    map->freeEntryByKey(key);
++}
++
++void
+ MemStore::unlink(StoreEntry &e)
+ {
+     if (e.mem_obj && e.mem_obj->memCache.index >= 0) {
+         map->freeEntry(e.mem_obj->memCache.index);
+         disconnect(e);
+     } else if (map) {
+         // the entry may have been loaded and then disconnected from the cache
+         map->freeEntryByKey(reinterpret_cast<cache_key*>(e.key));
+     }
+ 
+     e.destroyMemObject(); // XXX: but it may contain useful info such as a client list. The old code used to do that though, right?
+ }
+ 
+ void
+ MemStore::disconnect(StoreEntry &e)
+ {
+     assert(e.mem_obj);
+     MemObject &mem_obj = *e.mem_obj;
+     if (mem_obj.memCache.index >= 0) {
+         if (mem_obj.memCache.io == MemObject::ioWriting) {
+             map->abortWriting(mem_obj.memCache.index);
+             mem_obj.memCache.index = -1;
+             mem_obj.memCache.io = MemObject::ioDone;
+             Store::Root().transientsAbandon(e); // broadcasts after the change
+         } else {
+             assert(mem_obj.memCache.io == MemObject::ioReading);
+             map->closeForReading(mem_obj.memCache.index);
+             mem_obj.memCache.index = -1;
+             mem_obj.memCache.io = MemObject::ioDone;
+         }
+
+=== modified file 'src/MemStore.h'
+--- src/MemStore.h	2017-01-01 00:14:42 +0000
++++ src/MemStore.h	2017-05-31 19:00:27 +0000
+@@ -35,60 +35,61 @@ public:
+     /// whether e should be kept in local RAM for possible future caching
+     bool keepInLocalMemory(const StoreEntry &e) const;
+ 
+     /// copy non-shared entry data of the being-cached entry to our cache
+     void write(StoreEntry &e);
+ 
+     /// all data has been received; there will be no more write() calls
+     void completeWriting(StoreEntry &e);
+ 
+     /// called when the entry is about to forget its association with mem cache
+     void disconnect(StoreEntry &e);
+ 
+     /* Storage API */
+     virtual void create() override {}
+     virtual void init() override;
+     virtual StoreEntry *get(const cache_key *) override;
+     virtual uint64_t maxSize() const override;
+     virtual uint64_t minSize() const override;
+     virtual uint64_t currentSize() const override;
+     virtual uint64_t currentCount() const override;
+     virtual int64_t maxObjectSize() const override;
+     virtual void getStats(StoreInfoStats &stats) const override;
+     virtual void stat(StoreEntry &e) const override;
+     virtual void reference(StoreEntry &e) override;
+     virtual bool dereference(StoreEntry &e) override;
+     virtual void updateHeaders(StoreEntry *e) override;
+     virtual void maintain() override;
+     virtual bool anchorCollapsed(StoreEntry &e, bool &inSync) override;
+     virtual bool updateCollapsed(StoreEntry &e) override;
+     virtual void markForUnlink(StoreEntry &) override;
++    virtual void unlinkByKeyIfFound(const cache_key *key) override;
+     virtual void unlink(StoreEntry &e) override;
+     virtual bool smpAware() const override { return true; }
+ 
+     static int64_t EntryLimit();
+ 
+ protected:
+     friend ShmWriter;
+ 
+     bool shouldCache(StoreEntry &e) const;
+     bool startCaching(StoreEntry &e);
+ 
+     void copyToShm(StoreEntry &e);
+     void copyToShmSlice(StoreEntry &e, Ipc::StoreMapAnchor &anchor, Ipc::StoreMap::Slice &slice);
+     bool copyFromShm(StoreEntry &e, const sfileno index, const Ipc::StoreMapAnchor &anchor);
+     bool copyFromShmSlice(StoreEntry &e, const StoreIOBuffer &buf, bool eof);
+ 
+     void updateHeadersOrThrow(Ipc::StoreMapUpdate &update);
+ 
+     void anchorEntry(StoreEntry &e, const sfileno index, const Ipc::StoreMapAnchor &anchor);
+     bool updateCollapsedWith(StoreEntry &collapsed, const sfileno index, const Ipc::StoreMapAnchor &anchor);
+ 
+     Ipc::Mem::PageId pageForSlice(Ipc::StoreMapSliceId sliceId);
+     Ipc::StoreMap::Slice &nextAppendableSlice(const sfileno entryIndex, sfileno &sliceOffset);
+     sfileno reserveSapForWriting(Ipc::Mem::PageId &page);
+ 
+     // Ipc::StoreMapCleaner API
+     virtual void noteFreeMapSlice(const Ipc::StoreMapSliceId sliceId) override;
+ 
+ private:
+     // TODO: move freeSlots into map
+
+=== modified file 'src/Store.h'
+--- src/Store.h	2017-01-01 00:14:42 +0000
++++ src/Store.h	2017-05-31 18:39:29 +0000
+@@ -54,129 +54,146 @@ public:
+ 
+     /** Check if the Store entry is emtpty
+      * \retval true   Store contains 0 bytes of data.
+      * \retval false  Store contains 1 or more bytes of data.
+      * \retval false  Store contains negative content !!!!!!
+      */
+     virtual bool isEmpty() const {
+         assert (mem_obj);
+         return mem_obj->endOffset() == 0;
+     }
+     virtual bool isAccepting() const;
+     virtual size_t bytesWanted(Range<size_t> const aRange, bool ignoreDelayPool = false) const;
+     /// flags [truncated or too big] entry with ENTRY_BAD_LENGTH and releases it
+     void lengthWentBad(const char *reason);
+     virtual void complete();
+     virtual store_client_t storeClientType() const;
+     virtual char const *getSerialisedMetaData();
+     /// Store a prepared error response. MemObject locks the reply object.
+     void storeErrorResponse(HttpReply *reply);
+     void replaceHttpReply(HttpReply *, bool andStartWriting = true);
+     void startWriting(); ///< pack and write reply headers and, maybe, body
+     /// whether we may start writing to disk (now or in the future)
+     virtual bool mayStartSwapOut();
+     virtual void trimMemory(const bool preserveSwappable);
+ 
+     // called when a decision to cache in memory has been made
+     void memOutDecision(const bool willCacheInRam);
+     // called when a decision to cache on disk has been made
+     void swapOutDecision(const MemObject::SwapOut::Decision &decision);
+ 
++    // If the entry has already been marked for release, makes sure all
++    // associated caches know it. Meant to be called just before
++    // publishing swapout metadata, to deal with SMP race conditions.
++    void markIfDeleted();
++
+     void abort();
+     void makePublic(const KeyScope keyScope = ksDefault);
+     void makePrivate();
+     void setPublicKey(const KeyScope keyScope = ksDefault);
+     /// Resets existing public key to a public key with default scope,
+     /// releasing the old default-scope entry (if any).
+     /// Does nothing if the existing public key already has default scope.
+     void clearPublicKeyScope();
+     void setPrivateKey();
+     void expireNow();
+     void releaseRequest();
+     void negativeCache();
+     void cacheNegatively();     /** \todo argh, why both? */
+     void invokeHandlers();
+     void purgeMem();
+     void cacheInMemory(); ///< start or continue storing in memory cache
+     void swapOut();
+     /// whether we are in the process of writing this entry to disk
+     bool swappingOut() const { return swap_status == SWAPOUT_WRITING; }
++    /// whether this entry was fully written to disk some time in the past;
++    /// it may have been deleted since then though
++    bool swappedOut() const { return swap_status == SWAPOUT_DONE; }
+     void swapOutFileClose(int how);
+     const char *url() const;
+     /// Satisfies cachability requirements shared among disk and RAM caches.
+     /// Encapsulates common checks of mayStartSwapOut() and memoryCachable().
+     /// TODO: Rename and make private so only those two methods can call this.
+     bool checkCachable();
+     int checkNegativeHit() const;
+     int locked() const;
+     int validToSend() const;
+     bool memoryCachable(); ///< checkCachable() and can be cached in memory
+ 
+     /// if needed, initialize mem_obj member w/o URI-related information
+     MemObject *makeMemObject();
+ 
+     /// initialize mem_obj member (if needed) and supply URI-related info
+     void createMemObject(const char *storeId, const char *logUri, const HttpRequestMethod &aMethod);
+ 
+     void dump(int debug_lvl) const;
+     void hashDelete();
+     void hashInsert(const cache_key *);
+     void registerAbort(STABH * cb, void *);
+     void reset();
+     void setMemStatus(mem_status_t);
+     bool timestampsSet();
+     void unregisterAbort();
+     void destroyMemObject();
+     int checkTooSmall();
+ 
+     void delayAwareRead(const Comm::ConnectionPointer &conn, char *buf, int len, AsyncCall::Pointer callback);
+ 
+     void setNoDelay (bool const);
+     void lastModified(const time_t when) { lastModified_ = when; }
+     /// \returns entry's 'effective' modification time
+     time_t lastModified() const {
+         // may still return -1 if timestamp is not set
+         return lastModified_ < 0 ? timestamp : lastModified_;
+     }
+     /// \returns a formatted string with entry's timestamps
+     const char *describeTimestamps() const;
+     // TODO: consider removing currently unsupported imslen parameter
+     bool modifiedSince(const time_t ims, const int imslen = -1) const;
+     /// has ETag matching at least one of the If-Match etags
+     bool hasIfMatchEtag(const HttpRequest &request) const;
+     /// has ETag matching at least one of the If-None-Match etags
+     bool hasIfNoneMatchEtag(const HttpRequest &request) const;
+     /// whether this entry has an ETag; if yes, puts ETag value into parameter
+     bool hasEtag(ETag &etag) const;
+ 
+     /// the disk this entry is [being] cached on; asserts for entries w/o a disk
+     Store::Disk &disk() const;
++    /// whether there was a corresponding disk store entry at some time;
++    /// true result does not imply that the disk entry is locked now
++    bool hasDisk(const sdirno dirn = -1, const sfileno filen = -1) const;
++    /// Makes hasDisk(dirn, filn) true. The caller should have locked
++    /// the corresponding disk store entry for reading or writing.
++    void attachToDisk(const sdirno dirn, const sfileno filn, const swap_status_t status);
++    /// Makes hasDisk() false. The caller should have deleted
++    /// the corresponding disk store entry.
++    void detachFromDisk();
+ 
+     MemObject *mem_obj;
+     RemovalPolicyNode repl;
+     /* START OF ON-DISK STORE_META_STD TLV field */
+     time_t timestamp;
+     time_t lastref;
+     time_t expires;
+ private:
+     time_t lastModified_; ///< received Last-Modified value or -1; use lastModified()
+ public:
+     uint64_t swap_file_sz;
+     uint16_t refcount;
+     uint16_t flags;
+     /* END OF ON-DISK STORE_META_STD */
+ 
+     /// unique ID inside a cache_dir for swapped out entries; -1 for others
+     sfileno swap_filen:25; // keep in sync with SwapFilenMax
+ 
+     sdirno swap_dirn:7;
+ 
+     mem_status_t mem_status:3;
+ 
+     ping_status_t ping_status:3;
+ 
+     store_status_t store_status:3;
+ 
+     swap_status_t swap_status:3;
+ 
+ public:
+     static size_t inUseCount();
+@@ -202,60 +219,62 @@ public:
+     /// matching lock() and unlock() contexts eases leak triage but is optional
+     void lock(const char *context);
+ 
+     /// disclaim shared ownership; may remove entry from store and delete it
+     /// returns remaning lock level (zero for unlocked and possibly gone entry)
+     int unlock(const char *context);
+ 
+     /// returns a local concurrent use counter, for debugging
+     int locks() const { return static_cast<int>(lock_count); }
+ 
+     /// update last reference timestamp and related Store metadata
+     void touch();
+ 
+     virtual void release();
+ 
+ #if USE_ADAPTATION
+     /// call back producer when more buffer space is available
+     void deferProducer(const AsyncCall::Pointer &producer);
+     /// calls back producer registered with deferProducer
+     void kickProducer();
+ #endif
+ 
+     /* Packable API */
+     virtual void append(char const *, int);
+     virtual void vappendf(const char *, va_list);
+     virtual void buffer();
+     virtual void flush();
+ 
+ protected:
+     void transientsAbandonmentCheck();
++    /// does nothing except throwing if disk-associated data members are inconsistent
++    void checkDisk() const;
+ 
+ private:
+     bool checkTooBig() const;
+     void forcePublicKey(const cache_key *newkey);
+     void adjustVary();
+     const cache_key *calcPublicKey(const KeyScope keyScope);
+ 
+     static MemAllocator *pool;
+ 
+     unsigned short lock_count;      /* Assume < 65536! */
+ 
+ #if USE_ADAPTATION
+     /// producer callback registered with deferProducer
+     AsyncCall::Pointer deferredProducer;
+ #endif
+ 
+     bool validLength() const;
+     bool hasOneOfEtags(const String &reqETags, const bool allowWeakMatch) const;
+ };
+ 
+ std::ostream &operator <<(std::ostream &os, const StoreEntry &e);
+ 
+ /// \ingroup StoreAPI
+ class NullStoreEntry:public StoreEntry
+ {
+ 
+ public:
+     static NullStoreEntry *getInstance();
+     bool isNull() {
+         return true;
+
+=== modified file 'src/Transients.cc'
+--- src/Transients.cc	2017-01-01 00:14:42 +0000
++++ src/Transients.cc	2017-05-31 18:56:38 +0000
+@@ -134,60 +134,62 @@ void
+ Transients::reference(StoreEntry &)
+ {
+     // no replacement policy (but the cache(s) storing the entry may have one)
+ }
+ 
+ bool
+ Transients::dereference(StoreEntry &)
+ {
+     // no need to keep e in the global store_table for us; we have our own map
+     return false;
+ }
+ 
+ StoreEntry *
+ Transients::get(const cache_key *key)
+ {
+     if (!map)
+         return NULL;
+ 
+     sfileno index;
+     const Ipc::StoreMapAnchor *anchor = map->openForReading(key, index);
+     if (!anchor)
+         return NULL;
+ 
+     // If we already have a local entry, the store_table should have found it.
+     // Since it did not, the local entry key must have changed from public to
+     // private. We still need to keep the private entry around for syncing as
+     // its clients depend on it, but we should not allow new clients to join.
+     if (StoreEntry *oldE = locals->at(index)) {
+         debugs(20, 3, "not joining private " << *oldE);
+         assert(EBIT_TEST(oldE->flags, KEY_PRIVATE));
++    } else if (anchor->complete()) {
++        debugs(20, 3, "not joining completed " << storeKeyText(key));
+     } else if (StoreEntry *newE = copyFromShm(index)) {
+         return newE; // keep read lock to receive updates from others
+     }
+ 
+     // private entry or loading failure
+     map->closeForReading(index);
+     return NULL;
+ }
+ 
+ StoreEntry *
+ Transients::copyFromShm(const sfileno index)
+ {
+     const TransientsMapExtras::Item &extra = extras->items[index];
+ 
+     // create a brand new store entry and initialize it with stored info
+     StoreEntry *e = storeCreatePureEntry(extra.url, extra.url,
+                                          extra.reqFlags, extra.reqMethod);
+ 
+     assert(e->mem_obj);
+     e->mem_obj->method = extra.reqMethod;
+     e->mem_obj->xitTable.io = MemObject::ioReading;
+     e->mem_obj->xitTable.index = index;
+ 
+     // TODO: Support collapsed revalidation for SMP-aware caches.
+     e->setPublicKey(ksDefault);
+     assert(e->key);
+ 
+     // How do we know its SMP- and not just locally-collapsed? A worker gets
+     // locally-collapsed entries from the local store_table, not Transients.
+     // TODO: Can we remove smpCollapsed by not syncing non-transient entries?
+@@ -279,128 +281,142 @@ Transients::copyToShm(const StoreEntry &
+ 
+ void
+ Transients::noteFreeMapSlice(const Ipc::StoreMapSliceId)
+ {
+     // TODO: we should probably find the entry being deleted and abort it
+ }
+ 
+ void
+ Transients::abandon(const StoreEntry &e)
+ {
+     assert(e.mem_obj && map);
+     map->freeEntry(e.mem_obj->xitTable.index); // just marks the locked entry
+     CollapsedForwarding::Broadcast(e);
+     // We do not unlock the entry now because the problem is most likely with
+     // the server resource rather than a specific cache writer, so we want to
+     // prevent other readers from collapsing requests for that resource.
+ }
+ 
+ bool
+ Transients::abandoned(const StoreEntry &e) const
+ {
+     assert(e.mem_obj);
+     return abandonedAt(e.mem_obj->xitTable.index);
+ }
+ 
+ /// whether an in-transit entry at the index is now abandoned by its writer
+ bool
+ Transients::abandonedAt(const sfileno index) const
+ {
+     assert(map);
+-    return map->readableEntry(index).waitingToBeFreed;
++    const Ipc::StoreMap::Anchor &anchor = map->readableEntry(index);
++    return anchor.waitingToBeFreed && EBIT_TEST(anchor.basics.flags, ENTRY_ABORTED);
+ }
+ 
+ void
+ Transients::completeWriting(const StoreEntry &e)
+ {
+     if (e.mem_obj && e.mem_obj->xitTable.index >= 0) {
+         assert(e.mem_obj->xitTable.io == MemObject::ioWriting);
+         // there will be no more updates from us after this, so we must prevent
+         // future readers from joining
+-        map->freeEntry(e.mem_obj->xitTable.index); // just marks the locked entry
+         map->closeForWriting(e.mem_obj->xitTable.index);
+         e.mem_obj->xitTable.index = -1;
+         e.mem_obj->xitTable.io = MemObject::ioDone;
+     }
+ }
+ 
+ int
+ Transients::readers(const StoreEntry &e) const
+ {
+     if (e.mem_obj && e.mem_obj->xitTable.index >= 0) {
+         assert(map);
+         return map->peekAtEntry(e.mem_obj->xitTable.index).lock.readers;
+     }
+     return 0;
+ }
+ 
+ void
+ Transients::markForUnlink(StoreEntry &e)
+ {
+     unlink(e);
+ }
+ 
+ void
++Transients::unlinkByKeyIfFound(const cache_key *key)
++{
++    // Controller ensures that this worker has no StoreEntry to abandon() here.
++    map->freeEntryByKey(key);
++}
++
++void
+ Transients::unlink(StoreEntry &e)
+ {
+     if (e.mem_obj && e.mem_obj->xitTable.io == MemObject::ioWriting)
+         abandon(e);
+ }
+ 
+ void
+ Transients::disconnect(MemObject &mem_obj)
+ {
+     if (mem_obj.xitTable.index >= 0) {
+         assert(map);
+         if (mem_obj.xitTable.io == MemObject::ioWriting) {
+             map->abortWriting(mem_obj.xitTable.index);
+         } else {
+             assert(mem_obj.xitTable.io == MemObject::ioReading);
+             map->closeForReading(mem_obj.xitTable.index);
+         }
+         locals->at(mem_obj.xitTable.index) = NULL;
+         mem_obj.xitTable.index = -1;
+         mem_obj.xitTable.io = MemObject::ioDone;
+     }
+ }
+ 
+ /// calculates maximum number of entries we need to store and map
+ int64_t
+ Transients::EntryLimit()
+ {
+     // TODO: we should also check whether any SMP-aware caching is configured
+     if (!UsingSmp() || !Config.onoff.collapsed_forwarding)
+         return 0; // no SMP collapsed forwarding possible or needed
+ 
+     return Config.collapsed_forwarding_shared_entries_limit;
+ }
+ 
++bool
++Transients::markedForDeletion(const cache_key *key) const
++{
++    assert(map);
++    return map->markedForDeletion(key);
++}
++
+ /// initializes shared memory segment used by Transients
+ class TransientsRr: public Ipc::Mem::RegisteredRunner
+ {
+ public:
+     /* RegisteredRunner API */
+     TransientsRr(): mapOwner(NULL), extrasOwner(NULL) {}
+     virtual void useConfig();
+     virtual ~TransientsRr();
+ 
+ protected:
+     virtual void create();
+ 
+ private:
+     TransientsMap::Owner *mapOwner;
+     Ipc::Mem::Owner<TransientsMapExtras> *extrasOwner;
+ };
+ 
+ RunnerRegistrationEntry(TransientsRr);
+ 
+ void
+ TransientsRr::useConfig()
+ {
+     assert(Config.memShared.configured());
+     Ipc::Mem::RegisteredRunner::useConfig();
+ }
+ 
+ void
+ TransientsRr::create()
+ {
+     if (!Config.onoff.collapsed_forwarding)
+
+=== modified file 'src/Transients.h'
+--- src/Transients.h	2017-01-01 00:14:42 +0000
++++ src/Transients.h	2017-05-31 18:56:26 +0000
+@@ -43,62 +43,67 @@ public:
+ 
+     /// called when the in-transit entry has been successfully cached
+     void completeWriting(const StoreEntry &e);
+ 
+     /// the calling entry writer no longer expects to cache this entry
+     void abandon(const StoreEntry &e);
+ 
+     /// whether an in-transit entry is now abandoned by its writer
+     bool abandoned(const StoreEntry &e) const;
+ 
+     /// number of entry readers some time ago
+     int readers(const StoreEntry &e) const;
+ 
+     /// the caller is done writing or reading this entry
+     void disconnect(MemObject &mem_obj);
+ 
+     /* Store API */
+     virtual StoreEntry *get(const cache_key *) override;
+     virtual void create() override {}
+     virtual void init() override;
+     virtual uint64_t maxSize() const override;
+     virtual uint64_t minSize() const override;
+     virtual uint64_t currentSize() const override;
+     virtual uint64_t currentCount() const override;
+     virtual int64_t maxObjectSize() const override;
+     virtual void getStats(StoreInfoStats &stats) const override;
+     virtual void stat(StoreEntry &e) const override;
+     virtual void reference(StoreEntry &e) override;
+     virtual bool dereference(StoreEntry &e) override;
+     virtual void markForUnlink(StoreEntry &e) override;
++    virtual void unlinkByKeyIfFound(const cache_key *) override;
+     virtual void unlink(StoreEntry &e) override;
+     virtual void maintain() override;
+     virtual bool smpAware() const override { return true; }
+ 
++    /// whether the entry with the given key exists and was marked
++    /// for removal some time ago
++    bool markedForDeletion(const cache_key * key) const;
++
+     static int64_t EntryLimit();
+ 
+ protected:
+     StoreEntry *copyFromShm(const sfileno index);
+     bool copyToShm(const StoreEntry &e, const sfileno index, const RequestFlags &reqFlags, const HttpRequestMethod &reqMethod);
+ 
+     bool abandonedAt(const sfileno index) const;
+ 
+     // Ipc::StoreMapCleaner API
+     virtual void noteFreeMapSlice(const Ipc::StoreMapSliceId sliceId) override;
+ 
+ private:
+     /// shared packed info indexed by Store keys, for creating new StoreEntries
+     TransientsMap *map;
+ 
+     /// shared packed info that standard StoreMap does not store for us
+     typedef TransientsMapExtras Extras;
+     Ipc::Mem::Pointer<Extras> extras;
+ 
+     typedef std::vector<StoreEntry*> Locals;
+     /// local collapsed entries indexed by transient ID, for syncing old StoreEntries
+     Locals *locals;
+ };
+ 
+ // TODO: Why use Store as a base? We are not really a cache.
+ 
+ #endif /* SQUID_TRANSIENTS_H */
+ 
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2017-03-31 14:45:07 +0000
++++ src/client_side_reply.cc	2017-05-31 18:57:44 +0000
+@@ -867,74 +867,81 @@ clientReplyContext::blockedHit() const
+     // This does not happen, I hope, because we are called from CacheHit, which
+     // is called via a storeClientCopy() callback, and store should initialize
+     // the reply before calling that callback.
+     debugs(88, 3, "Missing reply!");
+     return false;
+ }
+ 
+ void
+ clientReplyContext::purgeRequestFindObjectToPurge()
+ {
+     /* Try to find a base entry */
+     http->flags.purging = true;
+     lookingforstore = 1;
+ 
+     // TODO: can we use purgeAllCached() here instead of doing the
+     // getPublicByRequestMethod() dance?
+     StoreEntry::getPublicByRequestMethod(this, http->request, Http::METHOD_GET);
+ }
+ 
+ // Purges all entries with a given url
+ // TODO: move to SideAgent parent, when we have one
+ /*
+  * We probably cannot purge Vary-affected responses because their MD5
+  * keys depend on vary headers.
+  */
+ void
+ purgeEntriesByUrl(HttpRequest * req, const char *url)
+ {
+ #if USE_HTCP
+     bool get_or_head_sent = false;
++    // Optimization: Do not call expensive Root().get() below unless it is needed.
++    const bool needEntry = neighborsHtcpClearNeeded(HTCP_CLR_INVALIDATION);
+ #endif
+ 
+     for (HttpRequestMethod m(Http::METHOD_NONE); m != Http::METHOD_ENUM_END; ++m) {
+         if (m.respMaybeCacheable()) {
+-            if (StoreEntry *entry = storeGetPublic(url, m)) {
+-                debugs(88, 5, "purging " << *entry << ' ' << m << ' ' << url);
++            const cache_key *key = storeKeyPublic(url, m);
++            debugs(88, 5, m << ' ' << url << ' ' << storeKeyText(key));
+ #if USE_HTCP
+-                neighborsHtcpClear(entry, url, req, m, HTCP_CLR_INVALIDATION);
+-                if (m == Http::METHOD_GET || m == Http::METHOD_HEAD) {
+-                    get_or_head_sent = true;
++            // TODO: Remove if HTCP_CLR_INVALIDATION does not need Store ID (i.e., entry->uri()).
++            if (needEntry) {
++                if (StoreEntry *entry = Store::Root().get(key)) {
++                    entry->lock("purgeEntriesByUrl");
++                    neighborsHtcpClear(entry, url, req, m, HTCP_CLR_INVALIDATION);
++                    if (m == Http::METHOD_GET || m == Http::METHOD_HEAD)
++                        get_or_head_sent = true;
++                    entry->unlock("purgeEntriesByUrl");
+                 }
+-#endif
+-                entry->release();
+             }
++#endif
++            Store::Root().unlinkByKeyIfFound(key);
+         }
+     }
+ 
+ #if USE_HTCP
+     if (!get_or_head_sent) {
+         neighborsHtcpClear(NULL, url, req, HttpRequestMethod(Http::METHOD_GET), HTCP_CLR_INVALIDATION);
+     }
+ #endif
+ }
+ 
+ void
+ clientReplyContext::purgeAllCached()
+ {
+     // XXX: performance regression, c_str() reallocates
+     SBuf url(http->request->effectiveRequestUri());
+     purgeEntriesByUrl(http->request, url.c_str());
+ }
+ 
+ void
+ clientReplyContext::created(StoreEntry *newEntry)
+ {
+     if (lookingforstore == 1)
+         purgeFoundGet(newEntry);
+     else if (lookingforstore == 2)
+         purgeFoundHead(newEntry);
+     else if (lookingforstore == 3)
+         purgeDoPurgeGet(newEntry);
+     else if (lookingforstore == 4)
+         purgeDoPurgeHead(newEntry);
+     else if (lookingforstore == 5)
+
+=== modified file 'src/enums.h'
+--- src/enums.h	2017-01-01 00:14:42 +0000
++++ src/enums.h	2017-05-31 10:20:36 +0000
+@@ -20,63 +20,67 @@ enum fd_type {
+ };
+ 
+ enum {
+     FD_READ,
+     FD_WRITE
+ };
+ 
+ typedef enum {
+     PEER_NONE,
+     PEER_SIBLING,
+     PEER_PARENT,
+     PEER_MULTICAST
+ } peer_t;
+ 
+ typedef enum _mem_status_t {
+     NOT_IN_MEMORY,
+     IN_MEMORY
+ } mem_status_t;
+ 
+ typedef enum {
+     PING_NONE,
+     PING_WAITING,
+     PING_DONE
+ } ping_status_t;
+ 
+ typedef enum {
+     STORE_OK,
+     STORE_PENDING
+ } store_status_t;
+ 
++///Store entry swapping out states.
+ typedef enum {
+-    SWAPOUT_NONE,
+-    SWAPOUT_WRITING,
++    SWAPOUT_NONE, ///< the store entry has not been stored on a disk
++    SWAPOUT_WRITING, ///< the store entry is being stored on a disk
++    /// The store entry has been stored on a disk some time ago.
++    /// However this does not guarantee that the cached entry has
++    /// not been deleted since then.
+     SWAPOUT_DONE
+ } swap_status_t;
+ 
+ typedef enum {
+     STORE_NON_CLIENT,
+     STORE_MEM_CLIENT,
+     STORE_DISK_CLIENT
+ } store_client_t;
+ 
+ /*
+  * These are for StoreEntry->flag, which is defined as a SHORT
+  *
+  * NOTE: These flags are written to swap.state, so think very carefully
+  * about deleting or re-assigning!
+  */
+ enum {
+     ENTRY_SPECIAL,
+     ENTRY_REVALIDATE_ALWAYS,
+     DELAY_SENDING,
+     RELEASE_REQUEST,
+     REFRESH_REQUEST,
+     ENTRY_REVALIDATE_STALE,
+     ENTRY_DISPATCHED,
+     KEY_PRIVATE,
+     ENTRY_FWD_HDR_WAIT,
+     ENTRY_NEGCACHED,
+     ENTRY_VALIDATED,
+     ENTRY_BAD_LENGTH,
+     ENTRY_ABORTED
+ };
+
+=== modified file 'src/fs/rock/RockSwapDir.cc'
+--- src/fs/rock/RockSwapDir.cc	2017-01-01 00:14:42 +0000
++++ src/fs/rock/RockSwapDir.cc	2017-05-31 18:58:03 +0000
+@@ -71,133 +71,125 @@ Rock::SwapDir::get(const cache_key *key)
+     e->hashInsert(key);
+     trackReferences(*e);
+ 
+     return e;
+     // the disk entry remains open for reading, protected from modifications
+ }
+ 
+ bool
+ Rock::SwapDir::anchorCollapsed(StoreEntry &collapsed, bool &inSync)
+ {
+     if (!map || !theFile || !theFile->canRead())
+         return false;
+ 
+     sfileno filen;
+     const Ipc::StoreMapAnchor *const slot = map->openForReading(
+             reinterpret_cast<cache_key*>(collapsed.key), filen);
+     if (!slot)
+         return false;
+ 
+     anchorEntry(collapsed, filen, *slot);
+     inSync = updateCollapsedWith(collapsed, *slot);
+     return true; // even if inSync is false
+ }
+ 
+ bool
+ Rock::SwapDir::updateCollapsed(StoreEntry &collapsed)
+ {
+     if (!map || !theFile || !theFile->canRead())
+         return false;
+ 
+-    if (collapsed.swap_filen < 0) // no longer using a disk cache
+-        return true;
+-    assert(collapsed.swap_dirn == index);
++    assert(collapsed.hasDisk(index));
+ 
+     const Ipc::StoreMapAnchor &s = map->readableEntry(collapsed.swap_filen);
+     return updateCollapsedWith(collapsed, s);
+ }
+ 
+ bool
+ Rock::SwapDir::updateCollapsedWith(StoreEntry &collapsed, const Ipc::StoreMapAnchor &anchor)
+ {
+     collapsed.swap_file_sz = anchor.basics.swap_file_sz;
+     return true;
+ }
+ 
+ void
+ Rock::SwapDir::anchorEntry(StoreEntry &e, const sfileno filen, const Ipc::StoreMapAnchor &anchor)
+ {
+     const Ipc::StoreMapAnchor::Basics &basics = anchor.basics;
+ 
+     e.swap_file_sz = basics.swap_file_sz;
+     e.lastref = basics.lastref;
+     e.timestamp = basics.timestamp;
+     e.expires = basics.expires;
+     e.lastModified(basics.lastmod);
+     e.refcount = basics.refcount;
+     e.flags = basics.flags;
+ 
+-    if (anchor.complete()) {
+-        e.store_status = STORE_OK;
+-        e.swap_status = SWAPOUT_DONE;
+-    } else {
+-        e.store_status = STORE_PENDING;
+-        e.swap_status = SWAPOUT_WRITING; // even though another worker writes?
+-    }
++    const bool complete = anchor.complete();
++    e.store_status = complete ? STORE_OK : STORE_PENDING;
++    // SWAPOUT_WRITING: even though another worker writes?
++    e.attachToDisk(index, filen, complete ? SWAPOUT_DONE : SWAPOUT_WRITING);
+ 
+     e.ping_status = PING_NONE;
+ 
+     EBIT_CLR(e.flags, RELEASE_REQUEST);
+     EBIT_CLR(e.flags, KEY_PRIVATE);
+     EBIT_SET(e.flags, ENTRY_VALIDATED);
+ 
+     e.swap_dirn = index;
+     e.swap_filen = filen;
+ }
+ 
+ void Rock::SwapDir::disconnect(StoreEntry &e)
+ {
+-    assert(e.swap_dirn == index);
+-    assert(e.swap_filen >= 0);
+-    // cannot have SWAPOUT_NONE entry with swap_filen >= 0
+-    assert(e.swap_status != SWAPOUT_NONE);
++    assert(e.hasDisk(index));
+ 
+     // do not rely on e.swap_status here because there is an async delay
+     // before it switches from SWAPOUT_WRITING to SWAPOUT_DONE.
+ 
+     // since e has swap_filen, its slot is locked for reading and/or writing
+     // but it is difficult to know whether THIS worker is reading or writing e,
+     // especially since we may switch from writing to reading. This code relies
+     // on Rock::IoState::writeableAnchor_ being set when we locked for writing.
+     if (e.mem_obj && e.mem_obj->swapout.sio != NULL &&
+             dynamic_cast<IoState&>(*e.mem_obj->swapout.sio).writeableAnchor_) {
+         map->abortWriting(e.swap_filen);
+         e.swap_dirn = -1;
+         e.swap_filen = -1;
+-        e.swap_status = SWAPOUT_NONE;
++        e.detachFromDisk();
+         dynamic_cast<IoState&>(*e.mem_obj->swapout.sio).writeableAnchor_ = NULL;
+         Store::Root().transientsAbandon(e); // broadcasts after the change
+     } else {
+         map->closeForReading(e.swap_filen);
+         e.swap_dirn = -1;
+         e.swap_filen = -1;
+-        e.swap_status = SWAPOUT_NONE;
++        e.detachFromDisk();
+     }
+ }
+ 
+ uint64_t
+ Rock::SwapDir::currentSize() const
+ {
+     const uint64_t spaceSize = !freeSlots ?
+                                maxSize() : (slotSize * freeSlots->size());
+     // everything that is not free is in use
+     return maxSize() - spaceSize;
+ }
+ 
+ uint64_t
+ Rock::SwapDir::currentCount() const
+ {
+     return map ? map->entryCount() : 0;
+ }
+ 
+ /// In SMP mode only the disker process reports stats to avoid
+ /// counting the same stats by multiple processes.
+ bool
+ Rock::SwapDir::doReportStat() const
+ {
+     return ::SwapDir::doReportStat() && (!UsingSmp() || IamDiskProcess());
+ }
+ 
+ void
+ Rock::SwapDir::swappedOut(const StoreEntry &)
+ {
+     // stats are not stored but computed when needed
+@@ -744,61 +736,61 @@ Rock::SwapDir::useFreeSlot(Ipc::Mem::Pag
+ 
+ bool
+ Rock::SwapDir::validSlotId(const SlotId slotId) const
+ {
+     return 0 <= slotId && slotId < slotLimitActual();
+ }
+ 
+ void
+ Rock::SwapDir::noteFreeMapSlice(const Ipc::StoreMapSliceId sliceId)
+ {
+     Ipc::Mem::PageId pageId;
+     pageId.pool = index+1;
+     pageId.number = sliceId+1;
+     if (waitingForPage) {
+         *waitingForPage = pageId;
+         waitingForPage = NULL;
+     } else {
+         freeSlots->push(pageId);
+     }
+ }
+ 
+ // tries to open an old entry with swap_filen for reading
+ StoreIOState::Pointer
+ Rock::SwapDir::openStoreIO(StoreEntry &e, StoreIOState::STFNCB *cbFile, StoreIOState::STIOCB *cbIo, void *data)
+ {
+     if (!theFile || theFile->error()) {
+         debugs(47,4, HERE << theFile);
+         return NULL;
+     }
+ 
+-    if (e.swap_filen < 0) {
++    if (!e.hasDisk()) {
+         debugs(47,4, HERE << e);
+         return NULL;
+     }
+ 
+     // Do not start I/O transaction if there are less than 10% free pages left.
+     // TODO: reserve page instead
+     if (needsDiskStrand() &&
+             Ipc::Mem::PageLevel(Ipc::Mem::PageId::ioPage) >= 0.9 * Ipc::Mem::PageLimit(Ipc::Mem::PageId::ioPage)) {
+         debugs(47, 5, HERE << "too few shared pages for IPC I/O left");
+         return NULL;
+     }
+ 
+     // The are two ways an entry can get swap_filen: our get() locked it for
+     // reading or our storeSwapOutStart() locked it for writing. Peeking at our
+     // locked entry is safe, but no support for reading the entry we swap out.
+     const Ipc::StoreMapAnchor *slot = map->peekAtReader(e.swap_filen);
+     if (!slot)
+         return NULL; // we were writing afterall
+ 
+     Rock::SwapDir::Pointer self(this);
+     IoState *sio = new IoState(self, &e, cbFile, cbIo, data);
+ 
+     sio->swap_dirn = index;
+     sio->swap_filen = e.swap_filen;
+     sio->readableAnchor_ = slot;
+     sio->file(theFile);
+ 
+     debugs(47,5, HERE << "dir " << index << " has old filen: " <<
+            std::setfill('0') << std::hex << std::uppercase << std::setw(8) <<
+            sio->swap_filen);
+@@ -964,73 +956,80 @@ Rock::SwapDir::maintain()
+ void
+ Rock::SwapDir::reference(StoreEntry &e)
+ {
+     debugs(47, 5, HERE << &e << ' ' << e.swap_dirn << ' ' << e.swap_filen);
+     if (repl && repl->Referenced)
+         repl->Referenced(repl, &e, &e.repl);
+ }
+ 
+ bool
+ Rock::SwapDir::dereference(StoreEntry &e)
+ {
+     debugs(47, 5, HERE << &e << ' ' << e.swap_dirn << ' ' << e.swap_filen);
+     if (repl && repl->Dereferenced)
+         repl->Dereferenced(repl, &e, &e.repl);
+ 
+     // no need to keep e in the global store_table for us; we have our own map
+     return false;
+ }
+ 
+ bool
+ Rock::SwapDir::unlinkdUseful() const
+ {
+     // no entry-specific files to unlink
+     return false;
+ }
+ 
+ void
+ Rock::SwapDir::unlink(StoreEntry &e)
+ {
+     debugs(47, 5, HERE << e);
++    assert(e.hasDisk(index));
+     ignoreReferences(e);
+     map->freeEntry(e.swap_filen);
+     disconnect(e);
+ }
+ 
+ void
+ Rock::SwapDir::markForUnlink(StoreEntry &e)
+ {
+     debugs(47, 5, e);
+     map->freeEntry(e.swap_filen);
+ }
+ 
+ void
++Rock::SwapDir::unlinkByKeyIfFound(const cache_key *key)
++{
++    map->freeEntryByKey(key); // may not be there
++}
++
++void
+ Rock::SwapDir::trackReferences(StoreEntry &e)
+ {
+     debugs(47, 5, HERE << e);
+     if (repl)
+         repl->Add(repl, &e, &e.repl);
+ }
+ 
+ void
+ Rock::SwapDir::ignoreReferences(StoreEntry &e)
+ {
+     debugs(47, 5, HERE << e);
+     if (repl)
+         repl->Remove(repl, &e, &e.repl);
+ }
+ 
+ void
+ Rock::SwapDir::statfs(StoreEntry &e) const
+ {
+     storeAppendPrintf(&e, "\n");
+     storeAppendPrintf(&e, "Maximum Size: %" PRIu64 " KB\n", maxSize() >> 10);
+     storeAppendPrintf(&e, "Current Size: %.2f KB %.2f%%\n",
+                       currentSize() / 1024.0,
+                       Math::doublePercent(currentSize(), maxSize()));
+ 
+     const int entryLimit = entryLimitActual();
+     const int slotLimit = slotLimitActual();
+     storeAppendPrintf(&e, "Maximum entries: %9d\n", entryLimit);
+     if (map && entryLimit > 0) {
+         const int entryCount = map->entryCount();
+         storeAppendPrintf(&e, "Current entries: %9d %.2f%%\n",
+@@ -1055,60 +1054,66 @@ Rock::SwapDir::statfs(StoreEntry &e) con
+     storeAppendPrintf(&e, "Pending operations: %d out of %d\n",
+                       store_open_disk_fd, Config.max_open_disk_fds);
+ 
+     storeAppendPrintf(&e, "Flags:");
+ 
+     if (flags.selected)
+         storeAppendPrintf(&e, " SELECTED");
+ 
+     if (flags.read_only)
+         storeAppendPrintf(&e, " READ-ONLY");
+ 
+     storeAppendPrintf(&e, "\n");
+ 
+ }
+ 
+ SBuf
+ Rock::SwapDir::inodeMapPath() const
+ {
+     return Ipc::Mem::Segment::Name(SBuf(path), "map");
+ }
+ 
+ const char *
+ Rock::SwapDir::freeSlotsPath() const
+ {
+     static String spacesPath;
+     spacesPath = path;
+     spacesPath.append("_spaces");
+     return spacesPath.termedBuf();
+ }
+ 
++bool
++Rock::SwapDir::hasEntry(const StoreEntry &e) const
++{
++    return map->hasEntry(reinterpret_cast<const cache_key*>(e.key));
++}
++
+ namespace Rock
+ {
+ RunnerRegistrationEntry(SwapDirRr);
+ }
+ 
+ void Rock::SwapDirRr::create()
+ {
+     Must(mapOwners.empty() && freeSlotsOwners.empty());
+     for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+         if (const Rock::SwapDir *const sd = dynamic_cast<Rock::SwapDir *>(INDEXSD(i))) {
+             const int64_t capacity = sd->slotLimitActual();
+ 
+             SwapDir::DirMap::Owner *const mapOwner =
+                 SwapDir::DirMap::Init(sd->inodeMapPath(), capacity);
+             mapOwners.push_back(mapOwner);
+ 
+             // TODO: somehow remove pool id and counters from PageStack?
+             Ipc::Mem::Owner<Ipc::Mem::PageStack> *const freeSlotsOwner =
+                 shm_new(Ipc::Mem::PageStack)(sd->freeSlotsPath(),
+                                              i+1, capacity, 0);
+             freeSlotsOwners.push_back(freeSlotsOwner);
+ 
+             // TODO: add method to initialize PageStack with no free pages
+             while (true) {
+                 Ipc::Mem::PageId pageId;
+                 if (!freeSlotsOwner->object()->pop(pageId))
+                     break;
+             }
+         }
+     }
+
+=== modified file 'src/fs/rock/RockSwapDir.h'
+--- src/fs/rock/RockSwapDir.h	2017-01-01 00:14:42 +0000
++++ src/fs/rock/RockSwapDir.h	2017-05-31 18:58:21 +0000
+@@ -13,68 +13,70 @@
+ #include "DiskIO/IORequestor.h"
+ #include "fs/rock/forward.h"
+ #include "fs/rock/RockDbCell.h"
+ #include "ipc/mem/Page.h"
+ #include "ipc/mem/PageStack.h"
+ #include "ipc/StoreMap.h"
+ #include "store/Disk.h"
+ #include <vector>
+ 
+ class DiskIOStrategy;
+ class ReadRequest;
+ class WriteRequest;
+ 
+ namespace Rock
+ {
+ 
+ /// \ingroup Rock
+ class SwapDir: public ::SwapDir, public IORequestor, public Ipc::StoreMapCleaner
+ {
+ public:
+     typedef RefCount<SwapDir> Pointer;
+     typedef Ipc::StoreMap DirMap;
+ 
+     SwapDir();
+     virtual ~SwapDir();
+ 
+     /* public ::SwapDir API */
+     virtual void reconfigure();
+     virtual StoreEntry *get(const cache_key *key);
+     virtual void markForUnlink(StoreEntry &e);
++    virtual void unlinkByKeyIfFound(const cache_key *key);
+     virtual void disconnect(StoreEntry &e);
+     virtual uint64_t currentSize() const;
+     virtual uint64_t currentCount() const;
+     virtual bool doReportStat() const;
+     virtual void swappedOut(const StoreEntry &e);
+     virtual void create();
+     virtual void parse(int index, char *path);
+     virtual bool smpAware() const { return true; }
++    virtual bool hasEntry(const StoreEntry &e) const;
+ 
+     // temporary path to the shared memory map of first slots of cached entries
+     SBuf inodeMapPath() const;
+     // temporary path to the shared memory stack of free slots
+     const char *freeSlotsPath() const;
+ 
+     int64_t entryLimitAbsolute() const { return SwapFilenMax+1; } ///< Core limit
+     int64_t entryLimitActual() const; ///< max number of possible entries in db
+     int64_t slotLimitAbsolute() const; ///< Rock store implementation limit
+     int64_t slotLimitActual() const; ///< total number of slots in this db
+ 
+     /// removes a slot from a list of free slots or returns false
+     bool useFreeSlot(Ipc::Mem::PageId &pageId);
+     /// whether the given slot ID may point to a slot in this db
+     bool validSlotId(const SlotId slotId) const;
+     /// purges one or more entries to make full() false and free some slots
+     void purgeSome();
+ 
+     int64_t diskOffset(Ipc::Mem::PageId &pageId) const;
+     int64_t diskOffset(int filen) const;
+     void writeError(StoreIOState &sio);
+ 
+     /* StoreMapCleaner API */
+     virtual void noteFreeMapSlice(const Ipc::StoreMapSliceId fileno);
+ 
+     uint64_t slotSize; ///< all db slots are of this size
+ 
+ protected:
+     /* Store API */
+     virtual bool anchorCollapsed(StoreEntry &collapsed, bool &inSync);
+
+=== modified file 'src/fs/ufs/RebuildState.cc'
+--- src/fs/ufs/RebuildState.cc	2017-03-12 12:12:44 +0000
++++ src/fs/ufs/RebuildState.cc	2017-05-31 10:20:36 +0000
+@@ -312,61 +312,61 @@ Fs::Ufs::RebuildState::rebuildFromSwapLo
+         return;
+     }
+ 
+     if (EBIT_TEST(swapData.flags, KEY_PRIVATE)) {
+         ++counts.badflags;
+         return;
+     }
+ 
+     /* this needs to become
+      * 1) unpack url
+      * 2) make synthetic request with headers ?? or otherwise search
+      * for a matching object in the store
+      * TODO FIXME change to new async api
+      */
+     currentEntry (Store::Root().get(swapData.key));
+ 
+     int used;           /* is swapfile already in use? */
+ 
+     used = sd->mapBitTest(swapData.swap_filen);
+ 
+     /* If this URL already exists in the cache, does the swap log
+      * appear to have a newer entry?  Compare 'lastref' from the
+      * swap log to e->lastref. */
+     /* is the log entry newer than current entry? */
+     int disk_entry_newer = currentEntry() ? (swapData.lastref > currentEntry()->lastref ? 1 : 0) : 0;
+ 
+     if (used && !disk_entry_newer) {
+         /* log entry is old, ignore it */
+         ++counts.clashcount;
+         return;
+-    } else if (used && currentEntry() && currentEntry()->swap_filen == swapData.swap_filen && currentEntry()->swap_dirn == sd->index) {
++    } else if (used && currentEntry() && currentEntry()->hasDisk(sd->index, swapData.swap_filen)) {
+         /* swapfile taken, same URL, newer, update meta */
+ 
+         if (currentEntry()->store_status == STORE_OK) {
+             currentEntry()->lastref = swapData.timestamp;
+             currentEntry()->timestamp = swapData.timestamp;
+             currentEntry()->expires = swapData.expires;
+             currentEntry()->lastModified(swapData.lastmod);
+             currentEntry()->flags = swapData.flags;
+             currentEntry()->refcount += swapData.refcount;
+             sd->dereference(*currentEntry());
+         } else {
+             debug_trap("commonUfsDirRebuildFromSwapLog: bad condition");
+             debugs(47, DBG_IMPORTANT, HERE << "bad condition");
+         }
+         return;
+     } else if (used) {
+         /* swapfile in use, not by this URL, log entry is newer */
+         /* This is sorta bad: the log entry should NOT be newer at this
+          * point.  If the log is dirty, the filesize check should have
+          * caught this.  If the log is clean, there should never be a
+          * newer entry. */
+         debugs(47, DBG_IMPORTANT, "WARNING: newer swaplog entry for dirno " <<
+                sd->index  << ", fileno "<< std::setfill('0') << std::hex <<
+                std::uppercase << std::setw(8) << swapData.swap_filen);
+ 
+         /* I'm tempted to remove the swapfile here just to be safe,
+          * but there is a bad race condition in the NOVM version if
+          * the swapfile has recently been opened for writing, but
+          * not yet opened for reading.  Because we can't map
+          * swapfiles back to StoreEntrys, we don't know the state
+@@ -395,61 +395,61 @@ Fs::Ufs::RebuildState::rebuildFromSwapLo
+     }
+ 
+     ++counts.objcount;
+ 
+     currentEntry(sd->addDiskRestore(swapData.key,
+                                     swapData.swap_filen,
+                                     swapData.swap_file_sz,
+                                     swapData.expires,
+                                     swapData.timestamp,
+                                     swapData.lastref,
+                                     swapData.lastmod,
+                                     swapData.refcount,
+                                     swapData.flags,
+                                     (int) flags.clean));
+ 
+     storeDirSwapLog(currentEntry(), SWAP_LOG_ADD);
+ }
+ 
+ /// undo the effects of adding an entry in rebuildFromSwapLog()
+ void
+ Fs::Ufs::RebuildState::undoAdd()
+ {
+     StoreEntry *added = currentEntry();
+     assert(added);
+     currentEntry(NULL);
+ 
+     // TODO: Why bother with these two if we are going to release?!
+     added->expireNow();
+     added->releaseRequest();
+ 
+-    if (added->swap_filen > -1) {
++    if (added->hasDisk()) {
+         SwapDir *someDir = INDEXSD(added->swap_dirn);
+         assert(someDir);
+         if (UFSSwapDir *ufsDir = dynamic_cast<UFSSwapDir*>(someDir))
+             ufsDir->undoAddDiskRestore(added);
+         // else the entry was loaded from and/or is currently in a non-UFS dir
+         // Thus, there is no use in preserving its disk file (the only purpose
+         // of undoAddDiskRestore!), even if we could. Instead, we release the
+         // the entry and [eventually] unlink its disk file or free its slot.
+     }
+ 
+     added->release();
+ }
+ 
+ int
+ Fs::Ufs::RebuildState::getNextFile(sfileno * filn_p, int *)
+ {
+     int fd = -1;
+     int dirs_opened = 0;
+     debugs(47, 3, HERE << "flag=" << flags.init  << ", " <<
+            sd->index  << ": /"<< std::setfill('0') << std::hex <<
+            std::uppercase << std::setw(2) << curlvl1  << "/" << std::setw(2) <<
+            curlvl2);
+ 
+     if (done)
+         return -2;
+ 
+     while (fd < 0 && done == 0) {
+         fd = -1;
+ 
+         if (!flags.init) {  /* initialize, open first file */
+
+=== modified file 'src/fs/ufs/UFSSwapDir.cc'
+--- src/fs/ufs/UFSSwapDir.cc	2017-01-01 00:14:42 +0000
++++ src/fs/ufs/UFSSwapDir.cc	2017-05-31 10:20:36 +0000
+@@ -774,91 +774,88 @@ Fs::Ufs::UFSSwapDir::validL1(int anInt)
+ {
+     return anInt < l1;
+ }
+ 
+ bool
+ Fs::Ufs::UFSSwapDir::validL2(int anInt) const
+ {
+     return anInt < l2;
+ }
+ 
+ StoreEntry *
+ Fs::Ufs::UFSSwapDir::addDiskRestore(const cache_key * key,
+                                     sfileno file_number,
+                                     uint64_t swap_file_sz,
+                                     time_t expires,
+                                     time_t timestamp,
+                                     time_t lastref,
+                                     time_t lastmod,
+                                     uint32_t refcount,
+                                     uint16_t newFlags,
+                                     int)
+ {
+     StoreEntry *e = NULL;
+     debugs(47, 5, HERE << storeKeyText(key)  <<
+            ", fileno="<< std::setfill('0') << std::hex << std::uppercase << std::setw(8) << file_number);
+     /* if you call this you'd better be sure file_number is not
+      * already in use! */
+     e = new StoreEntry();
+     e->store_status = STORE_OK;
+     e->setMemStatus(NOT_IN_MEMORY);
+-    e->swap_status = SWAPOUT_DONE;
+-    e->swap_filen = file_number;
+-    e->swap_dirn = index;
++    e->attachToDisk(index, file_number, SWAPOUT_DONE);
+     e->swap_file_sz = swap_file_sz;
+     e->lastref = lastref;
+     e->timestamp = timestamp;
+     e->expires = expires;
+     e->lastModified(lastmod);
+     e->refcount = refcount;
+     e->flags = newFlags;
+     EBIT_CLR(e->flags, RELEASE_REQUEST);
+     EBIT_CLR(e->flags, KEY_PRIVATE);
+     e->ping_status = PING_NONE;
+     EBIT_CLR(e->flags, ENTRY_VALIDATED);
+     mapBitSet(e->swap_filen);
+     cur_size += fs.blksize * sizeInBlocks(e->swap_file_sz);
+     ++n_disk_objects;
+     e->hashInsert(key); /* do it after we clear KEY_PRIVATE */
+     replacementAdd (e);
+     return e;
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::undoAddDiskRestore(StoreEntry *e)
+ {
+     debugs(47, 5, HERE << *e);
+     replacementRemove(e); // checks swap_dirn so do it before we invalidate it
+     // Do not unlink the file as it might be used by a subsequent entry.
+     mapBitReset(e->swap_filen);
+-    e->swap_filen = -1;
+-    e->swap_dirn = -1;
++    e->detachFromDisk();
+     cur_size -= fs.blksize * sizeInBlocks(e->swap_file_sz);
+     --n_disk_objects;
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::rebuild()
+ {
+     ++StoreController::store_dirs_rebuilding;
+     eventAdd("storeRebuild", Fs::Ufs::RebuildState::RebuildStep, new Fs::Ufs::RebuildState(this), 0.0, 1);
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::closeTmpSwapLog()
+ {
+     assert(rebuilding_);
+     rebuilding_ = false;
+ 
+     char *swaplog_path = xstrdup(logFile(NULL)); // where the swaplog should be
+     char *tmp_path = xstrdup(logFile(".new")); // the temporary file we have generated
+     int fd;
+     file_close(swaplog_fd);
+ 
+     if (xrename(tmp_path, swaplog_path) < 0) {
+         fatalf("Failed to rename log file %s to %s", tmp_path, swaplog_path);
+     }
+ 
+     fd = file_open(swaplog_path, O_WRONLY | O_CREAT | O_BINARY);
+ 
+     if (fd < 0) {
+         int xerrno = errno;
+@@ -1189,84 +1186,82 @@ Fs::Ufs::UFSSwapDir::validFileno(sfileno
+      */
+     if (flag)
+         if (filn > map->capacity())
+             return 0;
+ 
+     return 1;
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::unlinkFile(sfileno f)
+ {
+     debugs(79, 3, HERE << "unlinking fileno " <<  std::setfill('0') <<
+            std::hex << std::uppercase << std::setw(8) << f << " '" <<
+            fullPath(f,NULL) << "'");
+     /* commonUfsDirMapBitReset(this, f); */
+     IO->unlinkFile(fullPath(f,NULL));
+ }
+ 
+ bool
+ Fs::Ufs::UFSSwapDir::unlinkdUseful() const
+ {
+     // unlinkd may be useful only in workers
+     return IamWorkerProcess() && IO->io->unlinkdUseful();
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::unlink(StoreEntry & e)
+ {
+     debugs(79, 3, HERE << "dirno " << index  << ", fileno "<<
+            std::setfill('0') << std::hex << std::uppercase << std::setw(8) << e.swap_filen);
+-    if (e.swap_status == SWAPOUT_DONE) {
++    mapBitReset(e.swap_filen);
++    assert(e.hasDisk(index));
++    if (e.swappedOut()) {
+         cur_size -= fs.blksize * sizeInBlocks(e.swap_file_sz);
+         --n_disk_objects;
+     }
+     replacementRemove(&e);
+-    mapBitReset(e.swap_filen);
+     UFSSwapDir::unlinkFile(e.swap_filen);
+-    e.swap_filen = -1;
+-    e.swap_dirn = -1;
+-    e.swap_status = SWAPOUT_NONE;
++    e.detachFromDisk();
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::replacementAdd(StoreEntry * e)
+ {
+     debugs(47, 4, HERE << "added node " << e << " to dir " << index);
+     repl->Add(repl, e, &e->repl);
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::replacementRemove(StoreEntry * e)
+ {
+-    if (e->swap_dirn < 0)
+-        return;
++    assert(e->hasDisk());
+ 
+     SwapDirPointer SD = INDEXSD(e->swap_dirn);
+ 
+     assert (dynamic_cast<UFSSwapDir *>(SD.getRaw()) == this);
+ 
+     debugs(47, 4, HERE << "remove node " << e << " from dir " << index);
+ 
+     repl->Remove(repl, e, &e->repl);
+ }
+ 
+ void
+ Fs::Ufs::UFSSwapDir::dump(StoreEntry & entry) const
+ {
+     storeAppendPrintf(&entry, " %" PRIu64 " %d %d", maxSize() >> 20, l1, l2);
+     dumpOptions(&entry);
+ }
+ 
+ char *
+ Fs::Ufs::UFSSwapDir::fullPath(sfileno filn, char *fullpath) const
+ {
+     LOCAL_ARRAY(char, fullfilename, MAXPATHLEN);
+     int L1 = l1;
+     int L2 = l2;
+ 
+     if (!fullpath)
+         fullpath = fullfilename;
+ 
+     fullpath[0] = '\0';
+ 
+     snprintf(fullpath, MAXPATHLEN, "%s/%02X/%02X/%08X",
+
+=== modified file 'src/fs/ufs/UFSSwapDir.h'
+--- src/fs/ufs/UFSSwapDir.h	2017-01-01 00:14:42 +0000
++++ src/fs/ufs/UFSSwapDir.h	2017-05-31 18:58:48 +0000
+@@ -26,79 +26,81 @@ namespace Fs
+ {
+ namespace Ufs
+ {
+ /// \ingroup UFS
+ class UFSSwapDir : public SwapDir
+ {
+ public:
+     static bool IsUFSDir(SwapDir* sd);
+     static int DirClean(int swap_index);
+     /** check whether swapfile belongs to the specified cachedir/l1dir/l2dir
+      *
+      * \param cachedir the number of the cachedir which is being tested
+      * \param level1dir level-1 dir in the cachedir
+      * \param level2dir level-2 dir
+      */
+     static bool FilenoBelongsHere(int fn, int cachedir, int level1dir, int level2dir);
+ 
+     UFSSwapDir(char const *aType, const char *aModuleType);
+     virtual ~UFSSwapDir();
+ 
+     /* Store::Disk API */
+     virtual void create() override;
+     virtual void init() override;
+     virtual void dump(StoreEntry &) const override;
+     virtual bool doubleCheck(StoreEntry &) override;
+     virtual bool unlinkdUseful() const override;
+     virtual void unlink(StoreEntry &) override;
+     virtual void statfs(StoreEntry &) const override;
+     virtual void maintain() override;
+     virtual void markForUnlink(StoreEntry &) override {}
++    virtual void unlinkByKeyIfFound(const cache_key *) override {}
+     virtual bool canStore(const StoreEntry &e, int64_t diskSpaceNeeded, int &load) const override;
+     virtual void reference(StoreEntry &) override;
+     virtual bool dereference(StoreEntry &) override;
+     virtual StoreIOState::Pointer createStoreIO(StoreEntry &, StoreIOState::STFNCB *, StoreIOState::STIOCB *, void *) override;
+     virtual StoreIOState::Pointer openStoreIO(StoreEntry &, StoreIOState::STFNCB *, StoreIOState::STIOCB *, void *) override;
+     virtual void openLog() override;
+     virtual void closeLog() override;
+     virtual int writeCleanStart() override;
+     virtual void writeCleanDone() override;
+     virtual void logEntry(const StoreEntry & e, int op) const override;
+     virtual void parse(int index, char *path) override;
+     virtual void reconfigure() override;
+     virtual int callback() override;
+     virtual void sync() override;
+     virtual void swappedOut(const StoreEntry &e) override;
+     virtual uint64_t currentSize() const override { return cur_size; }
+     virtual uint64_t currentCount() const override { return n_disk_objects; }
+     virtual ConfigOption *getOptionTree() const override;
+     virtual bool smpAware() const override { return false; }
++    virtual bool hasEntry(const StoreEntry &e) const override { return false; };
+ 
+     void unlinkFile(sfileno f);
+     // move down when unlink is a virtual method
+     //protected:
+     Fs::Ufs::UFSStrategy *IO;
+     char *fullPath(sfileno, char *) const;
+     /* temp */
+     void closeTmpSwapLog();
+     FILE *openTmpSwapLog(int *clean_flag, int *zero_flag);
+     char *swapSubDir(int subdirn) const;
+     int mapBitTest(sfileno filn);
+     void mapBitReset(sfileno filn);
+     void mapBitSet(sfileno filn);
+     /** Add a new object to the cache with empty memory copy and pointer to disk
+      *
+      * This method is used to rebuild a store from disk
+      */
+     StoreEntry *addDiskRestore(const cache_key * key,
+                                sfileno file_number,
+                                uint64_t swap_file_sz,
+                                time_t expires,
+                                time_t timestamp,
+                                time_t lastref,
+                                time_t lastmod,
+                                uint32_t refcount,
+                                uint16_t flags,
+                                int clean);
+     /// Undo the effects of UFSSwapDir::addDiskRestore().
+     void undoAddDiskRestore(StoreEntry *e);
+     int validFileno(sfileno filn, int flag) const;
+
+=== modified file 'src/ipc/StoreMap.cc'
+--- src/ipc/StoreMap.cc	2017-01-01 00:14:42 +0000
++++ src/ipc/StoreMap.cc	2017-05-31 10:20:36 +0000
+@@ -185,60 +185,61 @@ Ipc::StoreMap::readableSlice(const Ancho
+     assert(validSlice(sliceId));
+     return sliceAt(sliceId);
+ }
+ 
+ Ipc::StoreMap::Anchor &
+ Ipc::StoreMap::writeableEntry(const AnchorId anchorId)
+ {
+     assert(anchorAt(anchorId).writing());
+     return anchorAt(anchorId);
+ }
+ 
+ const Ipc::StoreMap::Anchor &
+ Ipc::StoreMap::readableEntry(const AnchorId anchorId) const
+ {
+     assert(anchorAt(anchorId).reading());
+     return anchorAt(anchorId);
+ }
+ 
+ void
+ Ipc::StoreMap::abortWriting(const sfileno fileno)
+ {
+     debugs(54, 5, "aborting entry " << fileno << " for writing " << path);
+     Anchor &s = anchorAt(fileno);
+     assert(s.writing());
+     s.lock.appending = false; // locks out any new readers
+     if (!s.lock.readers) {
+         freeChain(fileno, s, false);
+         debugs(54, 5, "closed clean entry " << fileno << " for writing " << path);
+     } else {
+         s.waitingToBeFreed = true;
++        EBIT_SET(s.basics.flags, ENTRY_ABORTED);
+         s.lock.unlockExclusive();
+         debugs(54, 5, "closed dirty entry " << fileno << " for writing " << path);
+     }
+ }
+ 
+ void
+ Ipc::StoreMap::abortUpdating(Update &update)
+ {
+     const sfileno fileno = update.stale.fileNo;
+     debugs(54, 5, "aborting entry " << fileno << " for updating " << path);
+     if (update.stale) {
+         AssertFlagIsSet(update.stale.anchor->lock.updating);
+         update.stale.anchor->lock.unlockHeaders();
+         closeForReading(update.stale.fileNo);
+         update.stale = Update::Edition();
+     }
+     if (update.fresh) {
+         abortWriting(update.fresh.fileNo);
+         update.fresh = Update::Edition();
+     }
+     debugs(54, 5, "aborted entry " << fileno << " for updating " << path);
+ }
+ 
+ const Ipc::StoreMap::Anchor *
+ Ipc::StoreMap::peekAtReader(const sfileno fileno) const
+ {
+     const Anchor &s = anchorAt(fileno);
+     if (s.reading())
+         return &s; // immediate access by lock holder so no locking
+     if (s.writing())
+@@ -263,60 +264,82 @@ Ipc::StoreMap::freeEntry(const sfileno f
+     if (s.lock.lockExclusive())
+         freeChain(fileno, s, false);
+     else
+         s.waitingToBeFreed = true; // mark to free it later
+ }
+ 
+ void
+ Ipc::StoreMap::freeEntryByKey(const cache_key *const key)
+ {
+     debugs(54, 5, "marking entry with key " << storeKeyText(key)
+            << " to be freed in " << path);
+ 
+     const int idx = fileNoByKey(key);
+     Anchor &s = anchorAt(idx);
+     if (s.lock.lockExclusive()) {
+         if (s.sameKey(key))
+             freeChain(idx, s, true);
+         s.lock.unlockExclusive();
+     } else if (s.lock.lockShared()) {
+         if (s.sameKey(key))
+             s.waitingToBeFreed = true; // mark to free it later
+         s.lock.unlockShared();
+     } else {
+         // we cannot be sure that the entry we found is ours because we do not
+         // have a lock on it, but we still check to minimize false deletions
+         if (s.sameKey(key))
+             s.waitingToBeFreed = true; // mark to free it later
+     }
+ }
+ 
++bool
++Ipc::StoreMap::markedForDeletion(const cache_key *const key)
++{
++    const int idx = fileNoByKey(key);
++    Anchor &s = anchorAt(idx);
++    return s.sameKey(key) ? bool(s.waitingToBeFreed) : false;
++}
++
++bool
++Ipc::StoreMap::hasEntry(const cache_key *const key)
++{
++    sfileno index;
++    if (const Ipc::StoreMapAnchor *const slot = openForReading(reinterpret_cast<const cache_key*>(key), index)) {
++        closeForReading(index);
++        return true;
++    } else {
++        index = fileNoByKey(key);
++        Anchor &s = anchorAt(index);
++        return s.sameKey(key) && s.writing();
++    }
++}
++
+ /// unconditionally frees an already locked chain of slots, unlocking if needed
+ void
+ Ipc::StoreMap::freeChain(const sfileno fileno, Anchor &inode, const bool keepLocked)
+ {
+     debugs(54, 7, "freeing entry " << fileno <<
+            " in " << path);
+     if (!inode.empty())
+         freeChainAt(inode.start, inode.splicingPoint);
+     inode.rewind();
+ 
+     if (!keepLocked)
+         inode.lock.unlockExclusive();
+     --anchors->count;
+     debugs(54, 5, "freed entry " << fileno << " in " << path);
+ }
+ 
+ /// unconditionally frees an already locked chain of slots; no anchor maintenance
+ void
+ Ipc::StoreMap::freeChainAt(SliceId sliceId, const SliceId splicingPoint)
+ {
+     static uint64_t ChainId = 0; // to pair freeing/freed calls in debugs()
+     const uint64_t chainId = ++ChainId;
+     debugs(54, 7, "freeing chain #" << chainId << " starting at " << sliceId << " in " << path);
+     while (sliceId >= 0) {
+         Slice &slice = sliceAt(sliceId);
+         const SliceId nextId = slice.next;
+         slice.size = 0;
+         slice.next = -1;
+         if (cleaner)
+             cleaner->noteFreeMapSlice(sliceId); // might change slice state
+
+=== modified file 'src/ipc/StoreMap.h'
+--- src/ipc/StoreMap.h	2017-01-01 00:14:42 +0000
++++ src/ipc/StoreMap.h	2017-05-31 18:44:44 +0000
+@@ -226,60 +226,67 @@ public:
+     /// locks and returns an anchor for the empty fileno position; if
+     /// overwriteExisting is false and the position is not empty, returns nil
+     Anchor *openForWritingAt(sfileno fileno, bool overwriteExisting = true);
+     /// restrict opened for writing entry to appending operations; allow reads
+     void startAppending(const sfileno fileno);
+     /// successfully finish creating or updating the entry at fileno pos
+     void closeForWriting(const sfileno fileno, bool lockForReading = false);
+     /// unlock and "forget" openForWriting entry, making it Empty again
+     /// this call does not free entry slices so the caller has to do that
+     void forgetWritingEntry(const sfileno fileno);
+ 
+     /// finds and locks the Update entry for an exclusive metadata update
+     bool openForUpdating(Update &update, sfileno fileNoHint);
+     /// makes updated info available to others, unlocks, and cleans up
+     void closeForUpdating(Update &update);
+     /// undoes partial update, unlocks, and cleans up
+     void abortUpdating(Update &update);
+ 
+     /// only works on locked entries; returns nil unless the slice is readable
+     const Anchor *peekAtReader(const sfileno fileno) const;
+ 
+     /// only works on locked entries; returns the corresponding Anchor
+     const Anchor &peekAtEntry(const sfileno fileno) const;
+ 
+     /// free the entry if possible or mark it as waiting to be freed if not
+     void freeEntry(const sfileno fileno);
+     /// free the entry if possible or mark it as waiting to be freed if not
+     /// does nothing if we cannot check that the key matches the cached entry
+     void freeEntryByKey(const cache_key *const key);
+ 
++    /// whether the entry with the given key exists and was marked as
++    /// "waiting to be freed" some time ago
++    bool markedForDeletion(const cache_key *const key);
++
++    /// whether the index contains a valid readable entry with the given key
++    bool hasEntry(const cache_key *const key);
++
+     /// opens entry (identified by key) for reading, increments read level
+     const Anchor *openForReading(const cache_key *const key, sfileno &fileno);
+     /// opens entry (identified by sfileno) for reading, increments read level
+     const Anchor *openForReadingAt(const sfileno fileno);
+     /// closes open entry after reading, decrements read level
+     void closeForReading(const sfileno fileno);
+ 
+     /// writeable slice within an entry chain created by openForWriting()
+     Slice &writeableSlice(const AnchorId anchorId, const SliceId sliceId);
+     /// readable slice within an entry chain opened by openForReading()
+     const Slice &readableSlice(const AnchorId anchorId, const SliceId sliceId) const;
+     /// writeable anchor for the entry created by openForWriting()
+     Anchor &writeableEntry(const AnchorId anchorId);
+     /// readable anchor for the entry created by openForReading()
+     const Anchor &readableEntry(const AnchorId anchorId) const;
+ 
+     /// Returns the ID of the entry slice containing n-th byte or
+     /// a negative ID if the entry does not store that many bytes (yet).
+     /// Requires a read lock.
+     SliceId sliceContaining(const sfileno fileno, const uint64_t nth) const;
+ 
+     /// stop writing the entry, freeing its slot for others to use if possible
+     void abortWriting(const sfileno fileno);
+ 
+     /// either finds and frees an entry with at least 1 slice or returns false
+     bool purgeOne();
+ 
+     /// copies slice to its designated position
+     void importSlice(const SliceId sliceId, const Slice &slice);
+ 
+
+=== modified file 'src/neighbors.cc'
+--- src/neighbors.cc	2017-05-29 00:18:24 +0000
++++ src/neighbors.cc	2017-05-31 10:20:36 +0000
+@@ -566,61 +566,61 @@ neighbors_init(void)
+     sep = getservbyname("echo", "udp");
+     echo_port = sep ? ntohs((unsigned short) sep->s_port) : 7;
+ 
+     first_ping = Config.peers;
+ }
+ 
+ int
+ neighborsUdpPing(HttpRequest * request,
+                  StoreEntry * entry,
+                  IRCB * callback,
+                  void *callback_data,
+                  int *exprep,
+                  int *timeout)
+ {
+     const char *url = entry->url();
+     MemObject *mem = entry->mem_obj;
+     CachePeer *p = NULL;
+     int i;
+     int reqnum = 0;
+     int flags;
+     icp_common_t *query;
+     int queries_sent = 0;
+     int peers_pinged = 0;
+     int parent_timeout = 0, parent_exprep = 0;
+     int sibling_timeout = 0, sibling_exprep = 0;
+     int mcast_timeout = 0, mcast_exprep = 0;
+ 
+     if (Config.peers == NULL)
+         return 0;
+ 
+-    assert(entry->swap_status == SWAPOUT_NONE);
++    assert(!entry->hasDisk());
+ 
+     mem->start_ping = current_time;
+ 
+     mem->ping_reply_callback = callback;
+ 
+     mem->ircb_data = callback_data;
+ 
+     reqnum = icpSetCacheKey((const cache_key *)entry->key);
+ 
+     for (i = 0, p = first_ping; i++ < Config.npeers; p = p->next) {
+         if (p == NULL)
+             p = Config.peers;
+ 
+         debugs(15, 5, "neighborsUdpPing: Peer " << p->host);
+ 
+         if (!peerWouldBePinged(p, request))
+             continue;       /* next CachePeer */
+ 
+         ++peers_pinged;
+ 
+         debugs(15, 4, "neighborsUdpPing: pinging peer " << p->host << " for '" << url << "'");
+ 
+         debugs(15, 3, "neighborsUdpPing: key = '" << entry->getMD5Text() << "'");
+ 
+         debugs(15, 3, "neighborsUdpPing: reqnum = " << reqnum);
+ 
+ #if USE_HTCP
+         if (p->options.htcp && !p->options.htcp_only_clr) {
+             if (Config.Port.htcp <= 0) {
+                 debugs(15, DBG_CRITICAL, "HTCP is disabled! Cannot send HTCP request to peer.");
+@@ -1724,56 +1724,71 @@ neighborsHtcpReply(const cache_key * key
+         return;
+     }
+ 
+     if (e->ping_status != PING_WAITING) {
+         debugs(15, 2, "neighborsUdpAck: Entry " << storeKeyText(key) << " is not PING_WAITING");
+         neighborCountIgnored(p);
+         return;
+     }
+ 
+     if (!e->locked()) {
+         // TODO: many entries are unlocked; why is this reported at level 1?
+         debugs(12, DBG_IMPORTANT, "neighborsUdpAck: '" << storeKeyText(key) << "' has no locks");
+         neighborCountIgnored(p);
+         return;
+     }
+ 
+     if (p) {
+         ntype = neighborType(p, mem->request->url);
+         neighborUpdateRtt(p, mem);
+     }
+ 
+     if (ignoreMulticastReply(p, mem)) {
+         neighborCountIgnored(p);
+         return;
+     }
+ 
+     debugs(15, 3, "neighborsHtcpReply: e = " << e);
+     mem->ping_reply_callback(p, ntype, AnyP::PROTO_HTCP, htcp, mem->ircb_data);
+ }
+ 
++static bool
++neighborsHtcpClearPeerNeeded(const CachePeer &p, const htcp_clr_reason reason)
++{
++    if (!p.options.htcp)
++        return false;
++    if (p.options.htcp_no_clr)
++        return false;
++    if (p.options.htcp_no_purge_clr && reason == HTCP_CLR_PURGE)
++        return false;
++    return true;
++}
++
+ /*
+  * Send HTCP CLR messages to all peers configured to receive them.
+  */
+ void
+ neighborsHtcpClear(StoreEntry * e, const char *uri, HttpRequest * req, const HttpRequestMethod &method, htcp_clr_reason reason)
+ {
+     CachePeer *p;
+     char buf[128];
+ 
+     for (p = Config.peers; p; p = p->next) {
+-        if (!p->options.htcp) {
+-            continue;
+-        }
+-        if (p->options.htcp_no_clr) {
+-            continue;
++        if (neighborsHtcpClearPeerNeeded(*p, reason)) {
++            debugs(15, 3, "neighborsHtcpClear: sending CLR to " << p->in_addr.toUrl(buf, 128));
++            htcpClear(e, uri, req, method, p, reason);
+         }
+-        if (p->options.htcp_no_purge_clr && reason == HTCP_CLR_PURGE) {
+-            continue;
+-        }
+-        debugs(15, 3, "neighborsHtcpClear: sending CLR to " << p->in_addr.toUrl(buf, 128));
+-        htcpClear(e, uri, req, method, p, reason);
+     }
+ }
+ 
++bool
++neighborsHtcpClearNeeded(const htcp_clr_reason reason)
++{
++    for (const CachePeer *p = Config.peers; p; p = p->next) {
++        if (neighborsHtcpClearPeerNeeded(*p, reason))
++            return true;
++    }
++    return false;
++}
++
+ #endif
+ 
+
+=== modified file 'src/neighbors.h'
+--- src/neighbors.h	2017-05-07 20:16:59 +0000
++++ src/neighbors.h	2017-05-31 10:21:58 +0000
+@@ -13,60 +13,62 @@
+ 
+ #include "enums.h"
+ #include "ICP.h"
+ #include "lookup_t.h"
+ #include "typedefs.h" //for IRCB
+ 
+ class HttpRequest;
+ class HttpRequestMethod;
+ class CachePeer;
+ class StoreEntry;
+ class URL;
+ 
+ CachePeer *getFirstPeer(void);
+ CachePeer *getFirstUpParent(HttpRequest *);
+ CachePeer *getNextPeer(CachePeer *);
+ CachePeer *getSingleParent(HttpRequest *);
+ int neighborsCount(HttpRequest *);
+ int neighborsUdpPing(HttpRequest *,
+                      StoreEntry *,
+                      IRCB * callback,
+                      void *data,
+                      int *exprep,
+                      int *timeout);
+ void neighborAddAcl(const char *, const char *);
+ 
+ void neighborsUdpAck(const cache_key *, icp_common_t *, const Ip::Address &);
+ void neighborAdd(const char *, const char *, int, int, int, int, int);
+ void neighbors_init(void);
+ #if USE_HTCP
+ void neighborsHtcpClear(StoreEntry *, const char *, HttpRequest *, const HttpRequestMethod &, htcp_clr_reason);
++/// Whether calling neighborsHtcpClear(..., reason) is useful
++bool neighborsHtcpClearNeeded(const htcp_clr_reason);
+ #endif
+ CachePeer *peerFindByName(const char *);
+ CachePeer *peerFindByNameAndPort(const char *, unsigned short);
+ CachePeer *getDefaultParent(HttpRequest * request);
+ CachePeer *getRoundRobinParent(HttpRequest * request);
+ CachePeer *getWeightedRoundRobinParent(HttpRequest * request);
+ void peerClearRRStart(void);
+ void peerClearRR(void);
+ lookup_t peerDigestLookup(CachePeer * p, HttpRequest * request);
+ CachePeer *neighborsDigestSelect(HttpRequest * request);
+ void peerNoteDigestLookup(HttpRequest * request, CachePeer * p, lookup_t lookup);
+ void peerNoteDigestGone(CachePeer * p);
+ int neighborUp(const CachePeer * e);
+ const char *neighborTypeStr(const CachePeer * e);
+ peer_t neighborType(const CachePeer *, const URL &);
+ void peerConnectFailed(CachePeer *);
+ void peerConnectSucceded(CachePeer *);
+ void dump_peer_options(StoreEntry *, CachePeer *);
+ int peerHTTPOkay(const CachePeer *, HttpRequest *);
+ 
+ // TODO: Consider moving this method to CachePeer class.
+ /// \returns the effective connect timeout for the given peer
+ time_t peerConnectTimeout(const CachePeer *peer);
+ 
+ /// \returns max(1, timeout)
+ time_t positiveTimeout(const time_t timeout);
+ 
+ /// Whether we can open new connections to the peer (e.g., despite max-conn)
+ bool peerCanOpenMore(const CachePeer *p);
+ /// Whether the peer has idle or standby connections that can be used now
+
+=== modified file 'src/store.cc'
+--- src/store.cc	2017-03-31 11:07:18 +0000
++++ src/store.cc	2017-05-31 18:45:50 +0000
+@@ -248,61 +248,61 @@ StoreEntry::setNoDelay(bool const newVal
+ 
+ // XXX: Type names mislead. STORE_DISK_CLIENT actually means that we should
+ //      open swapin file, aggressively trim memory, and ignore read-ahead gap.
+ //      It does not mean we will read from disk exclusively (or at all!).
+ // XXX: May create STORE_DISK_CLIENT with no disk caching configured.
+ // XXX: Collapsed clients cannot predict their type.
+ store_client_t
+ StoreEntry::storeClientType() const
+ {
+     /* The needed offset isn't in memory
+      * XXX TODO: this is wrong for range requests
+      * as the needed offset may *not* be 0, AND
+      * offset 0 in the memory object is the HTTP headers.
+      */
+ 
+     assert(mem_obj);
+ 
+     if (mem_obj->inmem_lo)
+         return STORE_DISK_CLIENT;
+ 
+     if (EBIT_TEST(flags, ENTRY_ABORTED)) {
+         /* I don't think we should be adding clients to aborted entries */
+         debugs(20, DBG_IMPORTANT, "storeClientType: adding to ENTRY_ABORTED entry");
+         return STORE_MEM_CLIENT;
+     }
+ 
+     if (store_status == STORE_OK) {
+         /* the object has completed. */
+ 
+         if (mem_obj->inmem_lo == 0 && !isEmpty()) {
+-            if (swap_status == SWAPOUT_DONE) {
++            if (swappedOut()) {
+                 debugs(20,7, HERE << mem_obj << " lo: " << mem_obj->inmem_lo << " hi: " << mem_obj->endOffset() << " size: " << mem_obj->object_sz);
+                 if (mem_obj->endOffset() == mem_obj->object_sz) {
+                     /* hot object fully swapped in (XXX: or swapped out?) */
+                     return STORE_MEM_CLIENT;
+                 }
+             } else {
+                 /* Memory-only, or currently being swapped out */
+                 return STORE_MEM_CLIENT;
+             }
+         }
+         return STORE_DISK_CLIENT;
+     }
+ 
+     /* here and past, entry is STORE_PENDING */
+     /*
+      * If this is the first client, let it be the mem client
+      */
+     if (mem_obj->nclients == 1)
+         return STORE_MEM_CLIENT;
+ 
+     /*
+      * If there is no disk file to open yet, we must make this a
+      * mem client.  If we can't open the swapin file before writing
+      * to the client, there is no guarantee that we will be able
+      * to open it later when we really need it.
+      */
+     if (swap_status == SWAPOUT_NONE)
+         return STORE_MEM_CLIENT;
+ 
+     /*
+@@ -360,106 +360,106 @@ StoreEntry::kickProducer()
+ 
+ void
+ StoreEntry::destroyMemObject()
+ {
+     debugs(20, 3, HERE << "destroyMemObject " << mem_obj);
+ 
+     if (MemObject *mem = mem_obj) {
+         // Store::Root() is FATALly missing during shutdown
+         if (mem->xitTable.index >= 0 && !shutting_down)
+             Store::Root().transientsDisconnect(*mem);
+         if (mem->memCache.index >= 0 && !shutting_down)
+             Store::Root().memoryDisconnect(*this);
+ 
+         setMemStatus(NOT_IN_MEMORY);
+         mem_obj = NULL;
+         delete mem;
+     }
+ }
+ 
+ void
+ destroyStoreEntry(void *data)
+ {
+     debugs(20, 3, HERE << "destroyStoreEntry: destroying " <<  data);
+     StoreEntry *e = static_cast<StoreEntry *>(static_cast<hash_link *>(data));
+     assert(e != NULL);
+ 
+     if (e == NullStoreEntry::getInstance())
+         return;
+ 
+     // Store::Root() is FATALly missing during shutdown
+-    if (e->swap_filen >= 0 && !shutting_down)
++    if (e->hasDisk() && !shutting_down)
+         e->disk().disconnect(*e);
+ 
+     e->destroyMemObject();
+ 
+     e->hashDelete();
+ 
+     assert(e->key == NULL);
+ 
+     delete e;
+ }
+ 
+ /* ----- INTERFACE BETWEEN STORAGE MANAGER AND HASH TABLE FUNCTIONS --------- */
+ 
+ void
+ StoreEntry::hashInsert(const cache_key * someKey)
+ {
+     debugs(20, 3, "StoreEntry::hashInsert: Inserting Entry " << *this << " key '" << storeKeyText(someKey) << "'");
+     key = storeKeyDup(someKey);
+     hash_join(store_table, this);
+ }
+ 
+ void
+ StoreEntry::hashDelete()
+ {
+     if (key) { // some test cases do not create keys and do not hashInsert()
+         hash_remove_link(store_table, this);
+         storeKeyFree((const cache_key *)key);
+         key = NULL;
+     }
+ }
+ 
+ /* -------------------------------------------------------------------------- */
+ 
+ /* get rid of memory copy of the object */
+ void
+ StoreEntry::purgeMem()
+ {
+     if (mem_obj == NULL)
+         return;
+ 
+     debugs(20, 3, "StoreEntry::purgeMem: Freeing memory-copy of " << getMD5Text());
+ 
+     Store::Root().memoryUnlink(*this);
+ 
+-    if (swap_status != SWAPOUT_DONE)
++    if (!swappedOut())
+         release();
+ }
+ 
+ void
+ StoreEntry::lock(const char *context)
+ {
+     ++lock_count;
+     debugs(20, 3, context << " locked key " << getMD5Text() << ' ' << *this);
+ }
+ 
+ void
+ StoreEntry::touch()
+ {
+     lastref = squid_curtime;
+ }
+ 
+ void
+ StoreEntry::setReleaseFlag()
+ {
+     if (EBIT_TEST(flags, RELEASE_REQUEST))
+         return;
+ 
+     debugs(20, 3, "StoreEntry::setReleaseFlag: '" << getMD5Text() << "'");
+ 
+     EBIT_SET(flags, RELEASE_REQUEST);
+ 
+     Store::Root().markForUnlink(*this);
+ }
+ 
+ void
+@@ -564,61 +564,61 @@ storeGetPublicByRequest(HttpRequest * re
+ static int
+ getKeyCounter(void)
+ {
+     static int key_counter = 0;
+ 
+     if (++key_counter < 0)
+         key_counter = 1;
+ 
+     return key_counter;
+ }
+ 
+ /* RBC 20050104 AFAICT this should become simpler:
+  * rather than reinserting with a special key it should be marked
+  * as 'released' and then cleaned up when refcounting indicates.
+  * the StoreHashIndex could well implement its 'released' in the
+  * current manner.
+  * Also, clean log writing should skip over ia,t
+  * Otherwise, we need a 'remove from the index but not the store
+  * concept'.
+  */
+ void
+ StoreEntry::setPrivateKey()
+ {
+     if (key && EBIT_TEST(flags, KEY_PRIVATE))
+         return;                 /* is already private */
+ 
+     if (key) {
+         setReleaseFlag(); // will markForUnlink(); all caches/workers will know
+ 
+         // TODO: move into SwapDir::markForUnlink() already called by Root()
+-        if (swap_filen > -1)
++        if (hasDisk())
+             storeDirSwapLog(this, SWAP_LOG_DEL);
+ 
+         hashDelete();
+     }
+ 
+     if (mem_obj && mem_obj->hasUris())
+         mem_obj->id = getKeyCounter();
+     const cache_key *newkey = storeKeyPrivate();
+ 
+     assert(hash_lookup(store_table, newkey) == NULL);
+     EBIT_SET(flags, KEY_PRIVATE);
+     hashInsert(newkey);
+ }
+ 
+ void
+ StoreEntry::setPublicKey(const KeyScope scope)
+ {
+     if (key && !EBIT_TEST(flags, KEY_PRIVATE))
+         return;                 /* is already public */
+ 
+     assert(mem_obj);
+ 
+     /*
+      * We can't make RELEASE_REQUEST objects public.  Depending on
+      * when RELEASE_REQUEST gets set, we might not be swapping out
+      * the object.  If we're not swapping out, then subsequent
+      * store clients won't be able to access object data which has
+      * been freed from memory.
+      *
+      * If RELEASE_REQUEST is set, setPublicKey() should not be called.
+@@ -643,61 +643,61 @@ StoreEntry::clearPublicKeyScope()
+         return; // probably the old public key was deleted or made private
+ 
+     // TODO: adjustVary() when collapsed revalidation supports that
+ 
+     const cache_key *newKey = calcPublicKey(ksDefault);
+     if (!storeKeyHashCmp(key, newKey))
+         return; // probably another collapsed revalidation beat us to this change
+ 
+     forcePublicKey(newKey);
+ }
+ 
+ /// Unconditionally sets public key for this store entry.
+ /// Releases the old entry with the same public key (if any).
+ void
+ StoreEntry::forcePublicKey(const cache_key *newkey)
+ {
+     if (StoreEntry *e2 = (StoreEntry *)hash_lookup(store_table, newkey)) {
+         assert(e2 != this);
+         debugs(20, 3, "Making old " << *e2 << " private.");
+         e2->setPrivateKey();
+         e2->release();
+     }
+ 
+     if (key)
+         hashDelete();
+ 
+     EBIT_CLR(flags, KEY_PRIVATE);
+ 
+     hashInsert(newkey);
+ 
+-    if (swap_filen > -1)
++    if (hasDisk())
+         storeDirSwapLog(this, SWAP_LOG_ADD);
+ }
+ 
+ /// Calculates correct public key for feeding forcePublicKey().
+ /// Assumes adjustVary() has been called for this entry already.
+ const cache_key *
+ StoreEntry::calcPublicKey(const KeyScope keyScope)
+ {
+     assert(mem_obj);
+     return mem_obj->request ?  storeKeyPublicByRequest(mem_obj->request, keyScope) :
+            storeKeyPublic(mem_obj->storeId(), mem_obj->method, keyScope);
+ }
+ 
+ /// Updates mem_obj->request->vary_headers to reflect the current Vary.
+ /// The vary_headers field is used to calculate the Vary marker key.
+ /// Releases the old Vary marker with an outdated key (if any).
+ void
+ StoreEntry::adjustVary()
+ {
+     assert(mem_obj);
+ 
+     if (!mem_obj->request)
+         return;
+ 
+     HttpRequest *request = mem_obj->request;
+ 
+     if (mem_obj->vary_headers.isEmpty()) {
+         /* First handle the case where the object no longer varies */
+         request->vary_headers.clear();
+     } else {
+@@ -979,65 +979,64 @@ StoreEntry::checkCachable()
+     }
+ 
+ #if CACHE_ALL_METHODS
+ 
+     if (mem_obj->method != Http::METHOD_GET) {
+         debugs(20, 2, "StoreEntry::checkCachable: NO: non-GET method");
+         ++store_check_cachable_hist.no.non_get;
+     } else
+ #endif
+         if (store_status == STORE_OK && EBIT_TEST(flags, ENTRY_BAD_LENGTH)) {
+             debugs(20, 2, "StoreEntry::checkCachable: NO: wrong content-length");
+             ++store_check_cachable_hist.no.wrong_content_length;
+         } else if (EBIT_TEST(flags, ENTRY_NEGCACHED)) {
+             debugs(20, 3, "StoreEntry::checkCachable: NO: negative cached");
+             ++store_check_cachable_hist.no.negative_cached;
+             return 0;           /* avoid release call below */
+         } else if (!mem_obj || !getReply()) {
+             // XXX: In bug 4131, we forgetHit() without mem_obj, so we need
+             // this segfault protection, but how can we get such a HIT?
+             debugs(20, 2, "StoreEntry::checkCachable: NO: missing parts: " << *this);
+             ++store_check_cachable_hist.no.missing_parts;
+         } else if (checkTooBig()) {
+             debugs(20, 2, "StoreEntry::checkCachable: NO: too big");
+             ++store_check_cachable_hist.no.too_big;
+         } else if (checkTooSmall()) {
+             debugs(20, 2, "StoreEntry::checkCachable: NO: too small");
+             ++store_check_cachable_hist.no.too_small;
+         } else if (EBIT_TEST(flags, KEY_PRIVATE)) {
+             debugs(20, 3, "StoreEntry::checkCachable: NO: private key");
+             ++store_check_cachable_hist.no.private_key;
+-        } else if (swap_status != SWAPOUT_NONE) {
++        } else if (hasDisk()) {
+             /*
+-             * here we checked the swap_status because the remaining
+-             * cases are only relevant only if we haven't started swapping
+-             * out the object yet.
++             * the remaining cases are only relevant if we haven't
++             * started swapping out the object yet.
+              */
+             return 1;
+         } else if (storeTooManyDiskFilesOpen()) {
+             debugs(20, 2, "StoreEntry::checkCachable: NO: too many disk files open");
+             ++store_check_cachable_hist.no.too_many_open_files;
+         } else if (fdNFree() < RESERVED_FD) {
+             debugs(20, 2, "StoreEntry::checkCachable: NO: too many FD's open");
+             ++store_check_cachable_hist.no.too_many_open_fds;
+         } else {
+             ++store_check_cachable_hist.yes.Default;
+             return 1;
+         }
+ 
+     releaseRequest();
+     return 0;
+ }
+ 
+ void
+ storeCheckCachableStats(StoreEntry *sentry)
+ {
+     storeAppendPrintf(sentry, "Category\t Count\n");
+ 
+ #if CACHE_ALL_METHODS
+ 
+     storeAppendPrintf(sentry, "no.non_get\t%d\n",
+                       store_check_cachable_hist.no.non_get);
+ #endif
+ 
+     storeAppendPrintf(sentry, "no.not_entry_cachable\t%d\n",
+                       store_check_cachable_hist.no.not_entry_cachable);
+@@ -1220,76 +1219,76 @@ void
+ Store::Maintain(void *)
+ {
+     Store::Root().maintain();
+ 
+     /* Reregister a maintain event .. */
+     eventAdd("MaintainSwapSpace", Maintain, NULL, 1.0, 1);
+ 
+ }
+ 
+ /* The maximum objects to scan for maintain storage space */
+ #define MAINTAIN_MAX_SCAN       1024
+ #define MAINTAIN_MAX_REMOVE     64
+ 
+ /* release an object from a cache */
+ void
+ StoreEntry::release()
+ {
+     PROF_start(storeRelease);
+     debugs(20, 3, "releasing " << *this << ' ' << getMD5Text());
+     /* If, for any reason we can't discard this object because of an
+      * outstanding request, mark it for pending release */
+ 
+     if (locked()) {
+         expireNow();
+         debugs(20, 3, "storeRelease: Only setting RELEASE_REQUEST bit");
+         releaseRequest();
+         PROF_stop(storeRelease);
+         return;
+     }
+ 
+-    if (Store::Controller::store_dirs_rebuilding && swap_filen > -1) {
++    if (Store::Controller::store_dirs_rebuilding && hasDisk()) {
+         /* TODO: Teach disk stores to handle releases during rebuild instead. */
+ 
+         Store::Root().memoryUnlink(*this);
+ 
+         setPrivateKey();
+ 
+         // lock the entry until rebuilding is done
+         lock("storeLateRelease");
+         setReleaseFlag();
+         LateReleaseStack.push(this);
+         return;
+     }
+ 
+     storeLog(STORE_LOG_RELEASE, this);
+-    if (swap_filen > -1 && !EBIT_TEST(flags, KEY_PRIVATE)) {
++    if (hasDisk() && !EBIT_TEST(flags, KEY_PRIVATE)) {
+         // log before unlink() below clears swap_filen
+         storeDirSwapLog(this, SWAP_LOG_DEL);
+     }
+ 
+     Store::Root().unlink(*this);
+     destroyStoreEntry(static_cast<hash_link *>(this));
+     PROF_stop(storeRelease);
+ }
+ 
+ static void
+ storeLateRelease(void *)
+ {
+     StoreEntry *e;
+     static int n = 0;
+ 
+     if (Store::Controller::store_dirs_rebuilding) {
+         eventAdd("storeLateRelease", storeLateRelease, NULL, 1.0, 1);
+         return;
+     }
+ 
+     // TODO: this works but looks unelegant.
+     for (int i = 0; i < 10; ++i) {
+         if (LateReleaseStack.empty()) {
+             debugs(20, DBG_IMPORTANT, "storeLateRelease: released " << n << " objects");
+             return;
+         } else {
+             e = LateReleaseStack.top();
+             LateReleaseStack.pop();
+         }
+ 
+@@ -1379,61 +1378,61 @@ storeInit(void)
+     storeDigestInit();
+     storeLogOpen();
+     eventAdd("storeLateRelease", storeLateRelease, NULL, 1.0, 1);
+     Store::Root().init();
+     storeRebuildStart();
+ 
+     storeRegisterWithCacheManager();
+ }
+ 
+ void
+ storeConfigure(void)
+ {
+     Store::Root().updateLimits();
+ }
+ 
+ bool
+ StoreEntry::memoryCachable()
+ {
+     if (!checkCachable())
+         return 0;
+ 
+     if (mem_obj == NULL)
+         return 0;
+ 
+     if (mem_obj->data_hdr.size() == 0)
+         return 0;
+ 
+     if (mem_obj->inmem_lo != 0)
+         return 0;
+ 
+-    if (!Config.onoff.memory_cache_first && swap_status == SWAPOUT_DONE && refcount == 1)
++    if (!Config.onoff.memory_cache_first && swappedOut() && refcount == 1)
+         return 0;
+ 
+     return 1;
+ }
+ 
+ int
+ StoreEntry::checkNegativeHit() const
+ {
+     if (!EBIT_TEST(flags, ENTRY_NEGCACHED))
+         return 0;
+ 
+     if (expires <= squid_curtime)
+         return 0;
+ 
+     if (store_status != STORE_OK)
+         return 0;
+ 
+     return 1;
+ }
+ 
+ /**
+  * Set object for negative caching.
+  * Preserves any expiry information given by the server.
+  * In absence of proper expiry info it will set to expire immediately,
+  * or with HTTP-violations enabled the configured negative-TTL is observed
+  */
+ void
+ StoreEntry::negativeCache()
+ {
+     // XXX: should make the default for expires 0 instead of -1
+@@ -1453,61 +1452,61 @@ storeFreeMemory(void)
+     Store::FreeMemory();
+ #if USE_CACHE_DIGESTS
+     delete store_digest;
+ #endif
+     store_digest = NULL;
+ }
+ 
+ int
+ expiresMoreThan(time_t expires, time_t when)
+ {
+     if (expires < 0)            /* No Expires given */
+         return 1;
+ 
+     return (expires > (squid_curtime + when));
+ }
+ 
+ int
+ StoreEntry::validToSend() const
+ {
+     if (EBIT_TEST(flags, RELEASE_REQUEST))
+         return 0;
+ 
+     if (EBIT_TEST(flags, ENTRY_NEGCACHED))
+         if (expires <= squid_curtime)
+             return 0;
+ 
+     if (EBIT_TEST(flags, ENTRY_ABORTED))
+         return 0;
+ 
+     // now check that the entry has a cache backing or is collapsed
+-    if (swap_filen > -1) // backed by a disk cache
++    if (hasDisk()) // backed by a disk cache
+         return 1;
+ 
+     if (swappingOut()) // will be backed by a disk cache
+         return 1;
+ 
+     if (!mem_obj) // not backed by a memory cache and not collapsed
+         return 0;
+ 
+     // StoreEntry::storeClientType() assumes DISK_CLIENT here, but there is no
+     // disk cache backing that store_client constructor will assert. XXX: This
+     // is wrong for range requests (that could feed off nibbled memory) and for
+     // entries backed by the shared memory cache (that could, in theory, get
+     // nibbled bytes from that cache, but there is no such "memoryIn" code).
+     if (mem_obj->inmem_lo) // in memory cache, but got nibbled at
+         return 0;
+ 
+     // The following check is correct but useless at this position. TODO: Move
+     // it up when the shared memory cache can either replenish locally nibbled
+     // bytes or, better, does not use local RAM copy at all.
+     // if (mem_obj->memCache.index >= 0) // backed by a shared memory cache
+     //    return 1;
+ 
+     return 1;
+ }
+ 
+ bool
+ StoreEntry::timestampsSet()
+ {
+     const HttpReply *reply = getReply();
+     time_t served_date = reply->date;
+@@ -2008,105 +2007,151 @@ StoreEntry::hasIfNoneMatchEtag(const Htt
+ bool
+ StoreEntry::hasOneOfEtags(const String &reqETags, const bool allowWeakMatch) const
+ {
+     const ETag repETag = getReply()->header.getETag(Http::HdrType::ETAG);
+     if (!repETag.str)
+         return strListIsMember(&reqETags, "*", ',');
+ 
+     bool matched = false;
+     const char *pos = NULL;
+     const char *item;
+     int ilen;
+     while (!matched && strListGetItem(&reqETags, ',', &item, &ilen, &pos)) {
+         if (!strncmp(item, "*", ilen))
+             matched = true;
+         else {
+             String str;
+             str.append(item, ilen);
+             ETag reqETag;
+             if (etagParseInit(&reqETag, str.termedBuf())) {
+                 matched = allowWeakMatch ? etagIsWeakEqual(repETag, reqETag) :
+                           etagIsStrongEqual(repETag, reqETag);
+             }
+         }
+     }
+     return matched;
+ }
+ 
+ Store::Disk &
+ StoreEntry::disk() const
+ {
+-    assert(0 <= swap_dirn && swap_dirn < Config.cacheSwap.n_configured);
++    assert(hasDisk());
+     const RefCount<Store::Disk> &sd = INDEXSD(swap_dirn);
+     assert(sd);
+     return *sd;
+ }
+ 
++bool
++StoreEntry::hasDisk(const sdirno dirn, const sfileno filen) const
++{
++    checkDisk();
++    if (dirn < 0 && filen < 0)
++        return swap_dirn >= 0;
++    Must(dirn >= 0);
++    const bool matchingDisk = (swap_dirn == dirn);
++    return filen < 0 ? matchingDisk : (matchingDisk && swap_filen == filen);
++}
++
++void
++StoreEntry::attachToDisk(const sdirno dirn, const sfileno fno, const swap_status_t status)
++{
++    debugs(88, 3, "attaching entry with key " << getMD5Text() << " : " <<
++           swapStatusStr[status] << " " << dirn << " " <<
++           std::hex << std::setw(8) << std::setfill('0') <<
++           std::uppercase << fno);
++    checkDisk();
++    swap_dirn = dirn;
++    swap_filen = fno;
++    swap_status = status;
++    checkDisk();
++}
++
++void
++StoreEntry::detachFromDisk()
++{
++    swap_dirn = -1;
++    swap_filen = -1;
++    swap_status = SWAPOUT_NONE;
++}
++
++void
++StoreEntry::checkDisk() const
++{
++    const bool ok = (swap_dirn < 0) == (swap_filen < 0) &&
++              (swap_dirn < 0) == (swap_status == SWAPOUT_NONE) &&
++              (swap_dirn < 0 || swap_dirn < Config.cacheSwap.n_configured);
++
++    if (!ok) {
++        debugs(88, DBG_IMPORTANT, "inconsistent disk numbers for entry " << *this);
++        throw std::runtime_error("inconsistent disk numbers ");
++    }
++}
++
+ /*
+  * return true if the entry is in a state where
+  * it can accept more data (ie with write() method)
+  */
+ bool
+ StoreEntry::isAccepting() const
+ {
+     if (STORE_PENDING != store_status)
+         return false;
+ 
+     if (EBIT_TEST(flags, ENTRY_ABORTED))
+         return false;
+ 
+     return true;
+ }
+ 
+ const char *
+ StoreEntry::describeTimestamps() const
+ {
+     LOCAL_ARRAY(char, buf, 256);
+     snprintf(buf, 256, "LV:%-9d LU:%-9d LM:%-9d EX:%-9d",
+              static_cast<int>(timestamp),
+              static_cast<int>(lastref),
+              static_cast<int>(lastModified_),
+              static_cast<int>(expires));
+     return buf;
+ }
+ 
+ std::ostream &operator <<(std::ostream &os, const StoreEntry &e)
+ {
+     os << "e:";
+ 
+     if (e.mem_obj) {
+         if (e.mem_obj->xitTable.index > -1)
+             os << 't' << e.mem_obj->xitTable.index;
+         if (e.mem_obj->memCache.index > -1)
+             os << 'm' << e.mem_obj->memCache.index;
+     }
+-    if (e.swap_filen > -1 || e.swap_dirn > -1)
++    if (e.hasDisk())
+         os << 'd' << e.swap_filen << '@' << e.swap_dirn;
+ 
+     os << '=';
+ 
+     // print only non-default status values, using unique letters
+     if (e.mem_status != NOT_IN_MEMORY ||
+             e.store_status != STORE_PENDING ||
+             e.swap_status != SWAPOUT_NONE ||
+             e.ping_status != PING_NONE) {
+         if (e.mem_status != NOT_IN_MEMORY) os << 'm';
+         if (e.store_status != STORE_PENDING) os << 's';
+         if (e.swap_status != SWAPOUT_NONE) os << 'w' << e.swap_status;
+         if (e.ping_status != PING_NONE) os << 'p' << e.ping_status;
+     }
+ 
+     // print only set flags, using unique letters
+     if (e.flags) {
+         if (EBIT_TEST(e.flags, ENTRY_SPECIAL)) os << 'S';
+         if (EBIT_TEST(e.flags, ENTRY_REVALIDATE_ALWAYS)) os << 'R';
+         if (EBIT_TEST(e.flags, DELAY_SENDING)) os << 'P';
+         if (EBIT_TEST(e.flags, RELEASE_REQUEST)) os << 'X';
+         if (EBIT_TEST(e.flags, REFRESH_REQUEST)) os << 'F';
+         if (EBIT_TEST(e.flags, ENTRY_REVALIDATE_STALE)) os << 'E';
+         if (EBIT_TEST(e.flags, ENTRY_DISPATCHED)) os << 'D';
+         if (EBIT_TEST(e.flags, KEY_PRIVATE)) os << 'I';
+         if (EBIT_TEST(e.flags, ENTRY_FWD_HDR_WAIT)) os << 'W';
+         if (EBIT_TEST(e.flags, ENTRY_NEGCACHED)) os << 'N';
+         if (EBIT_TEST(e.flags, ENTRY_VALIDATED)) os << 'V';
+         if (EBIT_TEST(e.flags, ENTRY_BAD_LENGTH)) os << 'L';
+         if (EBIT_TEST(e.flags, ENTRY_ABORTED)) os << 'A';
+
+=== modified file 'src/store/Controller.cc'
+--- src/store/Controller.cc	2017-01-01 00:14:42 +0000
++++ src/store/Controller.cc	2017-05-31 19:07:21 +0000
+@@ -215,112 +215,136 @@ Store::Controller::sync(void)
+         memStore->sync();
+     swapDir->sync();
+ }
+ 
+ /*
+  * handle callbacks all avaliable fs'es
+  */
+ int
+ Store::Controller::callback()
+ {
+     /* This will likely double count. Thats ok. */
+     PROF_start(storeDirCallback);
+ 
+     /* mem cache callbacks ? */
+     int result = swapDir->callback();
+ 
+     PROF_stop(storeDirCallback);
+ 
+     return result;
+ }
+ 
+ void
+ Store::Controller::referenceBusy(StoreEntry &e)
+ {
+     // special entries do not belong to any specific Store, but are IN_MEMORY
+     if (EBIT_TEST(e.flags, ENTRY_SPECIAL))
+         return;
+ 
+     /* Notify the fs that we're referencing this object again */
+ 
+-    if (e.swap_dirn > -1)
++    if (e.hasDisk())
+         swapDir->reference(e);
+ 
+     // Notify the memory cache that we're referencing this object again
+     if (memStore && e.mem_status == IN_MEMORY)
+         memStore->reference(e);
+ 
+     // TODO: move this code to a non-shared memory cache class when we have it
+     if (e.mem_obj) {
+         if (mem_policy->Referenced)
+             mem_policy->Referenced(mem_policy, &e, &e.mem_obj->repl);
+     }
+ }
+ 
+ bool
+ Store::Controller::dereferenceIdle(StoreEntry &e, bool wantsLocalMemory)
+ {
+     // special entries do not belong to any specific Store, but are IN_MEMORY
+     if (EBIT_TEST(e.flags, ENTRY_SPECIAL))
+         return true;
+ 
+     bool keepInStoreTable = false; // keep only if somebody needs it there
+ 
+     /* Notify the fs that we're not referencing this object any more */
+ 
+-    if (e.swap_filen > -1)
++    if (e.hasDisk())
+         keepInStoreTable = swapDir->dereference(e) || keepInStoreTable;
+ 
+     // Notify the memory cache that we're not referencing this object any more
+     if (memStore && e.mem_status == IN_MEMORY)
+         keepInStoreTable = memStore->dereference(e) || keepInStoreTable;
+ 
+     // TODO: move this code to a non-shared memory cache class when we have it
+     if (e.mem_obj) {
+         if (mem_policy->Dereferenced)
+             mem_policy->Dereferenced(mem_policy, &e, &e.mem_obj->repl);
+         // non-shared memory cache relies on store_table
+         if (!memStore)
+             keepInStoreTable = wantsLocalMemory || keepInStoreTable;
+     }
+ 
+     return keepInStoreTable;
+ }
+ 
++bool
++Store::Controller::markedForDeletion(const cache_key *key) const
++{
++    // Checking Transients should be enough: assuming that every
++    // public store entry with 'key' has a corresponding Transients entry
++    // (and vice versa).
++    return transients && transients->markedForDeletion(key);
++}
++
++bool
++Store::Controller::unusedMarkedForDeletion(const StoreEntry &e) const
++{
++    return markedForDeletion(reinterpret_cast<const cache_key*>(e.key)) &&
++        !transients->readers(e);
++}
++
++bool
++Store::Controller::hasDiskEntry(const StoreEntry &e) const
++{
++    return swapDir->hasEntry(e);
++}
++
+ StoreEntry *
+ Store::Controller::get(const cache_key *key)
+ {
+-    if (StoreEntry *e = find(key)) {
+-        // this is not very precise: some get()s are not initiated by clients
+-        e->touch();
+-        referenceBusy(*e);
+-        return e;
++    if (!markedForDeletion(key)) {
++        if (StoreEntry *e = find(key)) {
++            // this is not very precise: some get()s are not initiated by clients
++            e->touch();
++            referenceBusy(*e);
++            return e;
++        }
+     }
+     return NULL;
+ }
+ 
+ /// Internal method to implements the guts of the Store::get() API:
+ /// returns an in-transit or cached object with a given key, if any.
+ StoreEntry *
+ Store::Controller::find(const cache_key *key)
+ {
+     debugs(20, 3, storeKeyText(key));
+ 
+     if (StoreEntry *e = static_cast<StoreEntry*>(hash_lookup(store_table, key))) {
+         // TODO: ignore and maybe handleIdleEntry() unlocked intransit entries
+         // because their backing store slot may be gone already.
+         debugs(20, 3, HERE << "got in-transit entry: " << *e);
+         return e;
+     }
+ 
+     // Must search transients before caches because we must sync those we find.
+     if (transients) {
+         if (StoreEntry *e = transients->get(key)) {
+             debugs(20, 3, "got shared in-transit entry: " << *e);
+             bool inSync = false;
+             const bool found = anchorCollapsed(*e, inSync);
+             if (!found || inSync)
+                 return e;
+             assert(!e->locked()); // ensure release will destroyStoreEntry()
+             e->release(); // do not let others into the same trap
+             return NULL;
+         }
+@@ -331,69 +355,88 @@ Store::Controller::find(const cache_key
+             debugs(20, 3, HERE << "got mem-cached entry: " << *e);
+             return e;
+         }
+     }
+ 
+     if (swapDir) {
+         if (StoreEntry *e = swapDir->get(key)) {
+             debugs(20, 3, "got disk-cached entry: " << *e);
+             return e;
+         }
+     }
+ 
+     debugs(20, 4, "cannot locate " << storeKeyText(key));
+     return nullptr;
+ }
+ 
+ int64_t
+ Store::Controller::accumulateMore(StoreEntry &entry) const
+ {
+     return swapDir ? swapDir->accumulateMore(entry) : 0;
+     // The memory cache should not influence for-swapout accumulation decision.
+ }
+ 
+ void
+ Store::Controller::markForUnlink(StoreEntry &e)
+ {
+     if (transients && e.mem_obj && e.mem_obj->xitTable.index >= 0)
+         transients->markForUnlink(e);
+     if (memStore && e.mem_obj && e.mem_obj->memCache.index >= 0)
+         memStore->markForUnlink(e);
+-    if (swapDir && e.swap_filen >= 0)
++    if (swapDir && e.hasDisk())
+         swapDir->markForUnlink(e);
+ }
+ 
+ void
++Store::Controller::unlinkByKeyIfFound(const cache_key *key)
++{
++    if (StoreEntry *entry = static_cast<StoreEntry*>(hash_lookup(store_table, key))) {
++        debugs(20, 3, "got in-transit entry: " << *entry);
++        entry->release();
++        // The entry should be locked (but see find()). Return here because the
++        // release of a locked entry should take care of all its stores.
++        return;
++    }
++
++    if (transients)
++        transients->unlinkByKeyIfFound(key);
++    if (memStore)
++        memStore->unlinkByKeyIfFound(key);
++    if (swapDir)
++        swapDir->unlinkByKeyIfFound(key);
++}
++
++void
+ Store::Controller::unlink(StoreEntry &e)
+ {
+     memoryUnlink(e);
+-    if (swapDir && e.swap_filen >= 0)
++    if (swapDir)
+         swapDir->unlink(e);
+ }
+ 
+ // move this into [non-shared] memory cache class when we have one
+ /// whether e should be kept in local RAM for possible future caching
+ bool
+ Store::Controller::keepForLocalMemoryCache(StoreEntry &e) const
+ {
+     if (!e.memoryCachable())
+         return false;
+ 
+     // does the current and expected size obey memory caching limits?
+     assert(e.mem_obj);
+     const int64_t loadedSize = e.mem_obj->endOffset();
+     const int64_t expectedSize = e.mem_obj->expectedReplySize(); // may be < 0
+     const int64_t ramSize = max(loadedSize, expectedSize);
+     const int64_t ramLimit = min(
+                                  static_cast<int64_t>(Config.memMaxSize),
+                                  static_cast<int64_t>(Config.Store.maxInMemObjSize));
+     return ramSize <= ramLimit;
+ }
+ 
+ void
+ Store::Controller::memoryOut(StoreEntry &e, const bool preserveSwappable)
+ {
+     bool keepInLocalMemory = false;
+     if (memStore)
+         memStore->write(e); // leave keepInLocalMemory false
+     else
+         keepInLocalMemory = keepForLocalMemoryCache(e);
+@@ -482,102 +525,103 @@ Store::Controller::handleIdleEntry(Store
+     }
+ 
+     debugs(20, 5, HERE << "keepInLocalMemory: " << keepInLocalMemory);
+ 
+     // TODO: move this into [non-shared] memory cache class when we have one
+     if (keepInLocalMemory) {
+         e.setMemStatus(IN_MEMORY);
+         e.mem_obj->unlinkRequest();
+     } else {
+         e.purgeMem(); // may free e
+     }
+ }
+ 
+ void
+ Store::Controller::updateOnNotModified(StoreEntry *old, const StoreEntry &newer)
+ {
+     /* update the old entry object */
+     Must(old);
+     HttpReply *oldReply = const_cast<HttpReply*>(old->getReply());
+     Must(oldReply);
+ 
+     const bool modified = oldReply->updateOnNotModified(newer.getReply());
+     if (!old->timestampsSet() && !modified)
+         return;
+ 
+     /* update stored image of the old entry */
+ 
+     if (memStore && old->mem_status == IN_MEMORY && !EBIT_TEST(old->flags, ENTRY_SPECIAL))
+         memStore->updateHeaders(old);
+ 
+-    if (old->swap_dirn > -1)
++    if (old->hasDisk())
+         swapDir->updateHeaders(old);
+ }
+ 
+ void
+ Store::Controller::allowCollapsing(StoreEntry *e, const RequestFlags &reqFlags,
+                                    const HttpRequestMethod &reqMethod)
+ {
+     const KeyScope keyScope = reqFlags.refresh ? ksRevalidation : ksDefault;
+     e->makePublic(keyScope); // this is needed for both local and SMP collapsing
+     if (transients)
+         transients->startWriting(e, reqFlags, reqMethod);
+     debugs(20, 3, "may " << (transients && e->mem_obj->xitTable.index >= 0 ?
+                              "SMP-" : "locally-") << "collapse " << *e);
+ }
+ 
+ void
+ Store::Controller::syncCollapsed(const sfileno xitIndex)
+ {
+     assert(transients);
+ 
+     StoreEntry *collapsed = transients->findCollapsed(xitIndex);
+     if (!collapsed) { // the entry is no longer locally active, ignore update
+         debugs(20, 7, "not SMP-syncing not-transient " << xitIndex);
+         return;
+     }
+     assert(collapsed->mem_obj);
+     assert(collapsed->mem_obj->smpCollapsed);
+ 
+     debugs(20, 7, "syncing " << *collapsed);
+ 
+     bool abandoned = transients->abandoned(*collapsed);
+     bool found = false;
+     bool inSync = false;
+     if (memStore && collapsed->mem_obj->memCache.io == MemObject::ioDone) {
+         found = true;
+         inSync = true;
+         debugs(20, 7, "fully mem-loaded " << *collapsed);
+     } else if (memStore && collapsed->mem_obj->memCache.index >= 0) {
+         found = true;
+         inSync = memStore->updateCollapsed(*collapsed);
+-    } else if (swapDir && collapsed->swap_filen >= 0) {
++        // TODO: handle entries attached to both memory and disk
++    } else if (swapDir && collapsed->hasDisk()) {
+         found = true;
+         inSync = swapDir->updateCollapsed(*collapsed);
+     } else {
+         found = anchorCollapsed(*collapsed, inSync);
+     }
+ 
+     if (abandoned && collapsed->store_status == STORE_PENDING) {
+         debugs(20, 3, "aborting abandoned but STORE_PENDING " << *collapsed);
+         collapsed->abort();
+         return;
+     }
+ 
+     if (inSync) {
+         debugs(20, 5, "synced " << *collapsed);
+         collapsed->invokeHandlers();
+     } else if (found) { // unrecoverable problem syncing this entry
+         debugs(20, 3, "aborting unsyncable " << *collapsed);
+         collapsed->abort();
+     } else { // the entry is still not in one of the caches
+         debugs(20, 7, "waiting " << *collapsed);
+     }
+ }
+ 
+ /// Called for in-transit entries that are not yet anchored to a cache.
+ /// For cached entries, return true after synchronizing them with their cache
+ /// (making inSync true on success). For not-yet-cached entries, return false.
+ bool
+ Store::Controller::anchorCollapsed(StoreEntry &collapsed, bool &inSync)
+ {
+     // this method is designed to work with collapsed transients only
+
+=== modified file 'src/store/Controller.h'
+--- src/store/Controller.h	2017-01-01 00:14:42 +0000
++++ src/store/Controller.h	2017-05-31 18:54:40 +0000
+@@ -12,64 +12,76 @@
+ #include "store/Storage.h"
+ 
+ class MemObject;
+ class RequestFlags;
+ class HttpRequestMethod;
+ 
+ namespace Store {
+ 
+ /// Public Store interface. Coordinates the work of memory/disk/transient stores
+ /// and hides their individual existence/differences from the callers.
+ class Controller: public Storage
+ {
+ public:
+     Controller();
+     virtual ~Controller() override;
+ 
+     /* Storage API */
+     virtual void create() override;
+     virtual void init() override;
+     virtual StoreEntry *get(const cache_key *) override;
+     virtual uint64_t maxSize() const override;
+     virtual uint64_t minSize() const override;
+     virtual uint64_t currentSize() const override;
+     virtual uint64_t currentCount() const override;
+     virtual int64_t maxObjectSize() const override;
+     virtual void getStats(StoreInfoStats &stats) const override;
+     virtual void stat(StoreEntry &) const override;
+     virtual void sync() override;
+     virtual void maintain() override;
+     virtual void markForUnlink(StoreEntry &) override;
++    virtual void unlinkByKeyIfFound(const cache_key *key) override;
+     virtual void unlink(StoreEntry &) override;
+     virtual int callback() override;
+     virtual bool smpAware() const override;
+ 
++    /// Whether the entry with the key exists and was marked for removal
++    /// some time ago; get(key) will return NULL in such case.
++    bool markedForDeletion(const cache_key *key) const;
++
++    /// Whether the backing store for the given StoreEntry was marked
++    /// for removal, and nobody is reading from it.
++    bool unusedMarkedForDeletion(const StoreEntry &e) const;
++
++    /// whether there is a disk entry with e.key
++    bool hasDiskEntry(const StoreEntry &e) const;
++
+     /// Additional unknown-size entry bytes required by Store in order to
+     /// reduce the risk of selecting the wrong disk cache for the growing entry.
+     int64_t accumulateMore(StoreEntry &) const;
+ 
+     /// slowly calculate (and cache) hi/lo watermarks and similar limits
+     void updateLimits();
+ 
+     /// called when the entry is no longer needed by any transaction
+     void handleIdleEntry(StoreEntry &);
+ 
+     /// called to get rid of no longer needed entry data in RAM, if any
+     void memoryOut(StoreEntry &, const bool preserveSwappable);
+ 
+     /// update old entry metadata and HTTP headers using a newer entry
+     void updateOnNotModified(StoreEntry *old, const StoreEntry &newer);
+ 
+     /// makes the entry available for collapsing future requests
+     void allowCollapsing(StoreEntry *, const RequestFlags &, const HttpRequestMethod &);
+ 
+     /// marks the entry completed for collapsed requests
+     void transientsCompleteWriting(StoreEntry &);
+ 
+     /// Update local intransit entry after changes made by appending worker.
+     void syncCollapsed(const sfileno);
+ 
+     /// calls Root().transients->abandon() if transients are tracked
+     void transientsAbandon(StoreEntry &);
+ 
+     /// number of the transient entry readers some time ago
+     int transientReaders(const StoreEntry &) const;
+
+=== modified file 'src/store/Disk.cc'
+--- src/store/Disk.cc	2017-01-01 00:14:42 +0000
++++ src/store/Disk.cc	2017-05-31 10:20:36 +0000
+@@ -160,64 +160,64 @@ Store::Disk::objectSizeIsAcceptable(int6
+     return minObjectSize() <= objsize && objsize <= maxObjectSize();
+ }
+ 
+ bool
+ Store::Disk::canStore(const StoreEntry &e, int64_t diskSpaceNeeded, int &load) const
+ {
+     debugs(47,8, HERE << "cache_dir[" << index << "]: needs " <<
+            diskSpaceNeeded << " <? " << max_objsize);
+ 
+     if (EBIT_TEST(e.flags, ENTRY_SPECIAL))
+         return false; // we do not store Squid-generated entries
+ 
+     if (!objectSizeIsAcceptable(diskSpaceNeeded))
+         return false; // does not satisfy size limits
+ 
+     if (flags.read_only)
+         return false; // cannot write at all
+ 
+     if (currentSize() > maxSize())
+         return false; // already overflowing
+ 
+     /* Return 999 (99.9%) constant load; TODO: add a named constant for this */
+     load = 999;
+     return true; // kids may provide more tests and should report true load
+ }
+ 
+ /* Move to StoreEntry ? */
+ bool
+ Store::Disk::canLog(StoreEntry const &e)const
+ {
+-    if (e.swap_filen < 0)
++    if (e.hasDisk())
+         return false;
+ 
+-    if (e.swap_status != SWAPOUT_DONE)
++    if (!e.swappedOut())
+         return false;
+ 
+     if (e.swap_file_sz <= 0)
+         return false;
+ 
+     if (EBIT_TEST(e.flags, RELEASE_REQUEST))
+         return false;
+ 
+     if (EBIT_TEST(e.flags, KEY_PRIVATE))
+         return false;
+ 
+     if (EBIT_TEST(e.flags, ENTRY_SPECIAL))
+         return false;
+ 
+     return true;
+ }
+ 
+ void
+ Store::Disk::openLog() {}
+ 
+ void
+ Store::Disk::closeLog() {}
+ 
+ int
+ Store::Disk::writeCleanStart()
+ {
+     return 0;
+ }
+ 
+ void
+
+=== modified file 'src/store/Disk.h'
+--- src/store/Disk.h	2017-01-01 00:14:42 +0000
++++ src/store/Disk.h	2017-05-31 10:20:36 +0000
+@@ -45,60 +45,63 @@ public:
+     /* Controlled API */
+     virtual void create() override;
+     virtual StoreEntry *get(const cache_key *) override;
+     virtual uint64_t maxSize() const override { return max_size; }
+     virtual uint64_t minSize() const override;
+     virtual int64_t maxObjectSize() const override;
+     virtual void getStats(StoreInfoStats &stats) const override;
+     virtual void stat(StoreEntry &) const override;
+     virtual void reference(StoreEntry &e) override;
+     virtual bool dereference(StoreEntry &e) override;
+     virtual void maintain() override;
+     virtual bool smpAware() const override { return false; }
+ 
+     /// the size of the smallest entry this cache_dir can store
+     int64_t minObjectSize() const;
+ 
+     /// configure the maximum object size for this storage area.
+     /// May be any size up to the total storage area.
+     void maxObjectSize(int64_t newMax);
+ 
+     /// whether we can store an object of the given size
+     /// negative objSize means the object size is currently unknown
+     bool objectSizeIsAcceptable(int64_t objSize) const;
+ 
+     /// called when the entry is about to forget its association with cache_dir
+     virtual void disconnect(StoreEntry &) {}
+ 
+     /// called when entry swap out is complete
+     virtual void swappedOut(const StoreEntry &e) = 0;
+ 
++    /// whether this cache dir has entry with e.key
++    virtual bool hasEntry(const StoreEntry &e) const  = 0;
++
+ protected:
+     void parseOptions(int reconfiguring);
+     void dumpOptions(StoreEntry * e) const;
+     virtual ConfigOption *getOptionTree() const;
+     virtual bool allowOptionReconfigure(const char *const) const { return true; }
+ 
+     int64_t sizeInBlocks(const int64_t size) const { return (size + fs.blksize - 1) / fs.blksize; }
+ 
+ private:
+     bool optionReadOnlyParse(char const *option, const char *value, int reconfiguring);
+     void optionReadOnlyDump(StoreEntry * e) const;
+     bool optionObjectSizeParse(char const *option, const char *value, int reconfiguring);
+     void optionObjectSizeDump(StoreEntry * e) const;
+     char const *theType;
+ 
+ protected:
+     uint64_t max_size;        ///< maximum allocatable size of the storage area
+     int64_t min_objsize;      ///< minimum size of any object stored here (-1 for no limit)
+     int64_t max_objsize;      ///< maximum size of any object stored here (-1 for no limit)
+ 
+ public:
+     char *path;
+     int index;          /* This entry's index into the swapDirs array */
+     int disker; ///< disker kid id dedicated to this SwapDir or -1
+     RemovalPolicy *repl;
+     int removals;
+     int scanned;
+ 
+     struct Flags {
+         Flags() : selected(false), read_only(false) {}
+
+=== modified file 'src/store/Disks.cc'
+--- src/store/Disks.cc	2017-01-01 00:14:42 +0000
++++ src/store/Disks.cc	2017-05-31 18:59:08 +0000
+@@ -460,117 +460,140 @@ void
+ Store::Disks::updateHeaders(StoreEntry *e)
+ {
+     Must(e);
+     return e->disk().updateHeaders(e);
+ }
+ 
+ void
+ Store::Disks::maintain()
+ {
+     int i;
+     /* walk each fs */
+ 
+     for (i = 0; i < Config.cacheSwap.n_configured; ++i) {
+         /* XXX FixMe: This should be done "in parallell" on the different
+          * cache_dirs, not one at a time.
+          */
+         /* call the maintain function .. */
+         store(i)->maintain();
+     }
+ }
+ 
+ void
+ Store::Disks::sync()
+ {
+     for (int i = 0; i < Config.cacheSwap.n_configured; ++i)
+         store(i)->sync();
+ }
+ 
+ void
+ Store::Disks::markForUnlink(StoreEntry &e) {
+-    if (e.swap_filen >= 0)
++    if (e.hasDisk())
+         store(e.swap_dirn)->markForUnlink(e);
+ }
+ 
+ void
+-Store::Disks::unlink(StoreEntry &e) {
+-    if (e.swap_filen >= 0)
+-        store(e.swap_dirn)->unlink(e);
++Store::Disks::unlinkByKeyIfFound(const cache_key *key)
++{
++    for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
++        if (dir(i).active())
++            dir(i).unlinkByKeyIfFound(key);
++    }
++}
++
++void
++Store::Disks::unlink(StoreEntry &e)
++{
++    for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
++        if (dir(i).active()) {
++            if (e.hasDisk(i))
++                dir(i).unlink(e);
++            else
++                dir(i).unlinkByKeyIfFound(reinterpret_cast<const cache_key*>(e.key));
++        }
++    }
+ }
+ 
+ bool
+ Store::Disks::anchorCollapsed(StoreEntry &collapsed, bool &inSync)
+ {
+     if (const int cacheDirs = Config.cacheSwap.n_configured) {
+         // ask each cache_dir until the entry is found; use static starting
+         // point to avoid asking the same subset of disks more often
+         // TODO: coordinate with put() to be able to guess the right disk often
+         static int idx = 0;
+         for (int n = 0; n < cacheDirs; ++n) {
+             idx = (idx + 1) % cacheDirs;
+             SwapDir &sd = dir(idx);
+             if (!sd.active())
+                 continue;
+ 
+             if (sd.anchorCollapsed(collapsed, inSync)) {
+                 debugs(20, 3, "cache_dir " << idx << " anchors " << collapsed);
+                 return true;
+             }
+         }
+     }
+ 
+     debugs(20, 4, "none of " << Config.cacheSwap.n_configured <<
+            " cache_dirs have " << collapsed);
+     return false;
+ }
+ 
+ bool
+ Store::Disks::updateCollapsed(StoreEntry &collapsed)
+ {
+-    return collapsed.swap_filen >= 0 &&
++    return collapsed.hasDisk() &&
+            dir(collapsed.swap_dirn).updateCollapsed(collapsed);
+ }
+ 
+ bool
+ Store::Disks::smpAware() const
+ {
+     for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+         // A mix is not supported, but we conservatively check every
+         // dir because features like collapsed revalidation should
+         // currently be disabled if any dir is SMP-aware
+         if (dir(i).smpAware())
+             return true;
+     }
+     return false;
+ }
+ 
+-/* Store::Disks globals that should be converted to use RegisteredRunner */
++bool
++Store::Disks::hasEntry(const StoreEntry &e) const
++{
++    for (int i = 0; i < Config.cacheSwap.n_configured; ++i)
++        if (dir(i).active() && dir(i).hasEntry(e))
++            return true;
++    return false;
++}
+ 
+ void
+ storeDirOpenSwapLogs()
+ {
+     for (int dirn = 0; dirn < Config.cacheSwap.n_configured; ++dirn)
+         INDEXSD(dirn)->openLog();
+ }
+ 
+ void
+ storeDirCloseSwapLogs()
+ {
+     for (int dirn = 0; dirn < Config.cacheSwap.n_configured; ++dirn)
+         INDEXSD(dirn)->closeLog();
+ }
+ 
+ /**
+  *  storeDirWriteCleanLogs
+  *
+  *  Writes a "clean" swap log file from in-memory metadata.
+  *  This is a rewrite of the original function to troll each
+  *  StoreDir and write the logs, and flush at the end of
+  *  the run. Thanks goes to Eric Stern, since this solution
+  *  came out of his COSS code.
+  */
+ int
+ storeDirWriteCleanLogs(int reopen)
+ {
+     const StoreEntry *e = NULL;
+     int n = 0;
+ 
+@@ -686,49 +709,49 @@ free_cachedir(Store::DiskConfig *swap)
+         /* TODO XXX this lets the swapdir free resources asynchronously
+         * swap->swapDirs[i]->deactivate();
+         * but there may be such a means already.
+         * RBC 20041225
+         */
+         swap->swapDirs[i] = NULL;
+     }
+ 
+     safe_free(swap->swapDirs);
+     swap->swapDirs = NULL;
+     swap->n_allocated = 0;
+     swap->n_configured = 0;
+ }
+ 
+ /* Globals that should be moved to some Store::UFS-specific logging module */
+ 
+ /**
+  * An entry written to the swap log MUST have the following
+  * properties.
+  *   1.  It MUST be a public key.  It does no good to log
+  *       a public ADD, change the key, then log a private
+  *       DEL.  So we need to log a DEL before we change a
+  *       key from public to private.
+  *   2.  It MUST have a valid (> -1) swap_filen.
+  */
+ void
+ storeDirSwapLog(const StoreEntry * e, int op)
+ {
+     assert (e);
+     assert(!EBIT_TEST(e->flags, KEY_PRIVATE));
+-    assert(e->swap_filen >= 0);
++    assert(e->hasDisk());
+     /*
+      * icons and such; don't write them to the swap log
+      */
+ 
+     if (EBIT_TEST(e->flags, ENTRY_SPECIAL))
+         return;
+ 
+     assert(op > SWAP_LOG_NOP && op < SWAP_LOG_MAX);
+ 
+     debugs(20, 3, "storeDirSwapLog: " <<
+            swap_log_op_str[op] << " " <<
+            e->getMD5Text() << " " <<
+            e->swap_dirn << " " <<
+            std::hex << std::uppercase << std::setfill('0') << std::setw(8) << e->swap_filen);
+ 
+     dynamic_cast<SwapDir *>(INDEXSD(e->swap_dirn))->logEntry(*e, op);
+ }
+ 
+
+=== modified file 'src/store/Disks.h'
+--- src/store/Disks.h	2017-01-01 00:14:42 +0000
++++ src/store/Disks.h	2017-05-31 18:59:24 +0000
+@@ -12,70 +12,73 @@
+ #include "store/Controlled.h"
+ #include "store/forward.h"
+ 
+ namespace Store {
+ 
+ /// summary view of all disk caches (cache_dirs) combined
+ class Disks: public Controlled
+ {
+ public:
+     Disks();
+ 
+     /* Storage API */
+     virtual void create() override;
+     virtual void init() override;
+     virtual StoreEntry *get(const cache_key *) override;
+     virtual uint64_t maxSize() const override;
+     virtual uint64_t minSize() const override;
+     virtual uint64_t currentSize() const override;
+     virtual uint64_t currentCount() const override;
+     virtual int64_t maxObjectSize() const override;
+     virtual void getStats(StoreInfoStats &stats) const override;
+     virtual void stat(StoreEntry &) const override;
+     virtual void sync() override;
+     virtual void reference(StoreEntry &) override;
+     virtual bool dereference(StoreEntry &e) override;
+     virtual void updateHeaders(StoreEntry *) override;
+     virtual void maintain() override;
+     virtual bool anchorCollapsed(StoreEntry &e, bool &inSync) override;
+     virtual bool updateCollapsed(StoreEntry &e) override;
+     virtual void markForUnlink(StoreEntry &) override;
++    virtual void unlinkByKeyIfFound(const cache_key *key) override;
+     virtual void unlink(StoreEntry &) override;
+     virtual int callback() override;
+ 
+     /// slowly calculate (and cache) hi/lo watermarks and similar limits
+     void updateLimits();
+ 
+     /// Additional unknown-size entry bytes required by disks in order to
+     /// reduce the risk of selecting the wrong disk cache for the growing entry.
+     int64_t accumulateMore(const StoreEntry&) const;
+     virtual bool smpAware() const override;
++    /// whether any of disk caches has entry with e.key
++    bool hasEntry(const StoreEntry &e) const;
+ 
+ private:
+     /* migration logic */
+     SwapDir *store(int const x) const;
+     SwapDir &dir(int const idx) const;
+ 
+     int64_t largestMinimumObjectSize; ///< maximum of all Disk::minObjectSize()s
+     int64_t largestMaximumObjectSize; ///< maximum of all Disk::maxObjectSize()s
+     int64_t secondLargestMaximumObjectSize; ///< the second-biggest Disk::maxObjectSize()
+ };
+ 
+ } // namespace Store
+ 
+ /* Store::Disks globals that should be converted to use RegisteredRunner */
+ void storeDirOpenSwapLogs(void);
+ int storeDirWriteCleanLogs(int reopen);
+ void storeDirCloseSwapLogs(void);
+ 
+ /* Globals that should be converted to static Store::Disks methods */
+ void allocate_new_swapdir(Store::DiskConfig *swap);
+ void free_cachedir(Store::DiskConfig *swap);
+ 
+ /* Globals that should be converted to Store::Disks private data members */
+ typedef int STDIRSELECT(const StoreEntry *e);
+ extern STDIRSELECT *storeDirSelectSwapDir;
+ 
+ /* Globals that should be moved to some Store::UFS-specific logging module */
+ void storeDirSwapLog(const StoreEntry *e, int op);
+ 
+ #endif /* SQUID_STORE_DISKS_H */
+
+=== modified file 'src/store/Storage.h'
+--- src/store/Storage.h	2017-01-01 00:14:42 +0000
++++ src/store/Storage.h	2017-05-31 18:52:56 +0000
+@@ -36,52 +36,59 @@ public:
+     /**
+      * The maximum size the store will support in normal use. Inaccuracy is
+      * permitted, but may throw estimates for memory etc out of whack.
+      */
+     virtual uint64_t maxSize() const = 0;
+ 
+     /// the minimum size the store will shrink to via normal housekeeping
+     virtual uint64_t minSize() const = 0;
+ 
+     /// current size
+     virtual uint64_t currentSize() const = 0;
+ 
+     /// the total number of objects stored right now
+     virtual uint64_t currentCount() const = 0;
+ 
+     /// the maximum size of a storable object; -1 if unlimited
+     virtual int64_t maxObjectSize() const = 0;
+ 
+     /// collect statistics
+     virtual void getStats(StoreInfoStats &stats) const = 0;
+ 
+     /**
+      * Output stats to the provided store entry.
+      \todo make these calls asynchronous
+      */
+     virtual void stat(StoreEntry &e) const = 0;
+ 
+     /// expect an unlink() call after the entry becomes idle
+     virtual void markForUnlink(StoreEntry &e) = 0;
+ 
+-    /// remove the entry from the store
++    /// Remove the entry from the store if possible
++    /// or mark it as waiting to be freed otherwise.
++    /// Do nothing if there is no matching entry in the store.
++    virtual void unlinkByKeyIfFound(const cache_key *key) = 0;
++
++    /// Remove the entry from the store if possible
++    /// or mark it as waiting to be freed otherwise.
++    /// The entry must be present in the store.
+     virtual void unlink(StoreEntry &e) = 0;
+ 
+     /// called once every main loop iteration; TODO: Move to UFS code.
+     virtual int callback() { return 0; }
+ 
+     /// perform regular periodic maintenance; TODO: move to UFSSwapDir::Maintain
+     virtual void maintain() = 0;
+ 
+     /// prepare for shutdown
+     virtual void sync() {}
+ 
+     /// whether this storage is capable of serving multiple workers;
+     /// a true result does not imply [lack of] non-SMP support because
+     /// [only] some SMP-aware storages also support non-SMP configss
+     virtual bool smpAware() const = 0;
+ };
+ 
+ } // namespace Store
+ 
+ #endif /* SQUID_STORE_STORAGE_H */
+ 
+
+=== modified file 'src/store_client.cc'
+--- src/store_client.cc	2017-03-31 12:34:45 +0000
++++ src/store_client.cc	2017-05-31 12:51:23 +0000
+@@ -135,61 +135,61 @@ static void
+ storeClientCopyEvent(void *data)
+ {
+     store_client *sc = (store_client *)data;
+     debugs(90, 3, "storeClientCopyEvent: Running");
+     assert (sc->flags.copy_event_pending);
+     sc->flags.copy_event_pending = false;
+ 
+     if (!sc->_callback.pending())
+         return;
+ 
+     storeClientCopy2(sc->entry, sc);
+ }
+ 
+ store_client::store_client(StoreEntry *e) :
+     cmp_offset(0),
+ #if STORE_CLIENT_LIST_DEBUG
+     owner(cbdataReference(data)),
+ #endif
+     entry(e),
+     type(e->storeClientType()),
+     object_ok(true)
+ {
+     flags.disk_io_pending = false;
+     flags.store_copying = false;
+     flags.copy_event_pending = false;
+     ++ entry->refcount;
+ 
+     if (getType() == STORE_DISK_CLIENT) {
+         /* assert we'll be able to get the data we want */
+         /* maybe we should open swapin_sio here */
+-        assert(entry->swap_filen > -1 || entry->swappingOut());
++        assert(entry->hasDisk() || entry->swappingOut());
+     }
+ }
+ 
+ store_client::~store_client()
+ {}
+ 
+ /* copy bytes requested by the client */
+ void
+ storeClientCopy(store_client * sc,
+                 StoreEntry * e,
+                 StoreIOBuffer copyInto,
+                 STCB * callback,
+                 void *data)
+ {
+     assert (sc != NULL);
+     sc->copy(e, copyInto,callback,data);
+ }
+ 
+ void
+ store_client::copy(StoreEntry * anEntry,
+                    StoreIOBuffer copyRequest,
+                    STCB * callback_fn,
+                    void *data)
+ {
+     assert (anEntry == entry);
+     assert (callback_fn);
+     assert (data);
+     assert(!EBIT_TEST(entry->flags, ENTRY_ABORTED));
+     debugs(90, 3, "store_client::copy: " << entry->getMD5Text() << ", from " <<
+            copyRequest.offset << ", for length " <<
+@@ -224,61 +224,61 @@ store_client::copy(StoreEntry * anEntry,
+     PROF_stop(storeClient_kickReads);
+     copying = false;
+ 
+     anEntry->lock("store_client::copy"); // see deletion note below
+ 
+     storeClientCopy2(entry, this);
+ 
+     // Bug 3480: This store_client object may be deleted now if, for example,
+     // the client rejects the hit response copied above. Use on-stack pointers!
+ 
+ #if USE_ADAPTATION
+     anEntry->kickProducer();
+ #endif
+     anEntry->unlock("store_client::copy");
+ 
+     // Add no code here. This object may no longer exist.
+ }
+ 
+ /// Whether there is (or will be) more entry data for us.
+ bool
+ store_client::moreToSend() const
+ {
+     if (entry->store_status == STORE_PENDING)
+         return true; // there may be more coming
+ 
+     /* STORE_OK, including aborted entries: no more data is coming */
+ 
+     const int64_t len = entry->objectLen();
+ 
+     // If we do not know the entry length, then we have to open the swap file.
+-    const bool canSwapIn = entry->swap_filen >= 0;
++    const bool canSwapIn = entry->hasDisk();
+     if (len < 0)
+         return canSwapIn;
+ 
+     if (copyInto.offset >= len)
+         return false; // sent everything there is
+ 
+     if (canSwapIn)
+         return true; // if we lack prefix, we can swap it in
+ 
+     // If we cannot swap in, make sure we have what we want in RAM. Otherwise,
+     // scheduleRead calls scheduleDiskRead which asserts without a swap file.
+     const MemObject *mem = entry->mem_obj;
+     return mem &&
+            mem->inmem_lo <= copyInto.offset && copyInto.offset < mem->endOffset();
+ }
+ 
+ static void
+ storeClientCopy2(StoreEntry * e, store_client * sc)
+ {
+     /* reentrancy not allowed  - note this could lead to
+      * dropped events
+      */
+ 
+     if (sc->flags.copy_event_pending) {
+         return;
+     }
+ 
+     if (EBIT_TEST(e->flags, ENTRY_FWD_HDR_WAIT)) {
+         debugs(90, 5, "storeClientCopy2: returning because ENTRY_FWD_HDR_WAIT set");
+         return;
+@@ -414,61 +414,61 @@ store_client::scheduleDiskRead()
+     assert(!flags.disk_io_pending);
+ 
+     debugs(90, 3, "reading " << *entry << " from disk");
+ 
+     fileRead();
+ 
+     flags.store_copying = false;
+ }
+ 
+ void
+ store_client::scheduleMemRead()
+ {
+     /* What the client wants is in memory */
+     /* Old style */
+     debugs(90, 3, "store_client::doCopy: Copying normal from memory");
+     size_t sz = entry->mem_obj->data_hdr.copy(copyInto);
+     callback(sz);
+     flags.store_copying = false;
+ }
+ 
+ void
+ store_client::fileRead()
+ {
+     MemObject *mem = entry->mem_obj;
+ 
+     assert(_callback.pending());
+     assert(!flags.disk_io_pending);
+     flags.disk_io_pending = true;
+ 
+     if (mem->swap_hdr_sz != 0)
+-        if (entry->swap_status == SWAPOUT_WRITING)
++        if (entry->swappingOut())
+             assert(mem->swapout.sio->offset() > copyInto.offset + (int64_t)mem->swap_hdr_sz);
+ 
+     storeRead(swapin_sio,
+               copyInto.data,
+               copyInto.length,
+               copyInto.offset + mem->swap_hdr_sz,
+               mem->swap_hdr_sz == 0 ? storeClientReadHeader
+               : storeClientReadBody,
+               this);
+ }
+ 
+ void
+ store_client::readBody(const char *, ssize_t len)
+ {
+     int parsed_header = 0;
+ 
+     // Don't assert disk_io_pending here.. may be called by read_header
+     flags.disk_io_pending = false;
+     assert(_callback.pending());
+     debugs(90, 3, "storeClientReadBody: len " << len << "");
+ 
+     if (copyInto.offset == 0 && len > 0 && entry->getReply()->sline.status() == Http::scNone) {
+         /* Our structure ! */
+         HttpReply *rep = (HttpReply *) entry->getReply(); // bypass const
+ 
+         if (!rep->parseCharBuf(copyInto.data, headersEnd(copyInto.data, len))) {
+             debugs(90, DBG_CRITICAL, "Could not parse headers from on disk object");
+         } else {
+             parsed_header = 1;
+         }
+@@ -640,61 +640,61 @@ storeClientCopyPending(store_client * sc
+  * This routine hasn't been optimised to take advantage of the
+  * passed sc. Yet.
+  */
+ int
+ storeUnregister(store_client * sc, StoreEntry * e, void *data)
+ {
+     MemObject *mem = e->mem_obj;
+ #if STORE_CLIENT_LIST_DEBUG
+ 
+     assert(sc == storeClientListSearch(e->mem_obj, data));
+ #endif
+ 
+     if (mem == NULL)
+         return 0;
+ 
+     debugs(90, 3, "storeUnregister: called for '" << e->getMD5Text() << "'");
+ 
+     if (sc == NULL) {
+         debugs(90, 3, "storeUnregister: No matching client for '" << e->getMD5Text() << "'");
+         return 0;
+     }
+ 
+     if (mem->clientCount() == 0) {
+         debugs(90, 3, "storeUnregister: Consistency failure - store client being unregistered is not in the mem object's list for '" << e->getMD5Text() << "'");
+         return 0;
+     }
+ 
+     dlinkDelete(&sc->node, &mem->clients);
+     -- mem->nclients;
+ 
+-    if (e->store_status == STORE_OK && e->swap_status != SWAPOUT_DONE)
++    if (e->store_status == STORE_OK && !e->swappedOut())
+         e->swapOut();
+ 
+     if (sc->swapin_sio != NULL) {
+         storeClose(sc->swapin_sio, StoreIOState::readerDone);
+         sc->swapin_sio = NULL;
+         ++statCounter.swap.ins;
+     }
+ 
+     if (sc->_callback.pending()) {
+         /* callback with ssize = -1 to indicate unexpected termination */
+         debugs(90, 3, "store_client for " << *e << " has a callback");
+         sc->fail();
+     }
+ 
+ #if STORE_CLIENT_LIST_DEBUG
+     cbdataReferenceDone(sc->owner);
+ 
+ #endif
+ 
+     delete sc;
+ 
+     assert(e->locked());
+     // An entry locked by others may be unlocked (and destructed) by others, so
+     // we must lock again to safely dereference e after CheckQuickAbortIsReasonable().
+     e->lock("storeUnregister");
+ 
+     if (CheckQuickAbortIsReasonable(e))
+         e->abort();
+     else
+         mem->kickReads();
+
+=== modified file 'src/store_rebuild.cc'
+--- src/store_rebuild.cc	2017-03-31 12:34:45 +0000
++++ src/store_rebuild.cc	2017-05-31 10:20:37 +0000
+@@ -48,61 +48,61 @@ storeCleanupDoubleCheck(StoreEntry * e)
+ }
+ 
+ static void
+ storeCleanup(void *)
+ {
+     static int store_errors = 0;
+     static StoreSearchPointer currentSearch;
+     static int validated = 0;
+     static int seen = 0;
+ 
+     if (currentSearch == NULL || currentSearch->isDone())
+         currentSearch = Store::Root().search();
+ 
+     size_t statCount = 500;
+ 
+     // TODO: Avoid the loop (and ENTRY_VALIDATED) unless opt_store_doublecheck.
+     while (statCount-- && !currentSearch->isDone() && currentSearch->next()) {
+         StoreEntry *e;
+ 
+         e = currentSearch->currentItem();
+ 
+         ++seen;
+ 
+         if (EBIT_TEST(e->flags, ENTRY_VALIDATED))
+             continue;
+ 
+         /*
+          * Calling StoreEntry->release() has no effect because we're
+          * still in 'store_rebuilding' state
+          */
+-        if (e->swap_filen < 0)
++        if (!e->hasDisk())
+             continue;
+ 
+         if (opt_store_doublecheck)
+             if (storeCleanupDoubleCheck(e))
+                 ++store_errors;
+ 
+         EBIT_SET(e->flags, ENTRY_VALIDATED);
+ 
+         /*
+          * Only set the file bit if we know its a valid entry
+          * otherwise, set it in the validation procedure
+          */
+ 
+         if ((++validated & 0x3FFFF) == 0)
+             /* TODO format the int with with a stream operator */
+             debugs(20, DBG_IMPORTANT, "  " << validated << " Entries Validated so far.");
+     }
+ 
+     if (currentSearch->isDone()) {
+         debugs(20, 2, "Seen: " << seen << " entries");
+         debugs(20, DBG_IMPORTANT, "  Completed Validation Procedure");
+         debugs(20, DBG_IMPORTANT, "  Validated " << validated << " Entries");
+         debugs(20, DBG_IMPORTANT, "  store_swap_size = " << Store::Root().currentSize() / 1024.0 << " KB");
+         --StoreController::store_dirs_rebuilding;
+         assert(0 == StoreController::store_dirs_rebuilding);
+ 
+         if (opt_store_doublecheck && store_errors) {
+             fatalf("Quitting after finding %d cache index inconsistencies. " \
+                    "Removing cache index will force its slow rebuild. " \
+                    "Removing -S will let Squid start with an inconsistent " \
+
+=== modified file 'src/store_swapin.cc'
+--- src/store_swapin.cc	2017-01-01 00:14:42 +0000
++++ src/store_swapin.cc	2017-05-31 10:20:37 +0000
+@@ -4,71 +4,64 @@
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 20    Storage Manager Swapin Functions */
+ 
+ #include "squid.h"
+ #include "globals.h"
+ #include "StatCounters.h"
+ #include "Store.h"
+ #include "store_swapin.h"
+ #include "StoreClient.h"
+ 
+ static StoreIOState::STIOCB storeSwapInFileClosed;
+ static StoreIOState::STFNCB storeSwapInFileNotify;
+ 
+ void
+ storeSwapInStart(store_client * sc)
+ {
+     StoreEntry *e = sc->entry;
+ 
+     if (!EBIT_TEST(e->flags, ENTRY_VALIDATED)) {
+         /* We're still reloading and haven't validated this entry yet */
+         return;
+     }
+ 
+     if (e->mem_status != NOT_IN_MEMORY)
+         debugs(20, 3, HERE << "already IN_MEMORY");
+ 
+-    debugs(20, 3, "storeSwapInStart: called for : " << e->swap_dirn << " " <<
+-           std::hex << std::setw(8) << std::setfill('0') << std::uppercase <<
+-           e->swap_filen << " " <<  e->getMD5Text());
++    debugs(20, 3, *e << " " <<  e->getMD5Text());
+ 
+-    if (e->swap_status != SWAPOUT_WRITING && e->swap_status != SWAPOUT_DONE) {
+-        debugs(20, DBG_IMPORTANT, "storeSwapInStart: bad swap_status (" << swapStatusStr[e->swap_status] << ")");
+-        return;
+-    }
+-
+-    if (e->swap_filen < 0) {
+-        debugs(20, DBG_IMPORTANT, "storeSwapInStart: swap_filen < 0");
++    if (!e->hasDisk()) {
++        debugs(20, DBG_IMPORTANT, "BUG: Attempt to swap in a not-stored entry " << *e << ". Salvaged.");
+         return;
+     }
+ 
+     assert(e->mem_obj != NULL);
+     debugs(20, 3, "storeSwapInStart: Opening fileno " << std::hex << std::setw(8) << std::setfill('0') << std::uppercase << e->swap_filen);
+     sc->swapin_sio = storeOpen(e, storeSwapInFileNotify, storeSwapInFileClosed, sc);
+ }
+ 
+ static void
+ storeSwapInFileClosed(void *data, int errflag, StoreIOState::Pointer)
+ {
+     store_client *sc = (store_client *)data;
+     debugs(20, 3, "storeSwapInFileClosed: sio=" << sc->swapin_sio.getRaw() << ", errflag=" << errflag);
+     sc->swapin_sio = NULL;
+ 
+     if (sc->_callback.pending()) {
+         assert (errflag <= 0);
+         sc->callback(0, errflag ? true : false);
+     }
+ 
+     ++statCounter.swap.ins;
+ }
+ 
+ static void
+ storeSwapInFileNotify(void *data, int, StoreIOState::Pointer)
+ {
+     store_client *sc = (store_client *)data;
+     StoreEntry *e = sc->entry;
+ 
+     debugs(1, 3, "storeSwapInFileNotify: changing " << e->swap_filen << "/" <<
+
+=== modified file 'src/store_swapout.cc'
+--- src/store_swapout.cc	2017-01-01 00:14:42 +0000
++++ src/store_swapout.cc	2017-05-31 12:54:07 +0000
+@@ -1,179 +1,177 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 20    Storage Manager Swapout Functions */
+ 
+ #include "squid.h"
+ #include "cbdata.h"
++#include "CollapsedForwarding.h"
+ #include "globals.h"
+ #include "Store.h"
+ #include "StoreClient.h"
+ /* FIXME: Abstract the use of this more */
+ #include "mem_node.h"
+ #include "MemObject.h"
+ #include "SquidConfig.h"
+ #include "StatCounters.h"
+ #include "store/Disk.h"
+ #include "store/Disks.h"
+ #include "store_log.h"
+ #include "swap_log_op.h"
+ 
+ static void storeSwapOutStart(StoreEntry * e);
+ static StoreIOState::STIOCB storeSwapOutFileClosed;
+ static StoreIOState::STFNCB storeSwapOutFileNotify;
+ 
+ // wrapper to cross C/C++ ABI boundary. xfree is extern "C" for libraries.
+ static void xfree_cppwrapper(void *x)
+ {
+     xfree(x);
+ }
+ 
+ /* start swapping object to disk */
+ static void
+ storeSwapOutStart(StoreEntry * e)
+ {
+     MemObject *mem = e->mem_obj;
+     StoreIOState::Pointer sio;
+     assert(mem);
+     /* Build the swap metadata, so the filesystem will know how much
+      * metadata there is to store
+      */
+     debugs(20, 5, "storeSwapOutStart: Begin SwapOut '" << e->url() << "' to dirno " <<
+            e->swap_dirn << ", fileno " << std::hex << std::setw(8) << std::setfill('0') <<
+            std::uppercase << e->swap_filen);
+-    e->swap_status = SWAPOUT_WRITING;
+     e->swapOutDecision(MemObject::SwapOut::swStarted);
+     /* If we start swapping out objects with OutOfBand Metadata,
+      * then this code needs changing
+      */
+ 
+     /* TODO: make some sort of data,size refcounted immutable buffer
+      * and stop fooling ourselves with "const char*" buffers.
+      */
+ 
+     // Create metadata now, possibly in vain: storeCreate needs swap_hdr_sz.
+     const char *buf = e->getSerialisedMetaData ();
+     assert(buf);
+ 
+     /* Create the swap file */
+     generic_cbdata *c = new generic_cbdata(e);
+     sio = storeCreate(e, storeSwapOutFileNotify, storeSwapOutFileClosed, c);
+ 
+     if (sio == NULL) {
+-        e->swap_status = SWAPOUT_NONE;
++        e->detachFromDisk();
+         e->swapOutDecision(MemObject::SwapOut::swImpossible);
+         delete c;
+         xfree((char*)buf);
+         storeLog(STORE_LOG_SWAPOUTFAIL, e);
+         return;
+     }
+ 
+     mem->swapout.sio = sio;
+     /* Don't lock until after create, or the replacement
+      * code might get confused */
+ 
+     e->lock("storeSwapOutStart");
+     /* Pick up the file number if it was assigned immediately */
+-    e->swap_filen = mem->swapout.sio->swap_filen;
+-
+-    e->swap_dirn = mem->swapout.sio->swap_dirn;
+-
++    e->attachToDisk(mem->swapout.sio->swap_dirn, mem->swapout.sio->swap_filen, SWAPOUT_WRITING);
++    e->markIfDeleted();
+     /* write out the swap metadata */
+     storeIOWrite(mem->swapout.sio, buf, mem->swap_hdr_sz, 0, xfree_cppwrapper);
+ }
+ 
+ static void
+ storeSwapOutFileNotify(void *data, int errflag, StoreIOState::Pointer self)
+ {
+     StoreEntry *e;
+     static_cast<generic_cbdata *>(data)->unwrap(&e);
+ 
+     MemObject *mem = e->mem_obj;
+-    assert(e->swap_status == SWAPOUT_WRITING);
++    assert(e->swappingOut());
+     assert(mem);
+     assert(mem->swapout.sio == self);
+     assert(errflag == 0);
+-    assert(e->swap_filen < 0); // if this fails, call SwapDir::disconnect(e)
++    assert(!e->hasDisk()); // if this fails, call SwapDir::disconnect(e)
+     e->swap_filen = mem->swapout.sio->swap_filen;
+     e->swap_dirn = mem->swapout.sio->swap_dirn;
+ }
+ 
+ static bool
+ doPages(StoreEntry *anEntry)
+ {
+     MemObject *mem = anEntry->mem_obj;
+ 
+     do {
+         // find the page containing the first byte we have not swapped out yet
+         mem_node *page =
+             mem->data_hdr.getBlockContainingLocation(mem->swapout.queue_offset);
+ 
+         if (!page)
+             break; // wait for more data to become available
+ 
+         // memNodeWriteComplete() and absence of buffer offset math below
+         // imply that we always write from the very beginning of the page
+         assert(page->start() == mem->swapout.queue_offset);
+ 
+         /*
+          * Get the length of this buffer. We are assuming(!) that the buffer
+          * length won't change on this buffer, or things are going to be very
+          * strange. I think that after the copy to a buffer is done, the buffer
+          * size should stay fixed regardless so that this code isn't confused,
+          * but we can look at this at a later date or whenever the code results
+          * in bad swapouts, whichever happens first. :-)
+          */
+         ssize_t swap_buf_len = page->nodeBuffer.length;
+ 
+         debugs(20, 3, "storeSwapOut: swap_buf_len = " << swap_buf_len);
+ 
+         assert(swap_buf_len > 0);
+ 
+         debugs(20, 3, "storeSwapOut: swapping out " << swap_buf_len << " bytes from " << mem->swapout.queue_offset);
+ 
+         mem->swapout.queue_offset += swap_buf_len;
+ 
+         // Quit if write() fails. Sio is going to call our callback, and that
+         // will cleanup, but, depending on the fs, that call may be async.
+         const bool ok = mem->swapout.sio->write(
+                             mem->data_hdr.NodeGet(page),
+                             swap_buf_len,
+                             -1,
+                             memNodeWriteComplete);
+ 
+-        if (!ok || anEntry->swap_status != SWAPOUT_WRITING)
++        if (!ok || !anEntry->swappingOut())
+             return false;
+ 
+         int64_t swapout_size = mem->endOffset() - mem->swapout.queue_offset;
+ 
+         if (anEntry->store_status == STORE_PENDING)
+             if (swapout_size < SM_PAGE_SIZE)
+                 break;
+ 
+         if (swapout_size <= 0)
+             break;
+     } while (true);
+ 
+     // either wait for more data or call swapOutFileClose()
+     return true;
+ }
+ 
+ /* This routine is called every time data is sent to the client side.
+  * It's overhead is therefor, significant.
+  */
+ void
+ StoreEntry::swapOut()
+ {
+     if (!mem_obj)
+         return;
+ 
+     // this flag may change so we must check even if we are swappingOut
+     if (EBIT_TEST(flags, ENTRY_ABORTED)) {
+         assert(EBIT_TEST(flags, RELEASE_REQUEST));
+         // StoreEntry::abort() already closed the swap out file, if any
+         // no trimming: data producer must stop production if ENTRY_ABORTED
+@@ -183,222 +181,235 @@ StoreEntry::swapOut()
+     const bool weAreOrMayBeSwappingOut = swappingOut() || mayStartSwapOut();
+ 
+     Store::Root().memoryOut(*this, weAreOrMayBeSwappingOut);
+ 
+     if (mem_obj->swapout.decision < MemObject::SwapOut::swPossible)
+         return; // nothing else to do
+ 
+     // Aborted entries have STORE_OK, but swapoutPossible rejects them. Thus,
+     // store_status == STORE_OK below means we got everything we wanted.
+ 
+     debugs(20, 7, HERE << "storeSwapOut: mem->inmem_lo = " << mem_obj->inmem_lo);
+     debugs(20, 7, HERE << "storeSwapOut: mem->endOffset() = " << mem_obj->endOffset());
+     debugs(20, 7, HERE << "storeSwapOut: swapout.queue_offset = " << mem_obj->swapout.queue_offset);
+ 
+     if (mem_obj->swapout.sio != NULL)
+         debugs(20, 7, "storeSwapOut: storeOffset() = " << mem_obj->swapout.sio->offset()  );
+ 
+     int64_t const lowest_offset = mem_obj->lowestMemReaderOffset();
+ 
+     debugs(20, 7, HERE << "storeSwapOut: lowest_offset = " << lowest_offset);
+ 
+ #if SIZEOF_OFF_T <= 4
+ 
+     if (mem_obj->endOffset() > 0x7FFF0000) {
+         debugs(20, DBG_CRITICAL, "WARNING: preventing off_t overflow for " << url());
+         abort();
+         return;
+     }
+ 
+ #endif
+-    if (swap_status == SWAPOUT_WRITING)
++    if (swappingOut())
+         assert(mem_obj->inmem_lo <=  mem_obj->objectBytesOnDisk() );
+ 
+     // buffered bytes we have not swapped out yet
+     const int64_t swapout_maxsize = mem_obj->availableForSwapOut();
+     assert(swapout_maxsize >= 0);
+     debugs(20, 7, "storeSwapOut: swapout_size = " << swapout_maxsize);
+ 
+     if (swapout_maxsize == 0) { // swapped everything we got
+         if (store_status == STORE_OK) { // got everything we wanted
+             assert(mem_obj->object_sz >= 0);
+             swapOutFileClose(StoreIOState::wroteAll);
+         }
+         // else need more data to swap out
+         return;
+     }
+ 
+     if (store_status == STORE_PENDING) {
+         /* wait for a full block to write */
+ 
+         if (swapout_maxsize < SM_PAGE_SIZE)
+             return;
+ 
+         /*
+          * Wait until we are below the disk FD limit, only if the
+          * next read won't be deferred.
+          */
+         if (storeTooManyDiskFilesOpen() && !checkDeferRead(-1))
+             return;
+     }
+ 
+     /* Ok, we have stuff to swap out.  Is there a swapout.sio open? */
+-    if (swap_status == SWAPOUT_NONE) {
++    if (!hasDisk()) {
+         assert(mem_obj->swapout.sio == NULL);
+         assert(mem_obj->inmem_lo == 0);
+         storeSwapOutStart(this); // sets SwapOut::swImpossible on failures
+     }
+ 
+     if (mem_obj->swapout.sio == NULL)
+         return;
+ 
+     if (!doPages(this))
+         /* oops, we're not swapping out any more */
+         return;
+ 
+     if (store_status == STORE_OK) {
+         /*
+          * If the state is STORE_OK, then all data must have been given
+          * to the filesystem at this point because storeSwapOut() is
+          * not going to be called again for this entry.
+          */
+         assert(mem_obj->object_sz >= 0);
+         assert(mem_obj->endOffset() == mem_obj->swapout.queue_offset);
+         swapOutFileClose(StoreIOState::wroteAll);
+     }
+ }
+ 
+ void
+ StoreEntry::swapOutFileClose(int how)
+ {
+     assert(mem_obj != NULL);
+     debugs(20, 3, "storeSwapOutFileClose: " << getMD5Text() << " how=" << how);
+     debugs(20, 3, "storeSwapOutFileClose: sio = " << mem_obj->swapout.sio.getRaw());
+ 
+     if (mem_obj->swapout.sio == NULL)
+         return;
+ 
+     storeClose(mem_obj->swapout.sio, how);
+ }
+ 
+ static void
+ storeSwapOutFileClosed(void *data, int errflag, StoreIOState::Pointer self)
+ {
+     StoreEntry *e;
+     static_cast<generic_cbdata *>(data)->unwrap(&e);
+ 
+     MemObject *mem = e->mem_obj;
+     assert(mem->swapout.sio == self);
+-    assert(e->swap_status == SWAPOUT_WRITING);
++    assert(e->swappingOut());
+ 
+     // if object_size is still unknown, the entry was probably aborted
+     if (errflag || e->objectLen() < 0) {
+         debugs(20, 2, "storeSwapOutFileClosed: dirno " << e->swap_dirn << ", swapfile " <<
+                std::hex << std::setw(8) << std::setfill('0') << std::uppercase <<
+                e->swap_filen << ", errflag=" << errflag);
+ 
+         if (errflag == DISK_NO_SPACE_LEFT) {
+             /* FIXME: this should be handle by the link from store IO to
+              * Store, rather than being a top level API call.
+              */
+             e->disk().diskFull();
+             storeConfigure();
+         }
+ 
+-        if (e->swap_filen >= 0)
++        if (e->hasDisk())
+             e->disk().unlink(*e);
+ 
+-        assert(e->swap_status == SWAPOUT_NONE);
++        assert(!e->hasDisk());
+ 
+         e->releaseRequest();
+     } else {
+         /* swapping complete */
+         debugs(20, 3, "storeSwapOutFileClosed: SwapOut complete: '" << e->url() << "' to " <<
+                e->swap_dirn  << ", " << std::hex << std::setw(8) << std::setfill('0') <<
+                std::uppercase << e->swap_filen);
+         debugs(20, 5, HERE << "swap_file_sz = " <<
+                e->objectLen() << " + " << mem->swap_hdr_sz);
+ 
+         e->swap_file_sz = e->objectLen() + mem->swap_hdr_sz;
+         e->swap_status = SWAPOUT_DONE;
+         e->disk().swappedOut(*e);
+ 
+         // XXX: For some Stores, it is pointless to re-check cachability here
+         // and it leads to double counts in store_check_cachable_hist. We need
+         // another way to signal a completed but failed swapout. Or, better,
+         // each Store should handle its own logging and LOG state setting.
+         if (e->checkCachable()) {
+             storeLog(STORE_LOG_SWAPOUT, e);
+             storeDirSwapLog(e, SWAP_LOG_ADD);
+         }
+ 
+         ++statCounter.swap.outs;
+     }
+ 
+     debugs(20, 3, "storeSwapOutFileClosed: " << __FILE__ << ":" << __LINE__);
+     mem->swapout.sio = NULL;
+     e->unlock("storeSwapOutFileClosed");
+ }
+ 
++void
++StoreEntry::markIfDeleted()
++{
++    if (Store::Root().markedForDeletion(reinterpret_cast<const cache_key *>(this->key)))
++        setReleaseFlag();
++}
++
+ bool
+ StoreEntry::mayStartSwapOut()
+ {
+     // must be checked in the caller
+     assert(!EBIT_TEST(flags, ENTRY_ABORTED));
+     assert(!swappingOut());
+ 
+     if (!Config.cacheSwap.n_configured)
+         return false;
+ 
+     assert(mem_obj);
+     const MemObject::SwapOut::Decision &decision = mem_obj->swapout.decision;
+ 
+     // if we decided that starting is not possible, do not repeat same checks
+     if (decision == MemObject::SwapOut::swImpossible) {
+         debugs(20, 3, HERE << " already rejected");
+         return false;
+     }
+ 
+-    // if we swapped out already, do not start over
+-    if (swap_status == SWAPOUT_DONE) {
++    // if we are swapping out or swapped out already, do not start over
++    if (hasDisk() || Store::Root().hasDiskEntry(*this)) {
+         debugs(20, 3, "already did");
+         swapOutDecision(MemObject::SwapOut::swImpossible);
+         return false;
+     }
+ 
+-    // if we stared swapping out already, do not start over
++    // if we have just stared swapping out (attachToDisk() has not been
++    // called), do not start over
+     if (decision == MemObject::SwapOut::swStarted) {
+         debugs(20, 3, "already started");
+         swapOutDecision(MemObject::SwapOut::swImpossible);
+         return false;
+     }
+ 
++    if (Store::Root().unusedMarkedForDeletion(*this)) {
++        debugs(20, 3, "marked for deletion");
++        return false;
++    }
++
+     // if we decided that swapout is possible, do not repeat same checks
+     if (decision == MemObject::SwapOut::swPossible) {
+         debugs(20, 3, "already allowed");
+         return true;
+     }
+ 
+     if (!checkCachable()) {
+         debugs(20, 3,  HERE << "not cachable");
+         swapOutDecision(MemObject::SwapOut::swImpossible);
+         return false;
+     }
+ 
+     if (EBIT_TEST(flags, ENTRY_SPECIAL)) {
+         debugs(20, 3,  HERE  << url() << " SPECIAL");
+         swapOutDecision(MemObject::SwapOut::swImpossible);
+         return false;
+     }
+ 
+     if (mem_obj->inmem_lo > 0) {
+         debugs(20, 3, "storeSwapOut: (inmem_lo > 0)  imem_lo:" <<  mem_obj->inmem_lo);
+         swapOutDecision(MemObject::SwapOut::swImpossible);
+         return false;
+     }
+ 
+     if (!mem_obj->isContiguous()) {
+         debugs(20, 3, "storeSwapOut: not Contiguous");
+         swapOutDecision(MemObject::SwapOut::swImpossible);
+         return false;
+     }
+ 
+
+=== modified file 'src/tests/TestSwapDir.h'
+--- src/tests/TestSwapDir.h	2017-01-01 00:14:42 +0000
++++ src/tests/TestSwapDir.h	2017-05-31 18:59:46 +0000
+@@ -6,37 +6,38 @@
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef TEST_TESTSWAPDIR
+ #define TEST_TESTSWAPDIR
+ 
+ #include "store/Disk.h"
+ 
+ class TestSwapDir : public SwapDir
+ {
+ 
+ public:
+     TestSwapDir() : SwapDir("test"), statsCalled (false) {}
+ 
+     bool statsCalled;
+ 
+     /* Store::Disk API */
+     virtual uint64_t maxSize() const override;
+     virtual uint64_t currentSize() const override;
+     virtual uint64_t currentCount() const override;
+     virtual void stat(StoreEntry &) const override;
+     virtual void swappedOut(const StoreEntry &e) override {}
+     virtual void reconfigure() override;
+     virtual void init() override;
+     virtual bool unlinkdUseful() const override;
+     virtual bool canStore(const StoreEntry &e, int64_t diskSpaceNeeded, int &load) const override;
+     virtual StoreIOState::Pointer createStoreIO(StoreEntry &, StoreIOState::STFNCB *, StoreIOState::STIOCB *, void *) override;
+     virtual StoreIOState::Pointer openStoreIO(StoreEntry &, StoreIOState::STFNCB *, StoreIOState::STIOCB *, void *) override;
+     virtual void parse(int, char*) override;
+     virtual void markForUnlink(StoreEntry &) override {}
++    virtual void unlinkByKeyIfFound(const cache_key *) override {}
+     virtual void unlink(StoreEntry &) override {}
+ };
+ 
+ typedef RefCount<TestSwapDir> TestSwapDirPointer;
+ 
+ #endif  /* TEST_TESTSWAPDIR */
+ 
+
+=== modified file 'src/tests/stub_MemStore.cc'
+--- src/tests/stub_MemStore.cc	2017-01-01 00:14:42 +0000
++++ src/tests/stub_MemStore.cc	2017-05-31 19:00:15 +0000
+@@ -9,33 +9,34 @@
+ /* DEBUG: section 84    Helper process maintenance */
+ 
+ #include "squid.h"
+ #include "MemStore.h"
+ 
+ #define STUB_API "MemStore.cc"
+ #include "tests/STUB.h"
+ 
+ MemStore::MemStore() STUB
+ MemStore::~MemStore() STUB
+ bool MemStore::keepInLocalMemory(const StoreEntry &) const STUB_RETVAL(false)
+ void MemStore::write(StoreEntry &e) STUB
+ void MemStore::completeWriting(StoreEntry &e) STUB
+ void MemStore::unlink(StoreEntry &e) STUB
+ void MemStore::disconnect(StoreEntry &e) STUB
+ void MemStore::reference(StoreEntry &) STUB
+ void MemStore::updateHeaders(StoreEntry *) STUB
+ void MemStore::maintain() STUB
+ void MemStore::noteFreeMapSlice(const Ipc::StoreMapSliceId) STUB
+ void MemStore::init() STUB
+ void MemStore::getStats(StoreInfoStats&) const STUB
+ void MemStore::stat(StoreEntry &) const STUB
+ StoreEntry *MemStore::get(const cache_key *) STUB_RETVAL(NULL)
+ uint64_t MemStore::maxSize() const STUB_RETVAL(0)
+ uint64_t MemStore::minSize() const STUB_RETVAL(0)
+ uint64_t MemStore::currentSize() const STUB_RETVAL(0)
+ uint64_t MemStore::currentCount() const STUB_RETVAL(0)
+ int64_t MemStore::maxObjectSize() const STUB_RETVAL(0)
+ bool MemStore::dereference(StoreEntry &) STUB_RETVAL(false)
+ void MemStore::markForUnlink(StoreEntry&) STUB
++void MemStore::unlinkByKeyIfFound(const cache_key *key) STUB
+ bool MemStore::anchorCollapsed(StoreEntry&, bool&) STUB_RETVAL(false)
+ bool MemStore::updateCollapsed(StoreEntry&) STUB_RETVAL(false)
+ 
+

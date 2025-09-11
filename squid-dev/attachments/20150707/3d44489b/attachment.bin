@@ -1,0 +1,175 @@
+Errors served using invalid certificates when dealing with SSL server errors.
+
+When bumping Squid needs to send an Squid-generated error "page" over a
+secure connection, Squid needs to generate a certificate for that connection.
+Prior to these changes, several scenarios could lead to Squid generating
+a certificate that clients could not validate. In those cases, the user would
+get a cryptic and misleading browser error instead of a Squid-generated
+error page with useful details about the problem.
+
+For example, is a server certificate that is rejected by the certificate
+validation helper. Squid no longer uses CN from that certificate to generate
+a fake certificate.
+
+Another example is a user accessing an origin server using one of its
+"alternative names" and getting a Squid-generated certificate containing just
+the server common name (CN).
+
+These changes make sure that certificate for error pages is generated using
+SNI (when peeking or staring, if available) or CONNECT host name (including
+server-first bumping mode). We now update the ConnStateData::sslCommonName 
+field (used as CN field for generated certificates) only _after_ the server
+certificate is successfully validated.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2015-06-09 06:14:43 +0000
++++ src/ssl/PeerConnector.cc	2015-07-07 16:17:23 +0000
+@@ -722,42 +722,45 @@
+                 handleServerCertificate();
+             }
+         }
+ 
+         if (error) {
+             // For intercepted connections, set the host name to the server
+             // certificate CN. Otherwise, we just hope that CONNECT is using
+             // a user-entered address (a host name or a user-entered IP).
+             const bool isConnectRequest = !request->clientConnectionManager->port->flags.isIntercepted();
+             if (request->flags.sslPeek && !isConnectRequest) {
+                 if (X509 *srvX509 = serverBump->serverCert.get()) {
+                     if (const char *name = Ssl::CommonHostName(srvX509)) {
+                         request->SetHost(name);
+                         debugs(83, 3, "reset request host: " << name);
+                     }
+                 }
+             }
+         }
+     }
+ 
+-    if (!error && splice)
+-        switchToTunnel(request.getRaw(), clientConn, serverConn);
++    if (!error) {
++        serverCertificateVerified();
++        if (splice)
++            switchToTunnel(request.getRaw(), clientConn, serverConn);
++    }
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::noteWantWrite()
+ {
+     const int fd = serverConnection()->fd;
+     SSL *ssl = fd_table[fd].ssl;
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
+ 
+     if ((srvBio->bumpMode() == Ssl::bumpPeek || srvBio->bumpMode() == Ssl::bumpStare) && srvBio->holdWrite()) {
+         debugs(81, DBG_IMPORTANT, "hold write on SSL connection on FD " << fd);
+         checkForPeekAndSplice();
+         return;
+     }
+ 
+     Ssl::PeerConnector::noteWantWrite();
+ }
+ 
+ void
+@@ -803,31 +806,48 @@
+ 
+     // else call parent noteNegotiationError to produce an error page
+     Ssl::PeerConnector::noteSslNegotiationError(result, ssl_error, ssl_lib_error);
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::handleServerCertificate()
+ {
+     if (serverCertificateHandled)
+         return;
+ 
+     if (ConnStateData *csd = request->clientConnectionManager.valid()) {
+         const int fd = serverConnection()->fd;
+         SSL *ssl = fd_table[fd].ssl;
+         Ssl::X509_Pointer serverCert(SSL_get_peer_certificate(ssl));
+         if (!serverCert.get())
+             return;
+ 
+         serverCertificateHandled = true;
+ 
+-        csd->resetSslCommonName(Ssl::CommonHostName(serverCert.get()));
+-        debugs(83, 5, "HTTPS server CN: " << csd->sslCommonName() <<
+-               " bumped: " << *serverConnection());
+-
+         // remember the server certificate for later use
+         if (Ssl::ServerBump *serverBump = csd->serverBump()) {
+             serverBump->serverCert.reset(serverCert.release());
+         }
+     }
+ }
+ 
++void
++Ssl::PeekingPeerConnector::serverCertificateVerified()
++{
++    if (ConnStateData *csd = request->clientConnectionManager.valid()) {
++        Ssl::X509_Pointer serverCert;
++        if(Ssl::ServerBump *serverBump = csd->serverBump())
++            serverCert.resetAndLock(serverBump->serverCert.get());
++        else {
++            const int fd = serverConnection()->fd;
++            SSL *ssl = fd_table[fd].ssl;
++            serverCert.reset(SSL_get_peer_certificate(ssl));
++        }
++        if (serverCert.get()) {
++            csd->resetSslCommonName(Ssl::CommonHostName(serverCert.get()));
++            debugs(83, 5, "HTTPS server CN: " << csd->sslCommonName() <<
++                   " bumped: " << *serverConnection());
++        }
++    }
++}
++
++
+
+=== modified file 'src/ssl/PeerConnector.h'
+--- src/ssl/PeerConnector.h	2015-05-16 08:41:00 +0000
++++ src/ssl/PeerConnector.h	2015-07-07 16:07:17 +0000
+@@ -224,36 +224,40 @@
+ 
+     /* PeerConnector API */
+     virtual SSL *initializeSsl();
+     virtual SSL_CTX *getSslContext();
+     virtual void noteWantWrite();
+     virtual void noteSslNegotiationError(const int result, const int ssl_error, const int ssl_lib_error);
+     virtual void noteNegotiationDone(ErrorState *error);
+ 
+     /// Updates associated client connection manager members
+     /// if the server certificate was received from the server.
+     void handleServerCertificate();
+ 
+     /// Initiates the ssl_bump acl check in step3 SSL bump step to decide
+     /// about bumping, splicing or terminating the connection.
+     void checkForPeekAndSplice();
+ 
+     /// Callback function for ssl_bump acl check in step3  SSL bump step.
+     /// Handles the final bumping decision.
+     void checkForPeekAndSpliceDone(Ssl::BumpMode const);
+ 
++    /// Runs after the server certificate verified to update client
++    /// connection manager members
++    void serverCertificateVerified();
++
+     /// A wrapper function for checkForPeekAndSpliceDone for use with acl
+     static void cbCheckForPeekAndSpliceDone(allow_t answer, void *data);
+ 
+ private:
+     Comm::ConnectionPointer clientConn; ///< TCP connection to the client
+     AsyncCall::Pointer callback; ///< we call this with the results
+     AsyncCall::Pointer closeHandler; ///< we call this when the connection closed
+     bool splice; ///< whether we are going to splice or not
+     bool resumingSession; ///< whether it is an SSL resuming session connection
+     bool serverCertificateHandled; ///< whether handleServerCertificate() succeeded
+ };
+ 
+ } // namespace Ssl
+ 
+ #endif /* SQUID_PEER_CONNECTOR_H */
+ 
+

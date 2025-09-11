@@ -1,0 +1,86 @@
+Allow chunking the last HTTP response on a connection.
+
+Squid should avoid signaling the message end by connection closure
+because it hurts message integrity and sometimes performance. Squid
+now chunks if:
+
+  1. the response has a body;
+  2. the client claims HTTP/1.1 support; and
+  3. Squid is not going to send a Content-Length header.
+
+AFAICT, Squid used to exclude to-be-closed connections from chunking
+because chunking support was added (trunk r10781) specifically to 
+optimize persistent connection reuse and closing connections were 
+incorrectly excluded as a non-interesting/out-of-scope case. And/or
+perhaps we did not realize the dangers of signaling the message end
+by connection closure.
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2016-03-11 18:00:51 +0000
++++ src/client_side_reply.cc	2016-05-04 21:35:29 +0000
+@@ -1507,63 +1507,61 @@
+     } else if (request->flags.proxyKeepalive && shutting_down) {
+         debugs(88, 3, "clientBuildReplyHeader: Shutting down, don't keep-alive.");
+         request->flags.proxyKeepalive = false;
+     } else if (request->flags.connectionAuth && !reply->keep_alive) {
+         debugs(33, 2, "clientBuildReplyHeader: Connection oriented auth but server side non-persistent");
+         request->flags.proxyKeepalive = false;
+     } else if (reply->bodySize(request->method) < 0 && !maySendChunkedReply) {
+         debugs(88, 3, "clientBuildReplyHeader: can't keep-alive, unknown body size" );
+         request->flags.proxyKeepalive = false;
+     } else if (fdUsageHigh()&& !request->flags.mustKeepalive) {
+         debugs(88, 3, "clientBuildReplyHeader: Not many unused FDs, can't keep-alive");
+         request->flags.proxyKeepalive = false;
+     } else if (request->flags.sslBumped && !reply->persistent()) {
+         // We do not really have to close, but we pretend we are a tunnel.
+         debugs(88, 3, "clientBuildReplyHeader: bumped reply forces close");
+         request->flags.proxyKeepalive = false;
+     } else if (request->pinnedConnection() && !reply->persistent()) {
+         // The peer wants to close the pinned connection
+         debugs(88, 3, "pinned reply forces close");
+         request->flags.proxyKeepalive = false;
+     } else if (http->getConn()) {
+         ConnStateData * conn = http->getConn();
+         if (!Comm::IsConnOpen(conn->port->listenConn)) {
+             // The listening port closed because of a reconfigure
+             debugs(88, 3, "listening port closed");
+             request->flags.proxyKeepalive = false;
+         }
+     }
+ 
+     // Decide if we send chunked reply
+-    if (maySendChunkedReply &&
+-            request->flags.proxyKeepalive &&
+-            reply->bodySize(request->method) < 0) {
++    if (maySendChunkedReply && reply->bodySize(request->method) < 0) {
+         debugs(88, 3, "clientBuildReplyHeader: chunked reply");
+         request->flags.chunkedReply = true;
+         hdr->putStr(Http::HdrType::TRANSFER_ENCODING, "chunked");
+     }
+ 
+     /* Append VIA */
+     if (Config.onoff.via) {
+         LOCAL_ARRAY(char, bbuf, MAX_URL + 32);
+         String strVia;
+         hdr->getList(Http::HdrType::VIA, &strVia);
+         snprintf(bbuf, MAX_URL + 32, "%d.%d %s",
+                  reply->sline.version.major,
+                  reply->sline.version.minor,
+                  ThisCache);
+         strListAdd(&strVia, bbuf, ',');
+         hdr->delById(Http::HdrType::VIA);
+         hdr->putStr(Http::HdrType::VIA, strVia.termedBuf());
+     }
+     /* Signal keep-alive or close explicitly */
+     hdr->putStr(Http::HdrType::CONNECTION, request->flags.proxyKeepalive ? "keep-alive" : "close");
+ 
+ #if ADD_X_REQUEST_URI
+     /*
+      * Knowing the URI of the request is useful when debugging persistent
+      * connections in a client; we cannot guarantee the order of http headers,
+      * but X-Request-URI is likely to be the very last header to ease use from a
+      * debugger [hdr->entries.count-1].
+      */
+     hdr->putStr(Http::HdrType::X_REQUEST_URI,
+                 http->memOjbect()->url ? http->memObject()->url : http->uri);
+

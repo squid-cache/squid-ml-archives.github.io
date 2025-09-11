@@ -1,0 +1,390 @@
+=== modified file 'src/Downloader.cc'
+--- src/Downloader.cc	2017-06-12 20:26:41 +0000
++++ src/Downloader.cc	2017-07-08 07:45:52 +0000
+@@ -128,12 +128,10 @@
+ {
+     const HttpRequestMethod method = Http::METHOD_GET;
+ 
+-    char *uri = xstrdup(url_.c_str());
+     const MasterXaction::Pointer mx = new MasterXaction(initiator_);
+-    HttpRequest *const request = HttpRequest::FromUrl(uri, mx, method);
++    HttpRequest *const request = HttpRequest::FromUrl(url_.c_str(), mx, method);
+     if (!request) {
+         debugs(33, 5, "Invalid URI: " << url_);
+-        xfree(uri);
+         return false; //earlyError(...)
+     }
+     request->http_ver = Http::ProtocolVersion();
+@@ -156,7 +154,8 @@
+     http->request = request;
+     HTTPMSGLOCK(http->request);
+     http->req_sz = 0;
+-    http->uri = uri;
++    // XXX: performance regression. c_str() reallocates
++    http->uri = xstrdup(url_.c_str());
+     setLogUri (http, urlCanonicalClean(request));
+ 
+     context_ = new DownloaderContext(this, http);
+
+=== modified file 'src/HttpRequest.cc'
+--- src/HttpRequest.cc	2017-06-26 02:14:42 +0000
++++ src/HttpRequest.cc	2017-07-08 15:43:55 +0000
+@@ -332,7 +332,7 @@
+ 
+     * (char *) end = '\0';     // temp terminate URI, XXX dangerous?
+ 
+-    const bool ret = url.parse(method, (char *) start);
++    const bool ret = url.parse(method, start);
+ 
+     * (char *) end = save;
+ 
+@@ -520,7 +520,7 @@
+  * If the request cannot be created cleanly, NULL is returned
+  */
+ HttpRequest *
+-HttpRequest::FromUrl(char * url, const MasterXaction::Pointer &mx, const HttpRequestMethod& method)
++HttpRequest::FromUrl(const char * url, const MasterXaction::Pointer &mx, const HttpRequestMethod& method)
+ {
+     std::unique_ptr<HttpRequest> req(new HttpRequest(mx));
+     if (req->url.parse(method, url)) {
+
+=== modified file 'src/HttpRequest.h'
+--- src/HttpRequest.h	2017-06-19 13:53:03 +0000
++++ src/HttpRequest.h	2017-07-08 08:13:49 +0000
+@@ -199,7 +199,7 @@
+ 
+     static void httpRequestPack(void *obj, Packable *p);
+ 
+-    static HttpRequest * FromUrl(char * url, const MasterXaction::Pointer &, const HttpRequestMethod &method = Http::METHOD_GET);
++    static HttpRequest * FromUrl(const char * url, const MasterXaction::Pointer &, const HttpRequestMethod &method = Http::METHOD_GET);
+ 
+     ConnStateData *pinnedConnection();
+ 
+
+=== modified file 'src/URL.h'
+--- src/URL.h	2017-06-26 02:14:42 +0000
++++ src/URL.h	2017-07-08 06:42:56 +0000
+@@ -53,7 +53,7 @@
+     }
+     void touch(); ///< clear the cached URI display forms
+ 
+-    bool parse(const HttpRequestMethod &, char *url);
++    bool parse(const HttpRequestMethod &, const char *url);
+ 
+     AnyP::UriScheme const & getScheme() const {return scheme_;}
+ 
+@@ -170,7 +170,6 @@
+ class HttpRequestMethod;
+ 
+ void urlInitialize(void);
+-bool urlParse(const HttpRequestMethod&, char *, HttpRequest &request);
+ char *urlCanonicalClean(const HttpRequest *);
+ const char *urlCanonicalFakeHttps(const HttpRequest * request);
+ bool urlIsRelative(const char *);
+
+=== modified file 'src/acl/Asn.cc'
+--- src/acl/Asn.cc	2017-06-12 20:26:41 +0000
++++ src/acl/Asn.cc	2017-07-08 10:18:20 +0000
+@@ -235,6 +235,7 @@
+ static void
+ asnCacheStart(int as)
+ {
++    // TODO: use class URL instead of generating a string and re-parsing
+     LOCAL_ARRAY(char, asres, 4096);
+     StoreEntry *e;
+     ASState *asState = new ASState;
+
+=== modified file 'src/adaptation/ecap/MessageRep.cc'
+--- src/adaptation/ecap/MessageRep.cc	2017-06-26 02:14:42 +0000
++++ src/adaptation/ecap/MessageRep.cc	2017-07-08 09:41:03 +0000
+@@ -205,10 +205,8 @@
+ {
+     // TODO: if method is not set, URL::parse will assume it is not connect;
+     // Can we change URL::parse API to remove the method parameter?
+-    // TODO: optimize: URL::parse should take constant URL buffer
+-    char *buf = xstrdup(aUri.toString().c_str());
++    const char *buf = aUri.toString().c_str();
+     const bool ok = theMessage.url.parse(theMessage.method, buf);
+-    xfree(buf);
+     Must(ok);
+ }
+ 
+
+=== modified file 'src/client_side_request.cc'
+--- src/client_side_request.cc	2017-06-26 02:14:42 +0000
++++ src/client_side_request.cc	2017-07-08 16:02:51 +0000
+@@ -344,7 +344,7 @@
+     /* allow size for url rewriting */
+     url_sz = strlen(url) + Config.appendDomainLen + 5;
+     http->uri = (char *)xcalloc(url_sz, 1);
+-    strcpy(http->uri, url);
++    strcpy(http->uri, url); // XXX: polluting http->uri before parser validation
+ 
+     if ((request = HttpRequest::FromUrl(http->uri, mx, method)) == NULL) {
+         debugs(85, 5, "Invalid URL: " << http->uri);
+@@ -1265,7 +1265,7 @@
+             // prevent broken helpers causing too much damage. If old URL == new URL skip the re-write.
+             if (urlNote != NULL && strcmp(urlNote, http->uri)) {
+                 URL tmpUrl;
+-                if (tmpUrl.parse(old_request->method, const_cast<char*>(urlNote))) {
++                if (tmpUrl.parse(old_request->method, urlNote)) {
+                     HttpRequest *new_request = old_request->clone();
+                     new_request->url = tmpUrl;
+                     debugs(61, 2, "URL-rewriter diverts URL from " << old_request->effectiveRequestUri() << " to " << new_request->effectiveRequestUri());
+
+=== modified file 'src/mgr/Inquirer.cc'
+--- src/mgr/Inquirer.cc	2017-06-12 20:26:41 +0000
++++ src/mgr/Inquirer.cc	2017-07-08 07:09:49 +0000
+@@ -74,8 +74,7 @@
+ 
+     std::unique_ptr<MemBuf> replyBuf;
+     if (strands.empty()) {
+-        LOCAL_ARRAY(char, url, MAX_URL);
+-        snprintf(url, MAX_URL, "%s", aggrAction->command().params.httpUri.termedBuf());
++        const char *url = aggrAction->command().params.httpUri.termedBuf();
+         const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initIpc);
+         HttpRequest *req = HttpRequest::FromUrl(url, mx);
+         ErrorState err(ERR_INVALID_URL, Http::scNotFound, req);
+
+=== modified file 'src/neighbors.cc'
+--- src/neighbors.cc	2017-06-26 00:10:34 +0000
++++ src/neighbors.cc	2017-07-08 10:20:59 +0000
+@@ -1373,19 +1373,20 @@
+     // APIs) to pass around a few basic data points like start_ping and ping!
+     CachePeer *p = (CachePeer *)data;
+     ps_state *psstate;
+-    StoreEntry *fake;
+     MemObject *mem;
+     icp_common_t *query;
+     int reqnum;
++    // TODO: use class URL instead of constructing and re-parsing a string
+     LOCAL_ARRAY(char, url, MAX_URL);
+     assert(p->type == PEER_MULTICAST);
+     p->mcast.flags.count_event_pending = false;
+     snprintf(url, MAX_URL, "http://");
+     p->in_addr.toUrl(url+7, MAX_URL -8 );
+     strcat(url, "/");
+-    fake = storeCreateEntry(url, url, RequestFlags(), Http::METHOD_GET);
+     const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initPeerMcast);
+     HttpRequest *req = HttpRequest::FromUrl(url, mx);
++    assert(req != nullptr);
++    StoreEntry *fake = storeCreateEntry(url, url, RequestFlags(), Http::METHOD_GET);
+     psstate = new ps_state(nullptr);
+     psstate->request = req;
+     HTTPMSGLOCK(psstate->request);
+
+=== modified file 'src/redirect.cc'
+--- src/redirect.cc	2017-06-26 02:14:42 +0000
++++ src/redirect.cc	2017-07-08 09:42:41 +0000
+@@ -108,10 +108,6 @@
+             // if we still have anything in other() after all that
+             // parse it into status=, url= and rewrite-url= keys
+             if (replySize) {
+-                /* 2012-06-28: This cast is due to URL::parse() truncating too-long URLs itself.
+-                 * At this point altering the helper buffer in that way is not harmful, but annoying.
+-                 * When Bug 1961 is resolved and URL::parse has a const API, this needs to die.
+-                 */
+                 MemBuf replyBuffer;
+                 replyBuffer.init(replySize, replySize);
+                 replyBuffer.append(reply.other().content(), reply.other().contentSize());
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2017-06-26 14:34:57 +0000
++++ src/servers/FtpServer.cc	2017-07-08 10:21:51 +0000
+@@ -339,6 +339,7 @@
+ void
+ Ftp::Server::calcUri(const SBuf *file)
+ {
++    // TODO: fill a class URL instead of string
+     uri = "ftp://";
+     uri.append(host);
+     if (port->ftp_track_dirs && master->workingDir.length()) {
+@@ -723,16 +724,15 @@
+     const SBuf *path = (params.length() && CommandHasPathParameter(cmd)) ?
+                        &params : NULL;
+     calcUri(path);
+-    char *newUri = xstrdup(uri.c_str());
+     MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
+     mx->tcpClient = clientConnection;
+-    HttpRequest *const request = HttpRequest::FromUrl(newUri, mx, method);
++    HttpRequest *const request = HttpRequest::FromUrl(uri.c_str(), mx, method);
+     if (!request) {
+         debugs(33, 5, "Invalid FTP URL: " << uri);
+         uri.clear();
+-        safe_free(newUri);
+         return earlyError(EarlyErrorKind::InvalidUri);
+     }
++    char *newUri = xstrdup(uri.c_str());
+ 
+     request->flags.ftpNative = true;
+     request->http_ver = Http::ProtocolVersion(Ftp::ProtocolVersion().major, Ftp::ProtocolVersion().minor);
+
+=== modified file 'src/servers/Http1Server.cc'
+--- src/servers/Http1Server.cc	2017-06-26 00:10:34 +0000
++++ src/servers/Http1Server.cc	2017-07-08 10:22:56 +0000
+@@ -132,6 +132,7 @@
+         return false;
+     }
+ 
++    // TODO: move URL parse into Http Parser and INVALID_URL into the above parse error handling
+     MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initClient);
+     mx->tcpClient = clientConnection;
+     if ((request = HttpRequest::FromUrl(http->uri, mx, parser_->method())) == NULL) {
+
+=== modified file 'src/store_digest.cc'
+--- src/store_digest.cc	2017-06-12 20:26:41 +0000
++++ src/store_digest.cc	2017-07-08 10:26:01 +0000
+@@ -401,10 +401,6 @@
+ static void
+ storeDigestRewriteStart(void *datanotused)
+ {
+-    RequestFlags flags;
+-    char *url;
+-    StoreEntry *e;
+-
+     assert(store_digest);
+     /* prevent overlapping if rewrite schedule is too tight */
+ 
+@@ -414,17 +410,21 @@
+     }
+ 
+     debugs(71, 2, "storeDigestRewrite: start rewrite #" << sd_state.rewrite_count + 1);
+-    /* make new store entry */
+-    url = internalLocalUri("/squid-internal-periodic/", SBuf(StoreDigestFileName));
++
++    char *url = internalLocalUri("/squid-internal-periodic/", SBuf(StoreDigestFileName));
++    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initCacheDigest);
++    auto req = HttpRequest::FromUrl(url, mx);
++
++    RequestFlags flags;
+     flags.cachable = true;
+-    e = storeCreateEntry(url, url, flags, Http::METHOD_GET);
++
++    StoreEntry *e = storeCreateEntry(url, url, flags, Http::METHOD_GET);
+     assert(e);
+     sd_state.rewrite_lock = e;
+     debugs(71, 3, "storeDigestRewrite: url: " << url << " key: " << e->getMD5Text());
+-    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initCacheDigest);
+-    e->mem_obj->request = HttpRequest::FromUrl(url, mx);
++    e->mem_obj->request = req;
++
+     /* wait for rebuild (if any) to finish */
+-
+     if (sd_state.rebuild_lock) {
+         debugs(71, 2, "storeDigestRewriteStart: waiting for rebuild to finish.");
+         return;
+
+=== modified file 'src/tests/stub_HttpRequest.cc'
+--- src/tests/stub_HttpRequest.cc	2017-06-19 13:53:03 +0000
++++ src/tests/stub_HttpRequest.cc	2017-07-08 08:42:17 +0000
+@@ -47,7 +47,7 @@
+ void HttpRequest::swapOut(StoreEntry *) STUB
+ void HttpRequest::pack(Packable *) const STUB
+ void HttpRequest::httpRequestPack(void *, Packable *) STUB
+-HttpRequest * HttpRequest::FromUrl(char *, const MasterXaction::Pointer &, const HttpRequestMethod &) STUB_RETVAL(NULL)
++HttpRequest * HttpRequest::FromUrl(const char *, const MasterXaction::Pointer &, const HttpRequestMethod &) STUB_RETVAL(NULL)
+ ConnStateData *HttpRequest::pinnedConnection() STUB_RETVAL(NULL)
+ const SBuf HttpRequest::storeId() STUB_RETVAL(SBuf("."))
+ void HttpRequest::ignoreRange(const char *) STUB
+
+=== modified file 'src/tests/stub_url.cc'
+--- src/tests/stub_url.cc	2017-06-26 02:14:42 +0000
++++ src/tests/stub_url.cc	2017-07-08 08:58:20 +0000
+@@ -14,7 +14,7 @@
+ #include "URL.h"
+ URL::URL(AnyP::UriScheme const &) {STUB}
+ void URL::touch() STUB
+-bool URL::parse(const HttpRequestMethod&, char *) STUB_RETVAL(true)
++bool URL::parse(const HttpRequestMethod&, const char *) STUB_RETVAL(true)
+ void URL::host(const char *) STUB
+ static SBuf nil;
+ const SBuf &URL::path() const STUB_RETVAL(nil)
+
+=== modified file 'src/url.cc'
+--- src/url.cc	2017-06-26 02:14:42 +0000
++++ src/url.cc	2017-07-08 06:43:40 +0000
+@@ -188,7 +188,7 @@
+  * being "end of host with implied path of /".
+  */
+ bool
+-URL::parse(const HttpRequestMethod& method, char *url)
++URL::parse(const HttpRequestMethod& method, const char *url)
+ {
+     LOCAL_ARRAY(char, proto, MAX_URL);
+     LOCAL_ARRAY(char, login, MAX_URL);
+@@ -205,8 +205,6 @@
+     proto[0] = foundHost[0] = urlpath[0] = login[0] = '\0';
+ 
+     if ((l = strlen(url)) + Config.appendDomainLen > (MAX_URL - 1)) {
+-        /* terminate so it doesn't overflow other buffers */
+-        *(url + (MAX_URL >> 1)) = '\0';
+         debugs(23, DBG_IMPORTANT, MYNAME << "URL too large (" << l << " bytes)");
+         return false;
+     }
+
+=== modified file 'src/urn.cc'
+--- src/urn.cc	2017-06-12 20:26:41 +0000
++++ src/urn.cc	2017-07-08 10:37:57 +0000
+@@ -145,23 +145,23 @@
+     }
+ 
+     SBuf uri = r->url.path();
++    // TODO: use class URL instead of generating a string and re-parsing
+     LOCAL_ARRAY(char, local_urlres, 4096);
+     char *host = getHost(uri);
+     snprintf(local_urlres, 4096, "http://%s/uri-res/N2L?urn:" SQUIDSBUFPH, host, SQUIDSBUFPRINT(uri));
+     safe_free(host);
+     safe_free(urlres);
+-    urlres = xstrdup(local_urlres);
+-    urlres_r = HttpRequest::FromUrl(urlres, r->masterXaction);
++    urlres_r = HttpRequest::FromUrl(local_urlres, r->masterXaction);
+ 
+-    if (urlres_r == NULL) {
+-        debugs(52, 3, "urnStart: Bad uri-res URL " << urlres);
++    if (!urlres_r) {
++        debugs(52, 3, "uri-res URL " << local_urlres);
+         ErrorState *err = new ErrorState(ERR_URN_RESOLVE, Http::scNotFound, r);
+-        err->url = urlres;
+-        urlres = NULL;
++        err->url = xstrdup(local_urlres);
+         errorAppendEntry(entry, err);
+         return;
+     }
+ 
++    urlres = xstrdup(local_urlres);
+     urlres_r->header.putStr(Http::HdrType::ACCEPT, "text/plain");
+ }
+ 
+@@ -395,7 +395,6 @@
+ {
+     char *buf = xstrdup(inbuf);
+     char *token;
+-    char *url;
+     char *host;
+     url_entry *list;
+     url_entry *old;
+@@ -415,8 +414,7 @@
+             safe_free(old);
+         }
+ 
+-        url = xstrdup(token);
+-        host = urlHostname(url);
++        host = urlHostname(token);
+ 
+         if (NULL == host)
+             continue;
+@@ -432,11 +430,11 @@
+         list[i].rtt = 0;
+ #endif
+ 
+-        list[i].url = url;
++        list[i].url = xstrdup(token);
+         list[i].host = xstrdup(host);
+         // TODO: Use storeHas() or lock/unlock entry to avoid creating unlocked
+         // ones.
+-        list[i].flags.cached = storeGetPublic(url, m) ? 1 : 0;
++        list[i].flags.cached = storeGetPublic(list[i].url, m) ? 1 : 0;
+         ++i;
+     }
+ 
+

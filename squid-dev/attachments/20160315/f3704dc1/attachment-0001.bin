@@ -1,0 +1,834 @@
+assertion failed: Write.cc:41: "!ccb->active()"
+
+Bug description:
+   - The client side and server side are finished
+   - On server side the Ftp::Relay::finalizeDataDownload() is called and
+     schedules the Ftp::Server::originDataCompletionCheckpoint
+   - On client side the "Ftp::Server::userDataCompletionCheckpoint" is
+     called. This is schedules a write to control connection and closes
+     data connection.
+   - The Ftp::Server::originDataCompletionCheckpoint is called which is
+     trying to write to control connection and the assertion triggered.
+
+This bug is an corner case, where the client-side  (FTP::Server) should
+wait for the server side (Ftp::Client/Ftp::Relay) to finish its job before
+respond to the FTP client. In this bug the existing mechanism, designed
+to handle such problems, did not worked correctly and resulted to a double
+write response to the client.
+
+This patch try to fix the existing mechanism as follows:
+
+- When Ftp::Server receives a "startWaitingForOrigin" callback, postpones
+  writting possible responses to the client and keeps waiting for the
+  stopWaitingForOrigin callback
+
+- When the Ftp::Server receives a "stopWaitingForOrigin" callback,
+  resumes any postponed response.
+
+- When the Ftp::Client starts working on a DATA-related transaction, calls the
+  Ftp::Server::startWaitingForOrigin callback
+
+- When the Ftp::Client finishes its job or when its abort abnormaly, checks
+  whether it needs to call Ftp::Server::stopWaitingForOrigin callback.
+
+- Also this patch try to fix the status code returned to the FTP client
+  taking in account the status code returned by FTP server. The
+  "Ftp::Server::stopWaitingForOrigin" is used to pass the returned status code
+  to the client side.
+
+This is a Measurement Factory project
+
+=== modified file 'src/clients/FtpRelay.cc'
+--- src/clients/FtpRelay.cc	2016-01-31 06:14:05 +0000
++++ src/clients/FtpRelay.cc	2016-03-15 12:44:32 +0000
+@@ -39,77 +39,84 @@
+     const Ftp::MasterState &master() const;
+     Ftp::MasterState &updateMaster();
+     Ftp::ServerState serverState() const { return master().serverState; }
+     void serverState(const Ftp::ServerState newState);
+ 
+     /* Ftp::Client API */
+     virtual void failed(err_type error = ERR_NONE, int xerrno = 0);
+     virtual void dataChannelConnected(const CommConnectCbParams &io);
+ 
+     /* Client API */
+     virtual void serverComplete();
+     virtual void handleControlReply();
+     virtual void processReplyBody();
+     virtual void handleRequestBodyProducerAborted();
+     virtual bool mayReadVirginReplyBody() const;
+     virtual void completeForwarding();
+     virtual bool abortOnData(const char *reason);
+ 
+     /* AsyncJob API */
+     virtual void start();
++    virtual void swanSong();
+ 
+     void forwardReply();
+     void forwardError(err_type error = ERR_NONE, int xerrno = 0);
+     void failedErrorMessage(err_type error, int xerrno);
+     HttpReply *createHttpReply(const Http::StatusCode httpStatus, const int64_t clen = 0);
+     void handleDataRequest();
+     void startDataDownload();
+     void startDataUpload();
+     bool startDirTracking();
+     void stopDirTracking();
+     bool weAreTrackingDir() const {return savedReply.message != NULL;}
+ 
+     typedef void (Relay::*PreliminaryCb)();
+     void forwardPreliminaryReply(const PreliminaryCb cb);
+     void proceedAfterPreliminaryReply();
+     PreliminaryCb thePreliminaryCb;
+ 
+     typedef void (Relay::*SM_FUNC)();
+     static const SM_FUNC SM_FUNCS[];
+     void readGreeting();
+     void sendCommand();
+     void readReply();
+     void readFeatReply();
+     void readPasvReply();
+     void readDataReply();
+     void readTransferDoneReply();
+     void readEpsvReply();
+     void readCwdOrCdupReply();
+     void readUserOrPassReply();
+ 
+     void scheduleReadControlReply();
+-    void finalizeDataDownload();
++
++    /// Inform Ftp::Server that we are done if originWaitInProgress
++    void stopOriginWait(int code);
+ 
+     static void abort(void *d); // TODO: Capitalize this and FwdState::abort().
+ 
+     bool forwardingCompleted; ///< completeForwarding() has been called
+ 
++    /// whether we are between Ftp::Server::startWaitingForOrigin() and
++    /// Ftp::Server::stopWaitingForOrigin() calls
++    bool originWaitInProgress;
++
+     struct {
+         wordlist *message; ///< reply message, one  wordlist entry per message line
+         char *lastCommand; ///< the command caused the reply
+         char *lastReply; ///< last line of reply: reply status plus message
+         int replyCode; ///< the reply status
+     } savedReply; ///< set and delayed while we are tracking using PWD
+ 
+     CBDATA_CLASS2(Relay);
+ };
+ 
+ } // namespace Ftp
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Ftp, Relay);
+ 
+ const Ftp::Relay::SM_FUNC Ftp::Relay::SM_FUNCS[] = {
+     &Ftp::Relay::readGreeting, // BEGIN
+     &Ftp::Relay::readUserOrPassReply, // SENT_USER
+     &Ftp::Relay::readUserOrPassReply, // SENT_PASS
+     NULL,/* &Ftp::Relay::readReply */ // SENT_TYPE
+     NULL,/* &Ftp::Relay::readReply */ // SENT_MDTM
+@@ -125,81 +132,91 @@
+     NULL,/* &Ftp::Relay::readDataReply, */ // SENT_NLST
+     NULL,/* &Ftp::Relay::readReply */ // SENT_REST
+     NULL,/* &Ftp::Relay::readDataReply */ // SENT_RETR
+     NULL,/* &Ftp::Relay::readReply */ // SENT_STOR
+     NULL,/* &Ftp::Relay::readReply */ // SENT_QUIT
+     &Ftp::Relay::readTransferDoneReply, // READING_DATA
+     &Ftp::Relay::readReply, // WRITING_DATA
+     NULL,/* &Ftp::Relay::readReply */ // SENT_MKDIR
+     &Ftp::Relay::readFeatReply, // SENT_FEAT
+     NULL,/* &Ftp::Relay::readPwdReply */ // SENT_PWD
+     &Ftp::Relay::readCwdOrCdupReply, // SENT_CDUP
+     &Ftp::Relay::readDataReply,// SENT_DATA_REQUEST
+     &Ftp::Relay::readReply, // SENT_COMMAND
+     NULL
+ };
+ 
+ Ftp::Relay::Relay(FwdState *const fwdState):
+     AsyncJob("Ftp::Relay"),
+     Ftp::Client(fwdState),
+     thePreliminaryCb(NULL),
+-    forwardingCompleted(false)
++    forwardingCompleted(false),
++    originWaitInProgress(false)
+ {
+     savedReply.message = NULL;
+     savedReply.lastCommand = NULL;
+     savedReply.lastReply = NULL;
+     savedReply.replyCode = 0;
+ 
+     // Nothing we can do at request creation time can mark the response as
+     // uncachable, unfortunately. This prevents "found KEY_PRIVATE" WARNINGs.
+     entry->releaseRequest();
+     // TODO: Convert registerAbort() to use AsyncCall
+     entry->registerAbort(Ftp::Relay::abort, this);
+ }
+ 
+ Ftp::Relay::~Relay()
+ {
+     closeServer(); // TODO: move to clients/Client.cc?
+     if (savedReply.message)
+         wordlistDestroy(&savedReply.message);
+ 
+     xfree(savedReply.lastCommand);
+     xfree(savedReply.lastReply);
+ }
+ 
+ void
+ Ftp::Relay::start()
+ {
+     if (!master().clientReadGreeting)
+         Ftp::Client::start();
+     else if (serverState() == fssHandleDataRequest ||
+              serverState() == fssHandleUploadRequest)
+         handleDataRequest();
+     else
+         sendCommand();
+ }
+ 
++void
++Ftp::Relay::swanSong()
++{
++    stopOriginWait(0);
++    Ftp::Client::swanSong();
++}
++
+ /// Keep control connection for future requests, after we are done with it.
+ /// Similar to COMPLETE_PERSISTENT_MSG handling in http.cc.
+ void
+ Ftp::Relay::serverComplete()
+ {
++    stopOriginWait(ctrl.replycode);
++
+     CbcPointer<ConnStateData> &mgr = fwd->request->clientConnectionManager;
+     if (mgr.valid()) {
+         if (Comm::IsConnOpen(ctrl.conn)) {
+             debugs(9, 7, "completing FTP server " << ctrl.conn <<
+                    " after " << ctrl.replycode);
+             fwd->unregister(ctrl.conn);
+             if (ctrl.replycode == 221) { // Server sends FTP 221 before closing
+                 mgr->unpinConnection(false);
+                 ctrl.close();
+             } else {
+                 mgr->pinConnection(ctrl.conn, fwd->request,
+                                    ctrl.conn->getPeer(),
+                                    fwd->request->flags.connectionAuth);
+                 ctrl.forget();
+             }
+         }
+     }
+     Ftp::Client::serverComplete();
+ }
+ 
+@@ -510,40 +527,53 @@
+         return;
+     }
+ 
+     SBuf buf;
+     if (params.size() > 0)
+         buf.Printf("%s %s%s", cmd.termedBuf(), params.termedBuf(), Ftp::crlf);
+     else
+         buf.Printf("%s%s", cmd.termedBuf(), Ftp::crlf);
+ 
+     writeCommand(buf.c_str());
+ 
+     state =
+         serverState() == fssHandleCdup ? SENT_CDUP :
+         serverState() == fssHandleCwd ? SENT_CWD :
+         serverState() == fssHandleFeat ? SENT_FEAT :
+         serverState() == fssHandleDataRequest ? SENT_DATA_REQUEST :
+         serverState() == fssHandleUploadRequest ? SENT_DATA_REQUEST :
+         serverState() == fssConnected ? SENT_USER :
+         serverState() == fssHandlePass ? SENT_PASS :
+         SENT_COMMAND;
++
++    if (state == SENT_DATA_REQUEST) {
++        CbcPointer<ConnStateData> &mgr = fwd->request->clientConnectionManager;
++        if (mgr.valid()) {
++            if (Ftp::Server *srv = dynamic_cast<Ftp::Server*>(mgr.get())) {
++                typedef NullaryMemFunT<Ftp::Server> CbDialer;
++                AsyncCall::Pointer call = JobCallback(11, 3, CbDialer, srv,
++                                                      Ftp::Server::startWaitingForOrigin);
++                ScheduleCallHere(call);
++                originWaitInProgress = true;
++            }
++        }
++    }
+ }
+ 
+ void
+ Ftp::Relay::readReply()
+ {
+     assert(serverState() == fssConnected ||
+            serverState() == fssHandleUploadRequest);
+ 
+     if (100 <= ctrl.replycode && ctrl.replycode < 200)
+         forwardPreliminaryReply(&Ftp::Relay::scheduleReadControlReply);
+     else
+         forwardReply();
+ }
+ 
+ void
+ Ftp::Relay::readFeatReply()
+ {
+     assert(serverState() == fssHandleFeat);
+ 
+     if (100 <= ctrl.replycode && ctrl.replycode < 200)
+@@ -666,103 +696,103 @@
+     if (weAreTrackingDir()) { // we are tracking
+         stopDirTracking(); // and forward the delayed response below
+     } else if (ctrl.replycode == 230) { // successful login
+         if (startDirTracking())
+             return;
+     }
+ 
+     forwardReply();
+ }
+ 
+ void
+ Ftp::Relay::readTransferDoneReply()
+ {
+     debugs(9, 3, status());
+ 
+     if (ctrl.replycode != 226 && ctrl.replycode != 250) {
+         debugs(9, DBG_IMPORTANT, "got FTP code " << ctrl.replycode <<
+                " after reading response data");
+     }
+ 
+-    finalizeDataDownload();
++    debugs(9, 2, "Complete data downloading");
++
++    serverComplete();
+ }
+ 
+ void
+ Ftp::Relay::dataChannelConnected(const CommConnectCbParams &io)
+ {
+     debugs(9, 3, status());
+     data.opener = NULL;
+ 
+     if (io.flag != Comm::OK) {
+         debugs(9, 2, "failed to connect FTP server data channel");
+         forwardError(ERR_CONNECT_FAIL, io.xerrno);
+         return;
+     }
+ 
+     debugs(9, 2, "connected FTP server data channel: " << io.conn);
+ 
+     data.opened(io.conn, dataCloser());
+ 
+     sendCommand();
+ }
+ 
+ void
+ Ftp::Relay::scheduleReadControlReply()
+ {
+     Ftp::Client::scheduleReadControlReply(0);
+ }
+ 
+-void
+-Ftp::Relay::finalizeDataDownload()
+-{
+-    debugs(9, 2, "Complete data downloading/Uploading");
+-
+-    updateMaster().waitForOriginData = false;
+-
+-    CbcPointer<ConnStateData> &mgr = fwd->request->clientConnectionManager;
+-    if (mgr.valid()) {
+-        if (Ftp::Server *srv = dynamic_cast<Ftp::Server*>(mgr.get())) {
+-            typedef NullaryMemFunT<Ftp::Server> CbDialer;
+-            AsyncCall::Pointer call = JobCallback(11, 3, CbDialer, srv,
+-                                                  Ftp::Server::originDataCompletionCheckpoint);
+-            ScheduleCallHere(call);
+-        }
+-    }
+-    serverComplete();
+-}
+-
+ bool
+ Ftp::Relay::abortOnData(const char *reason)
+ {
+     debugs(9, 3, "aborting transaction for " << reason <<
+            "; FD " << (ctrl.conn != NULL ? ctrl.conn->fd : -1) << ", Data FD " << (data.conn != NULL ? data.conn->fd : -1) << ", this " << this);
+     // this method is only called to handle data connection problems
+     // the control connection should keep going
+ 
+ #if USE_ADAPTATION
+     if (adaptedBodySource != NULL)
+         stopConsumingFrom(adaptedBodySource);
+ #endif
+ 
+     if (Comm::IsConnOpen(data.conn))
+         dataComplete();
+ 
+     return !Comm::IsConnOpen(ctrl.conn);
+ }
+ 
+ void
++Ftp::Relay::stopOriginWait(int code)
++{
++    if (originWaitInProgress) {
++        CbcPointer<ConnStateData> &mgr = fwd->request->clientConnectionManager;
++        if (mgr.valid()) {
++            if (Ftp::Server *srv = dynamic_cast<Ftp::Server*>(mgr.get())) {
++                typedef UnaryMemFunT<Ftp::Server, int> CbDialer;
++                AsyncCall::Pointer call = asyncCall(11, 3, "Ftp::Server::stopWaitingForOrigin",
++                                                    CbDialer(srv, &Ftp::Server::stopWaitingForOrigin, code));
++                ScheduleCallHere(call);
++            }
++        }
++        originWaitInProgress = false;
++    }
++}
++
++void
+ Ftp::Relay::abort(void *d)
+ {
+     Ftp::Relay *ftpClient = (Ftp::Relay *)d;
+     debugs(9, 2, "Client Data connection closed!");
+     if (!cbdataReferenceValid(ftpClient))
+         return;
+     if (Comm::IsConnOpen(ftpClient->data.conn))
+         ftpClient->dataComplete();
+ }
+ 
+ AsyncJob::Pointer
+ Ftp::StartRelay(FwdState *const fwdState)
+ {
+     return AsyncJob::Start(new Ftp::Relay(fwdState));
+ }
+ 
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2016-01-31 06:14:05 +0000
++++ src/servers/FtpServer.cc	2016-03-15 16:56:39 +0000
+@@ -42,41 +42,43 @@
+ namespace Ftp
+ {
+ static void PrintReply(MemBuf &mb, const HttpReply *reply, const char *const prefix = "");
+ static bool SupportedCommand(const SBuf &name);
+ static bool CommandHasPathParameter(const SBuf &cmd);
+ };
+ 
+ Ftp::Server::Server(const MasterXaction::Pointer &xact):
+     AsyncJob("Ftp::Server"),
+     ConnStateData(xact),
+     master(new MasterState),
+     uri(),
+     host(),
+     gotEpsvAll(false),
+     onDataAcceptCall(),
+     dataListenConn(),
+     dataConn(),
+     uploadAvailSize(0),
+     listener(),
+     connector(),
+-    reader()
++    reader(),
++    waitingForOrigin(false),
++    originDataDownloadAbortedOnError(false)
+ {
+     flags.readMore = false; // we need to announce ourselves first
+     *uploadBuf = 0;
+ }
+ 
+ Ftp::Server::~Server()
+ {
+     closeDataConnection();
+ }
+ 
+ int
+ Ftp::Server::pipelinePrefetchMax() const
+ {
+     return 0; // no support for concurrent FTP requests
+ }
+ 
+ time_t
+ Ftp::Server::idleTimeout() const
+ {
+     return Config.Timeout.ftpClientIdle;
+@@ -1016,40 +1018,46 @@
+         userDataCompletionCheckpoint(451);
+         debugs(33, 3, "FTP reply data transfer failed: STREAM_FAILED");
+         break;
+     default:
+         fatal("unreachable code");
+     }
+ }
+ 
+ void
+ Ftp::Server::handleUploadReply(const HttpReply *reply, StoreIOBuffer)
+ {
+     writeForwardedReply(reply);
+     // note that the client data connection may already be closed by now
+ }
+ 
+ void
+ Ftp::Server::writeForwardedReply(const HttpReply *reply)
+ {
+     Must(reply);
+ 
++    if (waitingForOrigin) {
++        Must(delayedReply == NULL);
++        delayedReply = reply;
++        return;
++    }
++
+     const HttpHeader &header = reply->header;
+     // adaptation and forwarding errors lack HDR_FTP_STATUS
+     if (!header.has(HDR_FTP_STATUS)) {
+         writeForwardedForeign(reply); // will get to Ftp::Server::wroteReply
+         return;
+     }
+ 
+     typedef CommCbMemFunT<Server, CommIoCbParams> Dialer;
+     AsyncCall::Pointer call = JobCallback(33, 5, Dialer, this, Ftp::Server::wroteReply);
+     writeForwardedReplyAndCall(reply, call);
+ }
+ 
+ void
+ Ftp::Server::handleEprtReply(const HttpReply *reply, StoreIOBuffer)
+ {
+     if (getCurrentContext()->http->request->errType != ERR_NONE) {
+         writeCustomReply(502, "Server does not support PASV (converted from EPRT)", reply);
+         return;
+     }
+ 
+@@ -1472,57 +1480,54 @@
+     Ip::Address cltAddr;
+     if (!Ftp::ParseIpPort(params.termedBuf(), NULL, cltAddr)) {
+         setReply(501, "Invalid parameter");
+         return false;
+     }
+ 
+     if (!createDataConnection(cltAddr))
+         return false;
+ 
+     changeState(fssHandlePort, "handlePortRequest");
+     setDataCommand();
+     return true; // forward our fake PASV request
+ }
+ 
+ bool
+ Ftp::Server::handleDataRequest(String &cmd, String &params)
+ {
+     if (!checkDataConnPre())
+         return false;
+ 
+-    master->waitForOriginData = true;
+     master->userDataDone = 0;
++    originDataDownloadAbortedOnError = false;
+ 
+     changeState(fssHandleDataRequest, "handleDataRequest");
+ 
+     return true;
+ }
+ 
+ bool
+ Ftp::Server::handleUploadRequest(String &cmd, String &params)
+ {
+     if (!checkDataConnPre())
+         return false;
+ 
+-    master->waitForOriginData = true;
+-    master->userDataDone = 0;
+-
+     changeState(fssHandleUploadRequest, "handleDataRequest");
+ 
+     return true;
+ }
+ 
+ bool
+ Ftp::Server::handleEprtRequest(String &cmd, String &params)
+ {
+     debugs(9, 3, "Process an EPRT " << params);
+ 
+     if (gotEpsvAll) {
+         setReply(500, "Rejecting EPRT after EPSV ALL");
+         return false;
+     }
+ 
+     if (!params.size()) {
+         setReply(501, "Missing parameter");
+         return false;
+     }
+ 
+@@ -1688,75 +1693,108 @@
+ 
+     RequestFlags reqFlags;
+     reqFlags.cachable = false; // force releaseRequest() in storeCreateEntry()
+     reqFlags.noCache = true;
+     repContext->createStoreEntry(http->request->method, reqFlags);
+     http->storeEntry()->replaceHttpReply(reply);
+ }
+ 
+ void
+ Ftp::Server::callException(const std::exception &e)
+ {
+     debugs(33, 2, "FTP::Server job caught: " << e.what());
+     closeDataConnection();
+     unpinConnection(true);
+     if (Comm::IsConnOpen(clientConnection))
+         clientConnection->close();
+     AsyncJob::callException(e);
+ }
+ 
+ void
+-Ftp::Server::originDataCompletionCheckpoint()
++Ftp::Server::startWaitingForOrigin()
+ {
+-    if (!master->userDataDone) {
+-        debugs(33, 5, "Transfering from/to client not finished yet");
+-        return;
++    debugs(33, 5, "waiting for Ftp::Client data transfer to end");
++    waitingForOrigin = true;
++}
++
++void
++Ftp::Server::stopWaitingForOrigin(int originStatus)
++{
++    Must(waitingForOrigin);
++    waitingForOrigin = false;
++
++    // if we have already decided how to respond, respond now
++    if (delayedReply != nullptr) {
++        HttpReply::Pointer reply = delayedReply;
++        delayedReply = nullptr;
++        writeForwardedReply(reply.getRaw());
++        return; // do not completeDataDownload() after an earlier response
+     }
+ 
+-    completeDataExchange();
++    if (master->serverState != fssHandleDataRequest)
++        return;
++
++    // completeDataDownload() could be waitingForOrigin in fssHandleDataRequest
++    // Depending on which side has finished downloading first, either trust 
++    // master->userDataDone status or set originDataDownloadAbortedOnError:
++    if (master->userDataDone) {
++        // We finished downloading before Ftp::Client. Most likely, the
++        // adaptation shortened the origin response or we hit an error.
++        // Our status (stored in master->userDataDone) is more informative.
++        // Use master->userDataDone; avoid originDataDownloadAbortedOnError.
++        completeDataDownload();
++    } else {
++        debugs(33, 5, "too early to write the response");
++        // Ftp::Client naturally finished downloading before us. Set
++        // originDataDownloadAbortedOnError to overwrite future
++        // master->userDataDone and relay Ftp::Client error, if there was
++        // any, to the user.
++        originDataDownloadAbortedOnError = (originStatus >= 400);
++    }
+ }
+ 
+ void Ftp::Server::userDataCompletionCheckpoint(int finalStatusCode)
+ {
+     Must(!master->userDataDone);
+     master->userDataDone = finalStatusCode;
+ 
+     if (in.bodyParser)
+         finishDechunkingRequest(false);
+ 
+-    // The origin control connection is gone, nothing to wait for
+-    if (!Comm::IsConnOpen(pinning.serverConnection))
+-        master->waitForOriginData = false;
+-
+-    if (master->waitForOriginData) {
+-        // The completeDataExchange() is not called here unconditionally
++    if (waitingForOrigin) {
++        // The completeDataDownload() is not called here unconditionally
+         // because we want to signal the FTP user that we are not fully
+         // done processing its data stream, even though all data bytes
+         // have been sent or received already.
+-        debugs(33, 5, "Transfering from/to FTP server is not complete");
++        debugs(33, 5, "Transfering from FTP server is not complete");
+         return;
+     }
+ 
+-    completeDataExchange();
++    // Adjust our reply if the server aborted with an error before we are done.
++    if (master->userDataDone == 226 && originDataDownloadAbortedOnError) {
++        debugs(33, 5, "Transfering from FTP server terminated with an error, adjust status code");
++        master->userDataDone = 451;
++    }
++    completeDataDownload();
+ }
+ 
+-void Ftp::Server::completeDataExchange()
++void Ftp::Server::completeDataDownload()
+ {
+     writeCustomReply(master->userDataDone, master->userDataDone == 226 ? "Transfer complete" : "Server error; transfer aborted");
+     closeDataConnection();
+ }
+ 
+ /// Whether Squid FTP Relay supports a named feature (e.g., a command).
+ static bool
+ Ftp::SupportedCommand(const SBuf &name)
+ {
+     static std::set<SBuf> BlackList;
+     if (BlackList.empty()) {
+         /* Add FTP commands that Squid cannot relay correctly. */
+ 
+         // We probably do not support AUTH TLS.* and AUTH SSL,
+         // but let's disclaim all AUTH support to KISS, for now.
+         BlackList.insert(cmdAuth());
+     }
+ 
+     // we claim support for all commands that we do not know about
+     return BlackList.find(name) == BlackList.end();
+
+=== modified file 'src/servers/FtpServer.h'
+--- src/servers/FtpServer.h	2016-01-31 05:39:09 +0000
++++ src/servers/FtpServer.h	2016-03-15 12:46:44 +0000
+@@ -24,65 +24,67 @@
+     fssHandlePasv,
+     fssHandlePort,
+     fssHandleDataRequest,
+     fssHandleUploadRequest,
+     fssHandleEprt,
+     fssHandleEpsv,
+     fssHandleCwd,
+     fssHandlePass,
+     fssHandleCdup,
+     fssError
+ } ServerState;
+ 
+ // TODO: This should become a part of MasterXaction when we start sending
+ // master transactions to the clients/ code.
+ /// Transaction information shared among our FTP client and server jobs.
+ class MasterState: public RefCountable
+ {
+ public:
+     typedef RefCount<MasterState> Pointer;
+ 
+-    MasterState(): serverState(fssBegin), clientReadGreeting(false), userDataDone(0), waitForOriginData(false) {}
++MasterState(): serverState(fssBegin), clientReadGreeting(false), userDataDone(0) {}
+ 
+     Ip::Address clientDataAddr; ///< address of our FTP client data connection
+     SBuf workingDir; ///< estimated current working directory for URI formation
+     ServerState serverState; ///< what our FTP server is doing
+     bool clientReadGreeting; ///< whether our FTP client read their FTP server greeting
+     /// Squid will send or has sent this final status code to the FTP client
+     int userDataDone;
+-    /// whether the transfer on the Squid-origin data connection is not over yet
+-    bool waitForOriginData;
+ };
+ 
+ /// Manages a control connection from an FTP client.
+ class Server: public ConnStateData
+ {
+ public:
+     explicit Server(const MasterXaction::Pointer &xact);
+     virtual ~Server();
+     /* AsyncJob API */
+     virtual void callException(const std::exception &e);
+ 
++    /// Called by Ftp::Client class when it is start receiving or
++    /// sending data.
++    void startWaitingForOrigin();
++
+     /// Called by Ftp::Client class when it is done receiving or
+     /// sending data. Waits for both agents to be done before
+     /// responding to the FTP client and closing the data connection.
+-    void originDataCompletionCheckpoint();
++    void stopWaitingForOrigin(int status);
+ 
+     // This is a pointer in hope to minimize future changes when MasterState
+     // becomes a part of MasterXaction. Guaranteed not to be nil.
+     MasterState::Pointer master; ///< info shared among our FTP client and server jobs
+ 
+ protected:
+     friend void StartListening();
+ 
+     // errors detected before it is possible to create an HTTP request wrapper
+     typedef enum {
+         eekHugeRequest,
+         eekMissingLogin,
+         eekMissingUsername,
+         eekMissingHost,
+         eekUnsupportedCommand,
+         eekInvalidUri,
+         eekMalformedCommand
+     } EarlyErrorKind;
+ 
+     /* ConnStateData API */
+@@ -104,41 +106,41 @@
+ 
+     /* Comm callbacks */
+     static void AcceptCtrlConnection(const CommAcceptCbParams &params);
+     void acceptDataConnection(const CommAcceptCbParams &params);
+     void readUploadData(const CommIoCbParams &io);
+     void wroteEarlyReply(const CommIoCbParams &io);
+     void wroteReply(const CommIoCbParams &io);
+     void wroteReplyData(const CommIoCbParams &io);
+     void connectedForData(const CommConnectCbParams &params);
+ 
+     unsigned int listenForDataConnection();
+     bool createDataConnection(Ip::Address cltAddr);
+     void closeDataConnection();
+ 
+     /// Called after data trasfer on client-to-squid data connection is
+     /// finished.
+     void userDataCompletionCheckpoint(int finalStatusCode);
+ 
+     /// Writes the data-transfer status reply to the FTP client and
+     /// closes the data connection.
+-    void completeDataExchange();
++    void completeDataDownload();
+ 
+     void calcUri(const SBuf *file);
+     void changeState(const Ftp::ServerState newState, const char *reason);
+     ClientSocketContext *handleUserRequest(const SBuf &cmd, SBuf &params);
+     bool checkDataConnPost() const;
+     void replyDataWritingCheckpoint();
+     void maybeReadUploadData();
+ 
+     void setReply(const int code, const char *msg);
+     void writeCustomReply(const int code, const char *msg, const HttpReply *reply = NULL);
+     void writeEarlyReply(const int code, const char *msg);
+     void writeErrorReply(const HttpReply *reply, const int status);
+     void writeForwardedForeign(const HttpReply *reply);
+     void writeForwardedReply(const HttpReply *reply);
+     void writeForwardedReplyAndCall(const HttpReply *reply, AsyncCall::Pointer &call);
+     void writeReply(MemBuf &mb);
+ 
+     ClientSocketContext *earlyError(const EarlyErrorKind eek);
+     bool handleRequest(HttpRequest *);
+     void setDataCommand();
+@@ -169,27 +171,35 @@
+     void handleEpsvReply(const HttpReply *header, StoreIOBuffer receivedData);
+ 
+ private:
+     void doProcessRequest();
+     void shovelUploadData();
+     void resetLogin(const char *reason);
+ 
+     SBuf uri; ///< a URI reconstructed from various FTP message details
+     SBuf host; ///< intended dest. of a transparently intercepted FTP conn
+     bool gotEpsvAll; ///< restrict data conn setup commands to just EPSV
+     AsyncCall::Pointer onDataAcceptCall; ///< who to call upon data conn acceptance
+     Comm::ConnectionPointer dataListenConn; ///< data connection listening socket
+     Comm::ConnectionPointer dataConn; ///< data connection
+     char uploadBuf[CLIENT_REQ_BUF_SZ]; ///< data connection input buffer
+     size_t uploadAvailSize; ///< number of yet unused uploadBuf bytes
+ 
+     AsyncCall::Pointer listener; ///< set when we are passively listening
+     AsyncCall::Pointer connector; ///< set when we are actively connecting
+     AsyncCall::Pointer reader; ///< set when we are reading FTP data
+ 
++    /// whether we wait for the origin data transfer to end
++    bool waitingForOrigin;
++    /// whether the origin data transfer aborted
++    bool originDataDownloadAbortedOnError;
++
++    /// a response which writing was postponed until stopWaitingForOrigin()
++    HttpReply::Pointer delayedReply;
++
+     CBDATA_CLASS2(Server);
+ };
+ 
+ } // namespace Ftp
+ 
+ #endif /* SQUID_SERVERS_FTP_SERVER_H */
+ 
+

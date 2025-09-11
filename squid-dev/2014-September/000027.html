@@ -1,0 +1,406 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Bug 3803 : IDENT upgrade pt1
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Bug%203803%20%3A%20IDENT%20upgrade%20pt1&In-Reply-To=%3C542A62A1.1010809%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="000026.html">
+   
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Bug 3803 : IDENT upgrade pt1</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Bug%203803%20%3A%20IDENT%20upgrade%20pt1&In-Reply-To=%3C542A62A1.1010809%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] Bug 3803 : IDENT upgrade pt1">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Tue Sep 30 07:58:25 UTC 2014</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000026.html">[squid-dev] MinGW build of Squid-3.5
+</A></li>
+        
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27">[ date ]</a>
+              <a href="thread.html#27">[ thread ]</a>
+              <a href="subject.html#27">[ subject ]</a>
+              <a href="author.html#27">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+Begin the process of conversion for IdentStateData to an AsyncJob.
+Referencing it as a 'job' below
+
+* convert the object from CBDATA struct to a class with
+CBDATA_CLASS2() API.
+
+* Bug 3803 is caused by a lack of proper cleanup and consistent exit
+actions terminating the job. Take the core logic changes from the
+tested bug patch and;
+
+ 1) define a swanSong() method to cleanup the memory allocated
+
+ 2) define a deleteThis() method to emulate AsyncJob::deleteThis()
+
+* Locate all code paths leveraging conn-&gt;close() to trigger cleanup
+via the connection close handler and convert to explicit deleteThis()
+with excuse. Including a few which were not but need to in order to
+terminate the job correctly as fixed in bug 3803 patch.
+
+The actions performed are nearly identical to the original code. The
+differences are that many code paths now omit an AsyncCall step going
+via the Comm close handler, and that all paths terminating the IDENT
+lookup now go through swanSong() cleanup.
+
+
+Further cleanup converting to a full AsyncJob is not included, since
+there is an explicit hash of running IdentStateData object pointers
+being used in the old code.
+
+Amos
+
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v2.0.22 (MingW32)
+
+iQEcBAEBAgAGBQJUKmKfAAoJELJo5wb/XPRjp7MIAMyTlRRFS4Wc8juQkBEdFk2T
+XJtxm9ADG27CzkRhlbxs3XHqx7t9691ndBRUH2akwFWL7PElGX9YUKpH5E4q+SZe
+qka4f2wK+aL8+siX6uGWgkZQruUY75x/ZEcGyf9qBngt/zkDxfAULtTH4Jmp8pXl
+8qo7ZgzccDfzXg7ojX3pHOeaaqZgpSzuPylw4f3h0x1Nr3o9sUb0UYCO8spxQpwz
+Q6tnmpTa0qxHusdRdDf7WtJHB3QU+5fEskwpKoTVTL8KoofBv/1z5eW4DphjSFmI
+e13AysTzXXKdMktyFBhyJPTRGRI8PjBrj+lSoA9rQLNXZz5BEhQOg6dIgT3d3z0=
+=8iNi
+-----END PGP SIGNATURE-----
+-------------- next part --------------
+=== modified file 'src/ident/Ident.cc'
+--- src/ident/Ident.cc	2014-09-13 13:59:43 +0000
++++ src/ident/Ident.cc	2014-09-29 13:36:32 +0000
+@@ -19,236 +19,259 @@
+ #include &quot;CommCalls.h&quot;
+ #include &quot;globals.h&quot;
+ #include &quot;ident/Config.h&quot;
+ #include &quot;ident/Ident.h&quot;
+ #include &quot;MemBuf.h&quot;
+ 
+ namespace Ident
+ {
+ 
+ #define IDENT_PORT 113
+ #define IDENT_KEY_SZ 50
+ #define IDENT_BUFSIZE 4096
+ 
+ typedef struct _IdentClient {
+     IDCB *callback;
+     void *callback_data;
+ 
+     struct _IdentClient *next;
+ } IdentClient;
+ 
+-typedef struct _IdentStateData {
++class IdentStateData
++{
++public:
++    /* AsyncJob API emulated */
++    void deleteThis(const char *aReason);
++    void swanSong();
++
++    /// notify all waiting IdentClient callbacks
++    void notify(const char *result);
++
+     hash_link hash;		/* must be first */
+     Comm::ConnectionPointer conn;
+     MemBuf queryMsg;  ///&lt; the lookup message sent to IDENT server
+     IdentClient *clients;
+     char buf[IDENT_BUFSIZE];
+-} IdentStateData;
++
++private:
++    CBDATA_CLASS2(IdentStateData);
++};
++
++CBDATA_CLASS_INIT(IdentStateData);
+ 
+ // TODO: make these all a series of Async job calls. They are self-contained callbacks now.
+ static IOCB ReadReply;
+ static IOCB WriteFeedback;
+ static CLCB Close;
+ static CTCB Timeout;
+ static CNCB ConnectDone;
+ static hash_table *ident_hash = NULL;
+ static void ClientAdd(IdentStateData * state, IDCB * callback, void *callback_data);
+-static void identCallback(IdentStateData * state, char *result);
+ 
+ } // namespace Ident
+ 
+ Ident::IdentConfig Ident::TheConfig;
+ 
+-/**** PRIVATE FUNCTIONS ****/
++void
++Ident::IdentStateData::deleteThis(const char *aReason)
++{
++    swanSong();
++    delete this;
++}
+ 
+ void
+-Ident::identCallback(IdentStateData * state, char *result)
++Ident::IdentStateData::swanSong()
+ {
+-    IdentClient *client;
++    if (clients != NULL)
++        notify(NULL);
++
++    if (!Comm::IsConnOpen(conn)) {
++        comm_remove_close_handler(conn-&gt;fd, Ident::Close, this);
++        conn-&gt;close();
++    }
+ 
+-    if (result &amp;&amp; *result == '\0')
+-        result = NULL;
++    queryMsg.clean();
+ 
+-    while ((client = state-&gt;clients)) {
++    hash_remove_link(ident_hash, (hash_link *) this);
++    xfree(hash.key);
++}
++
++void
++Ident::IdentStateData::notify(const char *result)
++{
++    while (IdentClient *client = clients) {
+         void *cbdata;
+-        state-&gt;clients = client-&gt;next;
++        clients = client-&gt;next;
+ 
+         if (cbdataReferenceValidDone(client-&gt;callback_data, &amp;cbdata))
+             client-&gt;callback(result, cbdata);
+ 
+         xfree(client);
+     }
+ }
+ 
+ void
+ Ident::Close(const CommCloseCbParams &amp;params)
+ {
+     IdentStateData *state = (IdentStateData *)params.data;
+-    identCallback(state, NULL);
+-    state-&gt;conn-&gt;close();
+-    hash_remove_link(ident_hash, (hash_link *) state);
+-    xfree(state-&gt;hash.key);
+-    cbdataFree(state);
++    state-&gt;deleteThis(&quot;connection closed&quot;);
+ }
+ 
+ void
+ Ident::Timeout(const CommTimeoutCbParams &amp;io)
+ {
+     debugs(30, 3, HERE &lt;&lt; io.conn);
+-    io.conn-&gt;close();
++    IdentStateData *state = (IdentStateData *)io.data;
++    state-&gt;deleteThis(&quot;timeout&quot;);
+ }
+ 
+ void
+ Ident::ConnectDone(const Comm::ConnectionPointer &amp;conn, Comm::Flag status, int xerrno, void *data)
+ {
+     IdentStateData *state = (IdentStateData *)data;
+ 
+     if (status != Comm::OK) {
+         if (status == Comm::TIMEOUT)
+             debugs(30, 3, &quot;IDENT connection timeout to &quot; &lt;&lt; state-&gt;conn-&gt;remote);
+-        Ident::identCallback(state, NULL);
++        state-&gt;deleteThis(status == Comm::TIMEOUT ? &quot;connect timeout&quot; : &quot;connect error&quot;);
+         return;
+     }
+ 
+-    assert(conn != NULL &amp;&amp; conn == state-&gt;conn);
+-
+     /*
+      * see if any of our clients still care
+      */
+     IdentClient *c;
+     for (c = state-&gt;clients; c; c = c-&gt;next) {
+         if (cbdataReferenceValid(c-&gt;callback_data))
+             break;
+     }
+ 
+     if (c == NULL) {
+-        /* no clients care */
+-        conn-&gt;close();
++        state-&gt;deleteThis(&quot;client(s) aborted&quot;);
+         return;
+     }
+ 
++    assert(conn != NULL &amp;&amp; conn == state-&gt;conn);
+     comm_add_close_handler(conn-&gt;fd, Ident::Close, state);
+ 
+     AsyncCall::Pointer writeCall = commCbCall(5,4, &quot;Ident::WriteFeedback&quot;,
+                                    CommIoCbPtrFun(Ident::WriteFeedback, state));
+     Comm::Write(conn, &amp;state-&gt;queryMsg, writeCall);
+     AsyncCall::Pointer readCall = commCbCall(5,4, &quot;Ident::ReadReply&quot;,
+                                   CommIoCbPtrFun(Ident::ReadReply, state));
+     comm_read(conn, state-&gt;buf, IDENT_BUFSIZE, readCall);
+     AsyncCall::Pointer timeoutCall = commCbCall(5,4, &quot;Ident::Timeout&quot;,
+                                      CommTimeoutCbPtrFun(Ident::Timeout, state));
+     commSetConnTimeout(conn, Ident::TheConfig.timeout, timeoutCall);
+ }
+ 
+ void
+ Ident::WriteFeedback(const Comm::ConnectionPointer &amp;conn, char *buf, size_t len, Comm::Flag flag, int xerrno, void *data)
+ {
+     debugs(30, 5, HERE &lt;&lt; conn &lt;&lt; &quot;: Wrote IDENT request &quot; &lt;&lt; len &lt;&lt; &quot; bytes.&quot;);
+ 
+     // TODO handle write errors better. retry or abort?
+     if (flag != Comm::OK) {
+         debugs(30, 2, HERE &lt;&lt; conn &lt;&lt; &quot; err-flags=&quot; &lt;&lt; flag &lt;&lt; &quot; IDENT write error: &quot; &lt;&lt; xstrerr(xerrno));
+-        conn-&gt;close();
++        IdentStateData *state = (IdentStateData *)data;
++        state-&gt;deleteThis(&quot;write error&quot;);
+     }
+ }
+ 
+ void
+ Ident::ReadReply(const Comm::ConnectionPointer &amp;conn, char *buf, size_t len, Comm::Flag flag, int xerrno, void *data)
+ {
+     IdentStateData *state = (IdentStateData *)data;
+     char *ident = NULL;
+     char *t = NULL;
+ 
+     assert(buf == state-&gt;buf);
+     assert(conn-&gt;fd == state-&gt;conn-&gt;fd);
+ 
+     if (flag != Comm::OK || len &lt;= 0) {
+-        state-&gt;conn-&gt;close();
++        state-&gt;deleteThis(&quot;read error&quot;);
+         return;
+     }
+ 
+     /*
+      * XXX This isn't really very tolerant. It should read until EOL
+      * or EOF and then decode the answer... If the reply is fragmented
+      * then this will fail
+      */
+     buf[len] = '\0';
+ 
+     if ((t = strchr(buf, '\r')))
+         *t = '\0';
+ 
+     if ((t = strchr(buf, '\n')))
+         *t = '\0';
+ 
+     debugs(30, 5, HERE &lt;&lt; conn &lt;&lt; &quot;: Read '&quot; &lt;&lt; buf &lt;&lt; &quot;'&quot;);
+ 
+     if (strstr(buf, &quot;USERID&quot;)) {
+         if ((ident = strrchr(buf, ':'))) {
+             while (xisspace(*++ident));
+-            Ident::identCallback(state, ident);
++            if (ident &amp;&amp; *ident == '\0')
++                ident = NULL;
++            state-&gt;notify(ident);
+         }
+     }
+ 
+-    state-&gt;conn-&gt;close();
++    state-&gt;deleteThis(&quot;completed&quot;);
+ }
+ 
+ void
+ Ident::ClientAdd(IdentStateData * state, IDCB * callback, void *callback_data)
+ {
+     IdentClient *c = (IdentClient *)xcalloc(1, sizeof(*c));
+     IdentClient **C;
+     c-&gt;callback = callback;
+     c-&gt;callback_data = cbdataReference(callback_data);
+ 
+     for (C = &amp;state-&gt;clients; *C; C = &amp;(*C)-&gt;next);
+     *C = c;
+ }
+ 
+-CBDATA_TYPE(IdentStateData);
+-
+-/**** PUBLIC FUNCTIONS ****/
+-
+ /*
+  * start a TCP connection to the peer host on port 113
+  */
+ void
+ Ident::Start(const Comm::ConnectionPointer &amp;conn, IDCB * callback, void *data)
+ {
+     IdentStateData *state;
+     char key1[IDENT_KEY_SZ];
+     char key2[IDENT_KEY_SZ];
+     char key[IDENT_KEY_SZ];
+ 
+     conn-&gt;local.toUrl(key1, IDENT_KEY_SZ);
+     conn-&gt;remote.toUrl(key2, IDENT_KEY_SZ);
+     snprintf(key, IDENT_KEY_SZ, &quot;%s,%s&quot;, key1, key2);
+ 
+     if (!ident_hash) {
+         Init();
+     }
+     if ((state = (IdentStateData *)hash_lookup(ident_hash, key)) != NULL) {
+         ClientAdd(state, callback, data);
+         return;
+     }
+ 
+-    CBDATA_INIT_TYPE(IdentStateData);
+-    state = cbdataAlloc(IdentStateData);
++    state = new IdentStateData;
+     state-&gt;hash.key = xstrdup(key);
+ 
+     // copy the conn details. We dont want the original FD to be re-used by IDENT.
+     state-&gt;conn = conn-&gt;copyDetails();
+     // NP: use random port for secure outbound to IDENT_PORT
+     state-&gt;conn-&gt;local.port(0);
+     state-&gt;conn-&gt;remote.port(IDENT_PORT);
+ 
+     // build our query from the original connection details
+     state-&gt;queryMsg.init();
+     state-&gt;queryMsg.Printf(&quot;%d, %d\r\n&quot;, conn-&gt;remote.port(), conn-&gt;local.port());
+ 
+     ClientAdd(state, callback, data);
+     hash_join(ident_hash, &amp;state-&gt;hash);
+ 
+     AsyncCall::Pointer call = commCbCall(30,3, &quot;Ident::ConnectDone&quot;, CommConnectCbPtrFun(Ident::ConnectDone, state));
+     AsyncJob::Start(new Comm::ConnOpener(state-&gt;conn, call, Ident::TheConfig.timeout));
+ }
+ 
+ void
+
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: ident_mk1_s35.patch.sig
+Type: application/octet-stream
+Size: 287 bytes
+Desc: not available
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/attachments/20140930/415c83fd/attachment.obj">http://lists.squid-cache.org/pipermail/squid-dev/attachments/20140930/415c83fd/attachment.obj</A>&gt;
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000026.html">[squid-dev] MinGW build of Squid-3.5
+</A></li>
+	
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27">[ date ]</a>
+              <a href="thread.html#27">[ thread ]</a>
+              <a href="subject.html#27">[ subject ]</a>
+              <a href="author.html#27">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

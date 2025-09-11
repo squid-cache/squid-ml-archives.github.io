@@ -1,0 +1,469 @@
+pconn_lifetime
+
+This patch add a new configuration option the 'pconn_lifetime' to allow users
+set the desired maximum lifetime of a persistent connection.
+
+When set, Squid will close a now-idle persistent connection that
+exceeded configured lifetime instead of moving the connection into
+the idle connection pool (or equivalent). No effect on ongoing/active
+transactions. Connection lifetime is the time period from the
+connection acceptance or opening time until "now".
+
+This limit is useful in environments with long-lived connections
+where Squid configuration or environmental factors change during a
+single connection lifetime. If unrestricted, some connections may
+last for hours and even days, ignoring those changes that should
+have affected their behavior or their existence.
+
+This option has the following behaviour when pipelined requests tunneled
+to a connection where its lifetime expired:
+
+ 1. finish interpreting the Nth request
+    check whether pconn_lifetime has expired
+ 2. if pconn_lifetime has expired, then stop further reading and
+    do not interpret any already read raw bytes of the N+1st request
+ 3. otherwise, read and interpret read raw bytes of the N+1st request
+    and go to #1.
+
+
+This is a Measurement Factory project
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2014-12-04 14:00:17 +0000
++++ src/SquidConfig.h	2014-12-15 09:28:15 +0000
+@@ -72,40 +72,41 @@
+ #if USE_HTTP_VIOLATIONS
+     time_t negativeTtl;
+ #endif
+     time_t maxStale;
+     time_t negativeDnsTtl;
+     time_t positiveDnsTtl;
+     time_t shutdownLifetime;
+     time_t backgroundPingRate;
+ 
+     struct {
+         time_t read;
+         time_t write;
+         time_t lifetime;
+         time_t connect;
+         time_t forward;
+         time_t peer_connect;
+         time_t request;
+         time_t clientIdlePconn;
+         time_t serverIdlePconn;
+         time_t ftpClientIdle;
++        time_t pconnLifetime; ///< pconn_lifetime in squid.conf
+         time_t siteSelect;
+         time_t deadPeer;
+         int icp_query;      /* msec */
+         int icp_query_max;  /* msec */
+         int icp_query_min;  /* msec */
+         int mcast_icp_query;    /* msec */
+         time_msec_t idns_retransmit;
+         time_msec_t idns_query;
+         time_t urlRewrite;
+     } Timeout;
+     size_t maxRequestHeaderSize;
+     int64_t maxRequestBodySize;
+     int64_t maxChunkedRequestBodySize;
+     size_t maxRequestBufferSize;
+     size_t maxReplyHeaderSize;
+     AclSizeLimit *ReplyBodySize;
+ 
+     struct {
+         unsigned short icp;
+ #if USE_HTCP
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2014-12-08 11:25:58 +0000
++++ src/cf.data.pre	2014-12-15 09:28:15 +0000
+@@ -6129,40 +6129,65 @@
+ TYPE: time_t
+ LOC: Config.Timeout.lifetime
+ DEFAULT: 1 day
+ DOC_START
+ 	The maximum amount of time a client (browser) is allowed to
+ 	remain connected to the cache process.  This protects the Cache
+ 	from having a lot of sockets (and hence file descriptors) tied up
+ 	in a CLOSE_WAIT state from remote clients that go away without
+ 	properly shutting down (either because of a network failure or
+ 	because of a poor client implementation).  The default is one
+ 	day, 1440 minutes.
+ 
+ 	NOTE:  The default value is intended to be much larger than any
+ 	client would ever need to be connected to your cache.  You
+ 	should probably change client_lifetime only as a last resort.
+ 	If you seem to have many client connections tying up
+ 	filedescriptors, we recommend first tuning the read_timeout,
+ 	request_timeout, persistent_request_timeout and quick_abort values.
+ DOC_END
+ 
++NAME: pconn_lifetime
++COMMENT: time-units
++TYPE: time_t
++LOC: Config.Timeout.pconnLifetime
++DEFAULT: 0 seconds
++DOC_START
++	Desired maximum lifetime of a persistent connection.
++	When set, Squid will close a now-idle persistent connection that
++	exceeded configured lifetime instead of moving the connection into
++	the idle connection pool (or equivalent). No effect on ongoing/active
++	transactions. Connection lifetime is the time period from the
++	connection acceptance or opening time until "now".
++	
++	This limit is useful in environments with long-lived connections
++	where Squid configuration or environmental factors change during a
++	single connection lifetime. If unrestricted, some connections may
++	last for hours and even days, ignoring those changes that should
++	have affected their behavior or their existence.
++	
++	Currently, a new lifetime value supplied via Squid reconfiguration
++	has no effect on already idle connections unless they become busy.
++	
++	When set to '0' this limit is not used.
++DOC_END
++
+ NAME: half_closed_clients
+ TYPE: onoff
+ LOC: Config.onoff.half_closed_clients
+ DEFAULT: off
+ DOC_START
+ 	Some clients may shutdown the sending side of their TCP
+ 	connections, while leaving their receiving sides open.	Sometimes,
+ 	Squid can not tell the difference between a half-closed and a
+ 	fully-closed TCP connection.
+ 
+ 	By default, Squid will immediately close client connections when
+ 	read(2) returns "no more data to read."
+ 
+ 	Change this option to 'on' and Squid will keep open connections
+ 	until a read(2) or write(2) on the socket returns an error.
+ 	This may show some benefits for reverse proxies. But if not
+ 	it is recommended to leave OFF.
+ DOC_END
+ 
+ NAME: server_idle_pconn_timeout pconn_timeout
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2014-12-05 13:02:46 +0000
++++ src/client_side.cc	2014-12-15 09:28:15 +0000
+@@ -1490,41 +1490,41 @@
+ 
+ static void
+ clientWriteBodyComplete(const Comm::ConnectionPointer &conn, char *buf, size_t size, Comm::Flag errflag, int xerrno, void *data)
+ {
+     debugs(33,7, HERE << "clientWriteBodyComplete schedules clientWriteComplete");
+     clientWriteComplete(conn, NULL, size, errflag, xerrno, data);
+ }
+ 
+ void
+ ConnStateData::readNextRequest()
+ {
+     debugs(33, 5, HERE << clientConnection << " reading next req");
+ 
+     fd_note(clientConnection->fd, "Idle client: Waiting for next request");
+     /**
+      * Set the timeout BEFORE calling readSomeData().
+      */
+     typedef CommCbMemFunT<ConnStateData, CommTimeoutCbParams> TimeoutDialer;
+     AsyncCall::Pointer timeoutCall = JobCallback(33, 5,
+                                      TimeoutDialer, this, ConnStateData::requestTimeout);
+-    commSetConnTimeout(clientConnection, idleTimeout(), timeoutCall);
++    commSetConnTimeout(clientConnection, clientConnection->timeLeft(idleTimeout()), timeoutCall);
+ 
+     readSomeData();
+     /** Please don't do anything with the FD past here! */
+ }
+ 
+ static void
+ ClientSocketContextPushDeferredIfNeeded(ClientSocketContext::Pointer deferredRequest, ConnStateData * conn)
+ {
+     debugs(33, 2, HERE << conn->clientConnection << " Sending next");
+ 
+     /** If the client stream is waiting on a socket write to occur, then */
+ 
+     if (deferredRequest->flags.deferred) {
+         /** NO data is allowed to have been sent. */
+         assert(deferredRequest->http->out.size == 0);
+         /** defer now. */
+         clientSocketRecipient(deferredRequest->deferredparams.node,
+                               deferredRequest->http,
+                               deferredRequest->deferredparams.rep,
+                               deferredRequest->deferredparams.queuedBuffer);
+@@ -2983,40 +2983,46 @@
+  */
+ bool
+ ConnStateData::clientParseRequests()
+ {
+     bool parsed_req = false;
+ 
+     debugs(33, 5, HERE << clientConnection << ": attempting to parse");
+ 
+     // Loop while we have read bytes that are not needed for producing the body
+     // On errors, bodyPipe may become nil, but readMore will be cleared
+     while (!in.buf.isEmpty() && !bodyPipe && flags.readMore) {
+ 
+         /* Don't try to parse if the buffer is empty */
+         if (in.buf.isEmpty())
+             break;
+ 
+         /* Limit the number of concurrent requests */
+         if (concurrentRequestQueueFilled())
+             break;
+ 
++        /*Do not read more requests if persistent connection lifetime exceeded*/
++        if (Config.Timeout.pconnLifetime && clientConnection->lifeTime() > Config.Timeout.pconnLifetime) {
++            flags.readMore = false;
++            break;
++        }
++
+         // try to parse the PROXY protocol header magic bytes
+         if (needProxyProtocolHeader_ && !parseProxyProtocolHeader())
+             break;
+ 
+         if (ClientSocketContext *context = parseOneRequest()) {
+             debugs(33, 5, clientConnection << ": done parsing a request");
+ 
+             AsyncCall::Pointer timeoutCall = commCbCall(5, 4, "clientLifetimeTimeout",
+                                              CommTimeoutCbPtrFun(clientLifetimeTimeout, context->http));
+             commSetConnTimeout(clientConnection, Config.Timeout.lifetime, timeoutCall);
+ 
+             context->registerWithConn();
+ 
+             processParsedRequest(context);
+ 
+             parsed_req = true; // XXX: do we really need to parse everything right NOW ?
+ 
+             if (context->mayUseConnection()) {
+                 debugs(33, 3, HERE << "Not parsing new requests, as this request may need the connection");
+                 break;
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2014-09-13 13:59:43 +0000
++++ src/client_side_reply.cc	2014-11-07 07:57:52 +0000
+@@ -1481,44 +1481,51 @@
+     } else if (request->flags.proxyKeepalive && shutting_down) {
+         debugs(88, 3, "clientBuildReplyHeader: Shutting down, don't keep-alive.");
+         request->flags.proxyKeepalive = false;
+     } else if (request->flags.connectionAuth && !reply->keep_alive) {
+         debugs(33, 2, "clientBuildReplyHeader: Connection oriented auth but server side non-persistent");
+         request->flags.proxyKeepalive = false;
+     } else if (reply->bodySize(request->method) < 0 && !maySendChunkedReply) {
+         debugs(88, 3, "clientBuildReplyHeader: can't keep-alive, unknown body size" );
+         request->flags.proxyKeepalive = false;
+     } else if (fdUsageHigh()&& !request->flags.mustKeepalive) {
+         debugs(88, 3, "clientBuildReplyHeader: Not many unused FDs, can't keep-alive");
+         request->flags.proxyKeepalive = false;
+     } else if (request->flags.sslBumped && !reply->persistent()) {
+         // We do not really have to close, but we pretend we are a tunnel.
+         debugs(88, 3, "clientBuildReplyHeader: bumped reply forces close");
+         request->flags.proxyKeepalive = false;
+     } else if (request->pinnedConnection() && !reply->persistent()) {
+         // The peer wants to close the pinned connection
+         debugs(88, 3, "pinned reply forces close");
+         request->flags.proxyKeepalive = false;
+-    } else if (http->getConn() && http->getConn()->port->listenConn == NULL) {
+-        // The listening port closed because of a reconfigure
+-        debugs(88, 3, "listening port closed");
+-        request->flags.proxyKeepalive = false;
++    } else if (http->getConn()) {
++        ConnStateData * conn = http->getConn();
++        if (!Comm::IsConnOpen(conn->port->listenConn)) {
++            // The listening port closed because of a reconfigure
++            debugs(88, 3, "listening port closed");
++            request->flags.proxyKeepalive = false;
++        } else if (Config.Timeout.pconnLifetime && conn->clientConnection->lifeTime() > Config.Timeout.pconnLifetime && conn->getConcurrentRequestCount() <= 1) {
++            // The persistent connection lifetime exceeded and we are the last parsed request
++            debugs(88, 3, "persistent connection lifetime exceeded");
++            request->flags.proxyKeepalive = false;
++        }
+     }
+ 
+     // Decide if we send chunked reply
+     if (maySendChunkedReply &&
+             request->flags.proxyKeepalive &&
+             reply->bodySize(request->method) < 0) {
+         debugs(88, 3, "clientBuildReplyHeader: chunked reply");
+         request->flags.chunkedReply = true;
+         hdr->putStr(HDR_TRANSFER_ENCODING, "chunked");
+     }
+ 
+     /* Append VIA */
+     if (Config.onoff.via) {
+         LOCAL_ARRAY(char, bbuf, MAX_URL + 32);
+         String strVia;
+         hdr->getList(HDR_VIA, &strVia);
+         snprintf(bbuf, MAX_URL + 32, "%d.%d %s",
+                  reply->sline.version.major,
+                  reply->sline.version.minor,
+                  ThisCache);
+
+=== modified file 'src/comm/Connection.cc'
+--- src/comm/Connection.cc	2014-09-13 13:59:43 +0000
++++ src/comm/Connection.cc	2014-10-03 08:11:29 +0000
+@@ -1,35 +1,36 @@
+ /*
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "CachePeer.h"
+ #include "cbdata.h"
+ #include "comm.h"
+ #include "comm/Connection.h"
+ #include "fde.h"
+ #include "neighbors.h"
++#include "SquidConfig.h"
+ #include "SquidTime.h"
+ 
+ class CachePeer;
+ bool
+ Comm::IsConnOpen(const Comm::ConnectionPointer &conn)
+ {
+     return conn != NULL && conn->isOpen();
+ }
+ 
+ Comm::Connection::Connection() :
+         local(),
+         remote(),
+         peerType(HIER_NONE),
+         fd(-1),
+         tos(0),
+         nfmark(0),
+         flags(COMM_NONBLOCKING),
+         peer_(NULL),
+         startTime_(squid_curtime)
+ {
+@@ -84,20 +85,30 @@
+ Comm::Connection::getPeer() const
+ {
+     if (cbdataReferenceValid(peer_))
+         return peer_;
+ 
+     return NULL;
+ }
+ 
+ void
+ Comm::Connection::setPeer(CachePeer *p)
+ {
+     /* set to self. nothing to do. */
+     if (getPeer() == p)
+         return;
+ 
+     cbdataReferenceDone(peer_);
+     if (p) {
+         peer_ = cbdataReference(p);
+     }
+ }
++
++time_t
++Comm::Connection::timeLeft(const time_t idleTimeout) const
++{
++    if (!Config.Timeout.pconnLifetime)
++        return idleTimeout;
++
++    const time_t lifeTimeLeft = lifeTime() < Config.Timeout.pconnLifetime ? Config.Timeout.pconnLifetime - lifeTime() : 1;
++    return min(lifeTimeLeft, idleTimeout);
++}
+
+=== modified file 'src/comm/Connection.h'
+--- src/comm/Connection.h	2014-12-01 04:05:48 +0000
++++ src/comm/Connection.h	2014-12-15 09:28:15 +0000
+@@ -80,40 +80,46 @@
+ 
+     /** Alter the stored IP address pair.
+      * WARNING: Does not ensure matching IPv4/IPv6 are supplied.
+      */
+     void setAddrs(const Ip::Address &aLocal, const Ip::Address &aRemote) {local = aLocal; remote = aRemote;}
+ 
+     /** retrieve the CachePeer pointer for use.
+      * The caller is responsible for all CBDATA operations regarding the
+      * used of the pointer returned.
+      */
+     CachePeer * getPeer() const;
+ 
+     /** alter the stored CachePeer pointer.
+      * Perform appropriate CBDATA operations for locking the CachePeer pointer
+      */
+     void setPeer(CachePeer * p);
+ 
+     /** The time the connection started */
+     time_t startTime() const {return startTime_;}
+ 
++    /** The connection lifetime */
++    time_t lifeTime() const {return squid_curtime - startTime_;}
++
++    /** The time left for this connection*/
++    time_t timeLeft(const time_t idleTimeout) const;
++
+     void noteStart() {startTime_ = squid_curtime;}
+ private:
+     /** These objects may not be exactly duplicated. Use copyDetails() instead. */
+     Connection(const Connection &c);
+ 
+     /** These objects may not be exactly duplicated. Use copyDetails() instead. */
+     Connection & operator =(const Connection &c);
+ 
+ public:
+     /** Address/Port for the Squid end of a TCP link. */
+     Ip::Address local;
+ 
+     /** Address for the Remote end of a TCP link. */
+     Ip::Address remote;
+ 
+     /** Hierarchy code for this connection link */
+     hier_code peerType;
+ 
+     /** Socket used by this connection. Negative if not open. */
+     int fd;
+
+=== modified file 'src/pconn.cc'
+--- src/pconn.cc	2014-09-13 13:59:43 +0000
++++ src/pconn.cc	2014-10-03 08:10:40 +0000
+@@ -165,41 +165,41 @@
+         debugs(48, 3, HERE << "growing idle Connection array");
+         capacity_ <<= 1;
+         const Comm::ConnectionPointer *oldList = theList_;
+         theList_ = new Comm::ConnectionPointer[capacity_];
+         for (int index = 0; index < size_; ++index)
+             theList_[index] = oldList[index];
+ 
+         delete[] oldList;
+     }
+ 
+     if (parent_)
+         parent_->noteConnectionAdded();
+ 
+     theList_[size_] = conn;
+     ++size_;
+     AsyncCall::Pointer readCall = commCbCall(5,4, "IdleConnList::Read",
+                                   CommIoCbPtrFun(IdleConnList::Read, this));
+     comm_read(conn, fakeReadBuf_, sizeof(fakeReadBuf_), readCall);
+     AsyncCall::Pointer timeoutCall = commCbCall(5,4, "IdleConnList::Timeout",
+                                      CommTimeoutCbPtrFun(IdleConnList::Timeout, this));
+-    commSetConnTimeout(conn, Config.Timeout.serverIdlePconn, timeoutCall);
++    commSetConnTimeout(conn, conn->timeLeft(Config.Timeout.serverIdlePconn), timeoutCall);
+ }
+ 
+ /// Determine whether an entry in the idle list is available for use.
+ /// Returns false if the entry is unset, closed or closing.
+ bool
+ IdleConnList::isAvailable(int i) const
+ {
+     const Comm::ConnectionPointer &conn = theList_[i];
+ 
+     // connection already closed. useless.
+     if (!Comm::IsConnOpen(conn))
+         return false;
+ 
+     // our connection early-read/close handler is scheduled to run already. unsafe
+     if (!COMMIO_FD_READCB(conn->fd)->active())
+         return false;
+ 
+     return true;
+ }
+ 
+

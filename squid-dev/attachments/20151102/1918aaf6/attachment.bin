@@ -1,0 +1,399 @@
+Allow unlimited LDAP search filter for ext_ldap_group_acl helper
+
+The LDAP search filter in ext_ldap_group_acl is limited to 256 characters.
+In some environments the user DN or group filter can be larger than this
+limitation. 
+This patch uses dynamic allocated buffers for LDAP search filters.
+
+This is a Measurement Factory project
+
+=== modified file 'helpers/external_acl/LDAP_group/ext_ldap_group_acl.cc'
+--- helpers/external_acl/LDAP_group/ext_ldap_group_acl.cc	2015-09-07 17:44:33 +0000
++++ helpers/external_acl/LDAP_group/ext_ldap_group_acl.cc	2015-10-28 12:25:24 +0000
+@@ -19,60 +19,63 @@
+  * or (at your option) any later version.
+  *
+  * Authors:
+  *  Flavio Pescuma <flavio@marasystems.com>
+  *  Henrik Nordstrom <hno@marasystems.com>
+  *  MARA Systems AB, Sweden <http://www.marasystems.com>
+  *
+  * With contributions from others mentioned in the ChangeLog file
+  *
+  * In part based on squid_ldap_auth by Glen Newton and Henrik Nordstrom.
+  *
+  * Latest version of this program can always be found from MARA Systems
+  * at http://marasystems.com/download/LDAP_Group/
+  *
+  * Dependencies: You need to get the OpenLDAP libraries
+  * from http://www.openldap.org or use another compatible
+  * LDAP C-API library.
+  *
+  * If you want to make a TLS enabled connection you will also need the
+  * OpenSSL libraries linked into openldap. See http://www.openssl.org/
+  */
+ #include "squid.h"
+ #include "helpers/defines.h"
+ #include "rfc1738.h"
+ #include "util.h"
+ 
+ #define LDAP_DEPRECATED 1
+ 
+ #include <cctype>
+ #include <cstring>
++#include <sstream>
++#include <iomanip>
++#include <algorithm>
+ 
+ #if _SQUID_WINDOWS_ && !_SQUID_CYGWIN_
+ 
+ #define snprintf _snprintf
+ #include <windows.h>
+ #include <winldap.h>
+ #ifndef LDAPAPI
+ #define LDAPAPI __cdecl
+ #endif
+ #ifdef LDAP_VERSION3
+ #ifndef LDAP_OPT_X_TLS
+ #define LDAP_OPT_X_TLS 0x6000
+ #endif
+ /* Some tricks to allow dynamic bind with ldap_start_tls_s entry point at
+  * run time.
+  */
+ #undef ldap_start_tls_s
+ #if LDAP_UNICODE
+ #define LDAP_START_TLS_S "ldap_start_tls_sW"
+ typedef WINLDAPAPI ULONG(LDAPAPI * PFldap_start_tls_s) (IN PLDAP, OUT PULONG, OUT LDAPMessage **, IN PLDAPControlW *, IN PLDAPControlW *);
+ #else
+ #define LDAP_START_TLS_S "ldap_start_tls_sA"
+ typedef WINLDAPAPI ULONG(LDAPAPI * PFldap_start_tls_s) (IN PLDAP, OUT PULONG, OUT LDAPMessage **, IN PLDAPControlA *, IN PLDAPControlA *);
+ #endif /* LDAP_UNICODE */
+ PFldap_start_tls_s Win32_ldap_start_tls_s;
+ #define ldap_start_tls_s(l,s,c) Win32_ldap_start_tls_s(l,NULL,NULL,s,c)
+ #endif /* LDAP_VERSION3 */
+ 
+ #else
+ 
+@@ -583,250 +586,243 @@
+                 break;
+             } else {
+                 if (tryagain) {
+                     tryagain = 0;
+                     ldap_unbind(ld);
+                     ld = NULL;
+                     goto recover;
+                 }
+             }
+         }
+         if (found)
+             SEND_OK("");
+         else {
+             SEND_ERR("");
+         }
+ 
+         if (ld != NULL) {
+             if (!persistent || (squid_ldap_errno(ld) != LDAP_SUCCESS && squid_ldap_errno(ld) != LDAP_INVALID_CREDENTIALS)) {
+                 ldap_unbind(ld);
+                 ld = NULL;
+             } else {
+                 tryagain = 1;
+             }
+         }
+     }
+     if (ld)
+         ldap_unbind(ld);
+     return 0;
+ }
+ 
+-static int
+-ldap_escape_value(char *escaped, int size, const char *src)
++static std::string
++escape_character(const char c)
+ {
+-    int n = 0;
+-    while (size > 4 && *src) {
+-        switch (*src) {
++    std::stringstream str;
++    switch (c) {
+         case '*':
+         case '(':
+         case ')':
+         case '\\':
+-            n += 3;
+-            size -= 3;
+-            if (size > 0) {
+-                *escaped = '\\';
+-                ++escaped;
+-                snprintf(escaped, 3, "%02x", (unsigned char) *src);
+-                ++src;
+-                escaped += 2;
+-            }
++            str << '\\' << std::setfill('0') << std::setw(2) << std::hex << (int)c;
+             break;
+         default:
+-            *escaped = *src;
+-            ++escaped;
+-            ++src;
+-            ++n;
+-            --size;
+-        }
++            str << c;
+     }
+-    *escaped = '\0';
+-    return n;
+-}
+-
+-static int
+-build_filter(char *filter, int size, const char *templ, const char *user, const char *group)
+-{
+-    int n;
+-    while (*templ && size > 0) {
++    return str.str();
++}
++
++static std::string
++ldap_escape_value(const std::string &src)
++{
++    std::string s;
++    std::for_each(src.begin(), src.end(), [&s](const char &c) { s.append(escape_character(c)); });
++    return s;
++}
++
++static bool
++build_filter(std::string &filter, const char *templ, const char *user, const char *group)
++{
++    std::stringstream str;
++    while (*templ) {
+         switch (*templ) {
+         case '%':
+             ++templ;
+             switch (*templ) {
+             case 'u':
+             case 'v':
+                 ++templ;
+-                n = ldap_escape_value(filter, size, user);
+-                size -= n;
+-                filter += n;
++                str << ldap_escape_value(user);
+                 break;
+             case 'g':
+             case 'a':
+                 ++templ;
+-                n = ldap_escape_value(filter, size, group);
+-                size -= n;
+-                filter += n;
++                str << ldap_escape_value(group);
+                 break;
+             default:
+                 fprintf(stderr, "ERROR: Unknown filter template string %%%c\n", *templ);
+-                return 1;
+-                break;
++                filter = str.str();
++                return false;
+             }
+             break;
+         case '\\':
+             ++templ;
+             if (*templ) {
+-                *filter = *templ;
+-                ++filter;
++                str << *templ;
+                 ++templ;
+-                --size;
+             }
+             break;
+         default:
+-            *filter = *templ;
+-            ++filter;
++            str << *templ;
+             ++templ;
+-            --size;
+             break;
+         }
+     }
+-    if (size <= 0) {
+-        fprintf(stderr, "ERROR: Filter too large\n");
+-        return 1;
+-    }
+-    *filter = '\0';
+-    return 0;
++    filter = str.str();
++    return true;
++}
++
++static std::string
++build_searchbase(const char *extension_dn, const char *base_dn)
++{
++    std::stringstream searchBaseStream;
++    if (extension_dn && *extension_dn)
++        searchBaseStream << extension_dn << ",";
++    searchBaseStream << basedn;
++    return searchBaseStream.str();
+ }
+ 
+ static int
+-searchLDAPGroup(LDAP * ld, char *group, char *member, char *extension_dn)
++searchLDAPGroup(LDAP * ld, const char *group, const char *member, const char *extension_dn)
+ {
+-    char filter[256];
+-    static char searchbase[256];
++    std::string filter;
+     LDAPMessage *res = NULL;
+     LDAPMessage *entry;
+     int rc;
+     char *searchattr[] = {(char *) LDAP_NO_ATTRS, NULL};
+ 
+-    if (extension_dn && *extension_dn)
+-        snprintf(searchbase, sizeof(searchbase), "%s,%s", extension_dn, basedn);
+-    else
+-        snprintf(searchbase, sizeof(searchbase), "%s", basedn);
+-
+-    if (build_filter(filter, sizeof(filter), searchfilter, member, group) != 0) {
+-        fprintf(stderr, PROGRAM_NAME ": ERROR: Failed to construct LDAP search filter. filter=\"%s\", user=\"%s\", group=\"%s\"\n", filter, member, group);
++    const std::string searchbase =build_searchbase(extension_dn, basedn);
++    if (!build_filter(filter, searchfilter, member, group)) {
++        fprintf(stderr, PROGRAM_NAME ": ERROR: Failed to construct LDAP search filter. filter=\"%s\", user=\"%s\", group=\"%s\"\n", filter.c_str(), member, group);
+         return 1;
+     }
+-    debug("group filter '%s', searchbase '%s'\n", filter, searchbase);
++    debug("group filter '%s', searchbase '%s'\n", filter.c_str(), searchbase.c_str());
+ 
+-    rc = ldap_search_s(ld, searchbase, searchscope, filter, searchattr, 1, &res);
++    rc = ldap_search_s(ld, searchbase.c_str(), searchscope, filter.c_str(), searchattr, 1, &res);
+     if (rc != LDAP_SUCCESS) {
+         if (noreferrals && rc == LDAP_PARTIAL_RESULTS) {
+             /* Everything is fine. This is expected when referrals
+              * are disabled.
+              */
+         } else {
+             fprintf(stderr, PROGRAM_NAME ": WARNING: LDAP search error '%s'\n", ldap_err2string(rc));
+ #if defined(NETSCAPE_SSL)
+             if (sslpath && ((rc == LDAP_SERVER_DOWN) || (rc == LDAP_CONNECT_ERROR))) {
+                 int sslerr = PORT_GetError();
+                 fprintf(stderr, PROGRAM_NAME ": WARNING: SSL error %d (%s)\n", sslerr, ldapssl_err2string(sslerr));
+             }
+ #endif
+             ldap_msgfree(res);
+             return 1;
+         }
+     }
+     entry = ldap_first_entry(ld, res);
+     if (!entry) {
+         ldap_msgfree(res);
+         return 1;
+     }
+     ldap_msgfree(res);
+     return 0;
+ }
+ 
++static void
++formatWithString(std::string &formatted, const std::string &value)
++{
++    size_t start_pos = 0;
++    while ((start_pos = formatted.find("%s", start_pos)) != std::string::npos) {
++        formatted.replace(start_pos, 2, value);
++        start_pos += 2;
++    }
++}
++
+ static int
+ searchLDAP(LDAP * ld, char *group, char *login, char *extension_dn)
+ {
+ 
++    const char *current_userdn = userbasedn ? userbasedn : basedn;
+     if (usersearchfilter) {
+-        char filter[8192];
+-        char searchbase[8192];
+-        char escaped_login[1024];
+         LDAPMessage *res = NULL;
+         LDAPMessage *entry;
+         int rc;
+         char *userdn;
+         char *searchattr[] = {(char *) LDAP_NO_ATTRS, NULL};
+-        if (extension_dn && *extension_dn)
+-            snprintf(searchbase, sizeof(searchbase), "%s,%s", extension_dn, userbasedn ? userbasedn : basedn);
+-        else
+-            snprintf(searchbase, sizeof(searchbase), "%s", userbasedn ? userbasedn : basedn);
+-        ldap_escape_value(escaped_login, sizeof(escaped_login), login);
+-        snprintf(filter, sizeof(filter), usersearchfilter, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login, escaped_login);
+-        debug("user filter '%s', searchbase '%s'\n", filter, searchbase);
+-        rc = ldap_search_s(ld, searchbase, searchscope, filter, searchattr, 1, &res);
++        const std::string searchbase = build_searchbase(extension_dn, current_userdn);
++        std::string filter(usersearchfilter);
++        const std::string escaped_login = ldap_escape_value(login);
++        formatWithString(filter, escaped_login);
++
++        debug("user filter '%s', searchbase '%s'\n", filter.c_str(), searchbase.c_str());
++        rc = ldap_search_s(ld, searchbase.c_str(), searchscope, filter.c_str(), searchattr, 1, &res);
+         if (rc != LDAP_SUCCESS) {
+             if (noreferrals && rc == LDAP_PARTIAL_RESULTS) {
+                 /* Everything is fine. This is expected when referrals
+                  * are disabled.
+                  */
+             } else {
+                 fprintf(stderr, PROGRAM_NAME ": WARNING: LDAP search error '%s'\n", ldap_err2string(rc));
+ #if defined(NETSCAPE_SSL)
+                 if (sslpath && ((rc == LDAP_SERVER_DOWN) || (rc == LDAP_CONNECT_ERROR))) {
+                     int sslerr = PORT_GetError();
+                     fprintf(stderr, PROGRAM_NAME ": WARNING: SSL error %d (%s)\n", sslerr, ldapssl_err2string(sslerr));
+                 }
+ #endif
+                 ldap_msgfree(res);
+                 return 1;
+             }
+         }
+         entry = ldap_first_entry(ld, res);
+         if (!entry) {
+-            fprintf(stderr, PROGRAM_NAME ": WARNING: User '%s' not found in '%s'\n", login, searchbase);
++            fprintf(stderr, PROGRAM_NAME ": WARNING: User '%s' not found in '%s'\n", login, searchbase.c_str());
+             ldap_msgfree(res);
+             return 1;
+         }
+         userdn = ldap_get_dn(ld, entry);
+         rc = searchLDAPGroup(ld, group, userdn, extension_dn);
+         squid_ldap_memfree(userdn);
+         ldap_msgfree(res);
+         return rc;
+     } else if (userdnattr) {
+-        char dn[8192];
++        std::stringstream str;
++        str << userdnattr << "=" << login << ", ";
+         if (extension_dn && *extension_dn)
+-            snprintf(dn, 8192, "%s=%s, %s, %s", userdnattr, login, extension_dn, userbasedn ? userbasedn : basedn);
+-        else
+-            snprintf(dn, 8192, "%s=%s, %s", userdnattr, login, userbasedn ? userbasedn : basedn);
+-        return searchLDAPGroup(ld, group, dn, extension_dn);
++            str << extension_dn << ", ";
++        str << current_userdn;
++        return searchLDAPGroup(ld, group, str.str().c_str(), extension_dn);
+     } else {
+         return searchLDAPGroup(ld, group, login, extension_dn);
+     }
+ }
+ 
+ int
+ readSecret(const char *filename)
+ {
+     char buf[BUFSIZ];
+     char *e = 0;
+     FILE *f;
+ 
+     if (!(f = fopen(filename, "r"))) {
+         fprintf(stderr, PROGRAM_NAME ": ERROR: Can not read secret file %s\n", filename);
+         return 1;
+     }
+     if (!fgets(buf, sizeof(buf) - 1, f)) {
+         fprintf(stderr, PROGRAM_NAME ": ERROR: Secret file %s is empty\n", filename);
+         fclose(f);
+         return 1;
+     }
+     /* strip whitespaces on end */
+     if ((e = strrchr(buf, '\n')))
+         *e = 0;
+     if ((e = strrchr(buf, '\r')))
+         *e = 0;
+ 
+     bindpasswd = xstrdup(buf);
+     if (!bindpasswd) {
+         fprintf(stderr, PROGRAM_NAME ": ERROR: can not allocate memory\n");
+

@@ -1,0 +1,440 @@
+Fixed Write.cc:41 "!ccb->active()" assertion.
+
+The following sequence of events triggers this assertion:
+  - The server sends an 1xx control message.
+  - http.cc schedules ConnStateData::sendControlMsg call.
+  - Before sendControlMsg is fired, http.cc detects an error (e.g., I/O
+    error or timeout) and starts writing the reply to the user.
+  - The ConnStateData::sendControlMsg is fired, starts writing 1xx, and
+    hits the "no concurrent writes" assertion.
+
+We could only reproduce this sequence in the lab after changing Squid
+code to trigger a timeout at the right moment, but the sequence looks
+plausible. Other event sequences might result in the same outcome.
+
+To avoid concurrent writes, Squid now drops the control message if
+Http::One::Server detects that a reply is already being written. Also,
+ConnStateData delays reply writing until a pending control message write
+has been completed.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-09-23 20:49:24 +0000
++++ src/client_side.cc	2016-11-17 10:39:10 +0000
+@@ -323,52 +323,66 @@
+     assert(http != NULL);
+     memset (reqbuf, '\0', sizeof (reqbuf));
+     flags.deferred = 0;
+     flags.parsed_ok = 0;
+     deferredparams.node = NULL;
+     deferredparams.rep = NULL;
+ }
+ 
+ void
+ ClientSocketContext::writeControlMsg(HttpControlMsg &msg)
+ {
+     HttpReply::Pointer rep(msg.reply);
+     Must(rep != NULL);
+ 
+     // remember the callback
+     cbControlMsgSent = msg.cbSuccess;
+ 
+     AsyncCall::Pointer call = commCbCall(33, 5, "ClientSocketContext::wroteControlMsg",
+                                          CommIoCbPtrFun(&WroteControlMsg, this));
+ 
+-    getConn()->writeControlMsgAndCall(this, rep.getRaw(), call);
++    if (!getConn()->writeControlMsgAndCall(this, rep.getRaw(), call)) {
++        // but still inform the caller (so it may resume its operation)
++        doneWithControlMsg();
++    }
++}
++
++void
++ClientSocketContext::doneWithControlMsg()
++{
++    ScheduleCallHere(cbControlMsgSent);
++    cbControlMsgSent = NULL;
++
++    debugs(33, 3, clientConnection << ": calling PushDeferredIfNeeded after control msg wrote");
++    ClientSocketContextPushDeferredIfNeeded(this, getConn());
++
+ }
+ 
+ /// called when we wrote the 1xx response
+ void
+ ClientSocketContext::wroteControlMsg(const Comm::ConnectionPointer &conn, char *, size_t, Comm::Flag errflag, int xerrno)
+ {
+     if (errflag == Comm::ERR_CLOSING)
+         return;
+ 
+     if (errflag == Comm::OK) {
+-        ScheduleCallHere(cbControlMsgSent);
++        doneWithControlMsg();
+         return;
+     }
+ 
+     debugs(33, 3, HERE << "1xx writing failed: " << xstrerr(xerrno));
+     // no error notification: see HttpControlMsg.h for rationale and
+     // note that some errors are detected elsewhere (e.g., close handler)
+ 
+     // close on 1xx errors to be conservative and to simplify the code
+     // (if we do not close, we must notify the source of a failure!)
+     conn->close();
+ 
+     // XXX: writeControlMsgAndCall() should handle writer-specific writing
+     // results, including errors and then call us with success/failure outcome.
+ }
+ 
+ /// wroteControlMsg() wrapper: ClientSocketContext is not an AsyncJob
+ void
+ ClientSocketContext::WroteControlMsg(const Comm::ConnectionPointer &conn, char *bufnotused, size_t size, Comm::Flag errflag, int xerrno, void *data)
+ {
+     ClientSocketContext *context = static_cast<ClientSocketContext*>(data);
+@@ -1438,40 +1452,42 @@
+     if (!http->getConn() || !cbdataReferenceValid(http->getConn()) || !Comm::IsConnOpen(http->getConn()->clientConnection))
+         return;
+ 
+     /* Test preconditions */
+     assert(node != NULL);
+     PROF_start(clientSocketRecipient);
+     /* TODO: handle this rather than asserting
+      * - it should only ever happen if we cause an abort and
+      * the callback chain loops back to here, so we can simply return.
+      * However, that itself shouldn't happen, so it stays as an assert for now.
+      */
+     assert(cbdataReferenceValid(node));
+     assert(node->node.next == NULL);
+     ClientSocketContext::Pointer context = dynamic_cast<ClientSocketContext *>(node->data.getRaw());
+     assert(context != NULL);
+ 
+     /* TODO: check offset is what we asked for */
+ 
+     if (context != http->getConn()->getCurrentContext())
+         context->deferRecipientForLater(node, rep, receivedData);
++    else if (context->controlMsgIsPending())
++        context->deferRecipientForLater(node, rep, receivedData);
+     else
+         http->getConn()->handleReply(rep, receivedData);
+ 
+     PROF_stop(clientSocketRecipient);
+ }
+ 
+ /**
+  * Called when a downstream node is no longer interested in
+  * our data. As we are a terminal node, this means on aborts
+  * only
+  */
+ void
+ clientSocketDetach(clientStreamNode * node, ClientHttpRequest * http)
+ {
+     /* Test preconditions */
+     assert(node != NULL);
+     /* TODO: handle this rather than asserting
+      * - it should only ever happen if we cause an abort and
+      * the callback chain loops back to here, so we can simply return.
+      * However, that itself shouldn't happen, so it stays as an assert for now.
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2016-06-18 13:36:07 +0000
++++ src/client_side.h	2016-11-17 10:39:55 +0000
+@@ -112,43 +112,47 @@
+     bool canPackMoreRanges() const;
+     clientStream_status_t socketState();
+     void sendBody(HttpReply * rep, StoreIOBuffer bodyData);
+     void sendStartOfMessage(HttpReply * rep, StoreIOBuffer bodyData);
+     size_t lengthToSend(Range<int64_t> const &available);
+     void noteSentBodyBytes(size_t);
+     void buildRangeHeader(HttpReply * rep);
+     clientStreamNode * getTail() const;
+     clientStreamNode * getClientReplyContext() const;
+     ConnStateData *getConn() const;
+     void connIsFinished();
+     void removeFromConnectionList(ConnStateData * conn);
+     void deferRecipientForLater(clientStreamNode * node, HttpReply * rep, StoreIOBuffer receivedData);
+     bool multipartRangeRequest() const;
+     void registerWithConn();
+     void noteIoError(const int xerrno); ///< update state to reflect I/O error
+ 
+     /// starts writing 1xx control message to the client
+     void writeControlMsg(HttpControlMsg &msg);
+ 
++    /// true if 1xx to the user is pending
++    bool controlMsgIsPending() {return cbControlMsgSent != NULL;}
++
+ protected:
+     static IOCB WroteControlMsg;
+     void wroteControlMsg(const Comm::ConnectionPointer &conn, char *bufnotused, size_t size, Comm::Flag errflag, int xerrno);
++    void doneWithControlMsg();
+ 
+ private:
+     void prepareReply(HttpReply * rep);
+     void packChunk(const StoreIOBuffer &bodyData, MemBuf &mb);
+     void packRange(StoreIOBuffer const &, MemBuf * mb);
+     void deRegisterWithConn();
+     void doClose();
+     void initiateClose(const char *reason);
+ 
+     AsyncCall::Pointer cbControlMsgSent; ///< notifies HttpControlMsg Source
+ 
+     bool mayUseConnection_; /* This request may use the connection. Don't read anymore requests for now */
+     bool connRegistered_;
+ 
+     CBDATA_CLASS2(ClientSocketContext);
+ };
+ 
+ class ConnectionDetail;
+ #if USE_OPENSSL
+ namespace Ssl
+@@ -370,41 +374,41 @@
+     /// Fill the certAdaptParams with the required data for certificate adaptation
+     /// and create the key for storing/retrieve the certificate to/from the cache
+     void buildSslCertGenerationParams(Ssl::CertificateProperties &certProperties);
+     /// Called when the client sends the first request on a bumped connection.
+     /// Returns false if no [delayed] error should be written to the client.
+     /// Otherwise, writes the error to the client and returns true. Also checks
+     /// for SQUID_X509_V_ERR_DOMAIN_MISMATCH on bumped requests.
+     bool serveDelayedError(ClientSocketContext *context);
+ 
+     Ssl::BumpMode sslBumpMode; ///< ssl_bump decision (Ssl::bumpEnd if n/a).
+ 
+ #else
+     bool switchedToHttps() const { return false; }
+ #endif
+ 
+     /* clt_conn_tag=tag annotation access */
+     const SBuf &connectionTag() const { return connectionTag_; }
+     void connectionTag(const char *aTag) { connectionTag_ = aTag; }
+ 
+     /// handle a control message received by context from a peer and call back
+-    virtual void writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &call) = 0;
++    virtual bool writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &call) = 0;
+ 
+     /// ClientStream calls this to supply response header (once) and data
+     /// for the current ClientSocketContext.
+     virtual void handleReply(HttpReply *header, StoreIOBuffer receivedData) = 0;
+ 
+     /// remove no longer needed leading bytes from the input buffer
+     void consumeInput(const size_t byteCount);
+ 
+     /* TODO: Make the methods below (at least) non-public when possible. */
+ 
+     /// stop parsing the request and create context for relaying error info
+     ClientSocketContext *abortRequestParsing(const char *const errUri);
+ 
+     /// generate a fake CONNECT request with the given payload
+     /// at the beginning of the client I/O buffer
+     void fakeAConnectRequest(const char *reason, const SBuf &payload);
+ 
+     /* Registered Runner API */
+     virtual void startShutdown();
+     virtual void endingShutdown();
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2016-06-30 21:09:12 +0000
++++ src/servers/FtpServer.cc	2016-11-15 11:30:40 +0000
+@@ -1135,46 +1135,47 @@
+     mb.Printf("%i %s\r\n", scode, reason); // error terminating line
+ 
+     // TODO: errorpage.cc should detect FTP client and use
+     // configurable FTP-friendly error templates which we should
+     // write to the client "as is" instead of hiding most of the info
+ 
+     writeReply(mb);
+ }
+ 
+ /// writes FTP response based on HTTP reply that is not an FTP-response wrapper
+ /// for example, internally-generated Squid "errorpages" end up here (for now)
+ void
+ Ftp::Server::writeForwardedForeign(const HttpReply *reply)
+ {
+     changeState(fssConnected, "foreign reply");
+     closeDataConnection();
+     // 451: We intend to keep the control connection open.
+     writeErrorReply(reply, 451);
+ }
+ 
+-void
++bool
+ Ftp::Server::writeControlMsgAndCall(ClientSocketContext *context, HttpReply *reply, AsyncCall::Pointer &call)
+ {
+     // the caller guarantees that we are dealing with the current context only
+     // the caller should also make sure reply->header.has(HDR_FTP_STATUS)
+     writeForwardedReplyAndCall(reply, call);
++    return true;
+ }
+ 
+ void
+ Ftp::Server::writeForwardedReplyAndCall(const HttpReply *reply, AsyncCall::Pointer &call)
+ {
+     assert(reply != NULL);
+     const HttpHeader &header = reply->header;
+ 
+     // without status, the caller must use the writeForwardedForeign() path
+     Must(header.has(HDR_FTP_STATUS));
+     Must(header.has(HDR_FTP_REASON));
+     const int scode = header.getInt(HDR_FTP_STATUS);
+     debugs(33, 7, "scode: " << scode);
+ 
+     // Status 125 or 150 implies upload or data request, but we still check
+     // the state in case the server is buggy.
+     if ((scode == 125 || scode == 150) &&
+             (master->serverState == fssHandleUploadRequest ||
+              master->serverState == fssHandleDataRequest)) {
+         if (checkDataConnPost()) {
+
+=== modified file 'src/servers/FtpServer.h'
+--- src/servers/FtpServer.h	2016-03-15 18:14:15 +0000
++++ src/servers/FtpServer.h	2016-11-15 11:30:13 +0000
+@@ -77,41 +77,41 @@
+     friend void StartListening();
+ 
+     // errors detected before it is possible to create an HTTP request wrapper
+     typedef enum {
+         eekHugeRequest,
+         eekMissingLogin,
+         eekMissingUsername,
+         eekMissingHost,
+         eekUnsupportedCommand,
+         eekInvalidUri,
+         eekMalformedCommand
+     } EarlyErrorKind;
+ 
+     /* ConnStateData API */
+     virtual ClientSocketContext *parseOneRequest(Http::ProtocolVersion &ver);
+     virtual void processParsedRequest(ClientSocketContext *context, const Http::ProtocolVersion &ver);
+     virtual void notePeerConnection(Comm::ConnectionPointer conn);
+     virtual void clientPinnedConnectionClosed(const CommCloseCbParams &io);
+     virtual void handleReply(HttpReply *header, StoreIOBuffer receivedData);
+     virtual int pipelinePrefetchMax() const;
+-    virtual void writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &call);
++    virtual bool writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &call);
+     virtual time_t idleTimeout() const;
+ 
+     /* BodyPipe API */
+     virtual void noteMoreBodySpaceAvailable(BodyPipe::Pointer);
+     virtual void noteBodyConsumerAborted(BodyPipe::Pointer ptr);
+ 
+     /* AsyncJob API */
+     virtual void start();
+ 
+     /* Comm callbacks */
+     static void AcceptCtrlConnection(const CommAcceptCbParams &params);
+     void acceptDataConnection(const CommAcceptCbParams &params);
+     void readUploadData(const CommIoCbParams &io);
+     void wroteEarlyReply(const CommIoCbParams &io);
+     void wroteReply(const CommIoCbParams &io);
+     void wroteReplyData(const CommIoCbParams &io);
+     void connectedForData(const CommConnectCbParams &params);
+ 
+     unsigned int listenForDataConnection();
+     bool createDataConnection(Ip::Address cltAddr);
+
+=== modified file 'src/servers/HttpServer.cc'
+--- src/servers/HttpServer.cc	2016-01-01 00:14:27 +0000
++++ src/servers/HttpServer.cc	2016-11-15 11:42:22 +0000
+@@ -18,41 +18,41 @@
+ #include "SquidConfig.h"
+ #include "Store.h"
+ 
+ namespace Http
+ {
+ 
+ /// Manages a connection from an HTTP client.
+ class Server: public ConnStateData
+ {
+ public:
+     Server(const MasterXaction::Pointer &xact, const bool beHttpsServer);
+     virtual ~Server() {}
+ 
+     void readSomeHttpData();
+ 
+ protected:
+     /* ConnStateData API */
+     virtual ClientSocketContext *parseOneRequest(Http::ProtocolVersion &ver);
+     virtual void processParsedRequest(ClientSocketContext *context, const Http::ProtocolVersion &ver);
+     virtual void handleReply(HttpReply *rep, StoreIOBuffer receivedData);
+-    virtual void writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &call);
++    virtual bool writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &call);
+     virtual time_t idleTimeout() const;
+ 
+     /* BodyPipe API */
+     virtual void noteMoreBodySpaceAvailable(BodyPipe::Pointer);
+     virtual void noteBodyConsumerAborted(BodyPipe::Pointer);
+ 
+     /* AsyncJob API */
+     virtual void start();
+ 
+ private:
+     void processHttpRequest(ClientSocketContext *const context);
+     void handleHttpRequestData();
+ 
+     HttpParser parser_;
+     HttpRequestMethod method_; ///< parsed HTTP method
+ 
+     /// temporary hack to avoid creating a true HttpsServer class
+     const bool isHttpsServer;
+ 
+     CBDATA_CLASS2(Server);
+@@ -150,51 +150,59 @@
+                                    !context->startOfOutput();
+     const bool responseFinishedOrFailed = !rep &&
+                                           !receivedData.data &&
+                                           !receivedData.length;
+     if (responseFinishedOrFailed && !mustSendLastChunk) {
+         context->writeComplete(context->clientConnection, NULL, 0, Comm::OK);
+         return;
+     }
+ 
+     if (!context->startOfOutput()) {
+         context->sendBody(rep, receivedData);
+         return;
+     }
+ 
+     assert(rep);
+     http->al->reply = rep;
+     HTTPMSGLOCK(http->al->reply);
+     context->sendStartOfMessage(rep, receivedData);
+ }
+ 
+-void
++bool
+ Http::Server::writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &call)
+ {
++    // Ignore this late control message if we have started sending a 
++    // reply to the user already (e.g., after an error).
++    if (context->reply) {
++        debugs(11, 2, "drop 1xx made late by " << context->reply);
++        return false;
++    }
++
+     // apply selected clientReplyContext::buildReplyHeader() mods
+     // it is not clear what headers are required for control messages
+     rep->header.removeHopByHopEntries();
+     rep->header.putStr(HDR_CONNECTION, "keep-alive");
+     httpHdrMangleList(&rep->header, getCurrentContext()->http->request, ROR_REPLY);
+ 
+     MemBuf *mb = rep->pack();
+ 
+     debugs(11, 2, "HTTP Client " << clientConnection);
+     debugs(11, 2, "HTTP Client CONTROL MSG:\n---------\n" << mb->buf << "\n----------");
+ 
+     Comm::Write(context->clientConnection, mb, call);
+ 
+     delete mb;
++    return true;
+ }
+ 
+ ConnStateData *
+ Http::NewServer(MasterXactionPointer &xact)
+ {
+     return new Server(xact, false);
+ }
+ 
+ ConnStateData *
+ Https::NewServer(MasterXactionPointer &xact)
+ {
+     return new Http::Server(xact, true);
+ }
+ 
+

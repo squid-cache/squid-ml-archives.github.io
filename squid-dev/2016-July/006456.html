@@ -1,0 +1,225 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Deletors for std::unique_ptr WAS: Re: Broken trunk after r14735
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Deletors%20for%20std%3A%3Aunique_ptr%20WAS%3A%20Re%3A%20Broken%0A%20trunk%20after%20r14735&In-Reply-To=%3C6578371b-f58a-a849-7d01-0c0a14010203%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006441.html">
+   <LINK REL="Next"  HREF="006457.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Deletors for std::unique_ptr WAS: Re: Broken trunk after r14735</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Deletors%20for%20std%3A%3Aunique_ptr%20WAS%3A%20Re%3A%20Broken%0A%20trunk%20after%20r14735&In-Reply-To=%3C6578371b-f58a-a849-7d01-0c0a14010203%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] Deletors for std::unique_ptr WAS: Re: Broken trunk after r14735">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Fri Jul 29 15:27:54 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006441.html">[squid-dev] Broken trunk after r14735
+</A></li>
+        <LI>Next message: <A HREF="006457.html">[squid-dev] [PATCH] Deletors for std::unique_ptr WAS: Re: Broken trunk after r14735
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6456">[ date ]</a>
+              <a href="thread.html#6456">[ thread ]</a>
+              <a href="subject.html#6456">[ subject ]</a>
+              <a href="author.html#6456">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 26/07/2016 2:10 a.m., Alex Rousskov wrote:
+&gt;<i> On 07/24/2016 01:04 AM, Amos Jeffries wrote:
+</I>&gt;<i> 
+</I>&gt;&gt;<i>   does replacing &quot;BIO_free&quot; with &quot;BIO_vfree&quot; in the ssl/gadgets.h
+</I>&gt;&gt;<i> definition of BIO_POinter fix this one?
+</I>&gt;<i> 
+</I>&gt;<i> Same startup exception (quoted below) after patching trunk revision
+</I>&gt;<i> 14756 with
+</I>&gt;<i> 
+</I>&gt;&gt;<i> -typedef std::unique_ptr&lt;BIO, std::function&lt;decltype(BIO_free)&gt;&gt; BIO_Pointer;
+</I>&gt;&gt;<i> +typedef std::unique_ptr&lt;BIO, std::function&lt;decltype(BIO_vfree)&gt;&gt; BIO_Pointer;
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> Thank you,
+</I>&gt;<i> 
+</I>&gt;<i> Alex.
+</I>&gt;<i> 
+</I>
+I got this config parsing crash replicated here and tried a dozen or so
+combinations. It does seem to keep coming back to my earlier approach of
+using per-type Functors as the most reliable solution.
+
+Attached patch seem to work for me. It implements a macro to simplify
+Functor creation.
+
+We could also wrap the std::unique_ptr definition parts inside the macro
+for much smaller visible code. But that would prevent re-use of the
+macro for other plain Functor definitions (not that anything else is
+using it).
+
+Amos
+
+-------------- next part --------------
+=== modified file 'src/security/LockingPointer.h'
+--- src/security/LockingPointer.h	2016-07-13 12:39:22 +0000
++++ src/security/LockingPointer.h	2016-07-29 13:30:35 +0000
+@@ -31,6 +31,14 @@
+             function(a); \
+         }
+ 
++// Macro to be used to define the C++ wrapper functor of the OpenSSL *_free
++// and GnuTLS *_deinit family of functions. The C++ functor is suffixed with
++// the _Deleter extension and intended for use by std::unique_ptr
++#define CtoDeleter(argument_type, function) \
++        struct argument_type ## _Deleter { \
++            void operator()(argument_type *a) { function(a); } \
++        }
++
+ namespace Security
+ {
+ 
+
+=== modified file 'src/security/cert_generators/file/certificate_db.cc'
+--- src/security/cert_generators/file/certificate_db.cc	2016-07-05 23:37:12 +0000
++++ src/security/cert_generators/file/certificate_db.cc	2016-07-29 15:17:30 +0000
+@@ -287,12 +287,18 @@
+     load();
+     if (!db || !cert || !pkey)
+         return false;
++
++    // Functor to wrap xfree() for std::unique_ptr
++    struct CharDeleter {
++        void operator()(char *a) {xfree(a);}
++    };
++
+     Row row;
+     ASN1_INTEGER * ai = X509_get_serialNumber(cert.get());
+     std::string serial_string;
+     Ssl::BIGNUM_Pointer serial(ASN1_INTEGER_to_BN(ai, NULL));
+     {
+-        std::unique_ptr&lt;char, std::function&lt;decltype(xfree)&gt;&gt; hex_bn(BN_bn2hex(serial.get()));
++        std::unique_ptr&lt;char, CharDeleter&gt; hex_bn(BN_bn2hex(serial.get()));
+         serial_string = std::string(hex_bn.get());
+     }
+     row.setValue(cnlSerial, serial_string.c_str());
+@@ -305,7 +311,7 @@
+     }
+ 
+     {
+-        std::unique_ptr&lt;char, std::function&lt;decltype(xfree)&gt;&gt; subject(X509_NAME_oneline(X509_get_subject_name(cert.get()), nullptr, 0));
++        std::unique_ptr&lt;char, CharDeleter&gt; subject(X509_NAME_oneline(X509_get_subject_name(cert.get()), nullptr, 0));
+         Security::CertPointer findCert;
+         Ssl::EVP_PKEY_Pointer findPkey;
+         if (pure_find(useName.empty() ? subject.get() : useName, findCert, findPkey)) {
+@@ -348,7 +354,7 @@
+     if (!useName.empty())
+         row.setValue(cnlName, useName.c_str());
+     else {
+-        std::unique_ptr&lt;char, std::function&lt;decltype(xfree)&gt;&gt; subject(X509_NAME_oneline(X509_get_subject_name(cert.get()), nullptr, 0));
++        std::unique_ptr&lt;char, CharDeleter&gt; subject(X509_NAME_oneline(X509_get_subject_name(cert.get()), nullptr, 0));
+         row.setValue(cnlName, subject.get());
+     }
+ 
+
+=== modified file 'src/ssl/gadgets.h'
+--- src/ssl/gadgets.h	2016-06-29 10:44:40 +0000
++++ src/ssl/gadgets.h	2016-07-29 15:01:44 +0000
+@@ -47,33 +47,44 @@
+ CtoCpp1(EVP_PKEY_free, EVP_PKEY *)
+ typedef Security::LockingPointer&lt;EVP_PKEY, EVP_PKEY_free_cpp, CRYPTO_LOCK_EVP_PKEY&gt; EVP_PKEY_Pointer;
+ 
+-typedef std::unique_ptr&lt;BIGNUM, std::function&lt;decltype(BN_free)&gt;&gt; BIGNUM_Pointer;
+-
+-typedef std::unique_ptr&lt;BIO, std::function&lt;decltype(BIO_free)&gt;&gt; BIO_Pointer;
+-
+-typedef std::unique_ptr&lt;ASN1_INTEGER, std::function&lt;decltype(ASN1_INTEGER_free)&gt;&gt; ASN1_INT_Pointer;
+-
+-typedef std::unique_ptr&lt;ASN1_OCTET_STRING, std::function&lt;decltype(ASN1_OCTET_STRING_free)&gt;&gt; ASN1_OCTET_STRING_Pointer;
+-
+-typedef std::unique_ptr&lt;TXT_DB, std::function&lt;decltype(TXT_DB_free)&gt;&gt; TXT_DB_Pointer;
+-
+-typedef std::unique_ptr&lt;X509_NAME, std::function&lt;decltype(X509_NAME_free)&gt;&gt; X509_NAME_Pointer;
+-
+-typedef std::unique_ptr&lt;RSA, std::function&lt;decltype(RSA_free)&gt;&gt; RSA_Pointer;
+-
+-typedef std::unique_ptr&lt;X509_REQ, std::function&lt;decltype(X509_REQ_free)&gt;&gt; X509_REQ_Pointer;
++CtoDeleter(BIGNUM, BN_free);
++typedef std::unique_ptr&lt;BIGNUM, BIGNUM_Deleter&gt; BIGNUM_Pointer;
++
++CtoDeleter(BIO, BIO_vfree);
++typedef std::unique_ptr&lt;BIO, BIO_Deleter&gt; BIO_Pointer;
++
++CtoDeleter(ASN1_INTEGER, ASN1_INTEGER_free);
++typedef std::unique_ptr&lt;ASN1_INTEGER, ASN1_INTEGER_Deleter&gt; ASN1_INT_Pointer;
++
++CtoDeleter(ASN1_OCTET_STRING, ASN1_OCTET_STRING_free);
++typedef std::unique_ptr&lt;ASN1_OCTET_STRING, ASN1_OCTET_STRING_Deleter&gt; ASN1_OCTET_STRING_Pointer;
++
++CtoDeleter(TXT_DB, TXT_DB_free);
++typedef std::unique_ptr&lt;TXT_DB, TXT_DB_Deleter&gt; TXT_DB_Pointer;
++
++CtoDeleter(X509_NAME, X509_NAME_free);
++typedef std::unique_ptr&lt;X509_NAME, X509_NAME_Deleter&gt; X509_NAME_Pointer;
++
++CtoDeleter(RSA, RSA_free);
++typedef std::unique_ptr&lt;RSA, RSA_Deleter&gt; RSA_Pointer;
++
++CtoDeleter(X509_REQ, X509_REQ_free);
++typedef std::unique_ptr&lt;X509_REQ, X509_REQ_Deleter&gt; X509_REQ_Pointer;
+ 
+ sk_dtor_wrapper(sk_X509_NAME, STACK_OF(X509_NAME) *, X509_NAME_free);
+ typedef std::unique_ptr&lt;STACK_OF(X509_NAME), sk_X509_NAME_free_wrapper&gt; X509_NAME_STACK_Pointer;
+ 
+-typedef std::unique_ptr&lt;AUTHORITY_KEYID, std::function&lt;decltype(AUTHORITY_KEYID_free)&gt;&gt; AUTHORITY_KEYID_Pointer;
++CtoDeleter(AUTHORITY_KEYID, AUTHORITY_KEYID_free);
++typedef std::unique_ptr&lt;AUTHORITY_KEYID, AUTHORITY_KEYID_Deleter&gt; AUTHORITY_KEYID_Pointer;
+ 
+ sk_dtor_wrapper(sk_GENERAL_NAME, STACK_OF(GENERAL_NAME) *, GENERAL_NAME_free);
+ typedef std::unique_ptr&lt;STACK_OF(GENERAL_NAME), sk_GENERAL_NAME_free_wrapper&gt; GENERAL_NAME_STACK_Pointer;
+ 
+-typedef std::unique_ptr&lt;GENERAL_NAME, std::function&lt;decltype(GENERAL_NAME_free)&gt;&gt; GENERAL_NAME_Pointer;
++CtoDeleter(GENERAL_NAME, GENERAL_NAME_free);
++typedef std::unique_ptr&lt;GENERAL_NAME, GENERAL_NAME_Deleter&gt; GENERAL_NAME_Pointer;
+ 
+-typedef std::unique_ptr&lt;X509_EXTENSION, std::function&lt;decltype(X509_EXTENSION_free)&gt;&gt; X509_EXTENSION_Pointer;
++CtoDeleter(X509_EXTENSION, X509_EXTENSION_free);
++typedef std::unique_ptr&lt;X509_EXTENSION, X509_EXTENSION_Deleter&gt; X509_EXTENSION_Pointer;
+ 
+ /**
+  \ingroup SslCrtdSslAPI
+
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006441.html">[squid-dev] Broken trunk after r14735
+</A></li>
+	<LI>Next message: <A HREF="006457.html">[squid-dev] [PATCH] Deletors for std::unique_ptr WAS: Re: Broken trunk after r14735
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6456">[ date ]</a>
+              <a href="thread.html#6456">[ thread ]</a>
+              <a href="subject.html#6456">[ subject ]</a>
+              <a href="author.html#6456">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

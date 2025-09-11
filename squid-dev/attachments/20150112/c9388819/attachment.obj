@@ -1,0 +1,708 @@
+# Bazaar merge directive format 2 (Bazaar 0.90)
+# revision_id: kinkie@squid-cache.org-20150112155556-rftjffb3f3kpv08p
+# target_branch: ../trunk
+# testament_sha1: 8a1a017a28d53f528c9cdcfd3e6def6a0b41f407
+# timestamp: 2015-01-12 20:46:43 +0100
+# base_revision_id: kinkie@squid-cache.org-20150112155358-\
+#   132pz2896k3ukeqf
+# 
+# Begin patch
+=== modified file 'src/acl/Acl.cc'
+--- src/acl/Acl.cc	2015-01-12 15:53:58 +0000
++++ src/acl/Acl.cc	2015-01-12 15:55:56 +0000
+@@ -378,7 +378,7 @@
+ 
+ ACL::~ACL()
+ {
+-    debugs(28, 3, "ACL::~ACL: '" << cfgline << "'");
++    debugs(28, 3, "freeing ACL " << name);
+     safe_free(cfgline);
+     AclMatchedName = NULL; // in case it was pointing to our name
+ }
+
+=== modified file 'src/acl/Arp.cc'
+--- src/acl/Arp.cc	2015-01-06 21:05:37 +0000
++++ src/acl/Arp.cc	2015-01-07 10:58:53 +0000
+@@ -20,9 +20,7 @@
+ #include "globals.h"
+ #include "ip/Address.h"
+ 
+-static void aclParseArpList(Splay<Eui::Eui48 *> **curlist);
+-static int aclMatchArp(Splay<Eui::Eui48 *> **dataptr, Ip::Address &c);
+-static Splay<Eui::Eui48 *>::SPLAYCMP aclArpCompare;
++#include <algorithm>
+ 
+ ACL *
+ ACLARP::clone() const
+@@ -30,21 +28,15 @@
+     return new ACLARP(*this);
+ }
+ 
+-ACLARP::ACLARP (char const *theClass) : data (NULL), class_ (theClass)
++ACLARP::ACLARP (char const *theClass) : class_ (theClass)
+ {}
+ 
+-ACLARP::ACLARP (ACLARP const & old) : data (NULL), class_ (old.class_)
++ACLARP::ACLARP (ACLARP const & old) : class_ (old.class_), aclArpData(old.aclArpData)
+ {
+-    /* we don't have copy constructors for the data yet */
+-    assert (!old.data);
+ }
+ 
+ ACLARP::~ACLARP()
+ {
+-    if (data) {
+-        data->destroy();
+-        delete data;
+-    }
+ }
+ 
+ char const *
+@@ -56,7 +48,7 @@
+ bool
+ ACLARP::empty () const
+ {
+-    return data->empty();
++    return aclArpData.empty();
+ }
+ 
+ /* ==== BEGIN ARP ACL SUPPORT ============================================= */
+@@ -114,14 +106,6 @@
+ void
+ ACLARP::parse()
+ {
+-    if (!data)
+-        data = new Splay<Eui::Eui48 *>();
+-    aclParseArpList(&data);
+-}
+-
+-void
+-aclParseArpList(Splay<Eui::Eui48 *> **curlist)
+-{
+     char *t = NULL;
+     Eui::Eui48 *q = NULL;
+ 
+@@ -129,8 +113,10 @@
+         if ((q = aclParseArpData(t)) == NULL)
+             continue;
+ 
+-        (*curlist)->insert(q, aclArpCompare);
++        aclArpData.insert(*q);
++        safe_free(q);
+     }
++
+ }
+ 
+ int
+@@ -144,47 +130,21 @@
+         return 0;
+     }
+ 
+-    return aclMatchArp(&data, checklist->src_addr);
+-}
+-
+-/***************/
+-/* aclMatchArp */
+-/***************/
+-int
+-aclMatchArp(Splay<Eui::Eui48 *> **dataptr, Ip::Address &c)
+-{
+     Eui::Eui48 lookingFor;
+-    if (lookingFor.lookup(c)) {
+-        Eui::Eui48 * const* lookupResult = (*dataptr)->find(&lookingFor,aclArpCompare);
+-        debugs(28, 3, "aclMatchArp: '" << c << "' " << (lookupResult ? "found" : "NOT found"));
+-        return (lookupResult != NULL);
+-    }
+-    debugs(28, 3, "aclMatchArp: " << c << " NOT found");
+-    return 0;
+-}
+-
+-static int
+-aclArpCompare(Eui::Eui48 * const &a, Eui::Eui48 * const &b)
+-{
+-    return memcmp(a, b, sizeof(Eui::Eui48));
+-}
+-
+-// visitor functor to collect the contents of the Arp Acl
+-struct ArpAclDumpVisitor {
+-    SBufList contents;
+-    void operator() (const Eui::Eui48 * v) {
+-        static char buf[48];
+-        v->encode(buf,48);
+-        contents.push_back(SBuf(buf));
+-    }
+-};
++    lookingFor.lookup(checklist->src_addr);
++    return (aclArpData.find(lookingFor) != aclArpData.end());
++}
+ 
+ SBufList
+ ACLARP::dump() const
+ {
+-    ArpAclDumpVisitor visitor;
+-    data->visit(visitor);
+-    return visitor.contents;
++    SBufList sl;
++    for (auto i = aclArpData.cbegin(); i != aclArpData.cend(); ++i) {
++        char buf[48];
++        i->encode(buf,48);
++        sl.push_back(SBuf(buf));
++    }
++    return sl;
+ }
+ 
+ /* ==== END ARP ACL SUPPORT =============================================== */
+
+=== modified file 'src/acl/Arp.h'
+--- src/acl/Arp.h	2014-12-30 14:59:16 +0000
++++ src/acl/Arp.h	2015-01-06 17:45:21 +0000
+@@ -13,6 +13,8 @@
+ #include "acl/Checklist.h"
+ #include "splay.h"
+ 
++#include <set>
++
+ namespace Eui
+ {
+ class Eui48;
+@@ -39,8 +41,9 @@
+ protected:
+     static Prototype RegistryProtoype;
+     static ACLARP RegistryEntry_;
+-    Splay<Eui::Eui48 *> *data;
+     char const *class_;
++    typedef std::set<Eui::Eui48> AclArpData_t;
++    AclArpData_t aclArpData;
+ };
+ 
+ #endif /* SQUID_ACLARP_H */
+
+=== modified file 'src/acl/Eui64.cc'
+--- src/acl/Eui64.cc	2015-01-06 21:05:37 +0000
++++ src/acl/Eui64.cc	2015-01-07 10:41:24 +0000
+@@ -20,31 +20,21 @@
+ #include "globals.h"
+ #include "ip/Address.h"
+ 
+-static void aclParseEuiList(Splay<Eui::Eui64 *> **curlist);
+-static int aclMatchEui(Splay<Eui::Eui64 *> **dataptr, Ip::Address &c);
+-static Splay<Eui::Eui64 *>::SPLAYCMP aclEui64Compare;
+-
+ ACL *
+ ACLEui64::clone() const
+ {
+     return new ACLEui64(*this);
+ }
+ 
+-ACLEui64::ACLEui64 (char const *theClass) : data (NULL), class_ (theClass)
++ACLEui64::ACLEui64 (char const *theClass) : class_ (theClass)
+ {}
+ 
+-ACLEui64::ACLEui64 (ACLEui64 const & old) : data (NULL), class_ (old.class_)
++ACLEui64::ACLEui64 (ACLEui64 const & old) : eui64Data(old.eui64Data), class_ (old.class_)
+ {
+-    /* we don't have copy constructors for the data yet */
+-    assert (!old.data);
+ }
+ 
+ ACLEui64::~ACLEui64()
+ {
+-    if (data) {
+-        data->destroy();
+-        delete data;
+-    }
+ }
+ 
+ char const *
+@@ -56,7 +46,7 @@
+ bool
+ ACLEui64::empty () const
+ {
+-    return data->empty();
++    return eui64Data.empty();
+ }
+ 
+ Eui::Eui64 *
+@@ -88,22 +78,13 @@
+ void
+ ACLEui64::parse()
+ {
+-    if (!data)
+-        data = new Splay<Eui::Eui64 *>();
+-    aclParseEuiList(&data);
+-}
+-
+-void
+-aclParseEuiList(Splay<Eui::Eui64 *> **curlist)
+-{
+     char *t = NULL;
+-    Eui::Eui64 *q = NULL;
+-
++    Eui::Eui64 *q;
+     while ((t = strtokFile())) {
+         if ((q = aclParseEuiData(t)) == NULL)
+             continue;
+-
+-        (*curlist)->insert(q, aclEui64Compare);
++        eui64Data.insert(*q);
++        safe_free(q);
+     }
+ }
+ 
+@@ -118,51 +99,27 @@
+         return 0;
+     }
+ 
+-    return aclMatchEui(&data, checklist->src_addr);
+-}
+-
+-/***************/
+-/* aclMatchEui */
+-/***************/
+-int
+-aclMatchEui(Splay<Eui::Eui64 *> **dataptr, Ip::Address &c)
+-{
+     Eui::Eui64 lookingFor;
+-
+-    if (lookingFor.lookup(c)) {
+-        Eui::Eui64 * const * lookupResult = (*dataptr)->find(&lookingFor, aclEui64Compare);
+-        debugs(28, 3, "aclMatchEui: '" << c << "' " << (lookupResult ? "found" : "NOT found"));
+-        return (lookupResult != NULL);
++    if (lookingFor.lookup(checklist->src_addr)) {
++        bool found = (eui64Data.find(lookingFor) != eui64Data.end());
++        debugs(28, 3,  checklist->src_addr << "' " << (found ? "found" : "NOT found"));
++        return found;
+     }
+ 
+-    /*
+-     * Address was not found on any interface
+-     */
+-    debugs(28, 3, "aclMatchEui: " << c << " NOT found");
++    debugs(28, 3, checklist->src_addr << " NOT found");
+     return 0;
+ }
+ 
+-static int
+-aclEui64Compare(Eui::Eui64 * const &a, Eui::Eui64 * const &b)
+-{
+-    return memcmp(a, b, sizeof(Eui::Eui64));
+-}
+-
+-struct AclEui64DumpVisitor {
+-    SBufList contents;
+-    void operator() ( const Eui::Eui64 * v) {
+-        static char buf[48];
+-        v->encode(buf, 48);
+-        contents.push_back(SBuf(buf));
+-    }
+-};
+-
+ SBufList
+ ACLEui64::dump() const
+ {
+-    AclEui64DumpVisitor visitor;
+-    data->visit(visitor);
+-    return visitor.contents;
++    SBufList sl;
++    for (auto i = eui64Data.cbegin(); i != eui64Data.end(); ++i) {
++        char buf[48];
++        i->encode(buf,48);
++        sl.push_back(SBuf(buf));
++    }
++    return sl;
+ }
+ 
+ #endif /* USE_SQUID_EUI */
+
+=== modified file 'src/acl/Eui64.h'
+--- src/acl/Eui64.h	2014-12-30 16:52:25 +0000
++++ src/acl/Eui64.h	2015-01-07 10:41:24 +0000
+@@ -13,6 +13,8 @@
+ #include "acl/Checklist.h"
+ #include "splay.h"
+ 
++#include <set>
++
+ namespace Eui
+ {
+ class Eui64;
+@@ -38,7 +40,8 @@
+ protected:
+     static Prototype RegistryProtoype;
+     static ACLEui64 RegistryEntry_;
+-    Splay<Eui::Eui64 *> *data;
++    typedef std::set<Eui::Eui64> Eui64Data_t;
++    Eui64Data_t eui64Data;
+     char const *class_;
+ };
+ 
+
+=== modified file 'src/acl/UserData.cc'
+--- src/acl/UserData.cc	2015-01-12 15:53:58 +0000
++++ src/acl/UserData.cc	2015-01-12 15:55:56 +0000
+@@ -13,39 +13,18 @@
+ #include "acl/UserData.h"
+ #include "ConfigParser.h"
+ #include "Debug.h"
++#include "globals.h"
+ #include "util.h"
+-
+-template<class T>
+-inline void
+-xRefFree(T &thing)
+-{
+-    xfree (thing);
+-}
++#include "SBufAlgos.h"
+ 
+ ACLUserData::~ACLUserData()
+ {
+-    if (names) {
+-        names->destroy(xRefFree);
+-        delete names;
+-    }
+-}
+-
+-static int
+-splaystrcasecmp (char * const &l, char * const &r)
+-{
+-    return strcasecmp ((char *)l,(char *)r);
+-}
+-
+-static int
+-splaystrcmp (char * const &l, char * const &r)
+-{
+-    return strcmp ((char *)l,(char *)r);
+ }
+ 
+ bool
+ ACLUserData::match(char const *user)
+ {
+-    debugs(28, 7, "aclMatchUser: user is " << user << ", case_insensitive is " << flags.case_insensitive);
++    debugs(28, 7, "user is " << user << ", case_insensitive is " << flags.case_insensitive);
+ 
+     if (user == NULL || strcmp(user, "-") == 0)
+         return 0;
+@@ -55,26 +34,11 @@
+         return 1;
+     }
+ 
+-    char * const *result;
+-
+-    if (flags.case_insensitive)
+-        result = names->find(const_cast<char *>(user), splaystrcasecmp);
+-    else
+-        result = names->find(const_cast<char *>(user), splaystrcmp);
+-
+-    /* Top=splay_splay(user,Top,(splayNode::SPLAYCMP *)dumping_strcmp); */
+-    debugs(28, 7, "aclMatchUser: returning " << (result != NULL));
+-
+-    return (result != NULL);
++    bool result = (userDataNames.find(SBuf(user)) != userDataNames.end());
++    debugs(28, 7, "returning " << result);
++    return result;
+ }
+ 
+-struct UserDataAclDumpVisitor {
+-    SBufList contents;
+-    void operator() (char * const & node_data) {
+-        contents.push_back(SBuf(node_data));
+-    }
+-};
+-
+ SBufList
+ ACLUserData::dump() const
+ {
+@@ -88,71 +52,84 @@
+     if (flags.case_insensitive)
+         sl.push_back(SBuf("-i"));
+ 
+-    /* damn this is VERY inefficient for long ACL lists... filling
+-     * a SBufList this way costs Sum(1,N) iterations. For instance
+-     * a 1000-elements list will be filled in 499500 iterations.
+-     */
+-    if (names) {
+-        UserDataAclDumpVisitor visitor;
+-        names->visit(visitor);
+-        sl.splice(sl.end(),visitor.contents);
+-    }
++    sl.insert(sl.end(), userDataNames.begin(), userDataNames.end());
+ 
++    debugs(28,5, "ACLUserData dump output: " << SBufContainerJoin(userDataNames,SBuf(" ")));
+     return sl;
+ }
+ 
++static bool
++CaseInsensitveSBufCompare(const SBuf &lhs, const SBuf &rhs)
++{
++    return (lhs.caseCmp(rhs) < 0);
++}
++
+ void
+ ACLUserData::parse()
+ {
+-    debugs(28, 2, "aclParseUserList: parsing user list");
+-
+-    if (!names)
+-        names = new Splay<char *>();
++    debugs(28, 2, "parsing user list");
+ 
+     char *t = NULL;
+     if ((t = ConfigParser::strtokFile())) {
+-        debugs(28, 5, "aclParseUserList: First token is " << t);
++        SBuf s(t);
++        debugs(28, 5, "first token is " << s);
+ 
+-        if (strcmp("-i", t) == 0) {
+-            debugs(28, 5, "aclParseUserList: Going case-insensitive");
++        if (s.cmp("-i",2) == 0) {
++            debugs(28, 5, "Going case-insensitive");
+             flags.case_insensitive = true;
+-        } else if (strcmp("REQUIRED", t) == 0) {
+-            debugs(28, 5, "aclParseUserList: REQUIRED-type enabled");
++            // due to how the std::set API work, if we want to change
++            // the comparison function we have to create a new std::set
++            UserDataNames_t newUdn(CaseInsensitveSBufCompare);
++            newUdn.insert(userDataNames.begin(), userDataNames.end());
++            swap(userDataNames,newUdn);
++        } else if (s.cmp("REQUIRED") == 0) {
++            debugs(28, 5, "REQUIRED-type enabled");
+             flags.required = true;
+         } else {
+             if (flags.case_insensitive)
+-                Tolower(t);
++                s.toLower();
+ 
+-            names->insert(xstrdup(t), splaystrcmp);
++            debugs(28, 6, "Adding user " << s);
++            userDataNames.insert(s);
+         }
+     }
+ 
+-    debugs(28, 3, "aclParseUserList: Case-insensitive-switch is " << flags.case_insensitive);
++    debugs(28, 3, "Case-insensitive-switch is " << flags.case_insensitive);
+     /* we might inherit from a previous declaration */
+ 
+-    debugs(28, 4, "aclParseUserList: parsing user list");
++    debugs(28, 4, "parsing following tokens");
+ 
+     while ((t = ConfigParser::strtokFile())) {
+-        debugs(28, 6, "aclParseUserList: Got token: " << t);
++        SBuf s(t);
++        debugs(28, 6, "Got token: " << s);
+ 
+         if (flags.case_insensitive)
+-            Tolower(t);
+-
+-        names->insert(xstrdup(t), splaystrcmp);
+-    }
++            s.toLower();
++
++        debugs(28, 6, "Adding user " << s);
++        userDataNames.insert(s);
++    }
++
++    if (flags.required && !userDataNames.empty()) {
++        debugs(28, DBG_PARSE_NOTE(1), "WARNING: detected attempt to add usernames to an acl of type REQUIRED");
++        userDataNames.clear();
++    }
++
++    debugs(28,4, "ACL contains " << userDataNames.size() << " users");
+ }
+ 
+ bool
+ ACLUserData::empty() const
+ {
+-    return (!names || names->empty()) && !flags.required;
++    debugs(28,6,"required: " << flags.required << ", number of users: " << userDataNames.size());
++    if (flags.required)
++        return false;
++    return userDataNames.empty();
+ }
+ 
+ ACLData<char const *> *
+ ACLUserData::clone() const
+ {
+-    /* Splay trees don't clone yet. */
+-    assert (!names);
+     return new ACLUserData;
+ }
+ 
+
+=== modified file 'src/acl/UserData.h'
+--- src/acl/UserData.h	2014-12-30 22:52:53 +0000
++++ src/acl/UserData.h	2015-01-07 18:06:15 +0000
+@@ -11,8 +11,11 @@
+ 
+ #include "acl/Acl.h"
+ #include "acl/Data.h"
++#include "SBuf.h"
+ #include "splay.h"
+ 
++#include <set>
++
+ class ACLUserData : public ACLData<char const *>
+ {
+     MEMPROXY_CLASS(ACLUserData);
+@@ -25,12 +28,16 @@
+     bool empty() const;
+     virtual ACLData<char const *> *clone() const;
+ 
+-    Splay<char *> *names;
++private:
++
++    typedef std::set<SBuf,bool(*)(const SBuf&, const SBuf&)> UserDataNames_t;
++    UserDataNames_t userDataNames;
+ 
+     struct {
+         bool case_insensitive;
+         bool required;
+     } flags;
++
+ };
+ 
+ #endif /* SQUID_ACLUSERDATA_H */
+
+=== modified file 'src/eui/Eui48.h'
+--- src/eui/Eui48.h	2014-12-30 14:59:16 +0000
++++ src/eui/Eui48.h	2015-01-06 17:45:21 +0000
+@@ -30,6 +30,8 @@
+ public:
+     Eui48() { clear(); }
+     Eui48(const Eui48 &t) { memcpy(this, &t, sizeof(Eui48)); }
++    bool operator== (const Eui48 &t) const { return memcmp(eui, t.eui, SZ_EUI48_BUF) == 0; }
++    bool operator< (const Eui48 &t) const { return memcmp(eui, t.eui, SZ_EUI48_BUF) < 0; }
+     ~Eui48() {}
+ 
+     const unsigned char *get(void);
+
+=== modified file 'src/eui/Eui64.h'
+--- src/eui/Eui64.h	2014-12-30 16:52:25 +0000
++++ src/eui/Eui64.h	2015-01-07 10:41:24 +0000
+@@ -37,6 +37,9 @@
+ public:
+     Eui64() { clear(); }
+     Eui64(const Eui64 &t) { memcpy(this, &t, sizeof(Eui64)); }
++    Eui64& operator= (const Eui64 &t) {memcpy(this, &t, sizeof(Eui64)); return *this;}
++    bool operator== (const Eui64 &t) const { return (memcmp(eui,t.eui,SZ_EUI64_BUF) == 0); }
++    bool operator< (const Eui64 &t) const { return (memcmp(eui,t.eui,SZ_EUI64_BUF) < 0); }
+     ~Eui64() {}
+ 
+     const unsigned char *get(void);
+
+# Begin bundle
+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

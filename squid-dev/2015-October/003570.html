@@ -1,0 +1,2665 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] external_acl_type logformat tokens
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20external_acl_type%20logformat%20tokens&In-Reply-To=%3C560F933B.8040804%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="003569.html">
+   <LINK REL="Next"  HREF="003580.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] external_acl_type logformat tokens</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20external_acl_type%20logformat%20tokens&In-Reply-To=%3C560F933B.8040804%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] external_acl_type logformat tokens">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Sat Oct  3 08:35:07 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003569.html">[squid-dev] Jenkins build is back to normal : trunk-polygraph #884
+</A></li>
+        <LI>Next message: <A HREF="003580.html">[squid-dev] [PATCH] external_acl_type logformat tokens
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3570">[ date ]</a>
+              <a href="thread.html#3570">[ thread ]</a>
+              <a href="subject.html#3570">[ subject ]</a>
+              <a href="author.html#3570">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Update the external_acl_type helper interface to use libformat and thus
+make any logformat token valid in its format parameter field.
+
+As a result much of the logic surrounding format code parsing, display
+and helper query generation has been completely dropped. What remains is
+a basic parse loop handling backward compatibility for the unusual
+%CERT_* token syntax, space delimiter and field default encodings.
+
+
+Extensions to logformat resulting from the merger:
+
+* adds \-escape encoding of output fields
+
+* allows {arg} field to be placed before or after the format code.
+
+* extended to accept the old external_acl_type %macros. But not
+documented, these are deprecated and only for backward compatibility.
+
+* extended to support outputting formats without a format-name prefix.
+
+
+The major side effect of this change is that these ACLs now require
+AccessLogEntry to be filled out with state data, rather than just the
+ACLChecklist object members.
+
+The requires*() mechanism of ACLChecklist has been extended to catch
+some cases resulting from missing the ALE entirely. But it cannot catch
+the more subtle problem of data members inside the ALE being unset.
+
+
+I have given it some basic testing and the commonly used %macros work
+fine for the common use cases. So I believe it is suitable for inclusion
+into trunk. But this definitely needs wider testing to catch uncommon
+and rare edge cases where the ALE object is not filled out early enough,
+or not presented by the checklist.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/AccessLogEntry.h'
+--- src/AccessLogEntry.h	2015-09-14 16:25:05 +0000
++++ src/AccessLogEntry.h	2015-10-02 10:25:46 +0000
+@@ -186,43 +186,50 @@
+     /** \brief This subclass holds general adaptation log info.
+      * \todo Inner class declarations should be moved outside.
+      */
+     class AdaptationDetails
+     {
+ 
+     public:
+         AdaptationDetails(): last_meta(NULL) {}
+ 
+         /// image of the last ICAP response header or eCAP meta received
+         char *last_meta;
+     } adapt;
+ #endif
+ 
+     // Why is this a sub-class and not a set of real &quot;private:&quot; fields?
+     // TODO: shuffle this to the relevant ICP/HTCP protocol section
+     class Private
+     {
+ 
+     public:
+-        Private() : method_str(NULL) {}
++        Private() : method_str(NULL), lastAclName(NULL), lastAclData(NULL) {}
++        ~Private() {
++            safe_free(lastAclName);
++            safe_free(lastAclData);
++        }
+ 
+         const char *method_str;
++        const char *lastAclName; ///&lt; string for external_acl_type %ACL format code
++        const char *lastAclData; ///&lt; string for external_acl_type %DATA format code
++
+     } _private;
+     HierarchyLogEntry hier;
+     HttpReply *reply;
+     HttpRequest *request; //&lt; virgin HTTP request
+     HttpRequest *adapted_request; //&lt; HTTP request after adaptation and redirection
+ 
+     /// key:value pairs set by squid.conf note directive and
+     /// key=value pairs returned from URL rewrite/redirect helper
+     NotePairs::Pointer notes;
+ 
+ #if ICAP_CLIENT
+     /** \brief This subclass holds log info for ICAP part of request
+      *  \todo Inner class declarations should be moved outside
+      */
+     class IcapLogEntry
+     {
+     public:
+         IcapLogEntry() : reqMethod(Adaptation::methodNone), bytesSent(0), bytesRead(0),
+             bodyBytesRead(-1), request(NULL), reply(NULL),
+             outcome(Adaptation::Icap::xoUnknown), resStatus(Http::scNone)
+
+=== modified file 'src/ExternalACL.h'
+--- src/ExternalACL.h	2015-02-04 16:45:30 +0000
++++ src/ExternalACL.h	2015-05-29 10:33:44 +0000
+@@ -34,40 +34,41 @@
+ 
+ #include &quot;acl/Acl.h&quot;
+ 
+ class ACLExternal : public ACL
+ {
+     MEMPROXY_CLASS(ACLExternal);
+ 
+ public:
+     static void ExternalAclLookup(ACLChecklist * ch, ACLExternal *);
+ 
+     ACLExternal(char const *);
+     ACLExternal(ACLExternal const &amp;);
+     ~ACLExternal();
+     ACLExternal&amp;operator=(ACLExternal const &amp;);
+ 
+     virtual ACL *clone()const;
+     virtual char const *typeString() const;
+     virtual void parse();
+     virtual int match(ACLChecklist *checklist);
+     /* This really should be dynamic based on the external class defn */
++    virtual bool requiresAleXXX() const {return true;}
+     virtual bool requiresRequest() const {return true;}
+ 
+     /* when requiresRequest is made dynamic, review this too */
+     //    virtual bool requiresReply() const {return true;}
+     virtual bool isProxyAuth() const;
+     virtual SBufList dump() const;
+     virtual bool valid () const;
+     virtual bool empty () const;
+ 
+ protected:
+     static Prototype RegistryProtoype;
+     static ACLExternal RegistryEntry_;
+     external_acl_data *data;
+     char const *class_;
+ };
+ 
+ void parse_externalAclHelper(external_acl **);
+ void dump_externalAclHelper(StoreEntry * sentry, const char *name, const external_acl *);
+ void free_externalAclHelper(external_acl **);
+ typedef void EAH(void *data, const ExternalACLEntryPointer &amp;result);
+
+=== modified file 'src/Makefile.am'
+--- src/Makefile.am	2015-09-25 10:12:56 +0000
++++ src/Makefile.am	2015-09-28 00:41:05 +0000
+@@ -3445,40 +3445,41 @@
+ 	HttpHeader.h \
+ 	HttpHeader.cc \
+ 	HttpHeaderFieldInfo.h \
+ 	HttpHeaderTools.h \
+ 	HttpHeaderTools.cc \
+ 	HttpMsg.cc \
+ 	HttpReply.cc \
+ 	PeerPoolMgr.h \
+ 	PeerPoolMgr.cc \
+ 	RequestFlags.h \
+ 	RequestFlags.cc \
+ 	HttpRequest.cc \
+ 	icp_v2.cc \
+ 	icp_v3.cc \
+ 	$(IPC_SOURCE) \
+ 	ipcache.cc \
+ 	int.h \
+ 	int.cc \
+ 	internal.h \
+ 	internal.cc \
++	tests/stub_libeui.cc \
+ 	LogTags.cc \
+ 	SquidList.h \
+ 	SquidList.cc \
+ 	MasterXaction.cc \
+ 	MasterXaction.h \
+ 	multicast.h \
+ 	multicast.cc \
+ 	mem_node.cc \
+ 	MemBuf.cc \
+ 	MemObject.cc \
+ 	mime.h \
+ 	mime.cc \
+ 	mime_header.h \
+ 	mime_header.cc \
+ 	neighbors.h \
+ 	neighbors.cc \
+ 	Notes.h \
+ 	Notes.cc \
+ 	Parsing.cc \
+ 	pconn.cc \
+
+=== modified file 'src/acl/Acl.cc'
+--- src/acl/Acl.cc	2015-08-24 14:20:07 +0000
++++ src/acl/Acl.cc	2015-09-30 09:36:05 +0000
+@@ -136,41 +136,44 @@
+     *name = 0;
+ }
+ 
+ bool ACL::valid () const
+ {
+     return true;
+ }
+ 
+ bool
+ ACL::matches(ACLChecklist *checklist) const
+ {
+     PROF_start(ACL_matches);
+     debugs(28, 5, &quot;checking &quot; &lt;&lt; name);
+ 
+     // XXX: AclMatchedName does not contain a matched ACL name when the acl
+     // does not match. It contains the last (usually leaf) ACL name checked
+     // (or is NULL if no ACLs were checked).
+     AclMatchedName = name;
+ 
+     int result = 0;
+-    if (!checklist-&gt;hasRequest() &amp;&amp; requiresRequest()) {
++    if (!checklist-&gt;hasAleXXX() &amp;&amp; requiresAleXXX()) {
++        debugs(28, DBG_IMPORTANT, &quot;WARNING: &quot; &lt;&lt; name &lt;&lt; &quot; ACL is used in &quot; &lt;&lt;
++               &quot;context without an ALE state. Assuming mismatch.&quot;);
++    } else if (!checklist-&gt;hasRequest() &amp;&amp; requiresRequest()) {
+         debugs(28, DBG_IMPORTANT, &quot;WARNING: &quot; &lt;&lt; name &lt;&lt; &quot; ACL is used in &quot; &lt;&lt;
+                &quot;context without an HTTP request. Assuming mismatch.&quot;);
+     } else if (!checklist-&gt;hasReply() &amp;&amp; requiresReply()) {
+         debugs(28, DBG_IMPORTANT, &quot;WARNING: &quot; &lt;&lt; name &lt;&lt; &quot; ACL is used in &quot; &lt;&lt;
+                &quot;context without an HTTP response. Assuming mismatch.&quot;);
+     } else {
+         // have to cast because old match() API is missing const
+         result = const_cast&lt;ACL*&gt;(this)-&gt;match(checklist);
+     }
+ 
+     const char *extra = checklist-&gt;asyncInProgress() ? &quot; async&quot; : &quot;&quot;;
+     debugs(28, 3, &quot;checked: &quot; &lt;&lt; name &lt;&lt; &quot; = &quot; &lt;&lt; result &lt;&lt; extra);
+     PROF_stop(ACL_matches);
+     return result == 1; // true for match; false for everything else
+ }
+ 
+ void
+ ACL::context(const char *aName, const char *aCfgLine)
+ {
+     name[0] = '\0';
+@@ -351,40 +354,46 @@
+ 
+ void
+ aclCacheMatchFlush(dlink_list * cache)
+ {
+     acl_proxy_auth_match_cache *auth_match;
+     dlink_node *link, *tmplink;
+     link = cache-&gt;head;
+ 
+     debugs(28, 8, &quot;aclCacheMatchFlush called for cache &quot; &lt;&lt; cache);
+ 
+     while (link) {
+         auth_match = (acl_proxy_auth_match_cache *)link-&gt;data;
+         tmplink = link;
+         link = link-&gt;next;
+         dlinkDelete(tmplink, cache);
+         delete auth_match;
+     }
+ }
+ 
+ bool
++ACL::requiresAleXXX() const
++{
++    return false;
++}
++
++bool
+ ACL::requiresReply() const
+ {
+     return false;
+ }
+ 
+ bool
+ ACL::requiresRequest() const
+ {
+     return false;
+ }
+ 
+ /*********************/
+ /* Destroy functions */
+ /*********************/
+ 
+ ACL::~ACL()
+ {
+     debugs(28, 3, &quot;freeing ACL &quot; &lt;&lt; name);
+     safe_free(cfgline);
+     AclMatchedName = NULL; // in case it was pointing to our name
+
+=== modified file 'src/acl/Acl.h'
+--- src/acl/Acl.h	2015-08-24 14:20:07 +0000
++++ src/acl/Acl.h	2015-09-28 00:41:05 +0000
+@@ -124,40 +124,42 @@
+         ~Prototype();
+         static bool Registered(char const *);
+         static ACL *Factory(char const *);
+ 
+     private:
+         ACL const *prototype;
+         char const *typeString;
+ 
+     private:
+         static std::vector&lt;Prototype const *&gt; * Registry;
+         static void *Initialized;
+         typedef std::vector&lt;Prototype const*&gt;::iterator iterator;
+         typedef std::vector&lt;Prototype const*&gt;::const_iterator const_iterator;
+         void registerMe();
+     };
+ 
+ private:
+     /// Matches the actual data in checklist against this ACL.
+     virtual int match(ACLChecklist *checklist) = 0; // XXX: missing const
+ 
++    /// whether our (i.e. shallow) match() requires checklist to have a AccessLogEntry
++    virtual bool requiresAleXXX() const;
+     /// whether our (i.e. shallow) match() requires checklist to have a request
+     virtual bool requiresRequest() const;
+     /// whether our (i.e. shallow) match() requires checklist to have a reply
+     virtual bool requiresReply() const;
+ };
+ 
+ /// \ingroup ACLAPI
+ typedef enum {
+     // Authorization ACL result states
+     ACCESS_DENIED,
+     ACCESS_ALLOWED,
+     ACCESS_DUNNO,
+ 
+     // Authentication ACL result states
+     ACCESS_AUTH_REQUIRED,    // Missing Credentials
+ } aclMatchCode;
+ 
+ /// \ingroup ACLAPI
+ /// ACL check answer; TODO: Rename to Acl::Answer
+ class allow_t
+
+=== modified file 'src/acl/Checklist.h'
+--- src/acl/Checklist.h	2015-08-30 20:36:48 +0000
++++ src/acl/Checklist.h	2015-09-28 00:41:05 +0000
+@@ -146,40 +146,41 @@
+     /// whether markFinished() was called
+     bool finished() const { return finished_; }
+     /// async call has been started and has not finished (or failed) yet
+     bool asyncInProgress() const { return asyncStage_ != asyncNone; }
+     /// called when no more ACLs should be checked; sets the final answer and
+     /// prints a debugging message explaining the reason for that answer
+     void markFinished(const allow_t &amp;newAnswer, const char *reason);
+ 
+     const allow_t &amp;currentAnswer() const { return allow_; }
+ 
+     /// whether the action is banned or not
+     bool bannedAction(const allow_t &amp;action) const;
+     /// add action to the list of banned actions
+     void banAction(const allow_t &amp;action);
+ 
+     // XXX: ACLs that need request or reply have to use ACLFilledChecklist and
+     // should do their own checks so that we do not have to povide these two
+     // for ACL::checklistMatches to use
+     virtual bool hasRequest() const = 0;
+     virtual bool hasReply() const = 0;
++    virtual bool hasAleXXX() const = 0;
+ 
+     /// change the current ACL list
+     /// \return a pointer to the old list value (may be nullptr)
+     const Acl::Tree *changeAcl(const Acl::Tree *t) {
+         const Acl::Tree *old = accessList;
+         if (t != accessList) {
+             cbdataReferenceDone(accessList);
+             accessList = cbdataReference(t);
+         }
+         return old;
+     }
+ 
+ private:
+     /// Calls non-blocking check callback with the answer and destroys self.
+     void checkCallback(allow_t answer);
+ 
+     void matchAndFinish();
+ 
+     void changeState(AsyncState *);
+     AsyncState *asyncState() const;
+
+=== modified file 'src/acl/FilledChecklist.h'
+--- src/acl/FilledChecklist.h	2015-09-14 16:25:05 +0000
++++ src/acl/FilledChecklist.h	2015-09-28 00:41:05 +0000
+@@ -45,67 +45,68 @@
+     ConnStateData * conn() const;
+ 
+     /// The client side fd. It uses conn() if available
+     int fd() const;
+ 
+     /// set either conn
+     void conn(ConnStateData *);
+     /// set the client side FD
+     void fd(int aDescriptor);
+ 
+     //int authenticated();
+ 
+     bool destinationDomainChecked() const;
+     void markDestinationDomainChecked();
+     bool sourceDomainChecked() const;
+     void markSourceDomainChecked();
+ 
+     // ACLChecklist API
+     virtual bool hasRequest() const { return request != NULL; }
+     virtual bool hasReply() const { return reply != NULL; }
++    virtual bool hasAleXXX() const { return al != NULL; }
+ 
+ public:
+     Ip::Address src_addr;
+     Ip::Address dst_addr;
+     Ip::Address my_addr;
+     SBuf dst_peer_name;
+     char *dst_rdns;
+ 
+     HttpRequest *request;
+     HttpReply *reply;
+ 
+     char rfc931[USER_IDENT_SZ];
+ #if USE_AUTH
+     Auth::UserRequest::Pointer auth_user_request;
+ #endif
+ #if SQUID_SNMP
+     char *snmp_community;
+ #endif
+ 
+ #if USE_OPENSSL
+     /// SSL [certificate validation] errors, in undefined order
+     Ssl::CertErrors *sslErrors;
+     /// The peer certificate
+     Security::CertPointer serverCert;
+ #endif
+ 
+-    AccessLogEntry::Pointer al; ///&lt; info for the future access.log entry
++    AccessLogEntry::Pointer al; ///&lt; info for the future access.log, and external ACL
+ 
+     ExternalACLEntryPointer extacl_entry;
+ 
+     err_type requestErrorType;
+ 
+ private:
+     ConnStateData * conn_;          /**&lt; hack for ident and NTLM */
+     int fd_;                        /**&lt; may be available when conn_ is not */
+     bool destinationDomainChecked_;
+     bool sourceDomainChecked_;
+     /// not implemented; will cause link failures if used
+     ACLFilledChecklist(const ACLFilledChecklist &amp;);
+     /// not implemented; will cause link failures if used
+     ACLFilledChecklist &amp;operator=(const ACLFilledChecklist &amp;);
+ };
+ 
+ /// convenience and safety wrapper for dynamic_cast&lt;ACLFilledChecklist*&gt;
+ inline
+ ACLFilledChecklist *Filled(ACLChecklist *checklist)
+ {
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2015-08-30 01:07:47 +0000
++++ src/cf.data.pre	2015-10-02 10:15:34 +0000
+@@ -700,141 +700,111 @@
+ DOC_END
+ 
+ COMMENT_START
+  ACCESS CONTROLS
+  -----------------------------------------------------------------------------
+ COMMENT_END
+ 
+ NAME: external_acl_type
+ TYPE: externalAclHelper
+ LOC: Config.externalAclHelperList
+ DEFAULT: none
+ DOC_START
+ 	This option defines external acl classes using a helper program
+ 	to look up the status
+ 
+ 	  external_acl_type name [options] FORMAT.. /path/to/helper [helper arguments..]
+ 
+ 	Options:
+ 
+ 	  ttl=n		TTL in seconds for cached results (defaults to 3600
+-	  		for 1 hour)
++			for 1 hour)
+ 
+ 	  negative_ttl=n
+-	  		TTL for cached negative lookups (default same
+-	  		as ttl)
++			TTL for cached negative lookups (default same
++			as ttl)
+ 
+ 	  grace=n	Percentage remaining of TTL where a refresh of a
+ 			cached entry should be initiated without needing to
+ 			wait for a new reply. (default is for no grace period)
+ 
+ 	  cache=n	Limit the result cache size, default is 262144.
+ 			The expanded FORMAT value is used as the cache key, so
+ 			if the details in FORMAT are highly variable a larger
+ 			cache may be needed to produce reduction in helper load.
+ 
+ 	  children-max=n
+ 			Maximum number of acl helper processes spawned to service
+ 			external acl lookups of this type. (default 20)
+ 
+ 	  children-startup=n
+ 			Minimum number of acl helper processes to spawn during
+ 			startup and reconfigure to service external acl lookups
+ 			of this type. (default 0)
+ 
+ 	  children-idle=n
+ 			Number of acl helper processes to keep ahead of traffic
+ 			loads. Squid will spawn this many at once whenever load
+ 			rises above the capabilities of existing processes.
+ 			Up to the value of children-max. (default 1)
+ 
+ 	  concurrency=n	concurrency level per process. Only used with helpers
+ 			capable of processing more than one query at a time.
+ 
+ 	  queue-size=N  The queue-size= option sets the maximum number of queued
+ 			requests. If the queued requests exceed queue size 
+ 			the acl is ignored.
+ 			The default value is set to 2*children-max.
+ 
+ 	  protocol=2.5	Compatibility mode for Squid-2.5 external acl helpers.
+ 
+ 	  ipv4 / ipv6	IP protocol used to communicate with this helper.
+ 			The default is to auto-detect IPv6 and use it when available.
+ 
+ 
+-	FORMAT specifications
++	FORMAT is a series of %macro codes. See logformat directive for a full list
++	of the accepted codes. Although note that at the time of any external ACL
++	being tested data may not be available and thus some %macro expand to '-'.
+ 
+-	  %LOGIN	Authenticated user login name
+-	  %un		A user name. Expands to the first available name
+-	  		from the following list of information sources:
+-			- authenticated user name, like %ul or %LOGIN
+-			- user name sent by an external ACL, like %EXT_USER
+-			- SSL client name, like %us in logformat
+-			- ident user name, like %ui in logformat
+-	  %EXT_USER	Username from previous external acl
+-	  %EXT_LOG	Log details from previous external acl
+-	  %EXT_TAG	Tag from previous external acl
+-	  %IDENT	Ident user name
+-	  %SRC		Client IP
+-	  %SRCPORT	Client source port
+-	  %URI		Requested URI
+-	  %DST		Requested host
+-	  %PROTO	Requested URL scheme
+-	  %PORT		Requested port
+-	  %PATH		Requested URL path
+-	  %METHOD	Request method
+-	  %MYADDR	Squid interface address
+-	  %MYPORT	Squid http_port number
+-	  %PATH		Requested URL-path (including query-string if any)
+-	  %USER_CERT	SSL User certificate in PEM format
+-	  %USER_CERTCHAIN SSL User certificate chain in PEM format
+-	  %USER_CERT_xx	SSL User certificate subject attribute xx
+-	  %USER_CA_CERT_xx SSL User certificate issuer attribute xx
+-	  %ssl::&gt;sni	SSL client SNI sent to Squid
+-	  %ssl::&lt;cert_subject SSL server certificate DN
+-	  %ssl::&lt;cert_issuer SSL server certificate issuer DN
+-
+-	  %&gt;{Header}	HTTP request header &quot;Header&quot;
+-	  %&gt;{Hdr:member}
+-	  		HTTP request header &quot;Hdr&quot; list member &quot;member&quot;
+-	  %&gt;{Hdr:;member}
+-	  		HTTP request header list member using ; as
+-	  		list separator. ; can be any non-alphanumeric
+-			character.
+-
+-	  %&lt;{Header}	HTTP reply header &quot;Header&quot;
+-	  %&lt;{Hdr:member}
+-	  		HTTP reply header &quot;Hdr&quot; list member &quot;member&quot;
+-	  %&lt;{Hdr:;member}
+-	  		HTTP reply header list member using ; as
+-	  		list separator. ; can be any non-alphanumeric
+-			character.
++	In addition to the logformat codes; when processing external ACLs these
++	additional macros are made available:
+ 
+ 	  %ACL		The name of the ACL being tested.
+-	  %DATA		The ACL arguments. If not used then any arguments
+-			is automatically added at the end of the line
+-			sent to the helper.
+-			NOTE: this will encode the arguments as one token,
+-			whereas the default will pass each separately.
+ 
+-	  %%		The percent sign. Useful for helpers which need
+-			an unchanging input format.
++	  %DATA		The ACL arguments. If a logformat encoding modifier
++			is used it will encode the whole set of arguments
++			as a single token.
++
++			If not used; then any arguments are automatically
++			added at the end of the line sent to the helper
++			as separately URL-encoded fields.
++
++	If SSL is enabled, the following formating codes become available:
++
++	  %USER_CERT		SSL User certificate in PEM format
++	  %USER_CERTCHAIN	SSL User certificate chain in PEM format
++	  %USER_CERT_xx		SSL User certificate subject attribute xx
++	  %USER_CA_CERT_xx	SSL User certificate issuer attribute xx
++
++
++	NOTE: all other format codes accepted by older Squid versions
++		are deprecated.
+ 
+ 
+ 	General request syntax:
+ 
+ 	  [channel-ID] FORMAT-values [acl-values ...]
+ 
+ 
+ 	FORMAT-values consists of transaction details expanded with
+ 	whitespace separation per the config file FORMAT specification
+ 	using the FORMAT macros listed above.
+ 
+ 	acl-values consists of any string specified in the referencing
+ 	config 'acl ... external' line. see the &quot;acl external&quot; directive.
+ 
+ 	Request values sent to the helper are URL escaped to protect
+ 	each value in requests against whitespaces.
+ 
+ 	If using protocol=2.5 then the request sent to the helper is not
+ 	URL escaped to protect against whitespace.
+ 
+@@ -868,43 +838,43 @@
+ 		An internal error occurred in the helper, preventing
+ 		a result being identified.
+ 
+ 	The meaning of 'a match' is determined by your squid.conf
+ 	access control configuration. See the Squid wiki for details.
+ 
+ 	Defined keywords:
+ 
+ 	  user=		The users name (login)
+ 
+ 	  password=	The users password (for login= cache_peer option)
+ 
+ 	  message=	Message describing the reason for this response.
+ 			Available as %o in error pages.
+ 			Useful on (ERR and BH results).
+ 
+ 	  tag=		Apply a tag to a request. Only sets a tag once,
+ 			does not alter existing tags.
+ 
+ 	  log=		String to be logged in access.log. Available as
+-	  		%ea in logformat specifications.
++			%ea in logformat specifications.
+ 
+-  	  clt_conn_tag= Associates a TAG with the client TCP connection.
++	  clt_conn_tag= Associates a TAG with the client TCP connection.
+ 			Please see url_rewrite_program related documentation
+ 			for this kv-pair.
+ 
+ 	Any keywords may be sent on any response whether OK, ERR or BH.
+ 
+ 	All response keyword values need to be a single token with URL
+ 	escaping, or enclosed in double quotes (&quot;) and escaped using \ on
+ 	any double quotes or \ characters within the value. The wrapping
+ 	double quotes are removed before the value is interpreted by Squid.
+ 	\r and \n are also replace by CR and LF.
+ 
+ 	Some example key values:
+ 
+ 		user=John%20Smith
+ 		user=&quot;John Smith&quot;
+ 		user=&quot;J. \&quot;Bob\&quot; Smith&quot;
+ DOC_END
+ 
+ NAME: acl
+ TYPE: acl
+@@ -4064,55 +4034,57 @@
+ NAME: logformat
+ TYPE: logformat
+ LOC: Log::TheConfig
+ DEFAULT: none
+ DEFAULT_DOC: The format definitions squid, common, combined, referrer, useragent are built in.
+ DOC_START
+ 	Usage:
+ 
+ 	logformat &lt;name&gt; &lt;format specification&gt;
+ 
+ 	Defines an access log format.
+ 
+ 	The &lt;format specification&gt; is a string with embedded % format codes
+ 
+ 	% format codes all follow the same basic structure where all but
+ 	the formatcode is optional. Output strings are automatically escaped
+ 	as required according to their context and the output format
+ 	modifiers are usually not needed, but can be specified if an explicit
+ 	output format is desired.
+ 
+-		% [&quot;|[|'|#] [-] [[0]width] [{argument}] formatcode
++		% [&quot;|[|'|#|/] [-] [[0]width] [{arg}] formatcode [{arg}]
+ 
+ 		&quot;	output in quoted string format
+ 		[	output in squid text log format as used by log_mime_hdrs
+ 		#	output in URL quoted format
++		/	output in shell \-escaped format
+ 		'	output as-is
+ 
+ 		-	left aligned
+ 
+ 		width	minimum and/or maximum field width:
+ 			    [width_min][.width_max]
+ 			When minimum starts with 0, the field is zero-padded.
+ 			String values exceeding maximum width are truncated.
+ 
+-		{arg}	argument such as header name etc
++		{arg}	argument such as header name etc. This field may be
++			placed before or after the token, but not both at once.
+ 
+ 	Format codes:
+ 
+ 		%	a literal % character
+ 		sn	Unique sequence number per log line entry
+ 		err_code    The ID of an error response served by Squid or
+ 				a similar internal error identifier.
+ 		err_detail  Additional err_code-dependent error information.
+ 		note	The annotation specified by the argument. Also
+ 			logs the adaptation meta headers set by the
+ 			adaptation_meta configuration parameter.
+ 			If no argument given all annotations logged.
+ 			The argument may include a separator to use with
+ 			annotation values:
+                             name[:separator]
+ 			By default, multiple note values are separated with &quot;,&quot;
+ 			and multiple notes are separated with &quot;\r\n&quot;.
+ 			When logging named notes with %{name}note, the
+ 			explicitly configured separator is used between note
+ 			values. When logging all notes with %note, the
+
+=== modified file 'src/external_acl.cc'
+--- src/external_acl.cc	2015-09-25 05:07:55 +0000
++++ src/external_acl.cc	2015-10-02 10:13:22 +0000
+@@ -1,41 +1,42 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 82    External ACL */
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;acl/Acl.h&quot;
+ #include &quot;acl/FilledChecklist.h&quot;
+ #include &quot;cache_cf.h&quot;
+ #include &quot;client_side.h&quot;
++#include &quot;client_side_request.h&quot;
+ #include &quot;comm/Connection.h&quot;
+ #include &quot;ConfigParser.h&quot;
+ #include &quot;ExternalACL.h&quot;
+ #include &quot;ExternalACLEntry.h&quot;
+ #include &quot;fde.h&quot;
+-#include &quot;format/ByteCode.h&quot;
++#include &quot;format/Token.h&quot;
+ #include &quot;helper.h&quot;
+ #include &quot;helper/Reply.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;ip/tools.h&quot;
+ #include &quot;MemBuf.h&quot;
+ #include &quot;mgr/Registration.h&quot;
+ #include &quot;rfc1738.h&quot;
+ #include &quot;SquidConfig.h&quot;
+ #include &quot;SquidString.h&quot;
+ #include &quot;SquidTime.h&quot;
+ #include &quot;Store.h&quot;
+ #include &quot;tools.h&quot;
+ #include &quot;URL.h&quot;
+ #include &quot;wordlist.h&quot;
+ #if USE_OPENSSL
+ #include &quot;ssl/ServerBump.h&quot;
+ #include &quot;ssl/support.h&quot;
+ #endif
+@@ -49,427 +50,301 @@
+ #endif
+ 
+ #ifndef DEFAULT_EXTERNAL_ACL_TTL
+ #define DEFAULT_EXTERNAL_ACL_TTL 1 * 60 * 60
+ #endif
+ #ifndef DEFAULT_EXTERNAL_ACL_CHILDREN
+ #define DEFAULT_EXTERNAL_ACL_CHILDREN 5
+ #endif
+ 
+ static char *makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data);
+ static void external_acl_cache_delete(external_acl * def, const ExternalACLEntryPointer &amp;entry);
+ static int external_acl_entry_expired(external_acl * def, const ExternalACLEntryPointer &amp;entry);
+ static int external_acl_grace_expired(external_acl * def, const ExternalACLEntryPointer &amp;entry);
+ static void external_acl_cache_touch(external_acl * def, const ExternalACLEntryPointer &amp;entry);
+ static ExternalACLEntryPointer external_acl_cache_add(external_acl * def, const char *key, ExternalACLEntryData const &amp;data);
+ 
+ /******************************************************************
+  * external_acl directive
+  */
+ 
+-class external_acl_format : public RefCountable
+-{
+-    MEMPROXY_CLASS(external_acl_format);
+-
+-public:
+-    typedef RefCount&lt;external_acl_format&gt; Pointer;
+-
+-    external_acl_format() :
+-        type(Format::LFT_NONE),
+-        header(nullptr),
+-        member(nullptr),
+-        separator(' '),
+-        header_id(Http::HdrType::BAD_HDR)
+-    {}
+-    ~external_acl_format() {
+-        xfree(header);
+-        xfree(member);
+-    }
+-
+-    Format::ByteCode_t type;
+-    external_acl_format::Pointer next;
+-    char *header;
+-    char *member;
+-    char separator;
+-    Http::HdrType header_id;
+-};
+-
+ class external_acl
+ {
+     /* FIXME: These are not really cbdata, but it is an easy way
+      * to get them pooled, refcounted, accounted and freed properly...
+      */
+     CBDATA_CLASS(external_acl);
+ 
+ public:
+     external_acl();
+     ~external_acl();
+ 
+     external_acl *next;
+ 
+     void add(const ExternalACLEntryPointer &amp;);
+ 
+     void trimCache();
+ 
+     int ttl;
+ 
+     int negative_ttl;
+ 
+     int grace;
+ 
+     char *name;
+ 
+-    external_acl_format::Pointer format;
++    Format::Format format;
+ 
+     wordlist *cmdline;
+ 
+     Helper::ChildConfig children;
+ 
+     helper *theHelper;
+ 
+     hash_table *cache;
+ 
+     dlink_list lru_list;
+ 
+     int cache_size;
+ 
+     int cache_entries;
+ 
+     dlink_list queue;
+ 
+ #if USE_AUTH
+     /**
+      * Configuration flag. May only be altered by the configuration parser.
+      *
+      * Indicates that all uses of this external_acl_type helper require authentication
+      * details to be processed. If none are available its a fail match.
+      */
+     bool require_auth;
+ #endif
+ 
+-    enum {
+-        QUOTE_METHOD_SHELL = 1,
+-        QUOTE_METHOD_URL
+-    } quote;
++    Format::Quoting quote; // default quoting to use, set by protocol= parameter
+ 
+     Ip::Address local_addr;
+ };
+ 
+ CBDATA_CLASS_INIT(external_acl);
+ 
+ external_acl::external_acl() :
+     next(NULL),
+     ttl(DEFAULT_EXTERNAL_ACL_TTL),
+     negative_ttl(-1),
+     grace(1),
+     name(NULL),
++    format(&quot;external_acl_type&quot;),
+     cmdline(NULL),
+     children(DEFAULT_EXTERNAL_ACL_CHILDREN),
+     theHelper(NULL),
+     cache(NULL),
+     cache_size(256*1024),
+     cache_entries(0),
+ #if USE_AUTH
+     require_auth(0),
+ #endif
+-    quote(external_acl::QUOTE_METHOD_URL)
++    quote(Format::LOG_QUOTE_URL)
+ {
+     local_addr.setLocalhost();
+ }
+ 
+ external_acl::~external_acl()
+ {
+     xfree(name);
+-    format = NULL;
+     wordlistDestroy(&amp;cmdline);
+ 
+     if (theHelper) {
+         helperShutdown(theHelper);
+         delete theHelper;
+         theHelper = NULL;
+     }
+ 
+     while (lru_list.tail) {
+         ExternalACLEntryPointer e(static_cast&lt;ExternalACLEntry *&gt;(lru_list.tail-&gt;data));
+         external_acl_cache_delete(this, e);
+     }
+     if (cache)
+         hashFreeMemory(cache);
+ 
+     while (next) {
+         external_acl *node = next;
+         next = node-&gt;next;
+         node-&gt;next = NULL; // prevent recursion
+         delete node;
+     }
+ }
+ 
+-/**
+- * Parse the External ACL format %&lt;{.*} and %&gt;{.*} token(s) to pass a specific
+- * request or reply header to external helper.
+- *
+- \param header   - the token being parsed (without the identifying prefix)
+- \param type     - format enum identifier for this element, pulled from identifying prefix
+- \param format   - structure to contain all the info about this format element.
+- */
+-void
+-parse_header_token(external_acl_format::Pointer format, char *header, const Format::ByteCode_t type)
+-{
+-    /* header format */
+-    char *member, *end;
+-
+-    /** Cut away the closing brace */
+-    end = strchr(header, '}');
+-    if (end &amp;&amp; strlen(end) == 1)
+-        *end = '\0';
+-    else
+-        self_destruct();
+-
+-    member = strchr(header, ':');
+-
+-    if (member) {
+-        /* Split in header and member */
+-        *member = '\0';
+-        ++member;
+-
+-        if (!xisalnum(*member)) {
+-            format-&gt;separator = *member;
+-            ++member;
+-        } else {
+-            format-&gt;separator = ',';
+-        }
+-
+-        format-&gt;member = xstrdup(member);
+-
+-        if (type == Format::LFT_ADAPTED_REQUEST_HEADER)
+-            format-&gt;type = Format::LFT_ADAPTED_REQUEST_HEADER_ELEM;
+-        else
+-            format-&gt;type = Format::LFT_REPLY_HEADER_ELEM;
+-
+-    } else {
+-        format-&gt;type = type;
+-    }
+-
+-    format-&gt;header = xstrdup(header);
+-    format-&gt;header_id = Http::HeaderLookupTable.lookup(SBuf(header)).id;
+-}
+-
+ void
+ parse_externalAclHelper(external_acl ** list)
+ {
+     external_acl *a = new external_acl;
+     char *token = ConfigParser::NextToken();
+ 
+     if (!token)
+         self_destruct();
+ 
+     a-&gt;name = xstrdup(token);
+ 
+     // Allow supported %macros inside quoted tokens
+     ConfigParser::EnableMacros();
+     token = ConfigParser::NextToken();
+ 
+     /* Parse options */
+     while (token) {
+         if (strncmp(token, &quot;ttl=&quot;, 4) == 0) {
+             a-&gt;ttl = atoi(token + 4);
+         } else if (strncmp(token, &quot;negative_ttl=&quot;, 13) == 0) {
+             a-&gt;negative_ttl = atoi(token + 13);
+         } else if (strncmp(token, &quot;children=&quot;, 9) == 0) {
+             a-&gt;children.n_max = atoi(token + 9);
+             debugs(0, DBG_CRITICAL, &quot;WARNING: external_acl_type option children=N has been deprecated in favor of children-max=N and children-startup=N&quot;);
+         } else if (strncmp(token, &quot;children-max=&quot;, 13) == 0) {
+             a-&gt;children.n_max = atoi(token + 13);
+         } else if (strncmp(token, &quot;children-startup=&quot;, 17) == 0) {
+             a-&gt;children.n_startup = atoi(token + 17);
+         } else if (strncmp(token, &quot;children-idle=&quot;, 14) == 0) {
+             a-&gt;children.n_idle = atoi(token + 14);
+         } else if (strncmp(token, &quot;concurrency=&quot;, 12) == 0) {
+             a-&gt;children.concurrency = atoi(token + 12);
+         } else if (strncmp(token, &quot;queue-size=&quot;, 11) == 0) {
+             a-&gt;children.queue_size = atoi(token + 11);
+             a-&gt;children.defaultQueueSize = false;
+         } else if (strncmp(token, &quot;cache=&quot;, 6) == 0) {
+             a-&gt;cache_size = atoi(token + 6);
+         } else if (strncmp(token, &quot;grace=&quot;, 6) == 0) {
+             a-&gt;grace = atoi(token + 6);
+         } else if (strcmp(token, &quot;protocol=2.5&quot;) == 0) {
+-            a-&gt;quote = external_acl::QUOTE_METHOD_SHELL;
++            a-&gt;quote = Format::LOG_QUOTE_SHELL;
+         } else if (strcmp(token, &quot;protocol=3.0&quot;) == 0) {
+             debugs(3, DBG_PARSE_NOTE(2), &quot;WARNING: external_acl_type option protocol=3.0 is deprecated. Remove this from your config.&quot;);
+-            a-&gt;quote = external_acl::QUOTE_METHOD_URL;
++            a-&gt;quote = Format::LOG_QUOTE_URL;
+         } else if (strcmp(token, &quot;quote=url&quot;) == 0) {
+             debugs(3, DBG_PARSE_NOTE(2), &quot;WARNING: external_acl_type option quote=url is deprecated. Remove this from your config.&quot;);
+-            a-&gt;quote = external_acl::QUOTE_METHOD_URL;
++            a-&gt;quote = Format::LOG_QUOTE_URL;
+         } else if (strcmp(token, &quot;quote=shell&quot;) == 0) {
+             debugs(3, DBG_PARSE_NOTE(2), &quot;WARNING: external_acl_type option quote=shell is deprecated. Use protocol=2.5 if still needed.&quot;);
+-            a-&gt;quote = external_acl::QUOTE_METHOD_SHELL;
++            a-&gt;quote = Format::LOG_QUOTE_SHELL;
+ 
+             /* INET6: allow admin to configure some helpers explicitly to
+                       bind to IPv4/v6 localhost port. */
+         } else if (strcmp(token, &quot;ipv4&quot;) == 0) {
+             if ( !a-&gt;local_addr.setIPv4() ) {
+                 debugs(3, DBG_CRITICAL, &quot;WARNING: Error converting &quot; &lt;&lt; a-&gt;local_addr &lt;&lt; &quot; to IPv4 in &quot; &lt;&lt; a-&gt;name );
+             }
+         } else if (strcmp(token, &quot;ipv6&quot;) == 0) {
+             if (!Ip::EnableIpv6)
+                 debugs(3, DBG_CRITICAL, &quot;WARNING: --enable-ipv6 required for external ACL helpers to use IPv6: &quot; &lt;&lt; a-&gt;name );
+             // else nothing to do.
+         } else {
+             break;
+         }
+ 
+         token = ConfigParser::NextToken();
+     }
+     ConfigParser::DisableMacros();
+ 
+     /* check that child startup value is sane. */
+     if (a-&gt;children.n_startup &gt; a-&gt;children.n_max)
+         a-&gt;children.n_startup = a-&gt;children.n_max;
+ 
+     /* check that child idle value is sane. */
+     if (a-&gt;children.n_idle &gt; a-&gt;children.n_max)
+         a-&gt;children.n_idle = a-&gt;children.n_max;
+     if (a-&gt;children.n_idle &lt; 1)
+         a-&gt;children.n_idle = 1;
+ 
+     if (a-&gt;negative_ttl == -1)
+         a-&gt;negative_ttl = a-&gt;ttl;
+ 
+     if (a-&gt;children.defaultQueueSize)
+         a-&gt;children.queue_size = 2 * a-&gt;children.n_max;
+ 
+-    /* Parse format */
+-    external_acl_format::Pointer *p = &amp;a-&gt;format;
+-
++    /* Legacy external_acl_type format parser.
++     * Handles a series of %... tokens where any non-% means
++     * the start of another parameter field (ie the path to binary).
++     */
++    enum Format::Quoting quote = Format::LOG_QUOTE_NONE;
++    Format::Token **fmt = &amp;a-&gt;format.format;
++    bool data_used = false;
+     while (token) {
+-        /* stop on first non-format token found */
+-
++        /* stop on first non-% token found */
+         if (*token != '%')
+             break;
+ 
+-        external_acl_format::Pointer format = new external_acl_format;
+-
+-        if (strncmp(token, &quot;%{&quot;, 2) == 0) {
+-            // deprecated. but assume the old configs all referred to request headers.
+-            debugs(82, DBG_PARSE_NOTE(DBG_IMPORTANT), &quot;WARNING: external_acl_type format %{...} is being replaced by %&gt;ha{...} for : &quot; &lt;&lt; token);
+-            parse_header_token(format, (token+2), Format::LFT_ADAPTED_REQUEST_HEADER);
+-        } else if (strncmp(token, &quot;%&gt;{&quot;, 3) == 0) {
+-            debugs(82, DBG_PARSE_NOTE(DBG_IMPORTANT), &quot;WARNING: external_acl_type format %&gt;{...} is being replaced by %&gt;ha{...} for : &quot; &lt;&lt; token);
+-            parse_header_token(format, (token+3), Format::LFT_ADAPTED_REQUEST_HEADER);
+-        } else if (strncmp(token, &quot;%&gt;ha{&quot;, 5) == 0) {
+-            parse_header_token(format, (token+5), Format::LFT_ADAPTED_REQUEST_HEADER);
+-        } else if (strncmp(token, &quot;%&lt;{&quot;, 3) == 0) {
+-            debugs(82, DBG_PARSE_NOTE(DBG_IMPORTANT), &quot;WARNING: external_acl_type format %&lt;{...} is being replaced by %&lt;h{...} for : &quot; &lt;&lt; token);
+-            parse_header_token(format, (token+3), Format::LFT_REPLY_HEADER);
+-        } else if (strncmp(token, &quot;%&lt;h{&quot;, 4) == 0) {
+-            parse_header_token(format, (token+4), Format::LFT_REPLY_HEADER);
+-#if USE_AUTH
+-        } else if (strcmp(token, &quot;%LOGIN&quot;) == 0 || strcmp(token, &quot;%ul&quot;) == 0) {
+-            format-&gt;type = Format::LFT_USER_LOGIN;
+-            a-&gt;require_auth = true;
+-#endif
+-        }
+-#if USE_IDENT
+-        else if (strcmp(token, &quot;%IDENT&quot;) == 0 || strcmp(token, &quot;%ui&quot;) == 0)
+-            format-&gt;type = Format::LFT_USER_IDENT;
+-#endif
+-        else if (strcmp(token, &quot;%SRC&quot;) == 0 || strcmp(token, &quot;%&gt;a&quot;) == 0)
+-            format-&gt;type = Format::LFT_CLIENT_IP_ADDRESS;
+-        else if (strcmp(token, &quot;%SRCPORT&quot;) == 0 || strcmp(token, &quot;%&gt;p&quot;) == 0)
+-            format-&gt;type = Format::LFT_CLIENT_PORT;
+-#if USE_SQUID_EUI
+-        else if (strcmp(token, &quot;%SRCEUI48&quot;) == 0)
+-            format-&gt;type = Format::LFT_EXT_ACL_CLIENT_EUI48;
+-        else if (strcmp(token, &quot;%SRCEUI64&quot;) == 0)
+-            format-&gt;type = Format::LFT_EXT_ACL_CLIENT_EUI64;
+-#endif
+-        else if (strcmp(token, &quot;%MYADDR&quot;) == 0 || strcmp(token, &quot;%la&quot;) == 0)
+-            format-&gt;type = Format::LFT_LOCAL_LISTENING_IP;
+-        else if (strcmp(token, &quot;%MYPORT&quot;) == 0 || strcmp(token, &quot;%lp&quot;) == 0)
+-            format-&gt;type = Format::LFT_LOCAL_LISTENING_PORT;
+-        else if (strcmp(token, &quot;%URI&quot;) == 0 || strcmp(token, &quot;%&gt;ru&quot;) == 0)
+-            format-&gt;type = Format::LFT_CLIENT_REQ_URI;
+-        else if (strcmp(token, &quot;%DST&quot;) == 0 || strcmp(token, &quot;%&gt;rd&quot;) == 0)
+-            format-&gt;type = Format::LFT_CLIENT_REQ_URLDOMAIN;
+-        else if (strcmp(token, &quot;%PROTO&quot;) == 0 || strcmp(token, &quot;%&gt;rs&quot;) == 0)
+-            format-&gt;type = Format::LFT_CLIENT_REQ_URLSCHEME;
+-        else if (strcmp(token, &quot;%PORT&quot;) == 0) // XXX: add a logformat token
+-            format-&gt;type = Format::LFT_CLIENT_REQ_URLPORT;
+-        else if (strcmp(token, &quot;%PATH&quot;) == 0 || strcmp(token, &quot;%&gt;rp&quot;) == 0)
+-            format-&gt;type = Format::LFT_CLIENT_REQ_URLPATH;
+-        else if (strcmp(token, &quot;%METHOD&quot;) == 0 || strcmp(token, &quot;%&gt;rm&quot;) == 0)
+-            format-&gt;type = Format::LFT_CLIENT_REQ_METHOD;
+-#if USE_OPENSSL
+-        else if (strcmp(token, &quot;%USER_CERT&quot;) == 0)
+-            format-&gt;type = Format::LFT_EXT_ACL_USER_CERT_RAW;
+-        else if (strcmp(token, &quot;%USER_CERTCHAIN&quot;) == 0)
+-            format-&gt;type = Format::LFT_EXT_ACL_USER_CERTCHAIN_RAW;
+-        else if (strncmp(token, &quot;%USER_CERT_&quot;, 11) == 0) {
+-            format-&gt;type = Format::LFT_EXT_ACL_USER_CERT;
+-            format-&gt;header = xstrdup(token + 11);
++        *fmt = new Format::Token;
++        // these tokens are whitespace delimited
++        (*fmt)-&gt;space = true;
++
++	// set the default encoding to match the protocol= config
++        // this will be overridden by explicit %macro attributes
++        (*fmt)-&gt;quote = a-&gt;quote;
++
++        // compatibility for old tokens incompatible with Format::Token syntax
++#if USE_OPENSSL // dont bother if we dont have to.
++        if (strncmp(token, &quot;%USER_CERT_&quot;, 11) == 0) {
++            (*fmt)-&gt;type = Format::LFT_EXT_ACL_USER_CERT;
++            (*fmt)-&gt;data.string = xstrdup(token + 11);
++            (*fmt)-&gt;data.header.header = (*fmt)-&gt;data.string;
+         } else if (strncmp(token, &quot;%USER_CA_CERT_&quot;, 14) == 0) {
+-            format-&gt;type = Format::LFT_EXT_ACL_USER_CA_CERT;
+-            format-&gt;header = xstrdup(token + 14);
++            (*fmt)-&gt;type = Format::LFT_EXT_ACL_USER_CA_CERT;
++            (*fmt)-&gt;data.string = xstrdup(token + 14);
++            (*fmt)-&gt;data.header.header = (*fmt)-&gt;data.string;
+         } else if (strncmp(token, &quot;%CA_CERT_&quot;, 9) == 0) {
+             debugs(82, DBG_PARSE_NOTE(DBG_IMPORTANT), &quot;WARNING: external_acl_type %CA_CERT_* code is obsolete. Use %USER_CA_CERT_* instead&quot;);
+-            format-&gt;type = Format::LFT_EXT_ACL_USER_CA_CERT;
+-            format-&gt;header = xstrdup(token + 9);
+-        } else if (strcmp(token, &quot;%ssl::&gt;sni&quot;) == 0)
+-            format-&gt;type = Format::LFT_SSL_CLIENT_SNI;
+-        else if (strcmp(token, &quot;%ssl::&lt;cert_subject&quot;) == 0)
+-            format-&gt;type = Format::LFT_SSL_SERVER_CERT_SUBJECT;
+-        else if (strcmp(token, &quot;%ssl::&lt;cert_issuer&quot;) == 0)
+-            format-&gt;type = Format::LFT_SSL_SERVER_CERT_ISSUER;
+-#endif
++            (*fmt)-&gt;type = Format::LFT_EXT_ACL_USER_CA_CERT;
++            (*fmt)-&gt;data.string = xstrdup(token + 9);
++            (*fmt)-&gt;data.header.header = (*fmt)-&gt;data.string;
++        } else
++#endif
++        {
++            // we can use the Format::Token::parse() method since it
++            // only pulls off one token. Since we already checked
++            // for '%' prefix above this is guaranteed to be a token.
++            const size_t len = (*fmt)-&gt;parse(token, &amp;quote);
++            assert(len == strlen(token));
++        }
++
++        // process special token-specific actions (only if necessary)
+ #if USE_AUTH
+-        else if (strcmp(token, &quot;%EXT_USER&quot;) == 0 || strcmp(token, &quot;%ue&quot;) == 0)
+-            format-&gt;type = Format::LFT_USER_EXTERNAL;
+-#endif
+-#if USE_AUTH || defined(USE_OPENSSL) || defined(USE_IDENT)
+-        else if (strcmp(token, &quot;%un&quot;) == 0)
+-            format-&gt;type = Format::LFT_USER_NAME;
++        if ((*fmt)-&gt;type == Format::LFT_USER_LOGIN)
++            a-&gt;require_auth = true;
+ #endif
+-        else if (strcmp(token, &quot;%EXT_LOG&quot;) == 0 || strcmp(token, &quot;%ea&quot;) == 0)
+-            format-&gt;type = Format::LFT_EXT_LOG;
+-        else if (strcmp(token, &quot;%TAG&quot;) == 0  || strcmp(token, &quot;%et&quot;) == 0)
+-            format-&gt;type = Format::LFT_TAG;
+-        else if (strcmp(token, &quot;%ACL&quot;) == 0)
+-            format-&gt;type = Format::LFT_EXT_ACL_NAME;
+-        else if (strcmp(token, &quot;%DATA&quot;) == 0)
+-            format-&gt;type = Format::LFT_EXT_ACL_DATA;
+-        else if (strcmp(token, &quot;%%&quot;) == 0)
+-            format-&gt;type = Format::LFT_PERCENT;
+-        else {
+-            debugs(0, DBG_CRITICAL, &quot;ERROR: Unknown Format token &quot; &lt;&lt; token);
+-            self_destruct();
+-        }
+ 
+-        *p = format;
+-        p = &amp;format-&gt;next;
++        if ((*fmt)-&gt;type == Format::LFT_EXT_ACL_DATA)
++            data_used = true;
++
++        fmt = &amp;((*fmt)-&gt;next);
+         token = ConfigParser::NextToken();
+     }
+ 
+     /* There must be at least one format token */
+-    if (!a-&gt;format)
++    if (!a-&gt;format.format)
+         self_destruct();
+ 
++    // format has implicit %DATA on the end if not used explicitly
++    if (!data_used) {
++        *fmt = new Format::Token;
++        (*fmt)-&gt;type = Format::LFT_EXT_ACL_DATA;
++        (*fmt)-&gt;quote = Format::LOG_QUOTE_URL;
++    }
++
+     /* helper */
+     if (!token)
+         self_destruct();
+ 
+     wordlistAdd(&amp;a-&gt;cmdline, token);
+ 
+     /* arguments */
+     parse_wordlist(&amp;a-&gt;cmdline);
+ 
+     while (*list)
+         list = &amp;(*list)-&gt;next;
+ 
+     *list = a;
+ }
+ 
+ void
+ dump_externalAclHelper(StoreEntry * sentry, const char *name, const external_acl * list)
+ {
+     const external_acl *node;
+     const wordlist *word;
+@@ -489,110 +364,44 @@
+             storeAppendPrintf(sentry, &quot; negative_ttl=%d&quot;, node-&gt;negative_ttl);
+ 
+         if (node-&gt;grace)
+             storeAppendPrintf(sentry, &quot; grace=%d&quot;, node-&gt;grace);
+ 
+         if (node-&gt;children.n_max != DEFAULT_EXTERNAL_ACL_CHILDREN)
+             storeAppendPrintf(sentry, &quot; children-max=%d&quot;, node-&gt;children.n_max);
+ 
+         if (node-&gt;children.n_startup != 1)
+             storeAppendPrintf(sentry, &quot; children-startup=%d&quot;, node-&gt;children.n_startup);
+ 
+         if (node-&gt;children.n_idle != (node-&gt;children.n_max + node-&gt;children.n_startup) )
+             storeAppendPrintf(sentry, &quot; children-idle=%d&quot;, node-&gt;children.n_idle);
+ 
+         if (node-&gt;children.concurrency)
+             storeAppendPrintf(sentry, &quot; concurrency=%d&quot;, node-&gt;children.concurrency);
+ 
+         if (node-&gt;cache)
+             storeAppendPrintf(sentry, &quot; cache=%d&quot;, node-&gt;cache_size);
+ 
+-        if (node-&gt;quote == external_acl::QUOTE_METHOD_SHELL)
++        if (node-&gt;quote == Format::LOG_QUOTE_SHELL)
+             storeAppendPrintf(sentry, &quot; protocol=2.5&quot;);
+ 
+-        for (external_acl_format::Pointer format = node-&gt;format; format!= NULL; format = format-&gt;next) {
+-            switch (format-&gt;type) {
+-
+-            case Format::LFT_ADAPTED_REQUEST_HEADER:
+-                storeAppendPrintf(sentry, &quot; %%&gt;ha{%s}&quot;, format-&gt;header);
+-                break;
+-
+-            case Format::LFT_ADAPTED_REQUEST_HEADER_ELEM:
+-                storeAppendPrintf(sentry, &quot; %%&gt;ha{%s:%s}&quot;, format-&gt;header, format-&gt;member);
+-                break;
+-
+-            case Format::LFT_REPLY_HEADER:
+-                storeAppendPrintf(sentry, &quot; %%&lt;h{%s}&quot;, format-&gt;header);
+-                break;
+-
+-            case Format::LFT_REPLY_HEADER_ELEM:
+-                storeAppendPrintf(sentry, &quot; %%&lt;h{%s:%s}&quot;, format-&gt;header, format-&gt;member);
+-                break;
+-
+-#define DUMP_EXT_ACL_TYPE_FMT(a, fmt, ...) \
+-            case Format::LFT_##a: \
+-                storeAppendPrintf(sentry, fmt, ##__VA_ARGS__); \
+-                break
+-#if USE_AUTH
+-                DUMP_EXT_ACL_TYPE_FMT(USER_LOGIN,&quot; %%ul&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(USER_NAME,&quot; %%un&quot;);
+-#endif
+-#if USE_IDENT
+-
+-                DUMP_EXT_ACL_TYPE_FMT(USER_IDENT,&quot; %%ui&quot;);
+-#endif
+-                DUMP_EXT_ACL_TYPE_FMT(CLIENT_IP_ADDRESS,&quot; %%&gt;a&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(CLIENT_PORT,&quot; %%&gt;p&quot;);
+-#if USE_SQUID_EUI
+-                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_CLIENT_EUI48,&quot; %%SRCEUI48&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_CLIENT_EUI64,&quot; %%SRCEUI64&quot;);
+-#endif
+-                DUMP_EXT_ACL_TYPE_FMT(LOCAL_LISTENING_IP,&quot; %%&gt;la&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(LOCAL_LISTENING_PORT,&quot; %%&gt;lp&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_URI,&quot; %%&gt;ru&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_URLDOMAIN,&quot; %%&gt;rd&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_URLSCHEME,&quot; %%&gt;rs&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_URLPORT,&quot; %%&gt;rP&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_URLPATH,&quot; %%&gt;rp&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_METHOD,&quot; %%&gt;rm&quot;);
+-#if USE_OPENSSL
+-                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_USER_CERT_RAW, &quot; %%USER_CERT_RAW&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_USER_CERTCHAIN_RAW, &quot; %%USER_CERTCHAIN_RAW&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_USER_CERT, &quot; %%USER_CERT_%s&quot;, format-&gt;header);
+-                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_USER_CA_CERT, &quot; %%USER_CA_CERT_%s&quot;, format-&gt;header);
+-                DUMP_EXT_ACL_TYPE_FMT(SSL_CLIENT_SNI, &quot;%%ssl::&gt;sni&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(SSL_SERVER_CERT_SUBJECT, &quot;%%ssl::&lt;cert_subject&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(SSL_SERVER_CERT_ISSUER, &quot;%%ssl::&lt;cert_issuer&quot;);
+-#endif
+-#if USE_AUTH
+-                DUMP_EXT_ACL_TYPE_FMT(USER_EXTERNAL,&quot; %%ue&quot;);
+-#endif
+-                DUMP_EXT_ACL_TYPE_FMT(EXT_LOG,&quot; %%ea&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(TAG,&quot; %%et&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_NAME,&quot; %%ACL&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_DATA,&quot; %%DATA&quot;);
+-                DUMP_EXT_ACL_TYPE_FMT(PERCENT, &quot; %%%%&quot;);
+-            default:
+-                fatal(&quot;unknown external_acl format error&quot;);
+-                break;
+-            }
+-        }
++        node-&gt;format.dump(sentry, NULL, false);
+ 
+         for (word = node-&gt;cmdline; word; word = word-&gt;next)
+             storeAppendPrintf(sentry, &quot; %s&quot;, word-&gt;key);
+ 
+         storeAppendPrintf(sentry, &quot;\n&quot;);
+     }
+ }
+ 
+ void
+ free_externalAclHelper(external_acl ** list)
+ {
+     delete *list;
+     *list = NULL;
+ }
+ 
+ static external_acl *
+ find_externalAclHelper(const char *name)
+ {
+     external_acl *node;
+ 
+@@ -881,361 +690,92 @@
+ 
+     return rv;
+ }
+ 
+ /******************************************************************
+  * external_acl cache
+  */
+ 
+ static void
+ external_acl_cache_touch(external_acl * def, const ExternalACLEntryPointer &amp;entry)
+ {
+     // this must not be done when nothing is being cached.
+     if (def-&gt;cache_size &lt;= 0 || (def-&gt;ttl &lt;= 0 &amp;&amp; entry-&gt;result == 1) || (def-&gt;negative_ttl &lt;= 0 &amp;&amp; entry-&gt;result != 1))
+         return;
+ 
+     dlinkDelete(&amp;entry-&gt;lru, &amp;def-&gt;lru_list);
+     ExternalACLEntry *e = const_cast&lt;ExternalACLEntry *&gt;(entry.getRaw()); // XXX: make hash a std::map of Pointer.
+     dlinkAdd(e, &amp;entry-&gt;lru, &amp;def-&gt;lru_list);
+ }
+ 
+-#if USE_OPENSSL
+-static const char *
+-external_acl_ssl_get_user_attribute(const ACLFilledChecklist &amp;ch, const char *attr)
+-{
+-    if (ch.conn() != NULL &amp;&amp; Comm::IsConnOpen(ch.conn()-&gt;clientConnection)) {
+-        if (SSL *ssl = fd_table[ch.conn()-&gt;clientConnection-&gt;fd].ssl)
+-            return sslGetUserAttribute(ssl, attr);
+-    }
+-    return NULL;
+-}
+-#endif
+-
+ static char *
+ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+ {
+     static MemBuf mb;
+-    char buf[256];
+-    int first = 1;
+-    wordlist *arg;
+-    HttpRequest *request = ch-&gt;request;
+-    HttpReply *reply = ch-&gt;reply;
+     mb.reset();
+-    bool data_used = false;
+-
+-    for (external_acl_format::Pointer format = acl_data-&gt;def-&gt;format; format != NULL; format = format-&gt;next) {
+-        const char *str = NULL;
+-        String sb;
+-
+-        switch (format-&gt;type) {
+-#if USE_AUTH
+-        case Format::LFT_USER_LOGIN:
+-            // if this ACL line was the cause of credentials fetch
+-            // they may not already be in the checklist
+-            if (ch-&gt;auth_user_request == NULL &amp;&amp; ch-&gt;request)
+-                ch-&gt;auth_user_request = ch-&gt;request-&gt;auth_user_request;
+ 
+-            if (ch-&gt;auth_user_request != NULL)
+-                str = ch-&gt;auth_user_request-&gt;username();
+-            break;
+-#endif
+-#if USE_IDENT
+-        case Format::LFT_USER_IDENT:
+-            str = ch-&gt;rfc931;
++    // check for special case tokens in the format
++    for (Format::Token *t = acl_data-&gt;def-&gt;format.format; t ; t = t-&gt;next) {
+ 
+-            if (!str || !*str) {
+-                // if we fail to go async, we still return NULL and the caller
+-                // will detect the failure in ACLExternal::match().
+-                (void)ch-&gt;goAsync(IdentLookup::Instance());
+-                return NULL;
+-            }
+-
+-            break;
+-#endif
+-
+-        case Format::LFT_CLIENT_IP_ADDRESS:
+-            str = ch-&gt;src_addr.toStr(buf,sizeof(buf));
+-            break;
+-
+-        case Format::LFT_CLIENT_PORT:
+-            snprintf(buf, sizeof(buf), &quot;%d&quot;, request-&gt;client_addr.port());
+-            str = buf;
+-            break;
+-
+-#if USE_SQUID_EUI
+-        case Format::LFT_EXT_ACL_CLIENT_EUI48:
+-            if (request-&gt;clientConnectionManager.valid() &amp;&amp; request-&gt;clientConnectionManager-&gt;clientConnection != NULL &amp;&amp;
+-                    request-&gt;clientConnectionManager-&gt;clientConnection-&gt;remoteEui48.encode(buf, sizeof(buf)))
+-                str = buf;
+-            break;
+-
+-        case Format::LFT_EXT_ACL_CLIENT_EUI64:
+-            if (request-&gt;clientConnectionManager.valid() &amp;&amp; request-&gt;clientConnectionManager-&gt;clientConnection != NULL &amp;&amp;
+-                    request-&gt;clientConnectionManager-&gt;clientConnection-&gt;remoteEui64.encode(buf, sizeof(buf)))
+-                str = buf;
+-            break;
+-#endif
+-
+-        case Format::LFT_LOCAL_LISTENING_IP:
+-            str = request-&gt;my_addr.toStr(buf, sizeof(buf));
+-            break;
+-
+-        case Format::LFT_LOCAL_LISTENING_PORT:
+-            snprintf(buf, sizeof(buf), &quot;%d&quot;, request-&gt;my_addr.port());
+-            str = buf;
+-            break;
+-
+-        case Format::LFT_CLIENT_REQ_URI:
+-            snprintf(buf, sizeof(buf), SQUIDSBUFPH, SQUIDSBUFPRINT(request-&gt;effectiveRequestUri()));
+-            str = buf;
+-            break;
+-
+-        case Format::LFT_CLIENT_REQ_URLDOMAIN:
+-            str = request-&gt;url.host();
+-            break;
+-
+-        case Format::LFT_CLIENT_REQ_URLSCHEME:
+-            str = request-&gt;url.getScheme().c_str();
+-            break;
+-
+-        case Format::LFT_CLIENT_REQ_URLPORT:
+-            snprintf(buf, sizeof(buf), &quot;%u&quot;, request-&gt;url.port());
+-            str = buf;
+-            break;
+-
+-        case Format::LFT_CLIENT_REQ_URLPATH: {
+-            SBuf tmp = request-&gt;url.path();
+-            str = tmp.c_str();
+-        }
+-        break;
+-
+-        case Format::LFT_CLIENT_REQ_METHOD: {
+-            const SBuf &amp;s = request-&gt;method.image();
+-            sb.append(s.rawContent(), s.length());
++        if (t-&gt;type == Format::LFT_EXT_ACL_NAME) {
++            // setup for %ACL
++            safe_free(ch-&gt;al-&gt;_private.lastAclName);
++            ch-&gt;al-&gt;_private.lastAclName = xstrdup(acl_data-&gt;name);
+         }
+-        str = sb.termedBuf();
+-        break;
+-
+-        case Format::LFT_ADAPTED_REQUEST_HEADER:
+-            if (format-&gt;header_id == Http::HdrType::BAD_HDR)
+-                sb = request-&gt;header.getByName(format-&gt;header);
+-            else
+-                sb = request-&gt;header.getStrOrList(format-&gt;header_id);
+-            str = sb.termedBuf();
+-            break;
+-
+-        case Format::LFT_ADAPTED_REQUEST_HEADER_ELEM:
+-            if (format-&gt;header_id == Http::HdrType::BAD_HDR)
+-                sb = request-&gt;header.getByNameListMember(format-&gt;header, format-&gt;member, format-&gt;separator);
+-            else
+-                sb = request-&gt;header.getListMember(format-&gt;header_id, format-&gt;member, format-&gt;separator);
+-            str = sb.termedBuf();
+-            break;
+-
+-        case Format::LFT_REPLY_HEADER:
+-            if (reply) {
+-                if (format-&gt;header_id == Http::HdrType::BAD_HDR)
+-                    sb = reply-&gt;header.getByName(format-&gt;header);
+-                else
+-                    sb = reply-&gt;header.getStrOrList(format-&gt;header_id);
+-                str = sb.termedBuf();
+-            }
+-            break;
+-
+-        case Format::LFT_REPLY_HEADER_ELEM:
+-            if (reply) {
+-                if (format-&gt;header_id == Http::HdrType::BAD_HDR)
+-                    sb = reply-&gt;header.getByNameListMember(format-&gt;header, format-&gt;member, format-&gt;separator);
+-                else
+-                    sb = reply-&gt;header.getListMember(format-&gt;header_id, format-&gt;member, format-&gt;separator);
+-                str = sb.termedBuf();
+-            }
+-            break;
+-
+-#if USE_OPENSSL
+-
+-        case Format::LFT_EXT_ACL_USER_CERT_RAW:
+-
+-            if (ch-&gt;conn() != NULL &amp;&amp; Comm::IsConnOpen(ch-&gt;conn()-&gt;clientConnection)) {
+-                if (auto ssl = fd_table[ch-&gt;conn()-&gt;clientConnection-&gt;fd].ssl)
+-                    str = sslGetUserCertificatePEM(ssl);
+-            }
+-
+-            break;
+-
+-        case Format::LFT_EXT_ACL_USER_CERTCHAIN_RAW:
+-
+-            if (ch-&gt;conn() != NULL &amp;&amp; Comm::IsConnOpen(ch-&gt;conn()-&gt;clientConnection)) {
+-                if (auto ssl = fd_table[ch-&gt;conn()-&gt;clientConnection-&gt;fd].ssl)
+-                    str = sslGetUserCertificateChainPEM(ssl);
+-            }
+-
+-            break;
+-
+-        case Format::LFT_EXT_ACL_USER_CERT:
+-
+-            str = external_acl_ssl_get_user_attribute(*ch, format-&gt;header);
+-            break;
+-
+-        case Format::LFT_EXT_ACL_USER_CA_CERT:
+-
+-            if (ch-&gt;conn() != NULL &amp;&amp; Comm::IsConnOpen(ch-&gt;conn()-&gt;clientConnection)) {
+-                if (auto ssl = fd_table[ch-&gt;conn()-&gt;clientConnection-&gt;fd].ssl)
+-                    str = sslGetCAAttribute(ssl, format-&gt;header);
+-            }
+ 
+-            break;
+-
+-        case Format::LFT_SSL_CLIENT_SNI:
+-            if (ch-&gt;conn() != NULL) {
+-                if (Ssl::ServerBump * srvBump = ch-&gt;conn()-&gt;serverBump()) {
+-                    if (!srvBump-&gt;clientSni.isEmpty())
+-                        str = srvBump-&gt;clientSni.c_str();
+-                }
+-            }
+-            break;
+-
+-        case Format::LFT_SSL_SERVER_CERT_SUBJECT:
+-        case Format::LFT_SSL_SERVER_CERT_ISSUER: {
+-            X509 *serverCert = NULL;
+-            if (ch-&gt;serverCert.get())
+-                serverCert = ch-&gt;serverCert.get();
+-            else if (ch-&gt;conn() &amp;&amp; ch-&gt;conn()-&gt;serverBump())
+-                serverCert = ch-&gt;conn()-&gt;serverBump()-&gt;serverCert.get();
+-
+-            if (serverCert) {
+-                if (format-&gt;type == Format::LFT_SSL_SERVER_CERT_SUBJECT)
+-                    str = Ssl::GetX509UserAttribute(serverCert, &quot;DN&quot;);
+-                else
+-                    str = Ssl::GetX509CAAttribute(serverCert, &quot;DN&quot;);
+-            }
+-            break;
+-        }
+-
+-#endif
+-#if USE_AUTH
+-        case Format::LFT_USER_EXTERNAL:
+-            str = request-&gt;extacl_user.termedBuf();
+-            break;
+-#endif
+-        case Format::LFT_USER_NAME:
+-            /* find the first available name from various sources */
+-#if USE_AUTH
+-            // if this ACL line was the cause of credentials fetch
+-            // they may not already be in the checklist
+-            if (!ch-&gt;auth_user_request &amp;&amp; ch-&gt;request)
+-                ch-&gt;auth_user_request = ch-&gt;request-&gt;auth_user_request;
+-
+-            if (ch-&gt;auth_user_request != NULL)
+-                str = ch-&gt;auth_user_request-&gt;username();
+-
+-            if ((!str || !*str) &amp;&amp;
+-                    (request-&gt;extacl_user.size() &gt; 0 &amp;&amp; request-&gt;extacl_user[0] != '-'))
+-                str = request-&gt;extacl_user.termedBuf();
+-#endif
+-#if USE_OPENSSL
+-            if (!str || !*str)
+-                str = external_acl_ssl_get_user_attribute(*ch, &quot;CN&quot;);
+-#endif
+-#if USE_IDENT
+-            if (!str || !*str)
+-                str = ch-&gt;rfc931;
+-#endif
+-            break;
+-        case Format::LFT_EXT_LOG:
+-            str = request-&gt;extacl_log.termedBuf();
+-            break;
+-        case Format::LFT_TAG:
+-            str = request-&gt;tag.termedBuf();
+-            break;
+-        case Format::LFT_EXT_ACL_NAME:
+-            str = acl_data-&gt;name;
+-            break;
+-        case Format::LFT_EXT_ACL_DATA:
+-            data_used = true;
+-            for (arg = acl_data-&gt;arguments; arg; arg = arg-&gt;next) {
+-                if (!first)
++        if (t-&gt;type == Format::LFT_EXT_ACL_DATA) {
++            // setup string for %DATA
++            SBuf sb;
++            for (auto arg = acl_data-&gt;arguments; arg; arg = arg-&gt;next) {
++                if (sb.length())
+                     sb.append(&quot; &quot;, 1);
+ 
+-                if (acl_data-&gt;def-&gt;quote == external_acl::QUOTE_METHOD_URL) {
++                if (acl_data-&gt;def-&gt;quote == Format::LOG_QUOTE_URL) {
+                     const char *quoted = rfc1738_escape(arg-&gt;key);
+                     sb.append(quoted, strlen(quoted));
+                 } else {
+                     static MemBuf mb2;
+                     mb2.init();
+                     strwordquote(&amp;mb2, arg-&gt;key);
+                     sb.append(mb2.buf, mb2.size);
+                     mb2.clean();
+                 }
+-
+-                first = 0;
+             }
+-            break;
+-        case Format::LFT_PERCENT:
+-            str = &quot;%&quot;;
+-            break;
+ 
+-        default:
+-            // TODO: replace this function with Format::assemble()
+-            // For now die on unsupported logformat codes.
+-            fatalf(&quot;ERROR: unknown external_acl_type format %u&quot;, (uint8_t)format-&gt;type);
+-            break;
++            ch-&gt;al-&gt;_private.lastAclData = sb.c_str();
+         }
+ 
+-        if (str)
+-            if (!*str)
+-                str = NULL;
+-
+-        if (!str)
+-            str = &quot;-&quot;;
+-
+-        if (!first)
+-            mb.append(&quot; &quot;, 1);
+-
+-        if (acl_data-&gt;def-&gt;quote == external_acl::QUOTE_METHOD_URL) {
+-            const char *quoted = rfc1738_escape(str);
+-            mb.append(quoted, strlen(quoted));
+-        } else {
+-            strwordquote(&amp;mb, str);
+-        }
+-
+-        sb.clean();
+-
+-        first = 0;
+-    }
+-
+-    if (!data_used) {
+-        for (arg = acl_data-&gt;arguments; arg; arg = arg-&gt;next) {
+-            if (!first)
+-                mb.append(&quot; &quot;, 1);
+-
+-            if (acl_data-&gt;def-&gt;quote == external_acl::QUOTE_METHOD_URL) {
+-                const char *quoted = rfc1738_escape(arg-&gt;key);
+-                mb.append(quoted, strlen(quoted));
+-            } else {
+-                strwordquote(&amp;mb, arg-&gt;key);
++#if USE_IDENT
++        if (t-&gt;type == Format::LFT_USER_IDENT) {
++            if (!*ch-&gt;rfc931) {
++                // if we fail to go async, we still return NULL and the caller
++                // will detect the failure in ACLExternal::match().
++                (void)ch-&gt;goAsync(IdentLookup::Instance());
++                return NULL;
+             }
+-
+-            first = 0;
+         }
++#endif
+     }
+ 
++    // assemble the full helper lookup string
++    acl_data-&gt;def-&gt;format.assemble(mb, ch-&gt;al, 0);
++
+     return mb.buf;
+ }
+ 
+ static int
+ external_acl_entry_expired(external_acl * def, const ExternalACLEntryPointer &amp;entry)
+ {
+     if (def-&gt;cache_size &lt;= 0)
+         return 1;
+ 
+     if (entry-&gt;date + (entry-&gt;result == 1 ? def-&gt;ttl : def-&gt;negative_ttl) &lt; squid_curtime)
+         return 1;
+     else
+         return 0;
+ }
+ 
+ static int
+ external_acl_grace_expired(external_acl * def, const ExternalACLEntryPointer &amp;entry)
+ {
+     if (def-&gt;cache_size &lt;= 0)
+         return 1;
+
+=== modified file 'src/format/ByteCode.h'
+--- src/format/ByteCode.h	2015-01-13 07:25:36 +0000
++++ src/format/ByteCode.h	2015-10-02 10:00:59 +0000
+@@ -206,44 +206,47 @@
+     LFT_ICAP_TR_RESPONSE_TIME,
+     LFT_ICAP_IO_TIME,
+     LFT_ICAP_OUTCOME,
+     LFT_ICAP_STATUS_CODE,
+ #endif
+     LFT_CREDENTIALS,
+ 
+ #if USE_OPENSSL
+     LFT_SSL_BUMP_MODE,
+     LFT_SSL_USER_CERT_SUBJECT,
+     LFT_SSL_USER_CERT_ISSUER,
+     LFT_SSL_CLIENT_SNI,
+     LFT_SSL_SERVER_CERT_SUBJECT,
+     LFT_SSL_SERVER_CERT_ISSUER,
+ #endif
+ 
+     LFT_NOTE,
+     LFT_PERCENT,            /* special string cases for escaped chars */
+ 
+     // TODO assign better bytecode names and Token strings for these
++#if USE_OPENSSL
+     LFT_EXT_ACL_USER_CERT_RAW,
+     LFT_EXT_ACL_USER_CERTCHAIN_RAW,
+     LFT_EXT_ACL_USER_CERT,
+     LFT_EXT_ACL_USER_CA_CERT,
++#endif
+     LFT_EXT_ACL_CLIENT_EUI48,
+     LFT_EXT_ACL_CLIENT_EUI64,
+     LFT_EXT_ACL_NAME,
+     LFT_EXT_ACL_DATA
+ 
+ } ByteCode_t;
+ 
+ /// Quoting style for a format output.
+ enum Quoting {
+     LOG_QUOTE_NONE = 0,
+     LOG_QUOTE_QUOTES,
+     LOG_QUOTE_MIMEBLOB,
+     LOG_QUOTE_URL,
++    LOG_QUOTE_SHELL,
+     LOG_QUOTE_RAW
+ };
+ 
+ } // namespace Format
+ 
+ #endif /* _SQUID_FMT_BYTECODE_H */
+ 
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2015-07-19 13:23:01 +0000
++++ src/format/Format.cc	2015-10-02 10:47:21 +0000
+@@ -5,40 +5,41 @@
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;AccessLogEntry.h&quot;
+ #include &quot;client_side.h&quot;
+ #include &quot;comm/Connection.h&quot;
+ #include &quot;err_detail_type.h&quot;
+ #include &quot;errorpage.h&quot;
+ #include &quot;fde.h&quot;
+ #include &quot;format/Format.h&quot;
+ #include &quot;format/Quoting.h&quot;
+ #include &quot;format/Token.h&quot;
+ #include &quot;fqdncache.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;MemBuf.h&quot;
+ #include &quot;rfc1738.h&quot;
+ #include &quot;SquidTime.h&quot;
+ #include &quot;Store.h&quot;
++#include &quot;tools.h&quot;
+ #include &quot;URL.h&quot;
+ #if USE_OPENSSL
+ #include &quot;ssl/ErrorDetail.h&quot;
+ #include &quot;ssl/ServerBump.h&quot;
+ #endif
+ 
+ /// Convert a string to NULL pointer if it is &quot;&quot;
+ #define strOrNull(s) ((s)==NULL||(s)[0]=='\0'?NULL:(s))
+ 
+ Format::Format::Format(const char *n) :
+     format(NULL),
+     next(NULL)
+ {
+     name = xstrdup(n);
+ }
+ 
+ Format::Format::~Format()
+ {
+     // erase the list without consuming stack space
+     while (next) {
+@@ -71,48 +72,49 @@
+     /* very inefficent parser, but who cares, this needs to be simple */
+     /* First off, let's tokenize, we'll optimize in a second pass.
+      * A token can either be a %-prefixed sequence (usually a dynamic
+      * token but it can be an escaped sequence), or a string. */
+     cur = def;
+     eos = def + strlen(def);
+     format = new_lt = last_lt = new Token;
+     cur += new_lt-&gt;parse(cur, &amp;quote);
+ 
+     while (cur &lt; eos) {
+         new_lt = new Token;
+         last_lt-&gt;next = new_lt;
+         last_lt = new_lt;
+         cur += new_lt-&gt;parse(cur, &amp;quote);
+     }
+ 
+     return true;
+ }
+ 
+ void
+-Format::Format::dump(StoreEntry * entry, const char *directiveName)
++Format::Format::dump(StoreEntry * entry, const char *directiveName, bool eol) const
+ {
+     debugs(46, 4, HERE);
+ 
+     // loop rather than recursing to conserve stack space.
+-    for (Format *fmt = this; fmt; fmt = fmt-&gt;next) {
++    for (const Format *fmt = this; fmt; fmt = fmt-&gt;next) {
+         debugs(46, 3, HERE &lt;&lt; &quot;Dumping format definition for &quot; &lt;&lt; fmt-&gt;name);
+-        storeAppendPrintf(entry, &quot;%s %s &quot;, directiveName, fmt-&gt;name);
++        if (directiveName)
++            storeAppendPrintf(entry, &quot;%s %s &quot;, directiveName, fmt-&gt;name);
+ 
+         for (Token *t = fmt-&gt;format; t; t = t-&gt;next) {
+             if (t-&gt;type == LFT_STRING)
+                 storeAppendPrintf(entry, &quot;%s&quot;, t-&gt;data.string);
+             else {
+                 char argbuf[256];
+                 char *arg = NULL;
+                 ByteCode_t type = t-&gt;type;
+ 
+                 switch (type) {
+                 /* special cases */
+ 
+                 case LFT_STRING:
+                     break;
+ #if USE_ADAPTATION
+                 case LFT_ADAPTATION_LAST_HEADER_ELEM:
+ #endif
+ #if ICAP_CLIENT
+                 case LFT_ICAP_REQ_HEADER_ELEM:
+                 case LFT_ICAP_REP_HEADER_ELEM:
+@@ -208,67 +210,72 @@
+                 entry-&gt;append(&quot;%&quot;, 1);
+ 
+                 switch (t-&gt;quote) {
+ 
+                 case LOG_QUOTE_QUOTES:
+                     entry-&gt;append(&quot;\&quot;&quot;, 1);
+                     break;
+ 
+                 case LOG_QUOTE_MIMEBLOB:
+                     entry-&gt;append(&quot;[&quot;, 1);
+                     break;
+ 
+                 case LOG_QUOTE_URL:
+                     entry-&gt;append(&quot;#&quot;, 1);
+                     break;
+ 
+                 case LOG_QUOTE_RAW:
+                     entry-&gt;append(&quot;'&quot;, 1);
+                     break;
+ 
++                case LOG_QUOTE_SHELL:
++                    entry-&gt;append(&quot;/&quot;, 1);
++                    break;
++
+                 case LOG_QUOTE_NONE:
+                     break;
+                 }
+ 
+                 if (t-&gt;left)
+                     entry-&gt;append(&quot;-&quot;, 1);
+ 
+                 if (t-&gt;zero)
+                     entry-&gt;append(&quot;0&quot;, 1);
+ 
+                 if (t-&gt;widthMin &gt;= 0)
+                     storeAppendPrintf(entry, &quot;%d&quot;, t-&gt;widthMin);
+ 
+                 if (t-&gt;widthMax &gt;= 0)
+                     storeAppendPrintf(entry, &quot;.%d&quot;, t-&gt;widthMax);
+ 
+                 if (arg)
+                     storeAppendPrintf(entry, &quot;{%s}&quot;, arg);
+ 
+                 storeAppendPrintf(entry, &quot;%s&quot;, t-&gt;label);
+ 
+                 if (t-&gt;space)
+                     entry-&gt;append(&quot; &quot;, 1);
+             }
+         }
+ 
+-        entry-&gt;append(&quot;\n&quot;, 1);
++        if (eol)
++            entry-&gt;append(&quot;\n&quot;, 1);
+     }
+ 
+ }
+ 
+ static void
+ log_quoted_string(const char *str, char *out)
+ {
+     char *p = out;
+ 
+     while (*str) {
+         int l = strcspn(str, &quot;\&quot;\\\r\n\t&quot;);
+         memcpy(p, str, l);
+         str += l;
+         p += l;
+ 
+         switch (*str) {
+ 
+         case '\0':
+             break;
+ 
+@@ -353,42 +360,62 @@
+ 
+             break;
+ 
+         case LFT_CLIENT_PORT:
+             if (al-&gt;request) {
+                 outint = al-&gt;request-&gt;client_addr.port();
+                 doint = 1;
+             }
+             break;
+ 
+         case LFT_CLIENT_EUI:
+ #if USE_SQUID_EUI
+             // TODO make the ACL checklist have a direct link to any TCP details.
+             if (al-&gt;request &amp;&amp; al-&gt;request-&gt;clientConnectionManager.valid() &amp;&amp; al-&gt;request-&gt;clientConnectionManager-&gt;clientConnection != NULL) {
+                 if (al-&gt;request-&gt;clientConnectionManager-&gt;clientConnection-&gt;remote.isIPv4())
+                     al-&gt;request-&gt;clientConnectionManager-&gt;clientConnection-&gt;remoteEui48.encode(tmp, 1024);
+                 else
+                     al-&gt;request-&gt;clientConnectionManager-&gt;clientConnection-&gt;remoteEui64.encode(tmp, 1024);
+                 out = tmp;
+             }
+-#else
+-            out = &quot;-&quot;;
++#endif
++            break;
++
++        case LFT_EXT_ACL_CLIENT_EUI48:
++#if USE_SQUID_EUI
++            if (al-&gt;request &amp;&amp; al-&gt;request-&gt;clientConnectionManager.valid() &amp;&amp;
++                    al-&gt;request-&gt;clientConnectionManager-&gt;clientConnection != NULL &amp;&amp;
++                    al-&gt;request-&gt;clientConnectionManager-&gt;clientConnection-&gt;remote.isIPv4()) {
++                al-&gt;request-&gt;clientConnectionManager-&gt;clientConnection-&gt;remoteEui48.encode(tmp, 1024);
++                out = tmp;
++            }
++#endif
++            break;
++
++        case LFT_EXT_ACL_CLIENT_EUI64:
++#if USE_SQUID_EUI
++            if (al-&gt;request &amp;&amp; al-&gt;request-&gt;clientConnectionManager.valid() &amp;&amp;
++                    al-&gt;request-&gt;clientConnectionManager-&gt;clientConnection != NULL &amp;&amp;
++                    !al-&gt;request-&gt;clientConnectionManager-&gt;clientConnection-&gt;remote.isIPv4()) {
++                al-&gt;request-&gt;clientConnectionManager-&gt;clientConnection-&gt;remoteEui64.encode(tmp, 1024);
++                out = tmp;
++            }
+ #endif
+             break;
+ 
+         case LFT_SERVER_IP_ADDRESS:
+             if (al-&gt;hier.tcpServer != NULL) {
+                 out = al-&gt;hier.tcpServer-&gt;remote.toStr(tmp,sizeof(tmp));
+             }
+             break;
+ 
+         case LFT_SERVER_FQDN_OR_PEER_NAME:
+             out = al-&gt;hier.host;
+             break;
+ 
+         case LFT_SERVER_PORT:
+             if (al-&gt;hier.tcpServer != NULL) {
+                 outint = al-&gt;hier.tcpServer-&gt;remote.port();
+                 doint = 1;
+             }
+             break;
+ 
+@@ -820,41 +847,45 @@
+ #if USE_OPENSSL
+             if (!out)
+                 out = strOrNull(al-&gt;cache.ssluser);
+ #endif
+             if (!out)
+                 out = strOrNull(al-&gt;cache.rfc931);
+             break;
+ 
+         case LFT_USER_LOGIN:
+ #if USE_AUTH
+             if (al-&gt;request &amp;&amp; al-&gt;request-&gt;auth_user_request != NULL)
+                 out = strOrNull(al-&gt;request-&gt;auth_user_request-&gt;username());
+ #endif
+             break;
+ 
+         case LFT_USER_IDENT:
+             out = strOrNull(al-&gt;cache.rfc931);
+             break;
+ 
+         case LFT_USER_EXTERNAL:
+-            out = strOrNull(al-&gt;cache.extuser);
++            if (al-&gt;request &amp;&amp; al-&gt;request-&gt;extacl_user.size())
++                out = al-&gt;request-&gt;extacl_user.termedBuf();
++
++            if (!out)
++                out = strOrNull(al-&gt;cache.extuser);
+             break;
+ 
+         /* case LFT_USER_REALM: */
+         /* case LFT_USER_SCHEME: */
+ 
+         // the fmt-&gt;type can not be LFT_HTTP_SENT_STATUS_CODE_OLD_30
+         // but compiler complains if ommited
+         case LFT_HTTP_SENT_STATUS_CODE_OLD_30:
+         case LFT_HTTP_SENT_STATUS_CODE:
+             outint = al-&gt;http.code;
+ 
+             doint = 1;
+ 
+             break;
+ 
+         case LFT_HTTP_RECEIVED_STATUS_CODE:
+             if (al-&gt;hier.peer_reply_status == Http::scNone) {
+                 out = &quot;-&quot;;
+             } else {
+                 outint = al-&gt;hier.peer_reply_status;
+@@ -878,42 +909,41 @@
+ 
+         case LFT_SQUID_STATUS:
+             out = al-&gt;cache.code.c_str();
+             break;
+ 
+         case LFT_SQUID_ERROR:
+             if (al-&gt;request &amp;&amp; al-&gt;request-&gt;errType != ERR_NONE)
+                 out = errorPageName(al-&gt;request-&gt;errType);
+             break;
+ 
+         case LFT_SQUID_ERROR_DETAIL:
+ #if USE_OPENSSL
+             if (al-&gt;request &amp;&amp; al-&gt;request-&gt;errType == ERR_SECURE_CONNECT_FAIL) {
+                 if (! (out = Ssl::GetErrorName(al-&gt;request-&gt;errDetail))) {
+                     snprintf(tmp, sizeof(tmp), &quot;SSL_ERR=%d&quot;, al-&gt;request-&gt;errDetail);
+                     out = tmp;
+                 }
+             } else
+ #endif
+                 if (al-&gt;request &amp;&amp; al-&gt;request-&gt;errDetail != ERR_DETAIL_NONE) {
+-                    if (al-&gt;request-&gt;errDetail &gt; ERR_DETAIL_START  &amp;&amp;
+-                            al-&gt;request-&gt;errDetail &lt; ERR_DETAIL_MAX)
++                    if (al-&gt;request-&gt;errDetail &gt; ERR_DETAIL_START &amp;&amp; al-&gt;request-&gt;errDetail &lt; ERR_DETAIL_MAX)
+                         out = errorDetailName(al-&gt;request-&gt;errDetail);
+                     else {
+                         if (al-&gt;request-&gt;errDetail &gt;= ERR_DETAIL_EXCEPTION_START)
+                             snprintf(tmp, sizeof(tmp), &quot;%s=0x%X&quot;,
+                                      errorDetailName(al-&gt;request-&gt;errDetail), (uint32_t) al-&gt;request-&gt;errDetail);
+                         else
+                             snprintf(tmp, sizeof(tmp), &quot;%s=%d&quot;,
+                                      errorDetailName(al-&gt;request-&gt;errDetail), al-&gt;request-&gt;errDetail);
+                         out = tmp;
+                     }
+                 }
+             break;
+ 
+         case LFT_SQUID_HIERARCHY:
+             if (al-&gt;hier.ping.timedout)
+                 mb.append(&quot;TIMEOUT_&quot;, 8);
+ 
+             out = hier_code_str[al-&gt;hier.code];
+ 
+             break;
+@@ -1112,60 +1142,101 @@
+             break;
+ 
+         case LFT_EXT_LOG:
+             if (al-&gt;request)
+                 out = al-&gt;request-&gt;extacl_log.termedBuf();
+ 
+             quote = 1;
+ 
+             break;
+ 
+         case LFT_SEQUENCE_NUMBER:
+             outoff = logSequenceNumber;
+             dooff = 1;
+             break;
+ 
+ #if USE_OPENSSL
+         case LFT_SSL_BUMP_MODE: {
+             const Ssl::BumpMode mode = static_cast&lt;Ssl::BumpMode&gt;(al-&gt;ssl.bumpMode);
+             // for Ssl::bumpEnd, Ssl::bumpMode() returns NULL and we log '-'
+             out = Ssl::bumpMode(mode);
+-            break;
+         }
++            break;
++
++        case LFT_EXT_ACL_USER_CERT_RAW:
++            if (al-&gt;request) {
++                ConnStateData *conn = al-&gt;request-&gt;clientConnectionManager.get();
++                if (conn != NULL &amp;&amp; Comm::IsConnOpen(conn-&gt;clientConnection)) {
++                    if (SSL *ssl = fd_table[conn-&gt;clientConnection-&gt;fd].ssl)
++                        out = sslGetUserCertificatePEM(ssl);
++                }
++            }
++            break;
++
++        case LFT_EXT_ACL_USER_CERTCHAIN_RAW:
++            if (al-&gt;request) {
++                ConnStateData *conn = al-&gt;request-&gt;clientConnectionManager.get();
++                if (conn != NULL &amp;&amp; Comm::IsConnOpen(conn-&gt;clientConnection)) {
++                    if (SSL *ssl = fd_table[conn-&gt;clientConnection-&gt;fd].ssl)
++                        out = sslGetUserCertificatePEM(ssl);
++                }
++            }
++            break;
++
++        case LFT_EXT_ACL_USER_CERT:
++            if (al-&gt;request) {
++                ConnStateData *conn = al-&gt;request-&gt;clientConnectionManager.get();
++                if (conn != NULL &amp;&amp; Comm::IsConnOpen(conn-&gt;clientConnection)) {
++                    if (SSL *ssl = fd_table[conn-&gt;clientConnection-&gt;fd].ssl)
++                        out = sslGetUserAttribute(ssl, format-&gt;data.header.header);
++                }
++            }
++            break;
++
++        case LFT_EXT_ACL_USER_CA_CERT:
++            if (al-&gt;request) {
++                ConnStateData *conn = al-&gt;request-&gt;clientConnectionManager.get();
++                if (conn != NULL &amp;&amp; Comm::IsConnOpen(conn-&gt;clientConnection)) {
++                    if (SSL *ssl = fd_table[conn-&gt;clientConnection-&gt;fd].ssl)
++                       out = sslGetCAAttribute(ssl, format-&gt;data.header.header);
++                }
++            }
++            break;
+ 
+         case LFT_SSL_USER_CERT_SUBJECT:
+             if (X509 *cert = al-&gt;cache.sslClientCert.get()) {
+                 if (X509_NAME *subject = X509_get_subject_name(cert)) {
+                     X509_NAME_oneline(subject, tmp, sizeof(tmp));
+                     out = tmp;
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_USER_CERT_ISSUER:
+             if (X509 *cert = al-&gt;cache.sslClientCert.get()) {
+                 if (X509_NAME *issuer = X509_get_issuer_name(cert)) {
+                     X509_NAME_oneline(issuer, tmp, sizeof(tmp));
+                     out = tmp;
+                 }
+             }
+             break;
++
+         case LFT_SSL_CLIENT_SNI:
+             if (al-&gt;request &amp;&amp; al-&gt;request-&gt;clientConnectionManager.valid()) {
+                 if (Ssl::ServerBump * srvBump = al-&gt;request-&gt;clientConnectionManager-&gt;serverBump()) {
+                     if (!srvBump-&gt;clientSni.isEmpty())
+                         out = srvBump-&gt;clientSni.c_str();
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_SERVER_CERT_ISSUER:
+         case LFT_SSL_SERVER_CERT_SUBJECT:
+             // Not implemented
+             break;
+ #endif
+ 
+         case LFT_REQUEST_URLGROUP_OLD_2X:
+             assert(LFT_REQUEST_URLGROUP_OLD_2X == 0); // should never happen.
+ 
+         case LFT_NOTE:
+             tmp[0] = fmt-&gt;data.header.separator;
+@@ -1199,52 +1270,46 @@
+                 if (al-&gt;notes != NULL &amp;&amp; !al-&gt;notes-&gt;empty())
+                     sb.append(al-&gt;notes-&gt;toString(separator));
+ 
+                 out = sb.termedBuf();
+                 quote = 1;
+             }
+             break;
+ 
+         case LFT_CREDENTIALS:
+ #if USE_AUTH
+             if (al-&gt;request &amp;&amp; al-&gt;request-&gt;auth_user_request != NULL)
+                 out = strOrNull(al-&gt;request-&gt;auth_user_request-&gt;credentialsStr());
+ #endif
+ 
+             break;
+ 
+         case LFT_PERCENT:
+             out = &quot;%&quot;;
+             break;
+ 
+-        // XXX: external_acl_type format tokens which are not output by logformat.
+-        // They are listed here because the switch requires
+-        // every ByteCode_t to be explicitly enumerated.
+-        // But do not output due to lack of access to the values.
+-        case LFT_EXT_ACL_USER_CERT_RAW:
+-        case LFT_EXT_ACL_USER_CERTCHAIN_RAW:
+-        case LFT_EXT_ACL_USER_CERT:
+-        case LFT_EXT_ACL_USER_CA_CERT:
+-        case LFT_EXT_ACL_CLIENT_EUI48:
+-        case LFT_EXT_ACL_CLIENT_EUI64:
+         case LFT_EXT_ACL_NAME:
++            out = al-&gt;_private.lastAclName;
++            break;
++
+         case LFT_EXT_ACL_DATA:
++            out = al-&gt;_private.lastAclData;
+             break;
+         }
+ 
+         if (dooff) {
+             snprintf(tmp, sizeof(tmp), &quot;%0*&quot; PRId64, fmt-&gt;zero &amp;&amp; fmt-&gt;widthMin &gt;= 0 ? fmt-&gt;widthMin : 0, outoff);
+             out = tmp;
+ 
+         } else if (doint) {
+             snprintf(tmp, sizeof(tmp), &quot;%0*ld&quot;, fmt-&gt;zero &amp;&amp; fmt-&gt;widthMin &gt;= 0 ? fmt-&gt;widthMin : 0, outint);
+             out = tmp;
+         } else if (doMsec) {
+             if (fmt-&gt;widthMax &lt; 0) {
+                 snprintf(tmp, sizeof(tmp), &quot;%0*ld&quot;, fmt-&gt;widthMin , tvToMsec(outtv));
+             } else {
+                 int precision = fmt-&gt;widthMax;
+                 snprintf(tmp, sizeof(tmp), &quot;%0*&quot; PRId64 &quot;.%0*&quot; PRId64 &quot;&quot;, fmt-&gt;zero &amp;&amp; (fmt-&gt;widthMin - precision - 1 &gt;= 0) ? fmt-&gt;widthMin - precision - 1 : 0, static_cast&lt;int64_t&gt;(outtv.tv_sec * 1000 + outtv.tv_usec / 1000), precision, static_cast&lt;int64_t&gt;((outtv.tv_usec % 1000 )* (1000 / fmt-&gt;divisor)));
+             }
+             out = tmp;
+         } else if (doSec) {
+             int precision = fmt-&gt;widthMax &gt;=0 ? fmt-&gt;widthMax :3;
+@@ -1266,40 +1331,49 @@
+                 case LOG_QUOTE_QUOTES: {
+                     size_t out_len = static_cast&lt;size_t&gt;(strlen(out)) * 2 + 1;
+                     if (out_len &gt;= sizeof(tmp)) {
+                         newout = (char *)xmalloc(out_len);
+                         newfree = 1;
+                     } else
+                         newout = tmp;
+                     log_quoted_string(out, newout);
+                 }
+                 break;
+ 
+                 case LOG_QUOTE_MIMEBLOB:
+                     newout = QuoteMimeBlob(out);
+                     newfree = 1;
+                     break;
+ 
+                 case LOG_QUOTE_URL:
+                     newout = rfc1738_escape(out);
+                     break;
+ 
++                case LOG_QUOTE_SHELL: {
++                    MemBuf mbq;
++                    mbq.init();
++                    strwordquote(&amp;mbq, out);
++                    newout = mbq.content();
++                    mbq.stolen = 1;
++                    newfree = 1;
++                    } break;
++
+                 case LOG_QUOTE_RAW:
+                     break;
+                 }
+ 
+                 if (newout) {
+                     if (dofree)
+                         safe_free(out);
+ 
+                     out = newout;
+ 
+                     dofree = newfree;
+                 }
+             }
+ 
+             // enforce width limits if configured
+             const bool haveMaxWidth = fmt-&gt;widthMax &gt;=0 &amp;&amp; !doint &amp;&amp; !dooff &amp;&amp; !doMsec &amp;&amp; !doSec;
+             if (haveMaxWidth || fmt-&gt;widthMin) {
+                 const int minWidth = fmt-&gt;widthMin &gt;= 0 ?
+                                      fmt-&gt;widthMin :0;
+                 const int maxWidth = haveMaxWidth ?
+
+=== modified file 'src/format/Format.h'
+--- src/format/Format.h	2015-01-13 07:25:36 +0000
++++ src/format/Format.h	2015-05-22 05:54:39 +0000
+@@ -34,31 +34,31 @@
+ 
+ class Token;
+ 
+ // XXX: inherit from linked list
+ class Format
+ {
+ public:
+     Format(const char *name);
+     virtual ~Format();
+ 
+     /* very inefficent parser, but who cares, this needs to be simple */
+     /* First off, let's tokenize, we'll optimize in a second pass.
+      * A token can either be a %-prefixed sequence (usually a dynamic
+      * token but it can be an escaped sequence), or a string. */
+     bool parse(const char *def);
+ 
+     /// assemble the state information into a formatted line.
+     void assemble(MemBuf &amp;mb, const AccessLogEntryPointer &amp;al, int logSequenceNumber) const;
+ 
+     /// dump this whole list of formats into the provided StoreEntry
+-    void dump(StoreEntry * entry, const char *directiveName);
++    void dump(StoreEntry * entry, const char *directiveName, bool eol = true) const;
+ 
+     char *name;
+     Token *format;
+     Format *next;
+ };
+ 
+ } // namespace Format
+ 
+ #endif /* _SQUID_FORMAT_FORMAT_H */
+ 
+
+=== modified file 'src/format/Token.cc'
+--- src/format/Token.cc	2015-01-13 07:25:36 +0000
++++ src/format/Token.cc	2015-08-09 11:23:34 +0000
+@@ -128,40 +128,66 @@
+     /*TokenTableEntry(&quot;stP&quot;, LFT_SERVER_IO_SIZE_TOTAL),*/
+ 
+     TokenTableEntry(&quot;et&quot;, LFT_TAG),
+     TokenTableEntry(&quot;ea&quot;, LFT_EXT_LOG),
+     TokenTableEntry(&quot;sn&quot;, LFT_SEQUENCE_NUMBER),
+ 
+     TokenTableEntry(NULL, LFT_NONE)        /* this must be last */
+ };
+ 
+ /// Miscellaneous &gt;2 byte tokens
+ static TokenTableEntry TokenTableMisc[] = {
+     TokenTableEntry(&quot;&gt;eui&quot;, LFT_CLIENT_EUI),
+     TokenTableEntry(&quot;&gt;qos&quot;, LFT_CLIENT_LOCAL_TOS),
+     TokenTableEntry(&quot;&lt;qos&quot;, LFT_SERVER_LOCAL_TOS),
+     TokenTableEntry(&quot;&gt;nfmark&quot;, LFT_CLIENT_LOCAL_NFMARK),
+     TokenTableEntry(&quot;&lt;nfmark&quot;, LFT_SERVER_LOCAL_NFMARK),
+     TokenTableEntry(&quot;err_code&quot;, LFT_SQUID_ERROR ),
+     TokenTableEntry(&quot;err_detail&quot;, LFT_SQUID_ERROR_DETAIL ),
+     TokenTableEntry(&quot;note&quot;, LFT_NOTE ),
+     TokenTableEntry(&quot;credentials&quot;, LFT_CREDENTIALS),
++    /*
++     * Legacy external_acl_type format tokens
++     */
++    TokenTableEntry(&quot;ACL&quot;, LFT_EXT_ACL_NAME),
++    TokenTableEntry(&quot;DATA&quot;, LFT_EXT_ACL_DATA),
++    TokenTableEntry(&quot;DST&quot;, LFT_CLIENT_REQ_URLDOMAIN),
++    TokenTableEntry(&quot;EXT_LOG&quot;, LFT_EXT_LOG),
++    TokenTableEntry(&quot;EXT_USER&quot;, LFT_USER_EXTERNAL),
++    TokenTableEntry(&quot;IDENT&quot;, LFT_USER_IDENT),
++    TokenTableEntry(&quot;LOGIN&quot;, LFT_USER_LOGIN),
++    TokenTableEntry(&quot;METHOD&quot;, LFT_CLIENT_REQ_METHOD),
++    TokenTableEntry(&quot;MYADDR&quot;, LFT_LOCAL_LISTENING_IP),
++    TokenTableEntry(&quot;MYPORT&quot;, LFT_LOCAL_LISTENING_PORT),
++    TokenTableEntry(&quot;PATH&quot;, LFT_CLIENT_REQ_URLPATH),
++    TokenTableEntry(&quot;PORT&quot;, LFT_CLIENT_REQ_URLPORT),
++    TokenTableEntry(&quot;PROTO&quot;, LFT_CLIENT_REQ_URLSCHEME),
++    TokenTableEntry(&quot;SRCEUI48&quot;, LFT_EXT_ACL_CLIENT_EUI48),
++    TokenTableEntry(&quot;SRCEUI64&quot;, LFT_EXT_ACL_CLIENT_EUI64),
++    TokenTableEntry(&quot;SRCPORT&quot;, LFT_CLIENT_PORT),
++    TokenTableEntry(&quot;SRC&quot;, LFT_CLIENT_IP_ADDRESS), // keep after longer SRC* tokens
++    TokenTableEntry(&quot;TAG&quot;, LFT_TAG),
++    TokenTableEntry(&quot;URI&quot;, LFT_CLIENT_REQ_URI),
++#if USE_OPENSSL
++    TokenTableEntry(&quot;USER_CERTCHAIN&quot;, LFT_EXT_ACL_USER_CERTCHAIN_RAW),
++    TokenTableEntry(&quot;USER_CERT&quot;, LFT_EXT_ACL_USER_CERT_RAW),
++#endif
+     TokenTableEntry(NULL, LFT_NONE)        /* this must be last */
+ };
+ 
+ #if USE_ADAPTATION
+ static TokenTableEntry TokenTableAdapt[] = {
+     TokenTableEntry(&quot;all_trs&quot;, LFT_ADAPTATION_ALL_XACT_TIMES),
+     TokenTableEntry(&quot;sum_trs&quot;, LFT_ADAPTATION_SUM_XACT_TIMES),
+     TokenTableEntry(&quot;&lt;last_h&quot;, LFT_ADAPTATION_LAST_HEADER),
+     TokenTableEntry(NULL, LFT_NONE)           /* this must be last */
+ };
+ #endif
+ 
+ #if ICAP_CLIENT
+ /// ICAP (icap::) tokens
+ static TokenTableEntry TokenTableIcap[] = {
+     TokenTableEntry(&quot;tt&quot;, LFT_ICAP_TOTAL_TIME),
+     TokenTableEntry(&quot;&lt;last_h&quot;, LFT_ADAPTATION_LAST_HEADER), // deprecated
+ 
+     TokenTableEntry(&quot;&lt;A&quot;,  LFT_ICAP_ADDR),
+     TokenTableEntry(&quot;&lt;service_name&quot;,  LFT_ICAP_SERV_NAME),
+@@ -185,41 +211,40 @@
+ 
+ #if USE_OPENSSL
+ // SSL (ssl::) tokens
+ static TokenTableEntry TokenTableSsl[] = {
+     TokenTableEntry(&quot;bump_mode&quot;, LFT_SSL_BUMP_MODE),
+     TokenTableEntry(&quot;&gt;cert_subject&quot;, LFT_SSL_USER_CERT_SUBJECT),
+     TokenTableEntry(&quot;&gt;cert_issuer&quot;, LFT_SSL_USER_CERT_ISSUER),
+     TokenTableEntry(&quot;&gt;sni&quot;, LFT_SSL_CLIENT_SNI),
+     /*TokenTableEntry(&quot;&lt;cert_subject&quot;, LFT_SSL_SERVER_CERT_SUBJECT), */
+     /*TokenTableEntry(&quot;&lt;cert_issuer&quot;, LFT_SSL_SERVER_CERT_ISSUER), */
+     TokenTableEntry(NULL, LFT_NONE)
+ };
+ #endif
+ } // namespace Format
+ 
+ /// Register all components custom format tokens
+ void
+ Format::Token::Init()
+ {
+     // TODO standard log tokens
+-    // TODO external ACL fmt tokens
+ 
+ #if USE_ADAPTATION
+     TheConfig.registerTokens(String(&quot;adapt&quot;),::Format::TokenTableAdapt);
+ #endif
+ #if ICAP_CLIENT
+     TheConfig.registerTokens(String(&quot;icap&quot;),::Format::TokenTableIcap);
+ #endif
+ #if USE_OPENSSL
+     TheConfig.registerTokens(String(&quot;ssl&quot;),::Format::TokenTableSsl);
+ #endif
+ }
+ 
+ /// Scans a token table to see if the next token exists there
+ /// returns a pointer to next unparsed byte and updates type member if found
+ const char *
+ Format::Token::scanForToken(TokenTableEntry const table[], const char *cur)
+ {
+     for (TokenTableEntry const *lte = table; lte-&gt;configTag != NULL; ++lte) {
+         debugs(46, 8, HERE &lt;&lt; &quot;compare tokens '&quot; &lt;&lt; lte-&gt;configTag &lt;&lt; &quot;' with '&quot; &lt;&lt; cur &lt;&lt; &quot;'&quot;);
+         if (strncmp(lte-&gt;configTag, cur, strlen(lte-&gt;configTag)) == 0) {
+@@ -318,40 +343,41 @@
+             left = true;
+             ++cur;
+         }
+ 
+         if (*cur == '0') {
+             zero = true;
+             ++cur;
+         }
+ 
+         char *endp;
+         if (xisdigit(*cur)) {
+             widthMin = strtol(cur, &amp;endp, 10);
+             cur = endp;
+         }
+ 
+         if (*cur == '.' &amp;&amp; xisdigit(*(++cur))) {
+             widthMax = strtol(cur, &amp;endp, 10);
+             cur = endp;
+         }
+ 
++        // when {arg} field is before the token (old logformat syntax)
+         if (*cur == '{') {
+             char *cp;
+             ++cur;
+             l = strcspn(cur, &quot;}&quot;);
+             cp = (char *)xmalloc(l + 1);
+             xstrncpy(cp, cur, l + 1);
+             data.string = cp;
+             cur += l;
+ 
+             if (*cur == '}')
+                 ++cur;
+         }
+ 
+         type = LFT_NONE;
+ 
+         // Scan each registered token namespace
+         debugs(46, 9, HERE &lt;&lt; &quot;check for token in &quot; &lt;&lt; TheConfig.tokens.size() &lt;&lt; &quot; namespaces.&quot;);
+         for (std::list&lt;TokenNamespace&gt;::const_iterator itr = TheConfig.tokens.begin(); itr != TheConfig.tokens.end(); ++itr) {
+             debugs(46, 7, HERE &lt;&lt; &quot;check for possible &quot; &lt;&lt; itr-&gt;prefix &lt;&lt; &quot;:: token&quot;);
+             const size_t len = itr-&gt;prefix.size();
+@@ -378,40 +404,55 @@
+ 
+             // Scan for various long tokens
+             debugs(46, 5, HERE &lt;&lt; &quot;scan for possible Misc token&quot;);
+             cur = scanForToken(TokenTableMisc, cur);
+             // scan for 2-char tokens
+             if (type == LFT_NONE) {
+                 debugs(46, 5, HERE &lt;&lt; &quot;scan for possible 2C token&quot;);
+                 cur = scanForToken(TokenTable2C, cur);
+             }
+             // finally scan for 1-char tokens.
+             if (type == LFT_NONE) {
+                 debugs(46, 5, HERE &lt;&lt; &quot;scan for possible 1C token&quot;);
+                 cur = scanForToken(TokenTable1C, cur);
+             }
+         }
+ 
+         if (type == LFT_NONE) {
+             fatalf(&quot;Can't parse configuration token: '%s'\n&quot;, def);
+         }
+ 
++        // when {arg} field is after the token (old external_acl_type token syntax)
++        // but accept only if there was none before the token
++        if (*cur == '{' &amp;&amp; !data.string) {
++            char *cp;
++            ++cur;
++            l = strcspn(cur, &quot;}&quot;);
++            cp = (char *)xmalloc(l + 1);
++            xstrncpy(cp, cur, l + 1);
++            data.string = cp;
++            cur += l;
++
++            if (*cur == '}')
++                ++cur;
++        }
++
+         if (*cur == ' ') {
+             space = true;
+             ++cur;
+         }
+     }
+ 
+     switch (type) {
+ 
+ #if USE_ADAPTATION
+     case LFT_ADAPTATION_LAST_HEADER:
+ #endif
+ 
+ #if ICAP_CLIENT
+     case LFT_ICAP_REQ_HEADER:
+ 
+     case LFT_ICAP_REP_HEADER:
+ #endif
+ 
+     case LFT_ADAPTED_REQUEST_HEADER:
+ 
+
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003569.html">[squid-dev] Jenkins build is back to normal : trunk-polygraph #884
+</A></li>
+	<LI>Next message: <A HREF="003580.html">[squid-dev] [PATCH] external_acl_type logformat tokens
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3570">[ date ]</a>
+              <a href="thread.html#3570">[ thread ]</a>
+              <a href="subject.html#3570">[ subject ]</a>
+              <a href="author.html#3570">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,481 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-users] Squid: Small packets and low performance between squid and icap
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20Squid%3A%20Small%20packets%20and%20low%20performance%20between%0A%20squid%20and%20icap&In-Reply-To=%3CCAMFQPn-wbxBYzRr%3Do2Pf5tu%2BJ1abUfiAmjQWUi_53xezc8cY0g%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009073.html">
+   <LINK REL="Next"  HREF="009082.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-users] Squid: Small packets and low performance between squid and icap</H1>
+    <B>Prashanth Prabhu</B> 
+    <A HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20Squid%3A%20Small%20packets%20and%20low%20performance%20between%0A%20squid%20and%20icap&In-Reply-To=%3CCAMFQPn-wbxBYzRr%3Do2Pf5tu%2BJ1abUfiAmjQWUi_53xezc8cY0g%40mail.gmail.com%3E"
+       TITLE="[squid-users] Squid: Small packets and low performance between squid and icap">prashanth.prabhu at gmail.com
+       </A><BR>
+    <I>Tue Feb  9 20:20:09 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="009073.html">[squid-users] Squid exiting all on its own
+</A></li>
+        <LI>Next message (by thread): <A HREF="009082.html">[squid-users] Squid: Small packets and low performance between	squid and icap
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9077">[ date ]</a>
+              <a href="thread.html#9077">[ thread ]</a>
+              <a href="subject.html#9077">[ subject ]</a>
+              <a href="author.html#9077">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi Amos,
+
+I have had a chance to perform some further investigation into the
+slow-upload issue. And, it appears to be due to how the buffer is used
+when reading from the client-socket.
+
+Here's the behavior I have seen: When the connection is set up, the
+buffer gets a size of 16KB (default). Squid reads from the socket,
+parses the data, and then sends it towards c-icap as appropriate. Now,
+as part of parsing the data, the buffer is NUL-terminated via a call
+to c_str(). This NUL-termination, however, is not accounted for by an
+increase in the &quot;offset&quot; (off) in the underlying MemBlob, therefore,
+the offset and size go out of sync. This seems to be OK in some cases,
+but in others this out-of-sync accounting causes problems.
+Specifically, it can result in MemBlob::canAppend() failing because
+MemBlob::isAppendOffset() fails -- the 'off' and 'size' are not the
+same due to the above c_str() call. When canAppend() fails, a new
+buffer is re-allocated. When this reallocation occurs, however, the
+new size of the buffer is dependent on the size being reserved. Since
+that size is usually smaller than 16KB (as an example), the new buffer
+is going to require a (usually) smaller buffer. Sometimes this buffer
+drops down to a few hundred bytes or as low as 40B. But, once the new
+buffer is allocated, its size now becomes the new maximum, with no
+subsequent reads being able to be larger than the new size. Therefore,
+read calls end up reduced to a few bytes at a time.
+
+As a temporary measure, I have an experimental change that checks
+whether the body size is known and if known always reserves a large
+enough size (currently 16K). With this in place, although there are
+occasional low-byte-count read calls, overall larger reads occur and
+therefore upload speed remains consistently high.
+
+The version I have is 3.5.1.
+
+I have some snippets from the logs below, to help with the flow. You
+can see, for instance, that between 22:09:07.469 and 22:09:07.470, the
+buffer drops down to the smallest possible 40B. Let me know if you
+need any further data on this.
+
+Regards.
+Prashanth
+
+
+src/SBuf.cc: SBuf::c_str
+----
+const char*
+SBuf::c_str()
+{
+    ++stats.rawAccess;
+    /* null-terminate the current buffer, by hand-appending a \0 at its tail but
+     * without increasing its length. May COW, the side-effect is to
+guarantee that
+     * the MemBlob's tail is availabe for us to use */
+    *rawSpace(1) = '\0';
+    ++store_-&gt;size;
+    ++stats.setChar;
+    ++stats.nulTerminate;
+    return buf();
+}
+----
+
+
+Snippets from the logs, showing the buffer SBuf2851
+----
+2016/01/06 22:09:06.398| SBuf.cc(79) SBuf: SBuf2851 created
+2016/01/06 22:09:06.398| SBuf.cc(79) SBuf: SBuf2852 created
+2016/01/06 22:09:06.398| SBuf.cc(79) SBuf: SBuf2853 created
+...
+2016/01/06 22:09:06.399| client_side.cc(3228) clientReadRequest:
+local=10.0.49.133:443 remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:06.399| cbdata.cc(394) cbdataInternalLock: 0x1123d58=7
+2016/01/06 22:09:06.399| SBuf.cc(168) rawSpace: reserving 16382 for SBuf2851
+2016/01/06 22:09:06.399| SBuf.cc(910) cow: new size:16382
+2016/01/06 22:09:06.399| SBuf.cc(880) reAlloc: new size: 16382
+2016/01/06 22:09:06.399| MemBlob.cc(57) MemBlob: constructed,
+this=0x12b10f0 id=blob4211 reserveSize=16382
+2016/01/06 22:09:06.399| MemBlob.cc(102) memAlloc: blob4211 memAlloc:
+requested=16382, received=16384
+2016/01/06 22:09:06.399| SBuf.cc(889) reAlloc: new store capacity: 16384
+2016/01/06 22:09:06.399| Read.cc(91) ReadNow: local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1, size 16382, retval 202, errno 0
+2016/01/06 22:09:06.399| SBuf.cc(215) append: from c-string to id SBuf2851
+2016/01/06 22:09:06.399| SBuf.cc(168) rawSpace: reserving 202 for SBuf2851
+2016/01/06 22:09:06.399| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:06.399| client_side.cc(3177) clientParseRequests:
+local=10.0.49.133:443 remote=10.0.0.254:59837 FD 15 flags=1:
+attempting to parse
+2016/01/06 22:09:06.399| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+2016/01/06 22:09:06.399| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:06.399| HttpParser.cc(37) reset: Request buffer is
+CONNECT www.box.com:443 HTTP/1.1^M
+...
+2016/01/06 22:09:06.400| client_side.h(95) mayUseConnection: This
+0x125d2b8 marked 1
+2016/01/06 22:09:06.400| SBuf.cc(487) consume: consume 202
+2016/01/06 22:09:06.400| SBuf.cc(87) SBuf: SBuf2857 created from id SBuf2851
+2016/01/06 22:09:06.400| SBuf.cc(124) ~SBuf: SBuf2857 destructed
+...
+2016/01/06 22:09:06.462| client_side.cc(3228) clientReadRequest:
+local=10.0.49.133:443 remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:06.462| cbdata.cc(394) cbdataInternalLock: 0x1123d58=13
+2016/01/06 22:09:06.462| SBuf.cc(168) rawSpace: reserving 16181 for SBuf2851
+2016/01/06 22:09:06.462| SBuf.cc(910) cow: new size:16181
+2016/01/06 22:09:06.462| SBuf.cc(880) reAlloc: new size: 16181
+2016/01/06 22:09:06.462| MemBlob.cc(57) MemBlob: constructed,
+this=0xcab240 id=blob4215 reserveSize=16181
+2016/01/06 22:09:06.462| MemBlob.cc(102) memAlloc: blob4215 memAlloc:
+requested=16181, received=16384
+2016/01/06 22:09:06.462| MemBlob.cc(83) ~MemBlob: destructed,
+this=0x12b10f0 id=blob4211 capacity=16384 size=203
+2016/01/06 22:09:06.462| SBuf.cc(889) reAlloc: new store capacity: 16384
+2016/01/06 22:09:06.462| bio.cc(120) read: FD 15 read 5 &lt;= 5
+2016/01/06 22:09:06.462| bio.cc(120) read: FD 15 read 288 &lt;= 288
+2016/01/06 22:09:06.462| Read.cc(91) ReadNow: local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1, size 16181, retval 250, errno 0
+2016/01/06 22:09:06.462| SBuf.cc(215) append: from c-string to id SBuf2851
+2016/01/06 22:09:06.462| SBuf.cc(168) rawSpace: reserving 250 for SBuf2851
+2016/01/06 22:09:06.462| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:06.462| client_side.cc(3177) clientParseRequests:
+local=10.0.49.133:443 remote=10.0.0.254:59837 FD 15 flags=1:
+attempting to parse
+2016/01/06 22:09:06.462| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+2016/01/06 22:09:06.462| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:06.462| HttpParser.cc(37) reset: Request buffer is
+PUT /w202b9ba3.4bec4ab9:00000008/t03/_00000001 HTTP/1.1^M
+...
+2016/01/06 22:09:06.463| BodyPipe.cc(138) BodyPipe:&#183;
+reentrant debuging 2-{cbdata.cc(492) cbdataReferenceValid: 0x1123d58}-2
+created BodyPipe [0&lt;=0&lt;=? 0+2047 pipe0x12db598 prod0x1123d58]
+2016/01/06 22:09:06.463| BodyPipe.cc(160) setBodySize:&#183;
+reentrant debuging 2-{cbdata.cc(492) cbdataReferenceValid: 0x1123d58}-2
+set body size [0&lt;=0&lt;=108334 0+2047 pipe0x12db598 prod0x1123d58]
+2016/01/06 22:09:06.463| SBuf.cc(487) consume: consume 250
+2016/01/06 22:09:06.463| SBuf.cc(87) SBuf: SBuf2882 created from id SBuf2851
+2016/01/06 22:09:06.463| SBuf.cc(124) ~SBuf: SBuf2882 destructed
+2016/01/06 22:09:06.463| client_side.cc(2402) consumeInput: in.buf has
+0 unused bytes
+2016/01/06 22:09:06.463| client_side.cc(3359) handleRequestBodyData:
+handling plain request body for local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:06.463| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+2016/01/06 22:09:06.463| SBuf.cc(910) cow: new size:1
+2016/01/06 22:09:06.463| SBuf.cc(880) reAlloc: new size: 1
+2016/01/06 22:09:06.463| MemBlob.cc(57) MemBlob: constructed,
+this=0x12b10f0 id=blob4216 reserveSize=1
+2016/01/06 22:09:06.463| MemBlob.cc(102) memAlloc: blob4216 memAlloc:
+requested=1, received=40
+2016/01/06 22:09:06.463| MemBlob.cc(83) ~MemBlob: destructed,
+this=0xcab240 id=blob4215 capacity=16384 size=251
+2016/01/06 22:09:06.463| SBuf.cc(889) reAlloc: new store capacity: 40
+...
+2016/01/06 22:09:07.463| client_side.cc(3228) clientReadRequest:
+local=10.0.49.133:443 remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.463| cbdata.cc(394) cbdataInternalLock: 0x1123d58=14
+2016/01/06 22:09:07.463| SBuf.cc(168) rawSpace: reserving 39 for SBuf2851
+2016/01/06 22:09:07.463| SBuf.cc(910) cow: new size:39
+2016/01/06 22:09:07.463| SBuf.cc(880) reAlloc: new size: 39
+2016/01/06 22:09:07.463| MemBlob.cc(57) MemBlob: constructed,
+this=0x12cacc0 id=blob4218 reserveSize=39
+2016/01/06 22:09:07.463| MemBlob.cc(102) memAlloc: blob4218 memAlloc:
+requested=39, received=40
+2016/01/06 22:09:07.463| MemBlob.cc(83) ~MemBlob: destructed,
+this=0x12b10f0 id=blob4216 capacity=40 size=1
+2016/01/06 22:09:07.463| SBuf.cc(889) reAlloc: new store capacity: 40
+2016/01/06 22:09:07.463| bio.cc(120) read: FD 15 read 5 &lt;= 5
+2016/01/06 22:09:07.463| bio.cc(120) read: FD 15 read 16432 &lt;= 16432
+2016/01/06 22:09:07.463| support.cc(1251) ssl_read_method: SSL FD 15 is pending
+2016/01/06 22:09:07.463| Read.cc(91) ReadNow: local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1, size 39, retval 39, errno 0
+2016/01/06 22:09:07.463| SBuf.cc(215) append: from c-string to id SBuf2851
+2016/01/06 22:09:07.463| SBuf.cc(168) rawSpace: reserving 39 for SBuf2851
+2016/01/06 22:09:07.463| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:07.463| client_side.cc(3359) handleRequestBodyData:
+handling plain request body for local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.463| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+2016/01/06 22:09:07.463| SBuf.cc(175) rawSpace: not growing
+...
+2016/01/06 22:09:07.464| AsyncCall.cc(93) ScheduleCall:
+BodyPipe.cc(417) will call
+BodyConsumer::noteMoreBodyDataAvailable(0x12db598*5) [call15135]
+2016/01/06 22:09:07.464| SBuf.cc(487) consume: consume 39
+2016/01/06 22:09:07.464| SBuf.cc(87) SBuf: SBuf2889 created from id SBuf2851
+2016/01/06 22:09:07.464| SBuf.cc(124) ~SBuf: SBuf2889 destructed
+2016/01/06 22:09:07.464| client_side.cc(2402) consumeInput: in.buf has
+0 unused bytes
+...
+2016/01/06 22:09:07.464| client_side.cc(3228) clientReadRequest:
+local=10.0.49.133:443 remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.464| SBuf.cc(910) cow: new size:4096
+2016/01/06 22:09:07.464| SBuf.cc(880) reAlloc: new size: 4096
+2016/01/06 22:09:07.464| MemBlob.cc(57) MemBlob: constructed,
+this=0x12b10f0 id=blob4219 reserveSize=4096
+2016/01/06 22:09:07.464| MemBlob.cc(102) memAlloc: blob4219 memAlloc:
+requested=4096, received=4096
+2016/01/06 22:09:07.464| MemBlob.cc(83) ~MemBlob: destructed,
+this=0x12cacc0 id=blob4218 capacity=40 size=40
+2016/01/06 22:09:07.464| SBuf.cc(889) reAlloc: new store capacity: 4096
+2016/01/06 22:09:07.465| client_side.cc(2350) maybeMakeSpaceAvailable:
+growing request buffer: available=4096 used=0
+2016/01/06 22:09:07.465| cbdata.cc(394) cbdataInternalLock: 0x1123d58=14
+2016/01/06 22:09:07.465| SBuf.cc(168) rawSpace: reserving 4096 for SBuf2851
+2016/01/06 22:09:07.465| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:07.465| support.cc(1251) ssl_read_method: SSL FD 15 is pending
+2016/01/06 22:09:07.465| Read.cc(91) ReadNow: local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1, size 4096, retval 4096, errno 0
+2016/01/06 22:09:07.465| SBuf.cc(215) append: from c-string to id SBuf2851
+2016/01/06 22:09:07.465| SBuf.cc(168) rawSpace: reserving 4096 for SBuf2851
+2016/01/06 22:09:07.465| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:07.465| client_side.cc(3359) handleRequestBodyData:
+handling plain request body for local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.465| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+2016/01/06 22:09:07.465| SBuf.cc(910) cow: new size:4097
+2016/01/06 22:09:07.465| SBuf.cc(880) reAlloc: new size: 4097
+2016/01/06 22:09:07.465| MemBlob.cc(57) MemBlob: constructed,
+this=0x12cacc0 id=blob4220 reserveSize=4097
+2016/01/06 22:09:07.465| MemBlob.cc(102) memAlloc: blob4220 memAlloc:
+requested=4097, received=16384
+2016/01/06 22:09:07.465| MemBlob.cc(83) ~MemBlob: destructed,
+this=0x12b10f0 id=blob4219 capacity=4096 size=4096
+2016/01/06 22:09:07.465| SBuf.cc(889) reAlloc: new store capacity: 16384
+...
+2016/01/06 22:09:07.466| client_side.cc(3228) clientReadRequest:
+local=10.0.49.133:443 remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.466| cbdata.cc(394) cbdataInternalLock: 0x1123d58=14
+2016/01/06 22:09:07.466| SBuf.cc(168) rawSpace: reserving 12287 for SBuf2851
+2016/01/06 22:09:07.466| SBuf.cc(910) cow: new size:12287
+2016/01/06 22:09:07.466| SBuf.cc(880) reAlloc: new size: 12287
+2016/01/06 22:09:07.466| MemBlob.cc(57) MemBlob: constructed,
+this=0x12b10f0 id=blob4221 reserveSize=12287
+2016/01/06 22:09:07.466| MemBlob.cc(102) memAlloc: blob4221 memAlloc:
+requested=12287, received=16384
+2016/01/06 22:09:07.466| MemBlob.cc(83) ~MemBlob: destructed,
+this=0x12cacc0 id=blob4220 capacity=16384 size=4097
+2016/01/06 22:09:07.466| SBuf.cc(889) reAlloc: new store capacity: 16384
+2016/01/06 22:09:07.466| Read.cc(91) ReadNow: local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1, size 12287, retval 12249, errno
+0
+2016/01/06 22:09:07.466| SBuf.cc(215) append: from c-string to id SBuf2851
+2016/01/06 22:09:07.466| SBuf.cc(168) rawSpace: reserving 12249 for SBuf2851
+2016/01/06 22:09:07.466| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:07.466| client_side.cc(3359) handleRequestBodyData:
+handling plain request body for local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.466| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+2016/01/06 22:09:07.466| SBuf.cc(175) rawSpace: not growing
+...
+2016/01/06 22:09:07.467| client_side.cc(3228) clientReadRequest:
+local=10.0.49.133:443 remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.467| cbdata.cc(394) cbdataInternalLock: 0x1123d58=14
+2016/01/06 22:09:07.467| SBuf.cc(168) rawSpace: reserving 4134 for SBuf2851
+2016/01/06 22:09:07.467| SBuf.cc(910) cow: new size:4134
+2016/01/06 22:09:07.467| SBuf.cc(880) reAlloc: new size: 4134
+2016/01/06 22:09:07.467| MemBlob.cc(57) MemBlob: constructed,
+this=0x12cacc0 id=blob4222 reserveSize=4134
+2016/01/06 22:09:07.467| MemBlob.cc(102) memAlloc: blob4222 memAlloc:
+requested=4134, received=16384
+2016/01/06 22:09:07.467| MemBlob.cc(83) ~MemBlob: destructed,
+this=0x12b10f0 id=blob4221 capacity=16384 size=12250
+2016/01/06 22:09:07.467| SBuf.cc(889) reAlloc: new store capacity: 16384
+2016/01/06 22:09:07.467| bio.cc(120) read: FD 15 read 5 &lt;= 5
+2016/01/06 22:09:07.467| bio.cc(120) read: FD 15 read 16432 &lt;= 16432
+2016/01/06 22:09:07.467| support.cc(1251) ssl_read_method: SSL FD 15 is pending
+2016/01/06 22:09:07.467| Read.cc(91) ReadNow: local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1, size 4134, retval 4134, errno 0
+2016/01/06 22:09:07.467| SBuf.cc(215) append: from c-string to id SBuf2851
+2016/01/06 22:09:07.467| SBuf.cc(168) rawSpace: reserving 4134 for SBuf2851
+2016/01/06 22:09:07.467| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:07.467| client_side.cc(3359) handleRequestBodyData:
+handling plain request body for local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.467| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+...
+2016/01/06 22:09:07.469| client_side.cc(3228) clientReadRequest:
+local=10.0.49.133:443 remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.469| cbdata.cc(394) cbdataInternalLock: 0x1123d58=14
+2016/01/06 22:09:07.469| SBuf.cc(168) rawSpace: reserving 12249 for SBuf2851
+2016/01/06 22:09:07.469| SBuf.cc(910) cow: new size:12249
+2016/01/06 22:09:07.469| SBuf.cc(880) reAlloc: new size: 12249
+2016/01/06 22:09:07.469| MemBlob.cc(57) MemBlob: constructed,
+this=0x12b10f0 id=blob4223 reserveSize=12249
+2016/01/06 22:09:07.469| MemBlob.cc(102) memAlloc: blob4223 memAlloc:
+requested=12249, received=16384
+2016/01/06 22:09:07.469| MemBlob.cc(83) ~MemBlob: destructed,
+this=0x12cacc0 id=blob4222 capacity=16384 size=4135
+2016/01/06 22:09:07.469| SBuf.cc(889) reAlloc: new store capacity: 16384
+2016/01/06 22:09:07.469| support.cc(1251) ssl_read_method: SSL FD 15 is pending
+2016/01/06 22:09:07.469| Read.cc(91) ReadNow: local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1, size 12249, retval 12249, errno
+0
+2016/01/06 22:09:07.469| SBuf.cc(215) append: from c-string to id SBuf2851
+2016/01/06 22:09:07.469| SBuf.cc(168) rawSpace: reserving 12249 for SBuf2851
+2016/01/06 22:09:07.469| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:07.469| client_side.cc(3359) handleRequestBodyData:
+handling plain request body for local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.469| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+2016/01/06 22:09:07.469| SBuf.cc(175) rawSpace: not growing
+...
+2016/01/06 22:09:07.470| client_side.cc(3359) handleRequestBodyData:
+handling plain request body for local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.470| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+2016/01/06 22:09:07.470| SBuf.cc(910) cow: new size:1
+2016/01/06 22:09:07.470| SBuf.cc(880) reAlloc: new size: 1
+2016/01/06 22:09:07.470| MemBlob.cc(57) MemBlob: constructed,
+this=0x12cacc0 id=blob4224 reserveSize=1
+2016/01/06 22:09:07.470| MemBlob.cc(102) memAlloc: blob4224 memAlloc:
+requested=1, received=40
+2016/01/06 22:09:07.470| MemBlob.cc(83) ~MemBlob: destructed,
+this=0x12b10f0 id=blob4223 capacity=16384 size=12250
+2016/01/06 22:09:07.470| SBuf.cc(889) reAlloc: new store capacity: 40
+...
+2016/01/06 22:09:07.470| client_side.cc(3228) clientReadRequest:
+local=10.0.49.133:443 remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.470| cbdata.cc(394) cbdataInternalLock: 0x1123d58=14
+2016/01/06 22:09:07.470| SBuf.cc(168) rawSpace: reserving 39 for SBuf2851
+2016/01/06 22:09:07.470| SBuf.cc(910) cow: new size:39
+2016/01/06 22:09:07.470| SBuf.cc(880) reAlloc: new size: 39
+2016/01/06 22:09:07.470| MemBlob.cc(57) MemBlob: constructed,
+this=0x12b10f0 id=blob4225 reserveSize=39
+2016/01/06 22:09:07.470| MemBlob.cc(102) memAlloc: blob4225 memAlloc:
+requested=39, received=40
+2016/01/06 22:09:07.470| MemBlob.cc(83) ~MemBlob: destructed,
+this=0x12cacc0 id=blob4224 capacity=40 size=1
+2016/01/06 22:09:07.470| SBuf.cc(889) reAlloc: new store capacity: 40
+2016/01/06 22:09:07.470| Read.cc(91) ReadNow: local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1, size 39, retval 1, errno 0
+2016/01/06 22:09:07.470| SBuf.cc(215) append: from c-string to id SBuf2851
+2016/01/06 22:09:07.470| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+2016/01/06 22:09:07.470| SBuf.cc(175) rawSpace: not growing
+2016/01/06 22:09:07.470| client_side.cc(3359) handleRequestBodyData:
+handling plain request body for local=10.0.49.133:443
+remote=10.0.0.254:59837 FD 15 flags=1
+2016/01/06 22:09:07.470| SBuf.cc(168) rawSpace: reserving 1 for SBuf2851
+2016/01/06 22:09:07.470| SBuf.cc(175) rawSpace: not growing
+...
+----
+
+
+On 5 November 2015 at 11:56, Prashanth Prabhu
+&lt;<A HREF="https://lists.squid-cache.org/listinfo/squid-users">prashanth.prabhu at gmail.com</A>&gt; wrote:
+&gt;<i> Hi Amos,
+</I>&gt;<i>
+</I>&gt;&gt;&gt;<i> I failed to mention that I am on 3.5.1. And, readSomeData() is already &quot;fixed&quot;:
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> Bug 4353 exists because the initial fix for 4206 was not enough to fully
+</I>&gt;&gt;<i> remove the behaviour. Sometimes yes, sometimes no.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> Only the nasty hack of allocating buffers twice and throwing one away
+</I>&gt;&gt;<i> unused seems to work fully so far. That is the patch in 4353.
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> To be clear, the code in 3.5.1 is already using the
+</I>&gt;<i> in.maybeMakeSpaceAvailable() call, therefore the patch for 4353 is
+</I>&gt;<i> useless for me.
+</I>&gt;<i>
+</I>&gt;<i> It appears that sometime during 3.5.3 the code was modified to use the
+</I>&gt;<i> following check instead and that is being backed out with 4353.
+</I>&gt;<i> ----
+</I>&gt;<i>      if (Config.maxRequestBufferSize - in.buf.length() &lt; 2)
+</I>&gt;<i> ----
+</I>&gt;<i>
+</I>&gt;<i> I thought that perhaps the first patch from 4206 would help, but a
+</I>&gt;<i> quick test has shown that it doesn't.
+</I>&gt;<i>
+</I>&gt;<i> Are there any documents on how buffer management is done in Squid? I
+</I>&gt;<i> am seeing small buffers being used to read from the client-side
+</I>&gt;<i> connection and I don't quite understand why. Why not read as much as
+</I>&gt;<i> possible, within the bounds of the space available in the &quot;bodypipe&quot;,
+</I>&gt;<i> so we maximize the reads?
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> Regards.
+</I>&gt;<i> Prashanth
+</I>&gt;<i>
+</I>&gt;<i> On 5 November 2015 at 07:14, Amos Jeffries &lt;<A HREF="https://lists.squid-cache.org/listinfo/squid-users">squid3 at treenet.co.nz</A>&gt; wrote:
+</I>&gt;&gt;<i> On 5/11/2015 10:41 p.m., Prashanth Prabhu wrote:
+</I>&gt;&gt;&gt;<i> Hello Amos,
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> Thanks for the quick response.
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> I failed to mention that I am on 3.5.1. And, readSomeData() is already &quot;fixed&quot;:
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> Bug 4353 exists because the initial fix for 4206 was not enough to fully
+</I>&gt;&gt;<i> remove the behaviour. Sometimes yes, sometimes no.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> Only the nasty hack of allocating buffers twice and throwing one away
+</I>&gt;&gt;<i> unused seems to work fully so far. That is the patch in 4353.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> ----
+</I>&gt;&gt;&gt;<i> void
+</I>&gt;&gt;&gt;<i> ConnStateData::readSomeData()
+</I>&gt;&gt;&gt;<i> {
+</I>&gt;&gt;&gt;<i>     if (reading())
+</I>&gt;&gt;&gt;<i>         return;
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i>     debugs(33, 4, HERE &lt;&lt; clientConnection &lt;&lt; &quot;: reading request...&quot;);
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i>     if (!in.maybeMakeSpaceAvailable())
+</I>&gt;&gt;&gt;<i>         return;
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i>     typedef CommCbMemFunT&lt;ConnStateData, CommIoCbParams&gt; Dialer;
+</I>&gt;&gt;&gt;<i>     reader = JobCallback(33, 5, Dialer, this, ConnStateData::clientReadRequest);
+</I>&gt;&gt;&gt;<i>     Comm::Read(clientConnection, reader);
+</I>&gt;&gt;&gt;<i> }
+</I>&gt;&gt;&gt;<i> ----
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> I am planning to try the &quot;patch client_side.cc to call
+</I>&gt;&gt;&gt;<i> maybeMakeSpaceAvailable()&quot; from #4206. Anything else, I should try?
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> The patch from 4353.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> And also upgrading to 3.5.11 unless that was a typo in the version
+</I>&gt;&gt;<i> number *.1 above.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> Amos
+</I>&gt;&gt;<i>
+</I>
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="009073.html">[squid-users] Squid exiting all on its own
+</A></li>
+	<LI>Next message (by thread): <A HREF="009082.html">[squid-users] Squid: Small packets and low performance between	squid and icap
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9077">[ date ]</a>
+              <a href="thread.html#9077">[ thread ]</a>
+              <a href="subject.html#9077">[ subject ]</a>
+              <a href="author.html#9077">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.squid-cache.org/listinfo/squid-users">More information about the squid-users
+mailing list</a><br>
+</body></html>

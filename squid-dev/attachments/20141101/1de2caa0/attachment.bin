@@ -1,0 +1,927 @@
+Adapting 100-continue
+
+Currently squid fails to handle correctly "100 Continue" requests/responses 
+when ICAP is used. The problems discussed in squid bugzilla:
+     http://bugs.squid-cache.org/show_bug.cgi?id=4067
+
+A short discussion of the problem:
+  When a data upload request enters squid (eg a PUT request with 
+"Expect: 100-continue" header), squid sends ICAP headers and HTTP headers to
+ICAP server and stucks waiting for ever  the request body data.
+
+This patch implements the "force_request_body_continuation" access list 
+directive which controls how Squid handles data upload requests from HTTP and
+send the request body to Squid. 
+An allow match tells Squid to respond with the HTTP 100 or FTP 150
+(Please Continue) control message on its own, before forwarding the
+request to an adaptation service or peer. Such a response usually forces
+the request sender to proceed with sending the body. A deny match tells
+Squid to delay that control response until the origin server confirms
+that the request body is needed. Delaying is the default behavior.
+
+This is a Measurement Factory project
+=== modified file 'src/HttpRequest.cc'
+--- src/HttpRequest.cc	2014-09-13 13:59:43 +0000
++++ src/HttpRequest.cc	2014-11-01 11:19:33 +0000
+@@ -95,40 +95,41 @@
+     vary_headers = NULL;
+     myportname = null_string;
+     tag = null_string;
+ #if USE_AUTH
+     extacl_user = null_string;
+     extacl_passwd = null_string;
+ #endif
+     extacl_log = null_string;
+     extacl_message = null_string;
+     pstate = psReadyToParseStartLine;
+ #if FOLLOW_X_FORWARDED_FOR
+     indirect_client_addr.setEmpty();
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+ #if USE_ADAPTATION
+     adaptHistory_ = NULL;
+ #endif
+ #if ICAP_CLIENT
+     icapHistory_ = NULL;
+ #endif
+     rangeOffsetLimit = -2; //a value of -2 means not checked yet
++    forcedBodyContinuation = false;
+ }
+ 
+ void
+ HttpRequest::clean()
+ {
+     // we used to assert that the pipe is NULL, but now the request only
+     // points to a pipe that is owned and initiated by another object.
+     body_pipe = NULL;
+ #if USE_AUTH
+     auth_user_request = NULL;
+ #endif
+     safe_free(canonical);
+ 
+     safe_free(vary_headers);
+ 
+     url.clear();
+     urlpath.clean();
+ 
+     header.clean();
+ 
+@@ -235,40 +236,42 @@
+     adaptHistory_ = aReq->adaptHistory();
+ #endif
+ #if ICAP_CLIENT
+     icapHistory_ = aReq->icapHistory();
+ #endif
+ 
+     // This may be too conservative for the 204 No Content case
+     // may eventually need cloneNullAdaptationImmune() for that.
+     flags = aReq->flags.cloneAdaptationImmune();
+ 
+     errType = aReq->errType;
+     errDetail = aReq->errDetail;
+ #if USE_AUTH
+     auth_user_request = aReq->auth_user_request;
+     extacl_user = aReq->extacl_user;
+     extacl_passwd = aReq->extacl_passwd;
+ #endif
+ 
+     myportname = aReq->myportname;
+ 
++    forcedBodyContinuation = aReq->forcedBodyContinuation;
++
+     // main property is which connection the request was received on (if any)
+     clientConnectionManager = aReq->clientConnectionManager;
+ 
+     notes = aReq->notes;
+     return true;
+ }
+ 
+ /**
+  * Checks the first line of an HTTP request is valid
+  * currently just checks the request method is present.
+  *
+  * NP: Other errors are left for detection later in the parse.
+  */
+ bool
+ HttpRequest::sanityCheckStartLine(MemBuf *buf, const size_t hdr_len, Http::StatusCode *error)
+ {
+     // content is long enough to possibly hold a reply
+     // 2 being magic size of a 1-byte request method plus space delimiter
+     if ( buf->contentSize() < 2 ) {
+         // this is ony a real error if the headers apparently complete.
+
+=== modified file 'src/HttpRequest.h'
+--- src/HttpRequest.h	2014-10-20 06:58:59 +0000
++++ src/HttpRequest.h	2014-11-01 11:19:33 +0000
+@@ -187,40 +187,43 @@
+ 
+     NotePairs::Pointer notes; ///< annotations added by the note directive and helpers
+ 
+     String tag;			/* Internal tag for this request */
+ 
+     String extacl_user;		/* User name returned by extacl lookup */
+ 
+     String extacl_passwd;	/* Password returned by extacl lookup */
+ 
+     String extacl_log;		/* String to be used for access.log purposes */
+ 
+     String extacl_message;	/* String to be used for error page purposes */
+ 
+ #if FOLLOW_X_FORWARDED_FOR
+     String x_forwarded_for_iterator; /* XXX a list of IP addresses */
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+ 
+     /// A strong etag of the cached entry. Used for refreshing that entry.
+     String etag;
+ 
++    /// whether we have responded with HTTP 100 or FTP 150 already
++    bool forcedBodyContinuation;
++
+ public:
+     bool multipartRangeRequest() const;
+ 
+     bool parseFirstLine(const char *start, const char *end);
+ 
+     int parseHeader(const char *parse_start, int len);
+ 
+     virtual bool expectingBody(const HttpRequestMethod& unused, int64_t&) const;
+ 
+     bool bodyNibbled() const; // the request has a [partially] consumed body
+ 
+     int prefixLen();
+ 
+     void swapOut(StoreEntry * e);
+ 
+     void pack(Packer * p);
+ 
+     static void httpRequestPack(void *obj, Packer *p);
+ 
+     static HttpRequest * CreateFromUrlAndMethod(char * url, const HttpRequestMethod& method);
+
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2014-10-07 14:11:12 +0000
++++ src/SquidConfig.h	2014-11-01 11:19:33 +0000
+@@ -360,40 +360,42 @@
+ 
+         acl_access *htcp;
+         acl_access *htcp_clr;
+ #endif
+ 
+ #if USE_OPENSSL
+         acl_access *ssl_bump;
+ #endif
+ #if FOLLOW_X_FORWARDED_FOR
+         acl_access *followXFF;
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+ 
+         /// acceptible PROXY protocol clients
+         acl_access *proxyProtocol;
+ 
+         /// spoof_client_ip squid.conf acl.
+         /// nil unless configured
+         acl_access* spoof_client_ip;
+ 
+         acl_access *ftp_epsv;
++
++        acl_access *forceRequestBodyContinuation;
+     } accessList;
+     AclDenyInfoList *denyInfoList;
+ 
+     struct {
+         size_t list_width;
+         int list_wrap;
+         char *anon_user;
+         int passive;
+         int epsv_all;
+         int epsv;
+         int eprt;
+         int sanitycheck;
+         int telnet;
+     } Ftp;
+     RefreshPattern *Refresh;
+ 
+     struct _cacheSwap {
+         RefCount<SwapDir> *swapDirs;
+         int n_allocated;
+         int n_configured;
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2014-10-17 00:35:19 +0000
++++ src/cf.data.pre	2014-11-01 11:19:33 +0000
+@@ -9286,21 +9286,50 @@
+ DEFAULT: none
+ DEFAULT_DOC: Let operating system decide.
+ DOC_START
+ 	Usage: cpu_affinity_map process_numbers=P1,P2,... cores=C1,C2,...
+ 
+ 	Sets 1:1 mapping between Squid processes and CPU cores. For example,
+ 
+ 	    cpu_affinity_map process_numbers=1,2,3,4 cores=1,3,5,7
+ 
+ 	affects processes 1 through 4 only and places them on the first
+ 	four even cores, starting with core #1.
+ 
+ 	CPU cores are numbered starting from 1. Requires support for
+ 	sched_getaffinity(2) and sched_setaffinity(2) system calls.
+ 
+ 	Multiple cpu_affinity_map options are merged.
+ 
+ 	See also: workers
+ DOC_END
+ 
++NAME: force_request_body_continuation
++TYPE: acl_access
++LOC: Config.accessList.forceRequestBodyContinuation
++DEFAULT: none
++DEFAULT_DOC: Deny, unless rules exist in squid.conf.
++DOC_START
++	This option controls how Squid handles data upload requests from HTTP
++	and FTP agents that require a "Please Continue" control message response
++	to actually send the request body to Squid. It is mostly useful in
++	adaptation environments.
++	
++	When Squid receives an HTTP request with an "Expect: 100-continue"
++	header or an FTP upload command (e.g., STOR), Squid normally sends the
++	request headers or FTP command information to an adaptation service (or
++	peer) and waits for a response. Most adaptation services (and some
++	broken peers) may not respond to Squid at that stage because they may
++	decide to wait for the HTTP request body or FTP data transfer. However,
++	that request body or data transfer may never come because Squid has not
++	responded with the HTTP 100 or FTP 150 (Please Continue) control message
++	to the request sender yet!
++	
++	An allow match tells Squid to respond with the HTTP 100 or FTP 150
++	(Please Continue) control message on its own, before forwarding the
++	request to an adaptation service or peer. Such a response usually forces
++	the request sender to proceed with sending the body. A deny match tells
++	Squid to delay that control response until the origin server confirms
++	that the request body is needed. Delaying is the default behavior.
++DOC_END
++
+ EOF
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2014-10-21 11:10:13 +0000
++++ src/client_side.cc	2014-11-01 11:19:33 +0000
+@@ -2490,160 +2490,76 @@
+                     SQUID_X509_V_ERR_DOMAIN_MISMATCH,
+                     srvCert, NULL);
+                 err->detail = errDetail;
+                 // Save the original request for logging purposes.
+                 if (!context->http->al->request) {
+                     context->http->al->request = request;
+                     HTTPMSGLOCK(context->http->al->request);
+                 }
+                 repContext->setReplyToError(request->method, err);
+                 assert(context->http->out.offset == 0);
+                 context->pullData();
+                 return true;
+             }
+         }
+     }
+ 
+     return false;
+ }
+ #endif // USE_OPENSSL
+ 
+-static void
++void
+ clientProcessRequestFinished(ConnStateData *conn, const HttpRequest::Pointer &request)
+ {
+     /*
+      * DPW 2007-05-18
+      * Moved the TCP_RESET feature from clientReplyContext::sendMoreData
+      * to here because calling comm_reset_close() causes http to
+      * be freed and the above connNoteUseOfBuffer() would hit an
+      * assertion, not to mention that we were accessing freed memory.
+      */
+     if (request != NULL && request->flags.resetTcp && Comm::IsConnOpen(conn->clientConnection)) {
+         debugs(33, 3, HERE << "Sending TCP RST on " << conn->clientConnection);
+         conn->flags.readMore = false;
+         comm_reset_close(conn->clientConnection);
+     }
+ }
+ 
+ void
+ clientProcessRequest(ConnStateData *conn, HttpParser *hp, ClientSocketContext *context, const HttpRequestMethod& method, Http::ProtocolVersion http_ver)
+ {
+     ClientHttpRequest *http = context->http;
+-    HttpRequest::Pointer request;
+     bool notedUseOfBuffer = false;
+     bool chunked = false;
+     bool mustReplyToOptions = false;
+     bool unsupportedTe = false;
+     bool expectBody = false;
+ 
++    // We already have the request parsed and checked, so we
++    // only need to go through the final body/conn setup to doCallouts().
++    assert(http->request);
++    HttpRequest::Pointer request = http->request;
++
+     // temporary hack to avoid splitting this huge function with sensitive code
+     const bool isFtp = !hp;
+-    if (isFtp) {
+-        // In FTP, case, we already have the request parsed and checked, so we
+-        // only need to go through the final body/conn setup to doCallouts().
+-        assert(http->request);
+-        request = http->request;
++    if (isFtp)
+         notedUseOfBuffer = true;
+-    } else {
+-
+-        if (context->flags.parsed_ok == 0) {
+-            clientStreamNode *node = context->getClientReplyContext();
+-            debugs(33, 2, "clientProcessRequest: Invalid Request");
+-            conn->quitAfterError(NULL);
+-            // setLogUri should called before repContext->setReplyToError
+-            setLogUri(http, http->uri,  true);
+-            clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+-            assert (repContext);
+-            switch (hp->request_parse_status) {
+-            case Http::scHeaderTooLarge:
+-                repContext->setReplyToError(ERR_TOO_BIG, Http::scBadRequest, method, http->uri, conn->clientConnection->remote, NULL, conn->in.buf.c_str(), NULL);
+-                break;
+-            case Http::scMethodNotAllowed:
+-                repContext->setReplyToError(ERR_UNSUP_REQ, Http::scMethodNotAllowed, method, http->uri,
+-                                            conn->clientConnection->remote, NULL, conn->in.buf.c_str(), NULL);
+-                break;
+-            default:
+-                repContext->setReplyToError(ERR_INVALID_REQ, hp->request_parse_status, method, http->uri,
+-                                            conn->clientConnection->remote, NULL, conn->in.buf.c_str(), NULL);
+-            }
+-            assert(context->http->out.offset == 0);
+-            context->pullData();
+-            connNoteUseOfBuffer(conn, http->req_sz);
+-            return;
+-        }
+-
+-        if ((request = HttpRequest::CreateFromUrlAndMethod(http->uri, method)) == NULL) {
+-            clientStreamNode *node = context->getClientReplyContext();
+-            debugs(33, 5, "Invalid URL: " << http->uri);
+-            conn->quitAfterError(request.getRaw());
+-            // setLogUri should called before repContext->setReplyToError
+-            setLogUri(http, http->uri,  true);
+-            clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+-            assert (repContext);
+-            repContext->setReplyToError(ERR_INVALID_URL, Http::scBadRequest, method, http->uri, conn->clientConnection->remote, NULL, NULL, NULL);
+-            assert(context->http->out.offset == 0);
+-            context->pullData();
+-            connNoteUseOfBuffer(conn, http->req_sz);
+-            return;
+-        }
+-
+-        /* RFC 2616 section 10.5.6 : handle unsupported HTTP major versions cleanly. */
+-        /* We currently only support 0.9, 1.0, 1.1 properly */
+-        /* TODO: move HTTP-specific processing into servers/HttpServer and such */
+-        if ( (http_ver.major == 0 && http_ver.minor != 9) ||
+-                (http_ver.major > 1) ) {
+-
+-            clientStreamNode *node = context->getClientReplyContext();
+-            debugs(33, 5, "Unsupported HTTP version discovered. :\n" << HttpParserHdrBuf(hp));
+-            conn->quitAfterError(request.getRaw());
+-            // setLogUri should called before repContext->setReplyToError
+-            setLogUri(http, http->uri,  true);
+-            clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+-            assert (repContext);
+-            repContext->setReplyToError(ERR_UNSUP_HTTPVERSION, Http::scHttpVersionNotSupported, method, http->uri,
+-                                        conn->clientConnection->remote, NULL, HttpParserHdrBuf(hp), NULL);
+-            assert(context->http->out.offset == 0);
+-            context->pullData();
+-            connNoteUseOfBuffer(conn, http->req_sz);
+-            clientProcessRequestFinished(conn, request);
+-            return;
+-        }
+-
+-        /* compile headers */
+-        /* we should skip request line! */
+-        /* XXX should actually know the damned buffer size here */
+-        if (http_ver.major >= 1 && !request->parseHeader(HttpParserHdrBuf(hp), HttpParserHdrSz(hp))) {
+-            clientStreamNode *node = context->getClientReplyContext();
+-            debugs(33, 5, "Failed to parse request headers:\n" << HttpParserHdrBuf(hp));
+-            conn->quitAfterError(request.getRaw());
+-            // setLogUri should called before repContext->setReplyToError
+-            setLogUri(http, http->uri,  true);
+-            clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+-            assert (repContext);
+-            repContext->setReplyToError(ERR_INVALID_REQ, Http::scBadRequest, method, http->uri, conn->clientConnection->remote, NULL, NULL, NULL);
+-            assert(context->http->out.offset == 0);
+-            context->pullData();
+-            connNoteUseOfBuffer(conn, http->req_sz);
+-            clientProcessRequestFinished(conn, request);
+-            return;
+-        }
+-    }
+ 
+     // Some blobs below are still HTTP-specific, but we would have to rewrite
+     // this entire function to remove them from the FTP code path. Connection
+     // setup and body_pipe preparation blobs are needed for FTP.
+ 
+     request->clientConnectionManager = conn;
+ 
+     request->flags.accelerated = http->flags.accel;
+     request->flags.sslBumped=conn->switchedToHttps();
+     request->flags.ignoreCc = conn->port->ignore_cc;
+     // TODO: decouple http->flags.accel from request->flags.sslBumped
+     request->flags.noDirect = (request->flags.accelerated && !request->flags.sslBumped) ?
+                               !conn->port->allow_direct : 0;
+ #if USE_AUTH
+     if (request->flags.sslBumped) {
+         if (conn->getAuth() != NULL)
+             request->auth_user_request = conn->getAuth();
+     }
+ #endif
+ 
+@@ -2741,45 +2657,40 @@
+     }
+ 
+     if (request->header.has(HDR_EXPECT)) {
+         const String expect = request->header.getList(HDR_EXPECT);
+         const bool supportedExpect = (expect.caseCmp("100-continue") == 0);
+         if (!supportedExpect) {
+             clientStreamNode *node = context->getClientReplyContext();
+             clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+             assert (repContext);
+             conn->quitAfterError(request.getRaw());
+             repContext->setReplyToError(ERR_INVALID_REQ, Http::scExpectationFailed, request->method, http->uri,
+                                         conn->clientConnection->remote, request.getRaw(), NULL, NULL);
+             assert(context->http->out.offset == 0);
+             context->pullData();
+             connNoteUseOfBuffer(conn, http->req_sz);
+             clientProcessRequestFinished(conn, request);
+             return;
+         }
+     }
+ 
+-    if (!isFtp) {
+-        http->request = request.getRaw();
+-        HTTPMSGLOCK(http->request);
+-    }
+-
+     clientSetKeepaliveFlag(http);
+     // Let tunneling code be fully responsible for CONNECT requests
+     if (http->request->method == Http::METHOD_CONNECT) {
+         context->mayUseConnection(true);
+         conn->flags.readMore = false;
+ 
+         // consume header early so that tunnel gets just the body
+         connNoteUseOfBuffer(conn, http->req_sz);
+         notedUseOfBuffer = true;
+     }
+ 
+ #if USE_OPENSSL
+     if (conn->switchedToHttps() && conn->serveDelayedError(context)) {
+         if (!notedUseOfBuffer)
+             connNoteUseOfBuffer(conn, http->req_sz);
+         clientProcessRequestFinished(conn, request);
+         return;
+     }
+ #endif
+ 
+
+=== modified file 'src/clients/FtpRelay.cc'
+--- src/clients/FtpRelay.cc	2014-09-29 05:13:17 +0000
++++ src/clients/FtpRelay.cc	2014-11-01 11:19:33 +0000
+@@ -560,41 +560,43 @@
+         return; // ignore preliminary replies
+ 
+     if (handleEpsvReply(updateMaster().clientDataAddr)) {
+         if (ctrl.message == NULL)
+             return; // didn't get complete reply yet
+ 
+         forwardReply();
+     } else
+         forwardError();
+ }
+ 
+ void
+ Ftp::Relay::readDataReply()
+ {
+     assert(serverState() == fssHandleDataRequest ||
+            serverState() == fssHandleUploadRequest);
+ 
+     if (ctrl.replycode == 125 || ctrl.replycode == 150) {
+         if (serverState() == fssHandleDataRequest)
+             forwardPreliminaryReply(&Ftp::Relay::startDataDownload);
+-        else // serverState() == fssHandleUploadRequest
++        else if (fwd->request->forcedBodyContinuation /*&& serverState() == fssHandleUploadRequest*/)
++            startDataUpload();
++        else // serverState() == fssHandleUploadRequest 
+             forwardPreliminaryReply(&Ftp::Relay::startDataUpload);
+     } else
+         forwardReply();
+ }
+ 
+ bool
+ Ftp::Relay::startDirTracking()
+ {
+     if (!fwd->request->clientConnectionManager->port->ftp_track_dirs)
+         return false;
+ 
+     debugs(9, 5, "start directory tracking");
+     savedReply.message = ctrl.message;
+     savedReply.lastCommand = ctrl.last_command;
+     savedReply.lastReply = ctrl.last_reply;
+     savedReply.replyCode = ctrl.replycode;
+ 
+     ctrl.last_command = NULL;
+     ctrl.last_reply = NULL;
+     ctrl.message = NULL;
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2014-10-22 11:50:24 +0000
++++ src/http.cc	2014-11-01 11:19:33 +0000
+@@ -765,42 +765,42 @@
+ 
+     checkDateSkew(vrep);
+ 
+     processSurrogateControl (vrep);
+ 
+     request->hier.peer_reply_status = newrep->sline.status();
+ 
+     ctx_exit(ctx);
+ }
+ 
+ /// ignore or start forwarding the 1xx response (a.k.a., control message)
+ void
+ HttpStateData::handle1xx(HttpReply *reply)
+ {
+     HttpReply::Pointer msg(reply); // will destroy reply if unused
+ 
+     // one 1xx at a time: we must not be called while waiting for previous 1xx
+     Must(!flags.handling1xx);
+     flags.handling1xx = true;
+ 
+-    if (!request->canHandle1xx()) {
+-        debugs(11, 2, HERE << "ignoring client-unsupported 1xx");
++    if (!request->canHandle1xx() || request->forcedBodyContinuation) {
++        debugs(11, 2, "ignoring 1xx because it is " << (request->forcedBodyContinuation ? "already sent" : "not supported by client"));
+         proceedAfter1xx();
+         return;
+     }
+ 
+ #if USE_HTTP_VIOLATIONS
+     // check whether the 1xx response forwarding is allowed by squid.conf
+     if (Config.accessList.reply) {
+         ACLFilledChecklist ch(Config.accessList.reply, originalRequest(), NULL);
+         ch.reply = reply;
+         HTTPMSGLOCK(ch.reply);
+         if (ch.fastCheck() != ACCESS_ALLOWED) { // TODO: support slow lookups?
+             debugs(11, 3, HERE << "ignoring denied 1xx");
+             proceedAfter1xx();
+             return;
+         }
+     }
+ #endif // USE_HTTP_VIOLATIONS
+ 
+     debugs(11, 2, HERE << "forwarding 1xx to client");
+ 
+
+=== modified file 'src/servers/FtpServer.cc'
+--- src/servers/FtpServer.cc	2014-10-30 15:18:20 +0000
++++ src/servers/FtpServer.cc	2014-11-01 11:19:33 +0000
+@@ -1,31 +1,32 @@
+ /*
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 33    Transfer protocol servers */
+ 
+ #include "squid.h"
++#include "acl/FilledChecklist.h"
+ #include "base/CharacterSet.h"
+ #include "base/RefCount.h"
+ #include "base/Subscription.h"
+ #include "client_side_reply.h"
+ #include "client_side_request.h"
+ #include "clientStream.h"
+ #include "comm/ConnOpener.h"
+ #include "comm/Read.h"
+ #include "comm/TcpAcceptor.h"
+ #include "comm/Write.h"
+ #include "errorpage.h"
+ #include "fd.h"
+ #include "ftp/Elements.h"
+ #include "ftp/Parsing.h"
+ #include "globals.h"
+ #include "HttpHdrCc.h"
+ #include "ip/tools.h"
+ #include "ipc/FdNotes.h"
+ #include "parser/Tokenizer.h"
+ #include "servers/forward.h"
+@@ -1474,40 +1475,60 @@
+     return true; // forward our fake PASV request
+ }
+ 
+ bool
+ Ftp::Server::handleDataRequest(String &cmd, String &params)
+ {
+     if (!checkDataConnPre())
+         return false;
+ 
+     changeState(fssHandleDataRequest, "handleDataRequest");
+ 
+     return true;
+ }
+ 
+ bool
+ Ftp::Server::handleUploadRequest(String &cmd, String &params)
+ {
+     if (!checkDataConnPre())
+         return false;
+ 
++    if (Config.accessList.forceRequestBodyContinuation) {
++        ClientHttpRequest *http = getCurrentContext()->http;
++        HttpRequest *request = http->request;
++        ACLFilledChecklist bodyContinuationCheck(Config.accessList.forceRequestBodyContinuation, request, NULL);
++        if (bodyContinuationCheck.fastCheck() == ACCESS_ALLOWED) {
++            request->forcedBodyContinuation = true;
++            if (checkDataConnPost()) {
++                // Write control Msg
++                writeEarlyReply(150, "Data connection opened");
++                maybeReadUploadData();
++            } else {
++                // wait for acceptDataConnection but tell it to call wroteEarlyReply
++                // after writing "150 Data connection opened"
++                typedef CommCbMemFunT<Server, CommIoCbParams> Dialer;
++                AsyncCall::Pointer call = JobCallback(33, 5, Dialer, this, Ftp::Server::wroteEarlyReply);
++                onDataAcceptCall = call;
++            }
++        }
++    }
++
+     changeState(fssHandleUploadRequest, "handleDataRequest");
+ 
+     return true;
+ }
+ 
+ bool
+ Ftp::Server::handleEprtRequest(String &cmd, String &params)
+ {
+     debugs(9, 3, "Process an EPRT " << params);
+ 
+     if (gotEpsvAll) {
+         setReply(500, "Rejecting EPRT after EPSV ALL");
+         return false;
+     }
+ 
+     if (!params.size()) {
+         setReply(501, "Missing parameter");
+         return false;
+     }
+ 
+
+=== modified file 'src/servers/HttpServer.cc'
+--- src/servers/HttpServer.cc	2014-09-13 13:59:43 +0000
++++ src/servers/HttpServer.cc	2014-11-01 11:37:55 +0000
+@@ -1,70 +1,79 @@
+ /*
+  * Copyright (C) 1996-2014 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 33    Client-side Routines */
+ 
+ #include "squid.h"
++#include "acl/FilledChecklist.h"
+ #include "client_side.h"
+ #include "client_side_request.h"
++#include "client_side_reply.h"
+ #include "comm/Write.h"
+ #include "HttpHeaderTools.h"
+ #include "profiler/Profiler.h"
+ #include "servers/forward.h"
+ #include "SquidConfig.h"
+ 
+ namespace Http
+ {
+ 
+ /// Manages a connection from an HTTP client.
+ class Server: public ConnStateData
+ {
+ public:
+     Server(const MasterXaction::Pointer &xact, const bool beHttpsServer);
+     virtual ~Server() {}
+ 
+     void readSomeHttpData();
+ 
+ protected:
+     /* ConnStateData API */
+     virtual ClientSocketContext *parseOneRequest(Http::ProtocolVersion &ver);
+     virtual void processParsedRequest(ClientSocketContext *context, const Http::ProtocolVersion &ver);
+     virtual void handleReply(HttpReply *rep, StoreIOBuffer receivedData);
+     virtual void writeControlMsgAndCall(ClientSocketContext *context, HttpReply *rep, AsyncCall::Pointer &call);
+     virtual time_t idleTimeout() const;
+ 
+     /* BodyPipe API */
+     virtual void noteMoreBodySpaceAvailable(BodyPipe::Pointer);
+     virtual void noteBodyConsumerAborted(BodyPipe::Pointer);
+ 
+     /* AsyncJob API */
+     virtual void start();
+ 
++    void proceedAfterBodyContinuation(ClientSocketContext::Pointer context);
++
+ private:
+     void processHttpRequest(ClientSocketContext *const context);
+     void handleHttpRequestData();
+ 
++    /// Parses incoming request and build the HttpRequest object for this
++    /// request.
++    /// Return true if no error found, or false if parsing is failed.
++    bool buildHttpRequest(ClientSocketContext *context, const Http::ProtocolVersion &ver);
++
+     HttpParser parser_;
+     HttpRequestMethod method_; ///< parsed HTTP method
+ 
+     /// temporary hack to avoid creating a true HttpsServer class
+     const bool isHttpsServer;
+ 
+     CBDATA_CLASS2(Server);
+ };
+ 
+ } // namespace Http
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Http, Server);
+ 
+ Http::Server::Server(const MasterXaction::Pointer &xact, bool beHttpsServer):
+         AsyncJob("Http::Server"),
+         ConnStateData(xact),
+         isHttpsServer(beHttpsServer)
+ {
+ }
+ 
+@@ -102,43 +111,167 @@
+         return;
+ 
+     // too late to read more body
+     if (!isOpen() || stoppedReceiving())
+         return;
+ 
+     readSomeData();
+ }
+ 
+ ClientSocketContext *
+ Http::Server::parseOneRequest(Http::ProtocolVersion &ver)
+ {
+     ClientSocketContext *context = NULL;
+     PROF_start(HttpServer_parseOneRequest);
+     HttpParserInit(&parser_, in.buf.c_str(), in.buf.length());
+     context = parseHttpRequest(this, &parser_, &method_, &ver);
+     PROF_stop(HttpServer_parseOneRequest);
+     return context;
+ }
+ 
++void clientProcessRequestFinished(ConnStateData *conn, const HttpRequest::Pointer &request);
++
++bool
++Http::Server::buildHttpRequest(ClientSocketContext *context, const Http::ProtocolVersion &http_ver)
++{
++    HttpRequest::Pointer request;
++    ClientHttpRequest *http = context->http;
++    if (context->flags.parsed_ok == 0) {
++        clientStreamNode *node = context->getClientReplyContext();
++        debugs(33, 2, "Invalid Request");
++        quitAfterError(NULL);
++        // setLogUri should called before repContext->setReplyToError
++        setLogUri(http, http->uri,  true);
++        clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
++        assert (repContext);
++        switch (parser_.request_parse_status) {
++        case Http::scHeaderTooLarge:
++            repContext->setReplyToError(ERR_TOO_BIG, Http::scBadRequest, method_, http->uri, clientConnection->remote, NULL, in.buf.c_str(), NULL);
++            break;
++        case Http::scMethodNotAllowed:
++            repContext->setReplyToError(ERR_UNSUP_REQ, Http::scMethodNotAllowed, method_, http->uri,
++                                        clientConnection->remote, NULL, in.buf.c_str(), NULL);
++            break;
++        default:
++            repContext->setReplyToError(ERR_INVALID_REQ, parser_.request_parse_status, method_, http->uri,
++                                        clientConnection->remote, NULL, in.buf.c_str(), NULL);
++        }
++        assert(context->http->out.offset == 0);
++        context->pullData();
++        consumeInput(http->req_sz);
++        return false;
++    }
++
++    if ((request = HttpRequest::CreateFromUrlAndMethod(http->uri, method_)) == NULL) {
++        clientStreamNode *node = context->getClientReplyContext();
++        debugs(33, 5, "Invalid URL: " << http->uri);
++        quitAfterError(request.getRaw());
++        // setLogUri should called before repContext->setReplyToError
++        setLogUri(http, http->uri,  true);
++        clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
++        assert (repContext);
++        repContext->setReplyToError(ERR_INVALID_URL, Http::scBadRequest, method_, http->uri, clientConnection->remote, NULL, NULL, NULL);
++        assert(context->http->out.offset == 0);
++        context->pullData();
++        consumeInput(http->req_sz);
++        return false;
++    }
++
++    /* RFC 2616 section 10.5.6 : handle unsupported HTTP major versions cleanly. */
++    /* We currently only support 0.9, 1.0, 1.1 properly */
++    /* TODO: move HTTP-specific processing into servers/HttpServer and such */
++    if ( (http_ver.major == 0 && http_ver.minor != 9) ||
++         (http_ver.major > 1) ) {
++
++        clientStreamNode *node = context->getClientReplyContext();
++        debugs(33, 5, "Unsupported HTTP version discovered. :\n" << HttpParserHdrBuf(&parser_));
++        quitAfterError(request.getRaw());
++        // setLogUri should called before repContext->setReplyToError
++        setLogUri(http, http->uri,  true);
++        clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
++        assert (repContext);
++        repContext->setReplyToError(ERR_UNSUP_HTTPVERSION, Http::scHttpVersionNotSupported, method_, http->uri,
++                                    clientConnection->remote, NULL, HttpParserHdrBuf(&parser_), NULL);
++        assert(context->http->out.offset == 0);
++        context->pullData();
++        consumeInput(http->req_sz);
++        clientProcessRequestFinished(this, request);
++        return false;
++    }
++
++    /* compile headers */
++    /* we should skip request line! */
++    /* XXX should actually know the damned buffer size here */
++    if (http_ver.major >= 1 && !request->parseHeader(HttpParserHdrBuf(&parser_), HttpParserHdrSz(&parser_))) {
++        clientStreamNode *node = context->getClientReplyContext();
++        debugs(33, 5, "Failed to parse request headers:\n" << HttpParserHdrBuf(&parser_));
++        quitAfterError(request.getRaw());
++        // setLogUri should called before repContext->setReplyToError
++        setLogUri(http, http->uri,  true);
++        clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
++        assert (repContext);
++        repContext->setReplyToError(ERR_INVALID_REQ, Http::scBadRequest, method_, http->uri, clientConnection->remote, NULL, NULL, NULL);
++        assert(context->http->out.offset == 0);
++        context->pullData();
++        consumeInput(http->req_sz);
++        clientProcessRequestFinished(this, request);
++        return false;
++    }
++
++    http->request = request.getRaw();
++    HTTPMSGLOCK(http->request);
++
++    return true;
++}
++
++void
++Http::Server::proceedAfterBodyContinuation(ClientSocketContext::Pointer context)
++{
++    debugs(33, 5, "Body Continuation written");
++    ClientHttpRequest *http = context->http;
++    HttpRequest *request = http->request;
++    clientProcessRequest(this, &parser_, context.getRaw(), method_, request->http_ver);
++}
++
+ void
+ Http::Server::processParsedRequest(ClientSocketContext *context, const Http::ProtocolVersion &ver)
+ {
++    if (!buildHttpRequest(context, ver))
++        return;
++
++    if (Config.accessList.forceRequestBodyContinuation) {
++        ClientHttpRequest *http = context->http;
++        HttpRequest *request = http->request;
++        ACLFilledChecklist bodyContinuationCheck(Config.accessList.forceRequestBodyContinuation, request, NULL);
++        if (bodyContinuationCheck.fastCheck() == ACCESS_ALLOWED) {
++            debugs(33, 5, "Body Continuation forced");
++            request->forcedBodyContinuation = true;
++            //sendControlMsg
++            HttpReply::Pointer rep = new HttpReply;
++            rep->sline.set(Http::ProtocolVersion(1,1), Http::scContinue);
++
++            typedef UnaryMemFunT<Http::Server, ClientSocketContext::Pointer> CbDialer;
++            const AsyncCall::Pointer cb = asyncCall(11, 3,  "Http::Server::proceedAfterBodyContinuation", CbDialer(this, &Http::Server::proceedAfterBodyContinuation, ClientSocketContext::Pointer(context)));
++            sendControlMsg(HttpControlMsg(rep, cb));
++            return;
++        }
++    }
+     clientProcessRequest(this, &parser_, context, method_, ver);
+ }
+ 
+ void
+ Http::Server::noteBodyConsumerAborted(BodyPipe::Pointer ptr)
+ {
+     ConnStateData::noteBodyConsumerAborted(ptr);
+     stopReceiving("virgin request body consumer aborted"); // closes ASAP
+ }
+ 
+ void
+ Http::Server::handleReply(HttpReply *rep, StoreIOBuffer receivedData)
+ {
+     // the caller guarantees that we are dealing with the current context only
+     ClientSocketContext::Pointer context = getCurrentContext();
+     Must(context != NULL);
+     const ClientHttpRequest *http = context->http;
+     Must(http != NULL);
+ 
+     // After sending Transfer-Encoding: chunked (at least), always send
+

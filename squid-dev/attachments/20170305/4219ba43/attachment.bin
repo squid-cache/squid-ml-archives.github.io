@@ -1,0 +1,411 @@
+Detail swapfile header inconsistencies.
+
+Squid may fail to load cache entry metadata for several very different
+reasons, including the following two relatively common ones:
+
+* A cache_dir entry corruption.
+* Huge cache_dir entry metadata that does not fit into the I/O buffer
+  used for loading entry metadata.
+
+Knowing the exact failure reason may help triage and guide development.
+We refactored existing checks to distinguish various error cases,
+including the two above. Refactoring also reduced code duplication.
+
+These improvements also uncovered and fixed a null pointer dereference
+inside ufsdump.cc (but ufsdump does not even build right now for reasons
+unrelated to these changes).
+
+=== modified file 'src/StoreMetaUnpacker.cc'
+--- src/StoreMetaUnpacker.cc	2017-02-10 23:37:05 +0000
++++ src/StoreMetaUnpacker.cc	2017-03-03 21:31:09 +0000
+@@ -1,75 +1,72 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 20    Storage Manager Swapfile Unpacker */
+ 
+ #include "squid.h"
++#include "base/TextException.h"
+ #include "Debug.h"
+ #include "defines.h"
+ #include "StoreMeta.h"
+ #include "StoreMetaUnpacker.h"
+ 
+ int const StoreMetaUnpacker::MinimumBufferLength = sizeof(char) + sizeof(int);
+ 
+ /// useful for meta stored in pre-initialized (with zeros) db files
+ bool
+ StoreMetaUnpacker::isBufferZero()
+ {
+     // We could memcmp the entire buffer, but it is probably safe enough
+     // to test a few bytes because if we do not detect a corrupted entry
+     // it is not a big deal. Empty entries are not isBufferSane anyway.
+     const int depth = 10;
+     if (buflen < depth)
+         return false; // cannot be sure enough
+ 
+     for (int i = 0; i < depth; ++i) {
+         if (buf[i])
+             return false;
+     }
+     return true;
+ }
+ 
+-bool
+-StoreMetaUnpacker::isBufferSane()
++void
++StoreMetaUnpacker::checkBuffer()
+ {
+-    if (buf[0] != (char) STORE_META_OK)
+-        return false;
+-
++    assert(buf); // paranoid; already checked in the constructor
++    if (buf[0] != static_cast<char>(STORE_META_OK))
++        throw TexcHere("store entry metadata is corrupted");
+     /*
+      * sanity check on 'buflen' value.  It should be at least big
+      * enough to hold one type and one length.
+      */
+     getBufferLength();
+-
+     if (*hdr_len < MinimumBufferLength)
+-        return false;
+-
++        throw TexcHere("store entry metadata is too small");
+     if (*hdr_len > buflen)
+-        return false;
+-
+-    return true;
++        throw TexcHere("store entry metadata is too big");
+ }
+ 
+ void
+ StoreMetaUnpacker::getBufferLength()
+ {
+     memcpy(hdr_len, &buf[1], sizeof(int));
+ }
+ 
+ StoreMetaUnpacker::StoreMetaUnpacker(char const *aBuffer, ssize_t aLen, int *anInt) :
+     buf(aBuffer),
+     buflen(aLen),
+     hdr_len(anInt),
+     position(1 + sizeof(int)),
+     type('\0'),
+     length(0),
+     tail(NULL)
+ {
+     assert(aBuffer != NULL);
+ }
+ 
+@@ -105,35 +102,38 @@ StoreMetaUnpacker::doOneEntry()
+         tail = StoreMeta::Add (tail, newNode);
+ 
+     position += length;
+ 
+     return true;
+ }
+ 
+ bool
+ StoreMetaUnpacker::moreToProcess() const
+ {
+     return *hdr_len - position - MinimumBufferLength >= 0;
+ }
+ 
+ StoreMeta *
+ StoreMetaUnpacker::createStoreMeta ()
+ {
+     tlv *TLV = NULL;
+     tail = &TLV;
+     assert(hdr_len != NULL);
+ 
+-    if (!isBufferSane())
+-        return NULL;
++    checkBuffer();
+ 
+     getBufferLength();
+ 
+     assert (position == 1 + sizeof(int));
+ 
+     while (moreToProcess()) {
+         if (!doOneEntry())
+             break;
+     }
+ 
++    if (!TLV)
++       throw TexcHere("store entry metadata is empty");
++
++    assert(TLV);
+     return TLV;
+ }
+ 
+
+=== modified file 'src/StoreMetaUnpacker.h'
+--- src/StoreMetaUnpacker.h	2017-02-10 23:37:05 +0000
++++ src/StoreMetaUnpacker.h	2017-03-03 21:31:09 +0000
+@@ -1,42 +1,43 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_TYPELENGTHVALUEUNPACKER_H
+ #define SQUID_TYPELENGTHVALUEUNPACKER_H
+ 
+ class StoreMeta;
+ class StoreEntry;
+ 
+ class StoreMetaUnpacker
+ {
+ 
+ public:
+     StoreMetaUnpacker (const char *buf, ssize_t bufferLength, int *hdrlen);
+     StoreMeta *createStoreMeta();
+-    bool isBufferZero(); ///< all-zeros buffer, implies !isBufferSane
+-    bool isBufferSane();
++    bool isBufferZero(); ///< all-zeros buffer, checkBuffer() would throw
++    /// validates buffer sanity and throws if validation fails
++    void checkBuffer();
+ 
+ private:
+     static int const MinimumBufferLength;
+ 
+     void getBufferLength();
+     void getType();
+     void getLength();
+     void getTLV();
+     bool doOneEntry();
+     bool moreToProcess() const;
+ 
+     char const * const buf;
+     ssize_t buflen;
+     int *hdr_len;
+     int position;
+     char type;
+     int length;
+     StoreMeta **tail;
+ };
+ 
+
+=== modified file 'src/fs/rock/RockHeaderUpdater.cc'
+--- src/fs/rock/RockHeaderUpdater.cc	2017-02-10 23:37:05 +0000
++++ src/fs/rock/RockHeaderUpdater.cc	2017-03-03 21:31:09 +0000
+@@ -227,41 +227,41 @@ Rock::HeaderUpdater::noteDoneWriting(int
+     Must(writer);
+     IoState &rockWriter = dynamic_cast<IoState&>(*writer);
+     update.fresh.splicingPoint = rockWriter.splicingPoint;
+     debugs(47, 5, "fresh chain ends at " << update.fresh.splicingPoint);
+     store->map->closeForUpdating(update);
+     rockWriter.writeableAnchor_ = nullptr;
+     writer = nullptr; // we are done writing
+ 
+     Must(doneAll());
+ }
+ 
+ void
+ Rock::HeaderUpdater::parseReadBytes()
+ {
+     if (!staleSwapHeaderSize) {
+         StoreMetaUnpacker aBuilder(
+             exchangeBuffer.rawContent(),
+             exchangeBuffer.length(),
+             &staleSwapHeaderSize);
+         // Squid assumes that metadata always fits into a single db slot
+-        Must(aBuilder.isBufferSane()); // cannot update what we cannot parse
++        aBuilder.checkBuffer(); // cannot update an entry with invalid metadata
+         debugs(47, 7, "staleSwapHeaderSize=" << staleSwapHeaderSize);
+         Must(staleSwapHeaderSize > 0);
+         exchangeBuffer.consume(staleSwapHeaderSize);
+     }
+ 
+     const size_t staleHttpHeaderSize = headersEnd(
+                                            exchangeBuffer.rawContent(),
+                                            exchangeBuffer.length());
+     debugs(47, 7, "staleHttpHeaderSize=" << staleHttpHeaderSize);
+     if (!staleHttpHeaderSize) {
+         readMore("need more stale HTTP reply header data");
+         return;
+     }
+ 
+     exchangeBuffer.consume(staleHttpHeaderSize);
+     debugs(47, 7, "httpBodySizePrefix=" << exchangeBuffer.length());
+ 
+     stopReading("read the last HTTP header slot");
+     startWriting();
+ }
+
+=== modified file 'src/store_client.cc'
+--- src/store_client.cc	2017-02-10 23:37:05 +0000
++++ src/store_client.cc	2017-03-03 21:31:09 +0000
+@@ -517,54 +517,49 @@ storeClientReadHeader(void *data, const
+ 
+ static void
+ storeClientReadBody(void *data, const char *buf, ssize_t len, StoreIOState::Pointer)
+ {
+     store_client *sc = (store_client *)data;
+     sc->readBody(buf, len);
+ }
+ 
+ bool
+ store_client::unpackHeader(char const *buf, ssize_t len)
+ {
+     int xerrno = errno; // FIXME: where does errno come from?
+     debugs(90, 3, "store_client::unpackHeader: len " << len << "");
+ 
+     if (len < 0) {
+         debugs(90, 3, "WARNING: unpack error: " << xstrerr(xerrno));
+         return false;
+     }
+ 
+     int swap_hdr_sz = 0;
+-    StoreMetaUnpacker aBuilder(buf, len, &swap_hdr_sz);
+-
+-    if (!aBuilder.isBufferSane()) {
+-        /* oops, bad disk file? */
+-        debugs(90, DBG_IMPORTANT, "WARNING: swapfile header inconsistent with available data");
+-        return false;
+-    }
+-
+-    tlv *tlv_list = aBuilder.createStoreMeta ();
+-
+-    if (tlv_list == NULL) {
+-        debugs(90, DBG_IMPORTANT, "WARNING: failed to unpack meta data");
++    tlv *tlv_list = nullptr;
++    try {
++        StoreMetaUnpacker aBuilder(buf, len, &swap_hdr_sz);
++        tlv_list = aBuilder.createStoreMeta();
++    } catch (const std::exception &e) {
++        debugs(90, DBG_IMPORTANT, "WARNING: failed to unpack metadata because " << e.what());
+         return false;
+     }
++    assert(tlv_list);
+ 
+     /*
+      * Check the meta data and make sure we got the right object.
+      */
+     for (tlv *t = tlv_list; t; t = t->next) {
+         if (!t->checkConsistency(entry)) {
+             storeSwapTLVFree(tlv_list);
+             return false;
+         }
+     }
+ 
+     storeSwapTLVFree(tlv_list);
+ 
+     assert(swap_hdr_sz >= 0);
+     entry->mem_obj->swap_hdr_sz = swap_hdr_sz;
+     if (entry->swap_file_sz > 0) { // collapsed hits may not know swap_file_sz
+         assert(entry->swap_file_sz >= static_cast<uint64_t>(swap_hdr_sz));
+         entry->mem_obj->object_sz = entry->swap_file_sz - swap_hdr_sz;
+     }
+     debugs(90, 5, "store_client::unpackHeader: swap_file_sz=" <<
+
+=== modified file 'src/store_rebuild.cc'
+--- src/store_rebuild.cc	2017-02-10 23:37:05 +0000
++++ src/store_rebuild.cc	2017-03-03 21:31:09 +0000
+@@ -292,51 +292,48 @@ storeRebuildLoadEntry(int fd, int diskIn
+                "Ignoring cached entry after meta data read failure: " << xstrerr(xerrno));
+         return false;
+     }
+ 
+     buf.appended(len);
+     return true;
+ }
+ 
+ bool
+ storeRebuildParseEntry(MemBuf &buf, StoreEntry &tmpe, cache_key *key,
+                        StoreRebuildData &stats,
+                        uint64_t expectedSize)
+ {
+     int swap_hdr_len = 0;
+     StoreMetaUnpacker aBuilder(buf.content(), buf.contentSize(), &swap_hdr_len);
+     if (aBuilder.isBufferZero()) {
+         debugs(47,5, HERE << "skipping empty record.");
+         return false;
+     }
+ 
+-    if (!aBuilder.isBufferSane()) {
+-        debugs(47, DBG_IMPORTANT, "WARNING: Ignoring malformed cache entry.");
+-        return false;
+-    }
+-
+-    StoreMeta *tlv_list = aBuilder.createStoreMeta();
+-    if (!tlv_list) {
+-        debugs(47, DBG_IMPORTANT, "WARNING: Ignoring cache entry with invalid " <<
+-               "meta data");
++    StoreMeta *tlv_list = nullptr;
++    try {
++        tlv_list = aBuilder.createStoreMeta();
++    } catch (const std::exception &e) {
++        debugs(47, DBG_IMPORTANT, "WARNING: Ignoring store entry because " << e.what());
+         return false;
+     }
++    assert(tlv_list);
+ 
+     // TODO: consume parsed metadata?
+ 
+     debugs(47,7, "successful swap meta unpacking; swap_file_sz=" << tmpe.swap_file_sz);
+     memset(key, '\0', SQUID_MD5_DIGEST_LENGTH);
+ 
+     InitStoreEntry visitor(&tmpe, key);
+     for_each(*tlv_list, visitor);
+     storeSwapTLVFree(tlv_list);
+     tlv_list = NULL;
+ 
+     if (storeKeyNull(key)) {
+         debugs(47, DBG_IMPORTANT, "WARNING: Ignoring keyless cache entry");
+         return false;
+     }
+ 
+     tmpe.key = key;
+     /* check sizes */
+ 
+     if (expectedSize > 0) {
+
+=== modified file 'src/ufsdump.cc'
+--- src/ufsdump.cc	2017-02-10 23:37:05 +0000
++++ src/ufsdump.cc	2017-03-03 21:31:09 +0000
+@@ -145,33 +145,33 @@ main(int argc, char *argv[])
+ 
+         close (fd);
+ 
+         fd = -1;
+ 
+         int hdr_len;
+ 
+         StoreMetaUnpacker aBuilder(tempbuf, len, &hdr_len);
+ 
+         metadata = aBuilder.createStoreMeta ();
+ 
+         cache_key key[SQUID_MD5_DIGEST_LENGTH];
+ 
+         memset(key, '\0', SQUID_MD5_DIGEST_LENGTH);
+ 
+         DumpStoreMeta dumper;
+ 
+         for_each(*metadata, dumper);
+ 
+         return 0;
+-    } catch (std::runtime_error error) {
+-        std::cout << "Failed : " << error.what() << std::endl;
++    } catch (const std::exception &e) {
++        std::cout << "Failed : " << e.what() << std::endl;
+ 
+         if (fd >= 0)
+             close(fd);
+ 
+         if (metadata)
+             StoreMeta::FreeList(&metadata);
+ 
+         return 1;
+     }
+ }
+ 
+

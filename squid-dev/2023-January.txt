@@ -1,0 +1,936 @@
+From hamilton.coutinho at gmail.com  Wed Jan 18 18:46:33 2023
+From: hamilton.coutinho at gmail.com (Hamilton Coutinho)
+Date: Wed, 18 Jan 2023 10:46:33 -0800
+Subject: [squid-dev] Squid 5.6 leaking memory when peeking for an origin
+ with an invalid certificate
+Message-ID: <CAL34ibm-a1GiedEOHO2LcCYzRZuJt_4Dm4ZjJfkEdweC5BNoYw@mail.gmail.com>
+
+Hi all,
+
+We are observing what seems to be several objects leaking in the output
+mgr:mem, to the tune of 10s of 1000s
+of HttpRequest, HttpHeaderEntry, Comm::Connection,
+Security::ErrorDetail, cbdata
+PeekingPeerConnector (31), etc.
+
+We dumped a core and managed to find some HttpRequest objects and they all
+seem to have failed in the same way, with an ERR_SECURE_CONNECT_FAIL
+category, for a site that has a certificate signed by a CA authority not
+available to squid.
+
+If I would guess, the origin of the problem might be in
+Ssl::PeekingPeerConnector::checkForPeekAndSpliceMatched():
+
+    if (finalAction == Ssl::bumpTerminate) {
+        bail(new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scForbidden,
+request.getRaw(), al));
+        clientConn->close();
+        clientConn = nullptr;
+
+Wondering if assigning null to clientConn there would be premature.
+
+Any thoughts?
+
+Thanks!
+
+-- 
+Hamilton
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <http://lists.squid-cache.org/pipermail/squid-dev/attachments/20230118/f4f8ced9/attachment.htm>
+
+From rousskov at measurement-factory.com  Wed Jan 18 19:11:22 2023
+From: rousskov at measurement-factory.com (Alex Rousskov)
+Date: Wed, 18 Jan 2023 14:11:22 -0500
+Subject: [squid-dev] Squid 5.6 leaking memory when peeking for an origin
+ with an invalid certificate
+In-Reply-To: <CAL34ibm-a1GiedEOHO2LcCYzRZuJt_4Dm4ZjJfkEdweC5BNoYw@mail.gmail.com>
+References: <CAL34ibm-a1GiedEOHO2LcCYzRZuJt_4Dm4ZjJfkEdweC5BNoYw@mail.gmail.com>
+Message-ID: <84f382a5-1830-39fa-5f0c-f0bc52425235@measurement-factory.com>
+
+On 1/18/23 13:46, Hamilton Coutinho wrote:
+> Hi all,
+> 
+> We are observing what seems to be several objects leaking in the output 
+> mgr:mem, to the tune of 10s of 1000s 
+> of?HttpRequest,?HttpHeaderEntry,?Comm::Connection,?Security::ErrorDetail,?cbdata PeekingPeerConnector (31), etc.
+> 
+> We dumped a core and managed to find some HttpRequest objects and they 
+> all seem to have failed in the same way, with an ERR_SECURE_CONNECT_FAIL 
+> category, for a site that has a certificate signed by a CA authority not 
+> available to squid.
+> 
+> If I would guess, the origin of the problem might be in 
+> Ssl::PeekingPeerConnector::checkForPeekAndSpliceMatched():
+> 
+>  ? ? if (finalAction == Ssl::bumpTerminate) {
+>  ? ? ? ? bail(new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scForbidden, 
+> request.getRaw(), al));
+>  ? ? ? ? clientConn->close();
+>  ? ? ? ? clientConn = nullptr;
+> 
+> Wondering if assigning null to clientConn there would be premature.
+
+
+FWIW, that connection pointer reset itself looks OK to me. ConnStateData 
+and/or others should have a connection closure handler attached to the 
+clientConn descriptor. That handler should be notified by Comm and 
+initiate cleanup of the objects responsible for client-Squid communication.
+
+The bail() call above should inform the requestor about the 
+error/termination and terminate this AsyncJob. That requestor should 
+then close the Squid-server connection and clean up associated state.
+
+While there may be bugs in those "should..." sequences, please note that 
+the pasted code is not related to handling of untrusted origin servers 
+(unless your ssl_bump rules specifically activate the terminate action 
+upon discovering such an origin server). The pasted code is reacting to 
+an "ssl_bump terminate" rule matching.
+
+
+Cheers,
+
+Alex.
+
+
+From hamilton.coutinho at gmail.com  Wed Jan 18 19:28:21 2023
+From: hamilton.coutinho at gmail.com (Hamilton Coutinho)
+Date: Wed, 18 Jan 2023 11:28:21 -0800
+Subject: [squid-dev] Squid 5.6 leaking memory when peeking for an origin
+ with an invalid certificate
+In-Reply-To: <84f382a5-1830-39fa-5f0c-f0bc52425235@measurement-factory.com>
+References: <CAL34ibm-a1GiedEOHO2LcCYzRZuJt_4Dm4ZjJfkEdweC5BNoYw@mail.gmail.com>
+ <84f382a5-1830-39fa-5f0c-f0bc52425235@measurement-factory.com>
+Message-ID: <CAL34ib=pMDnt2jhf5aM1-=NGwCCq-d2swbtOpDYfT_C0-dqESw@mail.gmail.com>
+
+Hi Alex,
+
+Thanks for the prompt reply! Thanks also for the clarifications.
+
+Agreed, I just realized the requests seem to be failing
+with Http::scServiceUnavailable, so my focus turned
+to Security::PeerConnector::sslCrtvdHandleReply() and friends.
+
+Best.
+
+On Wed, Jan 18, 2023 at 11:11 AM Alex Rousskov <
+rousskov at measurement-factory.com> wrote:
+
+> On 1/18/23 13:46, Hamilton Coutinho wrote:
+> > Hi all,
+> >
+> > We are observing what seems to be several objects leaking in the output
+> > mgr:mem, to the tune of 10s of 1000s
+> >
+> of HttpRequest, HttpHeaderEntry, Comm::Connection, Security::ErrorDetail, cbdata
+> PeekingPeerConnector (31), etc.
+> >
+> > We dumped a core and managed to find some HttpRequest objects and they
+> > all seem to have failed in the same way, with an ERR_SECURE_CONNECT_FAIL
+> > category, for a site that has a certificate signed by a CA authority not
+> > available to squid.
+> >
+> > If I would guess, the origin of the problem might be in
+> > Ssl::PeekingPeerConnector::checkForPeekAndSpliceMatched():
+> >
+> >      if (finalAction == Ssl::bumpTerminate) {
+> >          bail(new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scForbidden,
+> > request.getRaw(), al));
+> >          clientConn->close();
+> >          clientConn = nullptr;
+> >
+> > Wondering if assigning null to clientConn there would be premature.
+>
+>
+> FWIW, that connection pointer reset itself looks OK to me. ConnStateData
+> and/or others should have a connection closure handler attached to the
+> clientConn descriptor. That handler should be notified by Comm and
+> initiate cleanup of the objects responsible for client-Squid communication.
+>
+> The bail() call above should inform the requestor about the
+> error/termination and terminate this AsyncJob. That requestor should
+> then close the Squid-server connection and clean up associated state.
+>
+> While there may be bugs in those "should..." sequences, please note that
+> the pasted code is not related to handling of untrusted origin servers
+> (unless your ssl_bump rules specifically activate the terminate action
+> upon discovering such an origin server). The pasted code is reacting to
+> an "ssl_bump terminate" rule matching.
+>
+>
+> Cheers,
+>
+> Alex.
+>
+> _______________________________________________
+> squid-dev mailing list
+> squid-dev at lists.squid-cache.org
+> http://lists.squid-cache.org/listinfo/squid-dev
+>
+
+
+-- 
+Hamilton
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <http://lists.squid-cache.org/pipermail/squid-dev/attachments/20230118/317ac053/attachment.htm>
+
+From eduard.bagdasaryan at measurement-factory.com  Tue Jan 24 17:22:40 2023
+From: eduard.bagdasaryan at measurement-factory.com (Eduard Bagdasaryan)
+Date: Tue, 24 Jan 2023 20:22:40 +0300
+Subject: [squid-dev] Drop cache_object protocol support
+Message-ID: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+
+Hello,
+
+Today we can query cache manager in two ways:
+
+1. with cache_object:// URL scheme
+2. with an HTTP request having the 'squid-internal-mgr' path prefix.
+
+I guess that when (2) was initially added at e37bd29, its implementation 
+was somewhat incomplete compared to the old cache_object scheme (e.g., 
+it lacked authentication) and both methods existed. Since then, however, 
+(2) has been improved and it should be equivalent to (1) by now.? If so, 
+can we completely remove the non-standard cache_object scheme support 
+from Squid? This would simplify request forwarding logic, including code 
+paths where the existing code complexity may result in vulnerability issues.
+
+
+Thanks,
+
+Eduard.
+
+
+From rousskov at measurement-factory.com  Tue Jan 24 19:23:21 2023
+From: rousskov at measurement-factory.com (Alex Rousskov)
+Date: Tue, 24 Jan 2023 14:23:21 -0500
+Subject: [squid-dev] Drop cache_object protocol support
+In-Reply-To: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+References: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+Message-ID: <dea6512a-b10f-183b-ae9c-ae49f70468aa@measurement-factory.com>
+
+On 1/24/23 12:22, Eduard Bagdasaryan wrote:
+
+> Today we can query cache manager in two ways:
+> 
+> 1. with cache_object:// URL scheme
+> 2. with an HTTP request having the 'squid-internal-mgr' path prefix.
+> 
+> I guess that when (2) was initially added at e37bd29, its implementation 
+> was somewhat incomplete compared to the old cache_object scheme (e.g., 
+> it lacked authentication) and both methods existed. Since then, however, 
+> (2) has been improved and it should be equivalent to (1) by now.? If so, 
+> can we completely remove the non-standard cache_object scheme support 
+> from Squid? This would simplify request forwarding logic, including code 
+> paths where the existing code complexity may result in vulnerability 
+> issues.
+
+
+FWIW, I am not aware of any good reason to keep supporting the 
+"cache_object" URI scheme.
+
+MgrFieldChars() already calls that scheme deprecated. That special (and 
+undocumented?) scheme did cause significant problems in the past. I am 
+sure it will continue to cause problems if not removed. Removing it will 
+simplify code in several tricky places. There will be some upgrade pains 
+for admins, but we will be better off without cache_object long-term IMO.
+
+Needless to say, squidclient and cachemgr.cgi implementations would need 
+to be adjusted to use HTTP URLs instead, but I hope those adjustments 
+are straightforward.
+
+
+HTH,
+
+Alex.
+
+
+From squid3 at treenet.co.nz  Wed Jan 25 01:57:33 2023
+From: squid3 at treenet.co.nz (Amos Jeffries)
+Date: Wed, 25 Jan 2023 14:57:33 +1300
+Subject: [squid-dev] Drop cache_object protocol support
+In-Reply-To: <dea6512a-b10f-183b-ae9c-ae49f70468aa@measurement-factory.com>
+References: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+ <dea6512a-b10f-183b-ae9c-ae49f70468aa@measurement-factory.com>
+Message-ID: <3ff36659-8269-de2e-de89-2ffadf105e0f@treenet.co.nz>
+
+On 25/01/2023 8:23 am, Alex Rousskov wrote:
+> On 1/24/23 12:22, Eduard Bagdasaryan wrote:
+>
+>> Today we can query cache manager in two ways:
+>>
+>> 1. with cache_object:// URL scheme
+>> 2. with an HTTP request having the 'squid-internal-mgr' path prefix.
+>>
+>> I guess that when (2) was initially added at e37bd29, its 
+>> implementation was somewhat incomplete compared to the old 
+>> cache_object scheme (e.g., it lacked authentication
+
+No and intentionally. It is designed to share the proxy HTTP 
+authentication and http_access policy instead of the obsolete userinfo@ 
+standard that cache_object uses.
+
+Blocker #1:? The cachemgr_passwd directly still needs to be cleanly 
+removed, eg replaced by a manager_access ACL based mechanism.
+
+
+>> ) and both methods existed. Since then, however, (2) has been 
+>> improved and it should be equivalent to (1) by now.? If so, can we 
+>> completely remove the non-standard cache_object scheme support from 
+>> Squid? This would simplify request forwarding logic, including code 
+>> paths where the existing code complexity may result in vulnerability 
+>> issues.
+>
+>
+> FWIW, I am not aware of any good reason to keep supporting the 
+> "cache_object" URI scheme.
+>
+
+Blocker #2: The squidclient tool still sends cache_object: scheme when 
+given "mgr:" on the CLI. We need to upgrade that first and allow admin 
+some time to upgrade before removing the scheme support in squid itself.
+
+
+> MgrFieldChars() already calls that scheme deprecated. That special 
+> (and undocumented?) scheme did cause significant problems in the past. 
+> I am sure it will continue to cause problems if not removed. Removing 
+> it will simplify code in several tricky places. There will be some 
+> upgrade pains for admins, but we will be better off without 
+> cache_object long-term IMO.
+
+Agreed.
+
+> Needless to say, squidclient and cachemgr.cgi implementations would 
+> need to be adjusted to use HTTP URLs instead, but I hope those 
+> adjustments are straightforward.
+
+cachemgr.cgi should already prefer http(s) and only use cache_object as 
+a backup.
+
+IMO the CGI tool should stay that way, supporting the scheme for older 
+installations even after we drop it from the rest of Squid.
+
+HTH
+Amos
+
+
+From rousskov at measurement-factory.com  Wed Jan 25 04:34:45 2023
+From: rousskov at measurement-factory.com (Alex Rousskov)
+Date: Tue, 24 Jan 2023 23:34:45 -0500
+Subject: [squid-dev] Drop cache_object protocol support
+In-Reply-To: <3ff36659-8269-de2e-de89-2ffadf105e0f@treenet.co.nz>
+References: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+ <dea6512a-b10f-183b-ae9c-ae49f70468aa@measurement-factory.com>
+ <3ff36659-8269-de2e-de89-2ffadf105e0f@treenet.co.nz>
+Message-ID: <eec6c268-fb6c-4208-f464-27bee20722a3@measurement-factory.com>
+
+On 1/24/23 20:57, Amos Jeffries wrote:
+
+> Blocker #1:? The cachemgr_passwd directly still needs to be cleanly 
+> removed, eg replaced by a manager_access ACL based mechanism.
+
+I do not see a relationship: I have not tested it, but the existing 
+CacheManager::ParseHeaders() code already extracts authentication 
+information from cache manager requests that use "http" scheme AFAICT. 
+Can you detail why the cachemgr_passwd directive/code cannot continue to 
+work essentially as it works today after cache_object scheme support is 
+removed from Squid?
+
+
+> Blocker #2: The squidclient tool still sends cache_object: scheme when 
+> given "mgr:" on the CLI. We need to upgrade that first 
+
+Looks like we are in agreement on that.
+
+
+> and allow admin 
+> some time to upgrade before removing the scheme support in squid itself.
+
+Agreed. Would six months be enough in your opinion? If yes, we may be 
+able to remove cache_object support in v6. Otherwise, we can remove 
+cache_object support starting with v7 (as far as numbered releases are 
+concerned).
+
+
+> cachemgr.cgi should already prefer http(s) and only use cache_object 
+> as a backup.
+
+> IMO the CGI tool should stay that way, supporting the scheme for older 
+> installations even after we drop it from the rest of Squid.
+
+IMO, we should not keep any code that is only needed for Squid v3.1 and 
+earlier. Squid v3.2 and later should http-based cache manager access, 
+right? More code always means more maintenance overheads and higher 
+change costs. Given our lack of resources, we should start ignoring 
+Squid v3 needs.
+
+Moreover, I do not see how we can keep that "backup" code while 
+supporting newer Squids and Javascript-disabled browsers at the same 
+time: AFAICT, when Javascript is disabled (or not working properly), 
+that "only as a backup" code will send cache_object requests to modern 
+Squids that will no longer support them...
+
+I think we should upgrade that cachemgr.cgi code rather than preserve it 
+for Squid v3 needs. However, if you insist, it will stay simply because 
+I do not think cachemgr.cgi is worth our time.
+
+
+Cheers,
+
+Alex.
+
+
+From squid3 at treenet.co.nz  Wed Jan 25 12:29:18 2023
+From: squid3 at treenet.co.nz (Amos Jeffries)
+Date: Thu, 26 Jan 2023 01:29:18 +1300
+Subject: [squid-dev] Drop cache_object protocol support
+In-Reply-To: <eec6c268-fb6c-4208-f464-27bee20722a3@measurement-factory.com>
+References: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+ <dea6512a-b10f-183b-ae9c-ae49f70468aa@measurement-factory.com>
+ <3ff36659-8269-de2e-de89-2ffadf105e0f@treenet.co.nz>
+ <eec6c268-fb6c-4208-f464-27bee20722a3@measurement-factory.com>
+Message-ID: <642b9a31-821c-ab67-c77b-41d880ca96f1@treenet.co.nz>
+
+On 25/01/2023 5:34 pm, Alex Rousskov wrote:
+> On 1/24/23 20:57, Amos Jeffries wrote:
+>
+>> Blocker #1:? The cachemgr_passwd directly still needs to be cleanly 
+>> removed, eg replaced by a manager_access ACL based mechanism.
+>
+> I do not see a relationship: I have not tested it, but the existing 
+> CacheManager::ParseHeaders() code already extracts authentication 
+> information from cache manager requests that use "http" scheme AFAICT. 
+> Can you detail why the cachemgr_passwd directive/code cannot continue 
+> to work essentially as it works today after cache_object scheme 
+> support is removed from Squid?
+
+We should check that then. It may not be as impactful as I am recalling.
+
+
+>
+>> Blocker #2: The squidclient tool still sends cache_object: scheme 
+>> when given "mgr:" on the CLI. We need to upgrade that first 
+>
+> Looks like we are in agreement on that.
+>
+>
+>> and allow admin some time to upgrade before removing the scheme 
+>> support in squid itself.
+>
+> Agreed. Would six months be enough in your opinion? If yes, we may be 
+> able to remove cache_object support in v6. Otherwise, we can remove 
+> cache_object support starting with v7 (as far as numbered releases are 
+> concerned).
+
+v6 will "feature freeze" in 10 days. That 6 months beta period is for 
+proving the v6 behaviour changes work properly. Not for adding new 
+behaviour, especially any cause of admin annoyance.
+IMO what we have been discussing is far enough into new feature 
+territory to be a "no" for v6 backport. Specific patches may get a 
+different answer, but the whole change is unlikely.
+
+Early in v7 cycle should be good.
+
+
+>
+>> cachemgr.cgi should already prefer http(s) and only use cache_object 
+>> as a backup.
+>
+>> IMO the CGI tool should stay that way, supporting the scheme for 
+>> older installations even after we drop it from the rest of Squid.
+>
+> IMO, we should not keep any code that is only needed for Squid v3.1 
+> and earlier. Squid v3.2 and later should http-based cache manager 
+> access, right? More code always means more maintenance overheads and 
+> higher change costs. Given our lack of resources, we should start 
+> ignoring Squid v3 needs.
+
+In sentiment I agree. In practicality we have to cope with "LTS" from 
+vendors, and Squid bugs in the manager.
+
+v3.2 has http: but the https:, ftp:, whois:, gopher: schemes were broken 
+until late in the v3.5 series backports.
+So going by [1] LTS systems still using v3.2 are still a pain.
+
+For completeness, that MGR_INDEX regression you fixed a short while ago 
+also means some broken v4/v5 releases may be a pain source during the 
+transition.
+
+The longer we wait on removal from the CGI and CLI tools (only) the more 
+seamless it goes. So I am inclined to be very conservative on the tools 
+capability removal and proactive on ensuring they can cope with the 
+squid capability loss.
+I would schedule the squid binary cleanup for v7 and the admin tools for 
+v8 at earliest (4 years of v3.2 LTS pain).
+
+
+> Moreover, I do not see how we can keep that "backup" code while 
+> supporting newer Squids and Javascript-disabled browsers at the same 
+> time: AFAICT, when Javascript is disabled (or not working properly), 
+> that "only as a backup" code will send cache_object requests to modern 
+> Squids that will no longer support them...
+
+That would be a serious bug. It breaks admin ability to manage proxies 
+newer than their web server installation - which is more likely to be 
+running outdated LTS than the proxy servers.
+
+
+> I think we should upgrade that cachemgr.cgi code rather than preserve 
+> it for Squid v3 needs. However, if you insist, it will stay simply 
+> because I do not think cachemgr.cgi is worth our time.
+>
+
+
+[1] My records of what vendors are providing as of Nov 2022 indicate that:
+ ?* v5, v4, and v3.5 are currently being shipped in new installs.
+ ?* v3.4 and v3.2 are still in popular 5-10 year old machinery due to 
+vendor LTS.
+ ?* other Squid versions were effectively non-existent.
+
+
+HTH
+Amos
+
+
+From eduard.bagdasaryan at measurement-factory.com  Wed Jan 25 13:58:14 2023
+From: eduard.bagdasaryan at measurement-factory.com (Eduard Bagdasaryan)
+Date: Wed, 25 Jan 2023 16:58:14 +0300
+Subject: [squid-dev] Drop cache_object protocol support
+In-Reply-To: <642b9a31-821c-ab67-c77b-41d880ca96f1@treenet.co.nz>
+References: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+ <dea6512a-b10f-183b-ae9c-ae49f70468aa@measurement-factory.com>
+ <3ff36659-8269-de2e-de89-2ffadf105e0f@treenet.co.nz>
+ <eec6c268-fb6c-4208-f464-27bee20722a3@measurement-factory.com>
+ <642b9a31-821c-ab67-c77b-41d880ca96f1@treenet.co.nz>
+Message-ID: <f30b80d9-815a-8909-cd5c-770a5703ccec@measurement-factory.com>
+
+On 25.01.2023 15:29, Amos Jeffries wrote:
+> On 25/01/2023 5:34 pm, Alex Rousskov wrote:
+>> On 1/24/23 20:57, Amos Jeffries wrote:
+>>
+>>> Blocker #1:? The cachemgr_passwd directly still needs to be cleanly 
+>>> removed, eg replaced by a manager_access ACL based mechanism.
+>>
+>> I do not see a relationship: I have not tested it, but the existing 
+>> CacheManager::ParseHeaders() code already extracts authentication 
+>> information from cache manager requests that use "http" scheme 
+>> AFAICT. Can you detail why the cachemgr_passwd directive/code cannot 
+>> continue to work essentially as it works today after cache_object 
+>> scheme support is removed from Squid?
+>
+> We should check that then. It may not be as impactful as I am recalling. 
+
+
+My test showed that CacheManager::ParseHeaders() extracts password from 
+the Authorization header incorrectly: params.password gets an extra '\n' 
+symbol and CacheManager::CheckPassword() fails. This, however, seems 
+easy to fix.
+
+
+Eduard.
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <http://lists.squid-cache.org/pipermail/squid-dev/attachments/20230125/11f4c9ea/attachment.htm>
+
+From rousskov at measurement-factory.com  Wed Jan 25 14:30:11 2023
+From: rousskov at measurement-factory.com (Alex Rousskov)
+Date: Wed, 25 Jan 2023 09:30:11 -0500
+Subject: [squid-dev] Drop cache_object protocol support
+In-Reply-To: <642b9a31-821c-ab67-c77b-41d880ca96f1@treenet.co.nz>
+References: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+ <dea6512a-b10f-183b-ae9c-ae49f70468aa@measurement-factory.com>
+ <3ff36659-8269-de2e-de89-2ffadf105e0f@treenet.co.nz>
+ <eec6c268-fb6c-4208-f464-27bee20722a3@measurement-factory.com>
+ <642b9a31-821c-ab67-c77b-41d880ca96f1@treenet.co.nz>
+Message-ID: <7f9b03b0-e050-0526-19ca-95e611ced66e@measurement-factory.com>
+
+On 1/25/23 07:29, Amos Jeffries wrote:
+> On 25/01/2023 5:34 pm, Alex Rousskov wrote:
+>> On 1/24/23 20:57, Amos Jeffries wrote:
+>>> Blocker #2: The squidclient tool still sends cache_object: scheme 
+>>> when given "mgr:" on the CLI. We need to upgrade that first 
+>>
+>> Looks like we are in agreement on that.
+>>
+>>
+>>> and allow admin some time to upgrade before removing the scheme 
+>>> support in squid itself.
+>>
+>> Agreed. Would six months be enough in your opinion? If yes, we may be 
+>> able to remove cache_object support in v6. Otherwise, we can remove 
+>> cache_object support starting with v7 (as far as numbered releases are 
+>> concerned).
+
+> v6 will "feature freeze" in 10 days.
+
+With proper cooperation, 10 days is more than enough to remove 
+cache_object support, but I am not going to fight for that given your 
+resistance.
+
+
+> Early in v7 cycle should be good.
+
+Unless you stop me, I will post a message to squid-users to warn the 
+admins that they should not count on Squid instances supporting 
+cache_object scheme in v7 releases.
+
+
+>> IMO, we should not keep any code that is only needed for Squid v3.1 
+>> and earlier. Squid v3.2 and later should http-based cache manager 
+>> access, right? More code always means more maintenance overheads and 
+>> higher change costs. Given our lack of resources, we should start 
+>> ignoring Squid v3 needs.
+> 
+> In sentiment I agree. In practicality we have to cope with "LTS" from 
+> vendors, and Squid bugs in the manager.
+
+IMO, LTS vendors and old Squid bugs do not prevent us from removing 
+cache_object support from cachemgr.cgi: The number of admins that match 
+_all_ of the conditions listed below at the same time is negligible. We 
+should not spend our resources "coping" with those esoteric cases.
+
+1. Use Squid v3.
+2. Use Squid v7.
+3. Use cachemgr.cgi to manage both Squid versions.
+4. Cannot use cachemgr.cgi from Squid v6.
+5. Cannot patch cachemgr.cgi v7 to restore cache_object support.
+
+
+> v3.2 has http: but the https:, ftp:, whois:, gopher: schemes were broken 
+> until late in the v3.5 series backports.
+> So going by [1] LTS systems still using v3.2 are still a pain.
+
+We can stop that pain any time we want. All it takes is for us to stop 
+mentioning v3 releases when making design decisions like this one. We 
+_choose_ to prolong that pain and to spend scarce resources on a 
+negligible percentage of unimportant use cases instead of spending those 
+resources on popular and important use cases.
+
+
+> For completeness, that MGR_INDEX regression you fixed a short while ago 
+> also means some broken v4/v5 releases may be a pain source during the 
+> transition.
+
+Those releases should not be considered a pain in this context because 
+if that bug is actually important, it will be fixed in those releases.
+
+
+> The longer we wait on removal from the CGI and CLI tools (only) the more 
+> seamless it goes. So I am inclined to be very conservative on the tools 
+> capability removal and proactive on ensuring they can cope with the 
+> squid capability loss.
+
+And since there is no way to actually measure "more seamless" or to 
+prove that we are wasting resources on rare unimportant use cases, we 
+end up doing what we do best -- increasing and prolonging pain.
+
+Alex.
+
+
+From eduard.bagdasaryan at measurement-factory.com  Wed Jan 25 14:37:43 2023
+From: eduard.bagdasaryan at measurement-factory.com (Eduard Bagdasaryan)
+Date: Wed, 25 Jan 2023 17:37:43 +0300
+Subject: [squid-dev] Drop cache_object protocol support
+In-Reply-To: <f30b80d9-815a-8909-cd5c-770a5703ccec@measurement-factory.com>
+References: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+ <dea6512a-b10f-183b-ae9c-ae49f70468aa@measurement-factory.com>
+ <3ff36659-8269-de2e-de89-2ffadf105e0f@treenet.co.nz>
+ <eec6c268-fb6c-4208-f464-27bee20722a3@measurement-factory.com>
+ <642b9a31-821c-ab67-c77b-41d880ca96f1@treenet.co.nz>
+ <f30b80d9-815a-8909-cd5c-770a5703ccec@measurement-factory.com>
+Message-ID: <cdcc431b-21fc-968a-5091-ef9d79caa948@measurement-factory.com>
+
+On 25.01.2023 16:58, Eduard Bagdasaryan wrote:
+> On 25.01.2023 15:29, Amos Jeffries wrote:
+>> On 25/01/2023 5:34 pm, Alex Rousskov wrote:
+>>> On 1/24/23 20:57, Amos Jeffries wrote:
+>>>
+>>>> Blocker #1: The cachemgr_passwd directly still needs to be cleanly 
+>>>> removed, eg replaced by a manager_access ACL based mechanism.
+>>>
+>>> I do not see a relationship: I have not tested it, but the existing 
+>>> CacheManager::ParseHeaders() code already extracts authentication 
+>>> information from cache manager requests that use "http" scheme 
+>>> AFAICT. Can you detail why the cachemgr_passwd directive/code cannot 
+>>> continue to work essentially as it works today after cache_object 
+>>> scheme support is removed from Squid?
+>>
+>> We should check that then. It may not be as impactful as I am recalling. 
+>
+>
+> My test showed that CacheManager::ParseHeaders() extracts password 
+> from the Authorization header incorrectly: params.password gets an 
+> extra '\n' symbol and CacheManager::CheckPassword() fails. This, 
+> however, seems easy to fix.
+>
+
+My previous test was incorrect - please ignore this comment. I retested 
+it with a properly encoded base64 password now.
+
+
+Eduard.
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <http://lists.squid-cache.org/pipermail/squid-dev/attachments/20230125/77e08fce/attachment.htm>
+
+From squid3 at treenet.co.nz  Thu Jan 26 09:12:13 2023
+From: squid3 at treenet.co.nz (Amos Jeffries)
+Date: Thu, 26 Jan 2023 22:12:13 +1300
+Subject: [squid-dev] Drop cache_object protocol support
+In-Reply-To: <7f9b03b0-e050-0526-19ca-95e611ced66e@measurement-factory.com>
+References: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+ <dea6512a-b10f-183b-ae9c-ae49f70468aa@measurement-factory.com>
+ <3ff36659-8269-de2e-de89-2ffadf105e0f@treenet.co.nz>
+ <eec6c268-fb6c-4208-f464-27bee20722a3@measurement-factory.com>
+ <642b9a31-821c-ab67-c77b-41d880ca96f1@treenet.co.nz>
+ <7f9b03b0-e050-0526-19ca-95e611ced66e@measurement-factory.com>
+Message-ID: <e184a158-23c1-ab06-109e-5142e4b766f3@treenet.co.nz>
+
+On 26/01/2023 3:30 am, Alex Rousskov wrote:
+> On 1/25/23 07:29, Amos Jeffries wrote:
+>> On 25/01/2023 5:34 pm, Alex Rousskov wrote:
+>>> On 1/24/23 20:57, Amos Jeffries wrote:
+>>>> Blocker #2: The squidclient tool still sends cache_object: scheme 
+>>>> when given "mgr:" on the CLI. We need to upgrade that first 
+>>>
+>>> Looks like we are in agreement on that.
+>>>
+>>>
+>>>> and allow admin some time to upgrade before removing the scheme 
+>>>> support in squid itself.
+>>>
+>>> Agreed. Would six months be enough in your opinion? If yes, we may 
+>>> be able to remove cache_object support in v6. Otherwise, we can 
+>>> remove cache_object support starting with v7 (as far as numbered 
+>>> releases are concerned).
+>
+>> v6 will "feature freeze" in 10 days.
+>
+> With proper cooperation, 10 days is more than enough to remove 
+> cache_object support, but I am not going to fight for that given your 
+> resistance.
+>
+>
+>> Early in v7 cycle should be good.
+>
+> Unless you stop me, I will post a message to squid-users to warn the 
+> admins that they should not count on Squid instances supporting 
+> cache_object scheme in v7 releases.
+
+Sure. Don't forget to add it to the wiki schedule of deprecated features 
+if not already there.
+
+>
+>>> IMO, we should not keep any code that is only needed for Squid v3.1 
+>>> and earlier. Squid v3.2 and later should http-based cache manager 
+>>> access, right? More code always means more maintenance overheads and 
+>>> higher change costs. Given our lack of resources, we should start 
+>>> ignoring Squid v3 needs.
+>>
+>> In sentiment I agree. In practicality we have to cope with "LTS" from 
+>> vendors, and Squid bugs in the manager.
+>
+> IMO, LTS vendors and old Squid bugs do not prevent us from removing 
+> cache_object support from cachemgr.cgi: The number of admins that 
+> match _all_ of the conditions listed below at the same time is negligible.
+
+Evidence needed.
+
+> We should not spend our resources "coping" with those esoteric cases.
+>
+> 1. Use Squid v3.
+> 2. Use Squid v7.
+> 3. Use cachemgr.cgi to manage both Squid versions.
+> 4. Cannot use cachemgr.cgi from Squid v6.
+> 5. Cannot patch cachemgr.cgi v7 to restore cache_object support.
+
+Declaring groups of users "negligible" or "esoteric" without evidence 
+just to push your preferred decision is not a valid line of argument.
+
+
+>
+>> v3.2 has http: but the https:, ftp:, whois:, gopher: schemes were 
+>> broken until late in the v3.5 series backports.
+>> So going by [1] LTS systems still using v3.2 are still a pain.
+>
+> We can stop that pain any time we want. All it takes is for us to stop 
+> mentioning v3 releases when making design decisions like this one. We 
+> _choose_ to prolong that pain and to spend scarce resources on a 
+> negligible percentage of unimportant use cases instead of spending 
+> those resources on popular and important use cases.
+>
+
+We are making decisions which affect other peoples lives and employment. 
+The "pain" I have been mentioning is _their_ pain, not ours.
+It is appropriate to keep the human aspect in mind for this decision and 
+utilize the data we do have available.
+That data I have says v3.2 and v3.5 are still relevant factors for this 
+change.
+
+
+>
+>> For completeness, that MGR_INDEX regression you fixed a short while 
+>> ago also means some broken v4/v5 releases may be a pain source during 
+>> the transition.
+>
+> Those releases should not be considered a pain in this context because 
+> if that bug is actually important, it will be fixed in those releases.
+
+We can hope. But have no certainty of that. Thus I mentioned it.
+
+>
+>> The longer we wait on removal from the CGI and CLI tools (only) the 
+>> more seamless it goes. So I am inclined to be very conservative on 
+>> the tools capability removal and proactive on ensuring they can cope 
+>> with the squid capability loss.
+>
+> And since there is no way to actually measure "more seamless" or to 
+> prove that we are wasting resources on rare unimportant use cases, we 
+> end up doing what we do best -- increasing and prolonging pain.
+>
+
+We do have at least one measure. I use the count of Vendors distributing 
+each problematic release.
+Over time their old versions reach EOL, or LTS get updated to new Squid 
+versions etc.
+We can reasonably expect admin to be using a currently supported version 
+of their OS packages.
+
+Amos
+
+
+From rousskov at measurement-factory.com  Thu Jan 26 15:01:00 2023
+From: rousskov at measurement-factory.com (Alex Rousskov)
+Date: Thu, 26 Jan 2023 10:01:00 -0500
+Subject: [squid-dev] Drop cache_object protocol support
+In-Reply-To: <e184a158-23c1-ab06-109e-5142e4b766f3@treenet.co.nz>
+References: <a0388014-3c18-9fc4-b267-f9bc5bab8599@measurement-factory.com>
+ <dea6512a-b10f-183b-ae9c-ae49f70468aa@measurement-factory.com>
+ <3ff36659-8269-de2e-de89-2ffadf105e0f@treenet.co.nz>
+ <eec6c268-fb6c-4208-f464-27bee20722a3@measurement-factory.com>
+ <642b9a31-821c-ab67-c77b-41d880ca96f1@treenet.co.nz>
+ <7f9b03b0-e050-0526-19ca-95e611ced66e@measurement-factory.com>
+ <e184a158-23c1-ab06-109e-5142e4b766f3@treenet.co.nz>
+Message-ID: <cee466ca-564c-6358-7327-44be19f00a5f@measurement-factory.com>
+
+On 1/26/23 04:12, Amos Jeffries wrote:
+> On 26/01/2023 3:30 am, Alex Rousskov wrote:
+>> On 1/25/23 07:29, Amos Jeffries wrote:
+>>> On 25/01/2023 5:34 pm, Alex Rousskov wrote:
+>>>> IMO, we should not keep any code that is only needed for Squid v3.1 
+>>>> and earlier. Squid v3.2 and later should http-based cache manager 
+>>>> access, right? More code always means more maintenance overheads and 
+>>>> higher change costs. Given our lack of resources, we should start 
+>>>> ignoring Squid v3 needs.
+>>>
+>>> In sentiment I agree. In practicality we have to cope with "LTS" from 
+>>> vendors, and Squid bugs in the manager.
+>>
+>> IMO, LTS vendors and old Squid bugs do not prevent us from removing 
+>> cache_object support from cachemgr.cgi: The number of admins that 
+>> match _all_ of the conditions listed below at the same time is 
+>> negligible.
+
+> Evidence needed.
+
+It would be nice to back up my reasoning with hard evidence, but I do 
+not think it is _required_ in this case. It is impractical to prove 
+negligibly low count of X when there is no way to enumerate all 
+instances where X might exist. These kind of decisions require a 
+judgement call.
+
+Circumstantial evidence does exist -- the Project does not see a 
+constant stream of complaints, bug reports, and improvements related to 
+cachemgr.cgi despite its many shortcomings. We also do not see a lot of 
+complaints about v3.2 or a lot of examples where v3 users cannot 
+upgrade. To avoid misunderstanding, I am not claiming that evidence 
+proves my point beyond reasonable doubt. It is only partial and 
+circumstantial.
+
+
+>> We should not spend our resources "coping" with those esoteric cases.
+>>
+>> 1. Use Squid v3.
+>> 2. Use Squid v7.
+>> 3. Use cachemgr.cgi to manage both Squid versions.
+>> 4. Cannot use cachemgr.cgi from Squid v6.
+>> 5. Cannot patch cachemgr.cgi v7 to restore cache_object support.
+> 
+> Declaring groups of users "negligible" or "esoteric" without evidence 
+> just to push your preferred decision is not a valid line of argument.
+
+First of all, I am not declaring groups of users "negligible" or 
+"esoteric". I am speculating about the number of certain use cases and 
+classifying those use cases.
+
+I believe my line of argument is valid, even though it is not (and, 
+given existing Project limitations, cannot be) backed by hard evidence. 
+We will never know how many use cases match all 5 criteria. In fact, we 
+will never know how many Squid use cases are out there today!
+
+If you have hard evidence that illustrates that relevant use cases are 
+common, please present it. Needless to say, I am not aware of such evidence.
+
+
+>>> v3.2 has http: but the https:, ftp:, whois:, gopher: schemes were 
+>>> broken until late in the v3.5 series backports.
+>>> So going by [1] LTS systems still using v3.2 are still a pain.
+>>
+>> We can stop that pain any time we want. All it takes is for us to stop 
+>> mentioning v3 releases when making design decisions like this one. We 
+>> _choose_ to prolong that pain and to spend scarce resources on a 
+>> negligible percentage of unimportant use cases instead of spending 
+>> those resources on popular and important use cases.
+
+> We are making decisions which affect other peoples lives and employment. 
+> The "pain" I have been mentioning is _their_ pain, not ours.
+
+When making a decision, we should take into account the "lives and 
+employment" and "pains" of all affected people. We cannot make everybody 
+happy, and if we try, we are likely to increase the overall level of 
+unhappiness. Making (few) v3 users happier at the expense of hurting 
+(many more) v5 users is the wrong balance IMO, and that is what we often 
+end up doing when it comes to this kind of decisions.
+
+
+> It is appropriate to keep the human aspect in mind for this decision and 
+> utilize the data we do have available.
+
+Agreed. That is exactly what I am doing.
+
+
+> That data I have says v3.2 and v3.5 are still relevant factors for this 
+> change.
+
+Their relevance is not being disputed. What we disagree on is whether 
+those (real) v3 user needs are enough to hurt other (also real) users.
+
+
+>>> The longer we wait on removal from the CGI and CLI tools (only) the 
+>>> more seamless it goes. So I am inclined to be very conservative on 
+>>> the tools capability removal and proactive on ensuring they can cope 
+>>> with the squid capability loss.
+>>
+>> And since there is no way to actually measure "more seamless" or to 
+>> prove that we are wasting resources on rare unimportant use cases, we 
+>> end up doing what we do best -- increasing and prolonging pain.
+>>
+> 
+> We do have at least one measure. I use the count of Vendors distributing 
+> each problematic release.
+> Over time their old versions reach EOL, or LTS get updated to new Squid 
+> versions etc.
+> We can reasonably expect admin to be using a currently supported version 
+> of their OS packages.
+
+The proposed measure is just too coarse to be applicable here because 
+the proposal does _not_ inconvenience users of problematic releases. In 
+fact, the proposal does _not_  inconvenience users of _any_ given Squid 
+release in existence! It only inconvenience users that match a long list 
+of very special criteria. For example, it requires a user to use _both_ 
+v3 and v7 releases, at the same time.
+
+Alex.
+
+

@@ -1,0 +1,366 @@
+Create PID file ASAP, before the shared memory segments.
+
+PID file is created right after configuration finalization, before the
+allocation for any shared memory segments.
+
+Late PID file creation allowed N+1 concurrent Squid instances to create
+the same set of shared segments (overwriting each other segments),
+resulting in extremely confusing havoc because the N instances would
+later lose the race for the PID file (or some other critical resource)
+creation and remove the segments. If that removal happened before a kid
+of the single surviving instance started, that kid would fail to start
+with open() errors in Segment.cc because the shared segment it tries to
+open would be gone. Otherwise, that kid would fail to _restart_ after
+any unrelated failures (possibly many days after the conflict), with
+same errors, for the same reason.
+
+Shared state corruption was also possible if different kids (of the
+winning instance) opened (and started using) segments created (and
+initialized) by different instances.
+
+Situations with N+1 concurrent Squid instances are not uncommon because
+many Squid service management scripts (or manual admin commands!)
+* do not check whether another Squid is already running and/or
+* incorrectly assume that "squid -z" does not daemonize.
+
+This change finally makes starting N+1 Squid instances safe (AFAIK).
+
+Also made daemonized and non-daemonized Squid create the PID file at the
+same startup stage, reducing inconsistencies between the two modes.
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2017-05-06 19:13:13 +0000
++++ src/main.cc	2017-05-12 14:07:00 +0000
+@@ -1230,63 +1230,60 @@ mainInitialize(void)
+          */
+ 
+         eventInit();
+ 
+         // TODO: pconn is a good candidate for new-style registration
+         // PconnModule::GetInstance()->registerWithCacheManager();
+         //   moved to PconnModule::PconnModule()
+     }
+ 
+     if (IamPrimaryProcess()) {
+ #if USE_WCCP
+         wccpInit();
+ 
+ #endif
+ #if USE_WCCPv2
+ 
+         wccp2Init();
+ 
+ #endif
+     }
+ 
+     serverConnectionsOpen();
+ 
+     neighbors_init();
+ 
+     // neighborsRegisterWithCacheManager(); //moved to neighbors_init()
+ 
+     if (Config.chroot_dir)
+         no_suid();
+ 
+-    if (!InDaemonMode() && IamMasterProcess())
+-        Instance::WriteOurPid();
+-
+ #if defined(_SQUID_LINUX_THREADS_)
+ 
+     squid_signal(SIGQUIT, rotate_logs, SA_RESTART);
+ 
+     squid_signal(SIGTRAP, sigusr2_handle, SA_RESTART);
+ 
+ #else
+ 
+     squid_signal(SIGUSR1, rotate_logs, SA_RESTART);
+ 
+     squid_signal(SIGUSR2, sigusr2_handle, SA_RESTART);
+ 
+ #endif
+ 
+     squid_signal(SIGTERM, shut_down, SA_RESTART);
+ 
+     squid_signal(SIGINT, shut_down, SA_RESTART);
+ 
+ #ifdef SIGTTIN
+ 
+     squid_signal(SIGTTIN, shut_down, SA_RESTART);
+ 
+ #endif
+ 
+     memCheckInit();
+ 
+ #if USE_LOADABLE_MODULES
+     LoadableModulesConfigure(Config.loadable_module_names);
+ #endif
+ 
+@@ -1379,60 +1376,66 @@ SquidMainSafe(int argc, char **argv)
+     }
+     return -1; // TODO: return EXIT_FAILURE instead
+ }
+ 
+ /// computes name and ID for the current kid process
+ static void
+ ConfigureCurrentKid(const char *processName)
+ {
+     // kids are marked with parenthesis around their process names
+     if (processName && processName[0] == '(') {
+         if (const char *idStart = strrchr(processName, '-')) {
+             KidIdentifier = atoi(idStart + 1);
+             const size_t nameLen = idStart - (processName + 1);
+             assert(nameLen < sizeof(TheKidName));
+             xstrncpy(TheKidName, processName + 1, nameLen + 1);
+             if (!strcmp(TheKidName, "squid-coord"))
+                 TheProcessKind = pkCoordinator;
+             else if (!strcmp(TheKidName, "squid"))
+                 TheProcessKind = pkWorker;
+             else if (!strcmp(TheKidName, "squid-disk"))
+                 TheProcessKind = pkDisker;
+             else
+                 TheProcessKind = pkOther; // including coordinator
+         }
+     } else {
+         xstrncpy(TheKidName, APP_SHORTNAME, sizeof(TheKidName));
+         KidIdentifier = 0;
+     }
+ }
+ 
++static void StartUsingConfig()
++{
++    RunRegisteredHere(RegisteredRunner::claimMemoryNeeds);
++    RunRegisteredHere(RegisteredRunner::useConfig);
++}
++
+ int
+ SquidMain(int argc, char **argv)
+ {
+     ConfigureCurrentKid(argv[0]);
+ 
+     Debug::parseOptions(NULL);
+     debug_log = stderr;
+ 
+ #if defined(SQUID_MAXFD_LIMIT)
+ 
+     if (SQUID_MAXFD_LIMIT < Squid_MaxFD)
+         Squid_MaxFD = SQUID_MAXFD_LIMIT;
+ 
+ #endif
+ 
+     /* NOP under non-windows */
+     int WIN32_init_err=0;
+     if ((WIN32_init_err = WIN32_Subsystem_Init(&argc, &argv)))
+         return WIN32_init_err;
+ 
+     /* call mallopt() before anything else */
+ #if HAVE_MALLOPT
+ #ifdef M_GRAIN
+     /* Round up all sizes to a multiple of this */
+     mallopt(M_GRAIN, 16);
+ 
+ #endif
+ #ifdef M_MXFAST
+     /* biggest size that is considered a small block */
+     mallopt(M_MXFAST, 256);
+@@ -1542,69 +1545,73 @@ SquidMain(int argc, char **argv)
+ 
+ #if TEST_ACCESS
+ 
+     comm_init();
+ 
+     mainInitialize();
+ 
+     test_access();
+ 
+     return 0;
+ 
+ #endif
+ 
+     /* send signal to running copy and exit */
+     if (opt_send_signal != -1) {
+         /* chroot if configured to run inside chroot */
+         mainSetCwd();
+         if (Config.chroot_dir) {
+             no_suid();
+         } else {
+             leave_suid();
+         }
+ 
+         sendSignal();
+         return 0;
+     }
+ 
+     debugs(1,2, HERE << "Doing post-config initialization\n");
+     leave_suid();
+     RunRegisteredHere(RegisteredRunner::finalizeConfig);
+-    RunRegisteredHere(RegisteredRunner::claimMemoryNeeds);
+-    RunRegisteredHere(RegisteredRunner::useConfig);
+-    enter_suid();
+ 
+-    if (InDaemonMode() && IamMasterProcess()) {
+-        watch_child(argv);
+-        // NOTREACHED
++    if (IamMasterProcess()) {
++        if (InDaemonMode()) {
++            watch_child(argv);
++            // NOTREACHED
++        } else {
++            Instance::WriteOurPid();
++        }
+     }
+ 
++    StartUsingConfig();
++    enter_suid();
++
+     if (opt_create_swap_dirs) {
+         /* chroot if configured to run inside chroot */
+         mainSetCwd();
+ 
+         setEffectiveUser();
+         debugs(0, DBG_CRITICAL, "Creating missing swap directories");
+         Store::Root().create();
+ 
+         return 0;
+     }
+ 
+     if (IamPrimaryProcess())
+         CpuAffinityCheck();
+     CpuAffinityInit();
+ 
+     setMaxFD();
+ 
+     /* init comm module */
+     comm_init();
+ 
+     if (opt_no_daemon) {
+         /* we have to init fdstat here. */
+         fd_open(0, FD_LOG, "stdin");
+         fd_open(1, FD_LOG, "stdout");
+         fd_open(2, FD_LOG, "stderr");
+     }
+ 
+ #if USE_WIN32_SERVICE
+ 
+     WIN32_svcstatusupdate(SERVICE_START_PENDING, 10000);
+@@ -1735,115 +1742,119 @@ masterCheckAndBroadcastSignals()
+     if (do_shutdown)
+         shutting_down = 1;
+ 
+     BroadcastSignalIfAny(DebugSignal);
+     BroadcastSignalIfAny(RotateSignal);
+     BroadcastSignalIfAny(ReconfigureSignal);
+     BroadcastSignalIfAny(ShutdownSignal);
+ }
+ #endif
+ 
+ static inline bool
+ masterSignaled()
+ {
+     return (DebugSignal > 0 || RotateSignal > 0 || ReconfigureSignal > 0 || ShutdownSignal > 0);
+ }
+ 
+ static void
+ watch_child(char *argv[])
+ {
+ #if !_SQUID_WINDOWS_
+     char *prog;
+     PidStatus status_f, status;
+     pid_t pid;
+ #ifdef TIOCNOTTY
+ 
+     int i;
+ #endif
+ 
+     int nullfd;
+ 
++    enter_suid();
++
+     openlog(APP_SHORTNAME, LOG_PID | LOG_NDELAY | LOG_CONS, LOG_LOCAL4);
+ 
+     if ((pid = fork()) < 0) {
+         int xerrno = errno;
+         syslog(LOG_ALERT, "fork failed: %s", xstrerr(xerrno));
+     } else if (pid > 0) {
+         // parent
+         if (opt_foreground) {
+             if (WaitForAnyPid(status_f, 0) < 0) {
+                 int xerrno = errno;
+                 syslog(LOG_ALERT, "WaitForAnyPid failed: %s", xstrerr(xerrno));
+             }
+         }
+ 
+         exit(0);
+     }
+ 
+     if (setsid() < 0) {
+         int xerrno = errno;
+         syslog(LOG_ALERT, "setsid failed: %s", xstrerr(xerrno));
+     }
+ 
+     closelog();
+ 
+ #ifdef TIOCNOTTY
+ 
+     if ((i = open("/dev/tty", O_RDWR | O_TEXT)) >= 0) {
+         ioctl(i, TIOCNOTTY, NULL);
+         close(i);
+     }
+ 
+ #endif
+ 
+     /*
+      * RBCOLLINS - if cygwin stackdumps when squid is run without
+      * -N, check the cygwin1.dll version, it needs to be AT LEAST
+      * 1.1.3.  execvp had a bit overflow error in a loop..
+      */
+     /* Connect stdio to /dev/null in daemon mode */
+     nullfd = open(_PATH_DEVNULL, O_RDWR | O_TEXT);
+ 
+     if (nullfd < 0) {
+         int xerrno = errno;
+         fatalf(_PATH_DEVNULL " %s\n", xstrerr(xerrno));
+     }
+ 
+     dup2(nullfd, 0);
+ 
+     if (Debug::log_stderr < 0) {
+         dup2(nullfd, 1);
+         dup2(nullfd, 2);
+     }
+ 
++    leave_suid();
+     Instance::WriteOurPid();
+-    enter_suid(); // writing the PID file usually involves leave_suid()
++    StartUsingConfig();
++    enter_suid();
+ 
+ #if defined(_SQUID_LINUX_THREADS_)
+     squid_signal(SIGQUIT, rotate_logs, 0);
+     squid_signal(SIGTRAP, sigusr2_handle, 0);
+ #else
+     squid_signal(SIGUSR1, rotate_logs, 0);
+     squid_signal(SIGUSR2, sigusr2_handle, 0);
+ #endif
+ 
+     squid_signal(SIGHUP, reconfigure, 0);
+ 
+     squid_signal(SIGTERM, master_shutdown, 0);
+     squid_signal(SIGINT, master_shutdown, 0);
+ #ifdef SIGTTIN
+     squid_signal(SIGTTIN, master_shutdown, 0);
+ #endif
+ 
+     if (Config.workers > 128) {
+         syslog(LOG_ALERT, "Suspiciously high workers value: %d",
+                Config.workers);
+         // but we keep going in hope that user knows best
+     }
+     TheKids.init();
+ 
+     syslog(LOG_NOTICE, "Squid Parent: will start %d kids", (int)TheKids.count());
+ 
+     // keep [re]starting kids until it is time to quit
+     for (;;) {
+         bool mainStartScriptCalled = false;
+         // start each kid that needs to be [re]started; once
+

@@ -1,0 +1,181 @@
+Splice to origin cache_peer.
+
+Currently, Squid cannot redirect intercepted connections that are subject to
+SslBump rules to _originserver_ cache_peer. For example, consider Squid that
+enforces "safe search" by redirecting clients to forcesafesearch.example.com.
+Consider a TLS client that tries to connect to www.example.com. Squid needs to
+send that client to forcesafesearch.example.com (without changing the host
+header and SNI information; those would still point to www.example.com for
+safe search to work as intended!).
+
+The admin may configure Squid to send intercepted clients to an originserver
+cache_peer with the forcesafesearch.example.com address. Such a configuration
+does not currently work together with ssl_bump peek/splice rules.
+
+This patch:
+
+* Fixes src/neighbors.cc bug which prevented CONNECT requests from going
+  to originserver cache peers. This bug affects both true CONNECT requests
+  and intercepted SSL/TLS connections (with fake CONNECT requests). Squid
+  use the CachePeer::in_addr.port which is not meant to be used for the HTTP
+  port, apparently. HTTP checks should use CachePeer::http_port instead.
+
+* Changes Squid to not initiate SSL/TLS connection to cache_peer for
+  true CONNECT requests. 
+
+* Allows forwarding being-peeked (or stared) at connections to originserver
+  cache_peers.
+
+The bug fix described in the first bullet makes the last two changes
+necessary.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2015-06-09 06:14:43 +0000
++++ src/FwdState.cc	2015-06-23 14:29:15 +0000
+@@ -674,44 +674,47 @@
+                 peerConnectFailed(conn->getPeer());
+ 
+             conn->close();
+         }
+         retryOrBail();
+         return;
+     }
+ 
+     serverConn = conn;
+     flags.connected_okay = true;
+ 
+     debugs(17, 3, HERE << serverConnection() << ": '" << entry->url() << "'" );
+ 
+     comm_add_close_handler(serverConnection()->fd, fwdServerClosedWrapper, this);
+ 
+     if (serverConnection()->getPeer())
+         peerConnectSucceded(serverConnection()->getPeer());
+ 
+ #if USE_OPENSSL
+     if (!request->flags.pinned) {
+-        if ((serverConnection()->getPeer() && serverConnection()->getPeer()->secure.encryptTransport) ||
+-                (!serverConnection()->getPeer() && request->url.getScheme() == AnyP::PROTO_HTTPS) ||
+-                request->flags.sslPeek) {
+-
++        const CachePeer *p = serverConnection()->getPeer();
++        const bool peerWantsSsl = p && p->secure.encryptTransport;
++        const bool userWillSslToPeerForUs = p && p->options.originserver &&
++            request->method == Http::METHOD_CONNECT;
++        const bool sslToPeer = peerWantsSsl && !userWillSslToPeerForUs;
++        const bool sslToOrigin = !p && request->url.getScheme() == AnyP::PROTO_HTTPS;
++        if (sslToPeer || sslToOrigin || request->flags.sslPeek) {
+             HttpRequest::Pointer requestPointer = request;
+             AsyncCall::Pointer callback = asyncCall(17,4,
+                                                     "FwdState::ConnectedToPeer",
+                                                     FwdStatePeerAnswerDialer(&FwdState::connectedToPeer, this));
+             // Use positive timeout when less than one second is left.
+             const time_t sslNegotiationTimeout = max(static_cast<time_t>(1), timeLeft());
+             Ssl::PeekingPeerConnector *connector =
+                 new Ssl::PeekingPeerConnector(requestPointer, serverConnection(), clientConn, callback, sslNegotiationTimeout);
+             AsyncJob::Start(connector); // will call our callback
+             return;
+         }
+     }
+ #endif
+ 
+     // if not encrypting just run the post-connect actions
+     Security::EncryptorAnswer nil;
+     connectedToPeer(nil);
+ }
+ 
+ void
+@@ -773,41 +776,43 @@
+     if (ftimeout < ctimeout)
+         return (time_t)ftimeout;
+     else
+         return (time_t)ctimeout;
+ }
+ 
+ /**
+  * Called after forwarding path selection (via peer select) has taken place
+  * and whenever forwarding needs to attempt a new connection (routing failover).
+  * We have a vector of possible localIP->remoteIP paths now ready to start being connected.
+  */
+ void
+ FwdState::connectStart()
+ {
+     assert(serverDestinations.size() > 0);
+ 
+     debugs(17, 3, "fwdConnectStart: " << entry->url());
+ 
+     request->hier.startPeerClock();
+ 
+-    if (serverDestinations[0]->getPeer() && request->flags.sslBumped) {
++    // do not forward being-peeked/stared connections to peer
++    // unless it is an origin server
++    if (serverDestinations[0]->getPeer() && !serverDestinations[0]->getPeer()->options.originserver && request->flags.sslBumped) {
+         debugs(50, 4, "fwdConnectStart: Ssl bumped connections through parent proxy are not allowed");
+         ErrorState *anErr = new ErrorState(ERR_CANNOT_FORWARD, Http::scServiceUnavailable, request);
+         fail(anErr);
+         self = NULL; // refcounted
+         return;
+     }
+ 
+     request->flags.pinned = false; // XXX: what if the ConnStateData set this to flag existing credentials?
+     // XXX: answer: the peer selection *should* catch it and give us only the pinned peer. so we reverse the =0 step below.
+     // XXX: also, logs will now lie if pinning is broken and leads to an error message.
+     if (serverDestinations[0]->peerType == PINNED) {
+         ConnStateData *pinned_connection = request->pinnedConnection();
+         debugs(17,7, "pinned peer connection: " << pinned_connection);
+         // pinned_connection may become nil after a pconn race
+         if (pinned_connection)
+             serverConn = pinned_connection->borrowPinnedConnection(request, serverDestinations[0]->getPeer());
+         else
+             serverConn = NULL;
+         if (Comm::IsConnOpen(serverConn)) {
+             pinned_connection->stopPinnedConnectionMonitoring();
+
+=== modified file 'src/neighbors.cc'
+--- src/neighbors.cc	2015-06-09 06:14:43 +0000
++++ src/neighbors.cc	2015-06-23 14:30:44 +0000
+@@ -142,41 +142,41 @@
+ #if PEER_MULTICAST_SIBLINGS
+         if (p->type == PEER_MULTICAST && p->options.mcast_siblings &&
+                 (request->flags.noCache || request->flags.refresh || request->flags.loopDetected || request->flags.needValidation))
+             debugs(15, 2, "peerAllowedToUse(" << p->name << ", " << request->url.authority() << ") : multicast-siblings optimization match");
+ #endif
+         if (request->flags.noCache)
+             return false;
+ 
+         if (request->flags.refresh)
+             return false;
+ 
+         if (request->flags.loopDetected)
+             return false;
+ 
+         if (request->flags.needValidation)
+             return false;
+     }
+ 
+     // CONNECT requests are proxy requests. Not to be forwarded to origin servers.
+     // Unless the destination port matches, in which case we MAY perform a 'DIRECT' to this CachePeer.
+-    if (p->options.originserver && request->method == Http::METHOD_CONNECT && request->url.port() != p->in_addr.port())
++    if (p->options.originserver && request->method == Http::METHOD_CONNECT && request->url.port() != p->http_port)
+         return false;
+ 
+     if (p->access == NULL)
+         return true;
+ 
+     ACLFilledChecklist checklist(p->access, request, NULL);
+ 
+     return (checklist.fastCheck() == ACCESS_ALLOWED);
+ }
+ 
+ /* Return TRUE if it is okay to send an ICP request to this CachePeer.   */
+ static int
+ peerWouldBePinged(const CachePeer * p, HttpRequest * request)
+ {
+     if (p->icp.port == 0)
+         return 0;
+ 
+     if (p->options.no_query)
+         return 0;
+ 
+

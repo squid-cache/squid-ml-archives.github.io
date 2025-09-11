@@ -1,0 +1,1073 @@
+# Bazaar merge directive format 2 (Bazaar 0.90)
+# revision_id: kinkie@squid-cache.org-20150320133255-xsj0c38csqm6ow1s
+# target_branch: file:///home/kinkie/squid/workspace/trunk/
+# testament_sha1: ed123dfd6b8aa7131967971febeacbb9cc193575
+# timestamp: 2015-03-20 16:13:43 +0100
+# base_revision_id: squidadm@squid-cache.org-20150319121208-\
+#   l0ypujpog4sb621n
+# 
+# Begin patch
+=== modified file 'configure.ac'
+--- configure.ac	2015-03-13 16:57:58 +0000
++++ configure.ac	2015-03-18 16:43:56 +0000
+@@ -3852,6 +3852,7 @@
+ 	helpers/url_rewrite/LFS/Makefile
+ 	icons/Makefile
+ 	lib/Makefile
++	lib/trie/Makefile
+ 	lib/libTrie/Makefile
+ 	lib/libTrie/test/Makefile
+ 	lib/ntlmauth/Makefile
+
+=== modified file 'lib/Makefile.am'
+--- lib/Makefile.am	2015-01-29 16:09:11 +0000
++++ lib/Makefile.am	2015-03-18 17:57:23 +0000
+@@ -9,8 +9,8 @@
+ 
+ AUTOMAKE_OPTIONS = subdir-objects
+ 
+-DIST_SUBDIRS = ntlmauth profiler rfcnb smblib libTrie snmplib
+-SUBDIRS=
++DIST_SUBDIRS = ntlmauth profiler rfcnb smblib libTrie snmplib trie
++SUBDIRS = trie
+ EXTRA_DIST=
+ 
+ if USE_ESI
+
+=== added directory 'lib/trie'
+=== added file 'lib/trie/CompactArrayTrieNode.h'
+--- lib/trie/CompactArrayTrieNode.h	1970-01-01 00:00:00 +0000
++++ lib/trie/CompactArrayTrieNode.h	2015-03-20 12:10:56 +0000
+@@ -0,0 +1,275 @@
++#ifndef SQUID_COMPACTARRAYTRIENODE_H_
++#define SQUID_COMPACTARRAYTRIENODE_H_
++
++#include <cstddef>
++#include <vector>
++
++template <class Key, class Value>
++class CompactTrie;
++template <class Key, class Value>
++class CompactTrieIterator;
++
++/** Private auxiliary class for CompactTrie.
++ *
++ * DO NOT USE or try to access it in any other context.
++ */
++template <class Key, class Value>
++class CompactArrayTrieNode
++{
++public:
++    typedef unsigned int size_t;
++    typedef Key key_type;
++    typedef Value mapped_type;
++    typedef std::pair<key_type, mapped_type> value_type;
++    CompactArrayTrieNode();
++    ~CompactArrayTrieNode();
++
++    /** node lookup
++     *
++     * Main nonrecursive node lookup funciton.
++     * \return pointer to child node corresponding to char if present,
++     *  NULL if not present.
++     */
++    CompactArrayTrieNode *findInNode(unsigned int character);
++
++    /** subtree lookup
++     *
++     * \return a pointer to the node containing the exact key match if found,
++     *  or NULL if the key is not contained in the subtree
++     */
++    CompactArrayTrieNode *find(Key const & k) {
++        return find(k.begin(), k.end());
++    }
++    /// subtree lookup, iterator-based variant
++    template <class InputIterator>
++    CompactArrayTrieNode *find(InputIterator begin, const InputIterator& end) {
++        return iterativeLowFind(begin, end, false, false, 0, this);
++    }
++
++    /** subtree prefix lookup
++     *
++     * \return pointer to the node keyed on the SHORTEST prefix of key
++     *   or NULL if no prefix is found
++     */
++    CompactArrayTrieNode *findPrefix(Key const & key) {
++        return findPrefix(key.begin(), key.end());
++    }
++    /// subtree prefix lookup, iterator-based variant
++    template <class InputIterator>
++    CompactArrayTrieNode *findPrefix(InputIterator begin, const InputIterator& end) {
++        return iterativeLowFind(begin, end, true, false, 0, this);
++    }
++
++    /** subtree prefix lookup with terminator constraints
++     *
++     * Search for the node corresponding to the shortest prefix of the supplied
++     * key where the prefix ends with the supplied suffixChar
++     * or corresponding to the full key or to the full key plus suffixChar.
++     * For example, findPrefix("foo%bar%gazonk",'%') will return a pointer
++     * to the node corresponding to the first key among:
++     * "foo%", "foo%bar%", "foo%bar%gazonk", "foo%bar%gazonk%", NULL
++     *
++     * \return pointer to node if any constrained prefix is found, NULL
++     *   if no such prefix is found
++     */
++    CompactArrayTrieNode *findPrefix(Key const & key, const unsigned int suffixChar) {
++        return findPrefix(key.begin(), key.end(), suffixChar);
++    }
++    // subtree prefix lookup with terminator constraints, iterator variant
++    template <class InputIterator>
++    CompactArrayTrieNode *findPrefix(InputIterator begin, const InputIterator& end, const unsigned int suffixChar) {
++        return iterativeLowFind(begin, end, true, true, suffixChar, this);
++    }
++
++    /** subtree emptyness
++     *
++     * \return true if the subtree (including the current node) is empty
++     * \note this implementation is only correct if it's not possible
++     *   to remove children from the TrieNode. Once that API is implemented,
++     *   in order for empty() to be correct, it'll have to also clear the
++     *   children array once the last child is removed.
++     */
++    bool empty() const {
++        return (!haveData && children.empty());
++    }
++
++    /** insert a new value in the subtrie
++     *
++     * Add a new value_type made of Key and Value in the position pointed
++     * to by Key. This method is meant to be called on the root node of the
++     * Trie. Any preexisting value keyed on the same key gets replaced.
++     *
++     * \return false if the value can't be added.
++     */
++    bool insert(key_type const &k , const mapped_type &v) {
++        return iterativeAdd(k.begin(), k.end(), k, v, this);
++    }
++
++    /** data collector
++     *
++     * walk the subtree and fill the passed std::vector reference
++     * with pointers to nodes having data, sorted lexicographically
++     */
++    void recursivePreorderWalk(std::vector<CompactArrayTrieNode *> &) ;
++
++    friend class CompactTrie<key_type, mapped_type>;
++    friend class CompactTrieIterator<key_type, mapped_type>;
++
++private:
++    /** low-level matching method
++     *
++     * Low-level function implementing all the find variants: exact key match
++     *  (if prefix == false), prefix match (if prefix == true) and constrained
++     *  prefix metch (if prefix == true && haveTrailChar == true)
++     * \return pointer sought-for node or NULL if not found.
++     */
++    template <class InputIterator>
++    static CompactArrayTrieNode *iterativeLowFind(InputIterator begin, const InputIterator &end, bool const prefix, bool const haveTrailChar, const unsigned int trailchar, CompactArrayTrieNode *n);
++
++    typedef std::vector<CompactArrayTrieNode *> children_type;
++
++    children_type children;
++    value_type data;
++    size_t offset;
++    bool haveData;
++
++    /// not implemented
++    CompactArrayTrieNode(const CompactArrayTrieNode&);
++    /// not implemented
++    CompactArrayTrieNode& operator =(CompactArrayTrieNode const &);
++
++    /** low-level data insert
++     *
++     * Low-level function inserting new data in the Trie (or replacing
++     * data with the same key). Extends Trie storage as needed.
++     * \return false if data cannot be added
++     */
++    static bool iterativeAdd(const key_type &, const mapped_type &, CompactArrayTrieNode *);
++    template <class InputIterator>
++    /// low-level data insert, iterator-based variant
++    static bool iterativeAdd(InputIterator begin, const InputIterator &end, const key_type &, const mapped_type &, CompactArrayTrieNode *);
++};
++
++template <class key_type, class mapped_type>
++CompactArrayTrieNode<key_type,mapped_type>::CompactArrayTrieNode() :
++        offset(0),
++        haveData(false)
++{}
++
++template <class key_type, class mapped_type>
++CompactArrayTrieNode<key_type,mapped_type>::~CompactArrayTrieNode()
++{
++    for (typename children_type::iterator i=children.begin(); i != children.end(); ++i)
++        delete *i; // handles NULL automatically
++    // no need to handle data type, it has by-value semantics
++}
++
++template <class key_type, class mapped_type>
++template <class InputIterator>
++CompactArrayTrieNode<key_type,mapped_type> *
++CompactArrayTrieNode<key_type,mapped_type>::iterativeLowFind(InputIterator i, const InputIterator &end, bool const prefix, const bool haveTrailChar, const unsigned int trailchar, CompactArrayTrieNode *n)
++{
++    while (i != end) {
++        // not yet at the end of the key string, grab the next character
++        const unsigned int character = *i;
++
++        // the tree entry ending here is prefix of key, no need to search further
++        if (prefix && !haveTrailChar && n->haveData)
++            return n;
++
++        // does key character have any data associated to search in?
++        CompactArrayTrieNode *child = n->findInNode(character);
++
++        // if the key is "moc.elpmaxe.www" and tree contains "moc.elpmaxe." we want a match.
++        // "moc.elpmaxe." is a tree entry when child('.')->haveData == true
++        //
++        // NP: check for this here instead of on iterate because the child node
++        //     does not 'know' what character we used to reach it.
++        if (prefix && haveTrailChar && character == trailchar && child && child->haveData)
++            return child;
++
++        // if we have a child, iterate into it, otherwise it's a miss
++        if (child) {
++            n = child;
++            ++i;
++        } else {
++            return NULL;
++        }
++    }
++    // i == end, whole key was matched
++    if (n->haveData)
++        return n;
++
++    // if the key is "moc.elpmaxe" and tree contains "moc.elpmaxe." we want a match.
++    // - "moc.elpmaxe." is a tree entry only if child('.')->haveData == true
++    if (prefix && haveTrailChar) {
++        const auto child = n->findInNode(trailchar);
++        if (child && child->haveData)
++            return child;
++        return NULL;
++    }
++
++    return NULL;
++}
++
++template <class key_type, class mapped_type>
++CompactArrayTrieNode<key_type,mapped_type> *
++CompactArrayTrieNode<key_type,mapped_type>::findInNode(unsigned int character)
++{
++    const size_t realPos = character - offset;
++    if (character >= offset && realPos < children.size()) {
++        if (children[realPos])
++            return children[realPos];
++    }
++    return NULL;
++}
++
++// not used anymore; kept around as a reference for now
++template <class key_type, class mapped_type>
++bool
++CompactArrayTrieNode<key_type,mapped_type>::iterativeAdd(const key_type &k, const mapped_type &v, CompactArrayTrieNode *n)
++{
++    return iterativeAdd(k.begin(), k.end(), k, v, n);
++}
++
++template <class key_type, class mapped_type>
++template <class InputIterator>
++bool
++CompactArrayTrieNode<key_type,mapped_type>::iterativeAdd(InputIterator i, const InputIterator &end, const key_type &k,const mapped_type &v, CompactArrayTrieNode *n)
++{
++    while (i != end) {
++        const size_t slot = *i;
++        if (n->children.empty()) { // empty children. Make room for exactly one
++            n->children.resize(1, NULL);
++            n->offset = slot;
++        } else if (slot < n->offset) { //underflow. Insert and shift at head
++            n->children.insert(n->children.begin(), n->offset - slot, NULL);
++            n->offset = slot;
++        } else if (slot >= n->offset + n->children.size()) { //overflow. extend children
++            n->children.resize(slot - n->offset + 1, NULL);
++        }
++        const size_t actual_slot = slot - n->offset;
++        if (!n->children[actual_slot])
++            n->children[actual_slot] = new CompactArrayTrieNode;
++        n = n->children[actual_slot];
++        ++i;
++    }
++    n->haveData = true;
++    n->data = std::make_pair(k,v);
++    return true;
++}
++
++
++template <class key_type, class mapped_type>
++void
++CompactArrayTrieNode<key_type,mapped_type>::recursivePreorderWalk(std::vector<CompactArrayTrieNode *> &v)
++{
++    if (haveData)
++        v.push_back(this);
++    for (auto c = children.begin(); c != children.end(); ++c) {
++        if (*c)
++            (*c)->recursivePreorderWalk(v);
++    }
++}
++
++#endif /* SQUID_COMPACTARRAYTRIENODE_H_ */
+
+=== added file 'lib/trie/CompactTrie.h'
+--- lib/trie/CompactTrie.h	1970-01-01 00:00:00 +0000
++++ lib/trie/CompactTrie.h	2015-03-20 12:10:56 +0000
+@@ -0,0 +1,200 @@
++#ifndef SQUID_COMPACTTRIE_H_
++#define SQUID_COMPACTTRIE_H_
++
++#include "CompactArrayTrieNode.h"
++
++#include <algorithm>
++#include <cassert>
++#include <cstddef>
++
++template <class Key, class Value>
++class CompactTrieIterator;
++
++/** Associative ordered container oriented to efficient prefix lookups
++ *
++ * The implementation tries to mimic at least partly the use patterns of std::map.
++ * The requirement on the key is that it must be iterable, support begin()
++ * and end(), and its iterators' dereference must convert to an int.
++ * std::string and SBuf are both valid key types.
++ * There is no constraint on the value type, except that it must have
++ * by-value semantics (it must clean up after itself in its destructor).
++ *
++ * \sa http://en.wikipedia.org/wiki/Trie
++ * \sa http://www.cplusplus.com/reference/map/map/
++ */
++template <class Key, class Value>
++class CompactTrie {
++public:
++    typedef Key key_type;
++    typedef Value mapped_type;
++    // this is the actually-stored data type
++    typedef std::pair<key_type, mapped_type> value_type;
++    // not really a full iterator; just enough to mimic the most common patterns
++    typedef CompactTrieIterator<key_type, mapped_type> iterator;
++
++private:
++    // convenience type
++    typedef CompactArrayTrieNode<key_type, mapped_type> node_type;
++
++public:
++    CompactTrie() {}
++    virtual ~CompactTrie() {}
++
++    /** add a new item to the Trie
++     *
++     * \return false if item can't be added
++     */
++    bool insert(const key_type &k, mapped_type v) {
++        contentsCache.clear();
++        return root.insert(k,v);
++    }
++
++    /** Check for key or prefix presence
++     *
++     * \param k the key to be looked up
++     * \param prefix if true request a prefix lookup
++     * \return true if the key is present in the container; if prefix is true,
++     *   then return true if any of the keys stored in the container is
++     *   a prefix of k
++     */
++    bool has(const key_type &k, bool const prefix = false) {
++        return has(k.begin(), k.end(), prefix);
++    }
++    /// check for key/prefix presence, passing the key by begin and end iterators
++    template <class InputIterator>
++    bool has(InputIterator begin, const InputIterator &end_, bool const prefix = false) {
++        if (prefix)
++            return (root.findPrefix(begin, end_) != NULL);
++        return (root.find(begin, end_) != NULL);
++    }
++
++    /** key lookup
++     *
++     * \return iterator to value_type (std::pair<key_type, mapped_type>) if
++     *  key is present, or end() if key is not present
++     */
++    iterator find(const key_type &k) {
++        return find(k.begin(), k.end());
++    }
++    /// key lookup, passing the key by begin and end iterators
++    template <class InputIterator>
++    iterator find(InputIterator begin, const InputIterator& end_) {
++        node_type *f=root.find(begin,end_);
++        if (f == NULL)
++            return end();
++        return iterator(f);
++    }
++
++    /** prefix lookup
++     *
++     * \return iterator to value_type (std::pair<key_type, mapped_type>)
++     *  corresponding to the shortest prefix of the passed argument stored
++     *  in the Trie, or end() if no prefix of the argument is found
++     */
++    iterator prefixFind(const key_type & prefix) {
++        return prefixFind(prefix.begin(),prefix.end());
++    }
++    /// prefix lookup, passing the key by begin and end iterators
++    template <class InputIterator>
++    iterator prefixFind(InputIterator begin, const InputIterator& end_) {
++        node_type *f=root.findPrefix(begin,end_);
++        if (f == NULL)
++            return end();
++        return iterator(f);
++    }
++
++    /** constrained prefix find
++     *
++     * Search for the stored entry corresponding to the shortest prefix
++     * of the supplied key where the prefix ends with the supplied suffixChar
++     * or corresponding to the full key or to the full key plus suffixChar.
++     * For example, prefixFind("foo%bar%gazonk",'%') will return an iterator to
++     * the value_type of (if present, in order of preference):
++     * "foo%", "foo%bar%", "foo%bar%gazonk", "foo%bar%gazonk%", end()
++     *
++     * \return iterator to value_type (std::pair<key_type, mapped_type>)
++     *  if any constrained prefix is found, end() if no prefix is found
++     *
++     */
++    iterator prefixFind(const key_type & key, const unsigned int suffixChar) {
++        return prefixFind(key.begin(), key.end(), suffixChar);
++    }
++    /// constrained prefix lookup, passing the key by begin and end iterators
++    template <class InputIterator>
++    iterator prefixFind(InputIterator begin, const InputIterator& end_, const unsigned int suffixChar) {
++        node_type *f=root.findPrefix(begin, end_, suffixChar);
++        if (f == NULL)
++            return end();
++        return iterator(f);
++    }
++
++    /** end-iterator
++     *
++     * This iterator can support the common STL patterns, but it is only
++     * a facade. In particular TrieA.end() == TrieB.end() for any TrieA, TrieB
++     */
++    iterator end()
++    {
++        static CompactArrayTrieNode<Key,Value> endnode;
++        static typename CompactTrie<Key, Value>::iterator enditer(&endnode);
++        return enditer;
++    }
++
++    /// empty-trie test
++    bool empty() const {
++        return root.empty();
++    }
++
++    /** contents extractor
++     *
++     * \return std::vector of iterators to value_type
++     * (std::pair<key_type,mapped_type>), sorted by key in ascending order
++     */
++    const std::vector<iterator> & contents();
++
++    //TODO: add delete
++
++private:
++    node_type root;
++    std::vector<iterator> contentsCache; // valid if !empty() || root.empty()
++};
++
++template <class Key, class Value>
++const std::vector<typename CompactTrie<Key,Value>::iterator> &
++CompactTrie<Key,Value>::contents()
++{
++    // we have valid cached contents
++    if (!contentsCache.empty() || root.empty())
++        return contentsCache;
++
++    // possible optimization: keep a count of inserted/removed entries
++    // and preallocate the vector size correctly
++    std::vector<node_type *> v;
++    root.recursivePreorderWalk(v);
++    contentsCache.clear();
++    contentsCache.reserve(v.size());
++    for (auto i = v.begin(); i != v.end(); ++i)
++        contentsCache.push_back(iterator(*i));
++    return contentsCache;
++}
++
++template <class Key, class Value>
++class CompactTrieIterator
++{
++public:
++    typedef typename CompactTrie<Key,Value>::value_type value_type;
++    CompactTrieIterator() : node(NULL) {} // will bomb on dereferencing
++    CompactTrieIterator(const CompactTrieIterator& c) : node(c.node) {}
++    CompactTrieIterator& operator=(const CompactTrieIterator &c) { node = c.node; return *this;}
++    bool operator==(const CompactTrieIterator& c) const { return node == c.node; }
++    bool operator!=(const CompactTrieIterator& c) const { return node != c.node; }
++    value_type & operator*() const { assert(node && node->haveData); return node->data; }
++    value_type * operator->() const { assert(node && node->haveData); return &(node->data); }
++private:
++    friend class CompactTrie<Key, Value>;
++    explicit CompactTrieIterator(CompactArrayTrieNode <Key,Value> *n) : node(n) {}
++    CompactTrieIterator& operator++();
++    CompactArrayTrieNode<Key,Value> *node;
++};
++
++#endif /* SQUID_COMPACTTRIE_H_ */
+
+=== added file 'lib/trie/Makefile.am'
+--- lib/trie/Makefile.am	1970-01-01 00:00:00 +0000
++++ lib/trie/Makefile.am	2015-03-19 22:58:29 +0000
+@@ -0,0 +1,35 @@
++## Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++##
++## Squid software is distributed under GPLv2+ license and includes
++## contributions from numerous individuals and organizations.
++## Please see the COPYING and CONTRIBUTORS files for details.
++##
++
++include $(top_srcdir)/src/Common.am
++include $(top_srcdir)/src/TestHeaders.am
++
++noinst_HEADERS = CompactArrayTrieNode.h CompactTrie.h
++
++TESTS += testCompactArrayTrieNode testCompactTrie
++check_PROGRAMS += testCompactArrayTrieNode testCompactTrie
++
++testCompactArrayTrieNode_SOURCES = \
++	testCompactArrayTrieNode.cc \
++	testCompactArrayTrieNode.h \
++	CompactArrayTrieNode.h
++testCompactArrayTrieNode_LDFLAGS = $(LIBADD_DL)
++testCompactArrayTrieNode_LDADD = \
++    $(SQUID_CPPUNIT_LIBS) \
++    $(SQUID_CPPUNIT_LA)
++testCompactArrayTrieNode_DEPENDENCIES = $(SQUID_CPPUNIT_LA)
++
++testCompactTrie_SOURCES = \
++	testCompactTrie.cc \
++	testCompactTrie.h \
++	CompactArrayTrieNode.h \
++	CompactTrie.h
++testCompactTrie_LDFLAGS = $(LIBADD_DL)
++testCompactTrie_LDADD = \
++    $(SQUID_CPPUNIT_LIBS) \
++    $(SQUID_CPPUNIT_LA)
++testCompactTrie_DEPENDENCIES = $(SQUID_CPPUNIT_LA)
+
+=== added file 'lib/trie/testCompactArrayTrieNode.cc'
+--- lib/trie/testCompactArrayTrieNode.cc	1970-01-01 00:00:00 +0000
++++ lib/trie/testCompactArrayTrieNode.cc	2015-03-20 13:32:55 +0000
+@@ -0,0 +1,65 @@
++#include "testCompactArrayTrieNode.h"
++#include "CompactArrayTrieNode.h"
++
++#include <cppunit/BriefTestProgressListener.h>
++#include <cppunit/TextTestProgressListener.h>
++#include <cppunit/CompilerOutputter.h>
++#include <cppunit/extensions/TestFactoryRegistry.h>
++#include <cppunit/TestResult.h>
++#include <cppunit/TestResultCollector.h>
++#include <cppunit/TestRunner.h>
++
++void
++TestCompactArrayTrieNode::addToNode()
++{
++    CompactArrayTrieNode<std::string,int> tn;
++    CPPUNIT_ASSERT_EQUAL(true, tn.insert("foo",1));
++    CPPUNIT_ASSERT_EQUAL(true, tn.insert("bar",2));
++    int i=3;
++    CPPUNIT_ASSERT_EQUAL(true, tn.insert("gazonk",i)); // non-const value
++    CPPUNIT_ASSERT_EQUAL(true, tn.insert("foo",4)); // overwrite
++}
++
++void
++TestCompactArrayTrieNode::findInNode()
++{
++    CompactArrayTrieNode<std::string,int> tn;
++    tn.insert("foo",1);
++    tn.insert("bar",2);
++    CPPUNIT_ASSERT(tn.find("foo") != NULL);
++    CPPUNIT_ASSERT(tn.find("gazonk") == NULL);
++}
++
++/*** boilerplate starts here ***/
++
++CPPUNIT_TEST_SUITE_REGISTRATION( TestCompactArrayTrieNode );
++
++int
++main (int argc, char ** argv)
++{
++    // Create the event manager and test controller
++    CPPUNIT_NS::TestResult controller;
++
++    // Add a listener that colllects test result
++    CPPUNIT_NS::TestResultCollector result;
++    controller.addListener( &result );
++
++    // Add a listener that print dots as test run.
++    // use BriefTestProgressListener to get names of each test
++    // even when they pass.
++    CPPUNIT_NS::TextTestProgressListener progress;
++    controller.addListener( &progress );
++
++    // Add the top suite to the test runner
++    CPPUNIT_NS::TestRunner runner;
++    runner.addTest( CPPUNIT_NS::TestFactoryRegistry::getRegistry().makeTest() );
++    runner.run( controller );
++
++    // Print test in a compiler compatible format.
++    CPPUNIT_NS::CompilerOutputter outputter( &result, std::cerr );
++    outputter.write();
++
++    return result.wasSuccessful() ? 0 : 1;
++}
++
++
+
+=== added file 'lib/trie/testCompactArrayTrieNode.h'
+--- lib/trie/testCompactArrayTrieNode.h	1970-01-01 00:00:00 +0000
++++ lib/trie/testCompactArrayTrieNode.h	2015-03-18 16:43:56 +0000
+@@ -0,0 +1,24 @@
++#ifndef SQUID_TESTTERNARYTRIE_H_
++#define SQUID_TESTTERNARYTRIE_H_
++
++#include <cppunit/extensions/HelperMacros.h>
++
++/**
++ *
++ */
++class TestCompactArrayTrieNode  : public CPPUNIT_NS::TestFixture
++{
++    CPPUNIT_TEST_SUITE( TestCompactArrayTrieNode );
++    //    CPPUNIT_TEST(  );
++    CPPUNIT_TEST( addToNode );
++    CPPUNIT_TEST( findInNode );
++
++    CPPUNIT_TEST_SUITE_END();
++
++protected:
++    //  void testWhatever();
++    void addToNode();
++    void findInNode();
++};
++
++#endif /* SQUID_TESTTERNARYTRIE_H_ */
+
+=== added file 'lib/trie/testCompactTrie.cc'
+--- lib/trie/testCompactTrie.cc	1970-01-01 00:00:00 +0000
++++ lib/trie/testCompactTrie.cc	2015-03-18 16:43:56 +0000
+@@ -0,0 +1,172 @@
++#include "testCompactTrie.h"
++
++#include <cppunit/BriefTestProgressListener.h>
++#include <cppunit/TextTestProgressListener.h>
++#include <cppunit/CompilerOutputter.h>
++#include <cppunit/extensions/TestFactoryRegistry.h>
++#include <cppunit/TestResult.h>
++#include <cppunit/TestResultCollector.h>
++#include <cppunit/TestRunner.h>
++
++typedef CompactTrie<std::string, int> CT;
++
++void
++TestCompactTrie::testInsert()
++{
++    CT ct;
++    ct.insert("foo",1);
++    ct.insert("bar",2);
++    ct.insert("baz",3);
++    CPPUNIT_ASSERT(ct.has("foo"));
++    CPPUNIT_ASSERT(ct.has("bar"));
++    CPPUNIT_ASSERT(!ct.has("gazonk"));
++}
++
++void
++TestCompactTrie::testFind()
++{
++    CT ct;
++    ct.insert("foo",1);
++    ct.insert("bar",2);
++    ct.insert("foo.",3); //terminator WITH nonterminated variant
++    ct.insert("baz.", 4);  //terminator, no nonterminated variant
++    {
++        CT::iterator rv = ct.find("foo");
++        CPPUNIT_ASSERT(rv != ct.end()); // found
++        CPPUNIT_ASSERT_EQUAL(rv->second,1); // mapped data match
++        CPPUNIT_ASSERT(ct.find("gazonk") == ct.end()); // not found
++    }
++
++    {
++        // prefix find tests
++        CT::iterator rv;
++
++        rv = ct.prefixFind("foo"); // exact match
++        CPPUNIT_ASSERT(rv != ct.end());
++
++        rv = ct.prefixFind("fooo"); //prefix match
++        CPPUNIT_ASSERT(rv != ct.end());
++
++        rv = ct.prefixFind("go"); //prefix match, not found
++        CPPUNIT_ASSERT(rv == ct.end());
++    }
++
++    {
++        CT::iterator rv;
++
++        rv = ct.prefixFind("foo.", '.'); // exact match
++        CPPUNIT_ASSERT( rv != ct.end());
++
++        rv = ct.prefixFind("foo", '.'); // exact match, termination is irrelevant
++        CPPUNIT_ASSERT( rv != ct.end());
++
++        rv = ct.prefixFind("foooo", '.'); // prefix match but no terminator
++        CPPUNIT_ASSERT( rv == ct.end());
++
++        rv = ct.prefixFind("foo.bar", '.'); // prefix match and terminator
++        CPPUNIT_ASSERT( rv != ct.end());
++
++        rv = ct.prefixFind("baz.bar", '.'); // prefix match and terminator
++        CPPUNIT_ASSERT( rv != ct.end());
++
++        rv = ct.prefixFind("baz", '.');
++        CPPUNIT_ASSERT( rv != ct.end());
++
++        rv = ct.prefixFind("baz.www", '.');
++        CPPUNIT_ASSERT( rv != ct.end());
++
++        rv = ct.prefixFind("bazz.www", '.');
++        CPPUNIT_ASSERT( rv == ct.end());
++
++    }
++}
++
++void
++TestCompactTrie::testIterator()
++{
++    CT ct;
++
++    ct.insert("foo",1);
++    ct.insert("bar",2);
++    ct.insert("gazonk",3);
++
++    {
++        CT::iterator i1=ct.find("foo");
++        CT::iterator i2=ct.find("foo");
++        CPPUNIT_ASSERT(i1 == i2);
++
++        i2=ct.find("bar");
++        CPPUNIT_ASSERT(i1 != i2);
++
++        i2=ct.find("not found");
++        CPPUNIT_ASSERT(i1 != i2);
++    }
++
++    {
++        // note: this behavior DIFFERS from std:: iterators.
++        // the end() iterator is SHARED between all class intances
++        CT ct2;
++        CT::iterator e1=ct.find("not found");
++        CT::iterator e2=ct2.find("not found");
++        CPPUNIT_ASSERT(e1 == e2);
++    }
++}
++
++void
++TestCompactTrie::testEmpty()
++{
++    CT ct;
++    CPPUNIT_ASSERT(ct.empty());
++    ct.insert("foo",1);
++    CPPUNIT_ASSERT(!ct.empty());
++}
++
++void
++TestCompactTrie::testContents()
++{
++    CT ct;
++    CPPUNIT_ASSERT(ct.contents().empty());
++    ct.insert("foo",1);
++    CPPUNIT_ASSERT(!ct.contents().empty());
++    ct.insert("foo1",1);
++    ct.insert("foo0",1);
++    CPPUNIT_ASSERT(ct.contents().size() == 3);
++    CPPUNIT_ASSERT(ct.contents()[0]->first == "foo");
++    CPPUNIT_ASSERT(ct.contents()[1]->first == "foo0");
++    CPPUNIT_ASSERT(ct.contents()[2]->first == "foo1");
++}
++
++
++/*** boilerplate starts here ***/
++
++CPPUNIT_TEST_SUITE_REGISTRATION( TestCompactTrie );
++
++int
++main (int argc, char ** argv)
++{
++    // Create the event manager and test controller
++    CPPUNIT_NS::TestResult controller;
++
++    // Add a listener that colllects test result
++    CPPUNIT_NS::TestResultCollector result;
++    controller.addListener( &result );
++
++    // Add a listener that print dots as test run.
++    // use BriefTestProgressListener to get names of each test
++    // even when they pass.
++    CPPUNIT_NS::TextTestProgressListener progress;
++    controller.addListener( &progress );
++
++    // Add the top suite to the test runner
++    CPPUNIT_NS::TestRunner runner;
++    runner.addTest( CPPUNIT_NS::TestFactoryRegistry::getRegistry().makeTest() );
++    runner.run( controller );
++
++    // Print test in a compiler compatible format.
++    CPPUNIT_NS::CompilerOutputter outputter( &result, std::cerr );
++    outputter.write();
++
++    return result.wasSuccessful() ? 0 : 1;
++}
++
++
+
+=== added file 'lib/trie/testCompactTrie.h'
+--- lib/trie/testCompactTrie.h	1970-01-01 00:00:00 +0000
++++ lib/trie/testCompactTrie.h	2015-03-18 16:43:56 +0000
+@@ -0,0 +1,33 @@
++#ifndef SQUID_TESTCOMPACTTRIE_H_
++#define SQUID_TESTCOMPACTTRIE_H_
++
++#include "CompactTrie.h"
++
++#include <cppunit/extensions/HelperMacros.h>
++
++/**
++ *
++ */
++class TestCompactTrie  : public CPPUNIT_NS::TestFixture
++{
++    CPPUNIT_TEST_SUITE( TestCompactTrie );
++    CPPUNIT_TEST( testInsert );
++    CPPUNIT_TEST( testFind );
++    CPPUNIT_TEST( testIterator );
++    CPPUNIT_TEST( testEmpty );
++    CPPUNIT_TEST( testContents );
++    //    CPPUNIT_TEST(  );
++    CPPUNIT_TEST_SUITE_END();
++
++protected:
++    void testInsert();
++    void testFind();
++    void testIterator();
++    void testEmpty();
++    void testContents();
++    //  void testWhatever();
++};
++
++
++
++#endif /* SQUID_TESTCOMPACTTRIE_H_ */
+
+# Begin bundle
+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
+qf/F3JFOFCQ0KIMGgA==

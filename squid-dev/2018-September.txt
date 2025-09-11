@@ -1,0 +1,460 @@
+From bkwok at yahoo.com  Thu Sep 13 11:23:02 2018
+From: bkwok at yahoo.com (Benson Kwok)
+Date: Thu, 13 Sep 2018 11:23:02 +0000 (UTC)
+Subject: [squid-dev] 206 Partial Content Caching
+References: <1688790048.4227944.1536837782364.ref@mail.yahoo.com>
+Message-ID: <1688790048.4227944.1536837782364@mail.yahoo.com>
+
+Hi,
+I have successfully implemented caching of 206 Partial Content as a project at my job and want to know if you guys are interested in pulling it into main branch.  Here is what I did in brief:
+- adding range_offset and range_length to StoreEntry- caching single ranged requests by adding the range offset and length to store key hash function so they can be lookup by another request with the same range offset and length- offset and length are also added to StoreMeta so after a restart, the offset and range can be restored- enhancing HTCP so the range header from a peer is parsed and the offset and length are used during HIT/MISS lookup- skip ICP for range request since ICP cannot include range header- adjust store_client.cc copyInfo.offset by range_offset- adjust store_swapout.cc mem->swapout.queue_offset by range_offset- adjust trimSwappable() new_mem_lo by range_offset
+I have run through a good amount of testing with multiple clients running same or random range requests and everything seems to be working fine.  Also tried testing HTCP with 2 squids and HTCP messages are correctly answered with HIT/MISS.
+The diff can be found here:
+https://github.com/squid-cache/squid/compare/master...bkwzwz:206_partial_content_caching
+
+
+ThanksBenson
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <http://lists.squid-cache.org/pipermail/squid-dev/attachments/20180913/a799369a/attachment.html>
+
+From rousskov at measurement-factory.com  Thu Sep 13 16:14:58 2018
+From: rousskov at measurement-factory.com (Alex Rousskov)
+Date: Thu, 13 Sep 2018 10:14:58 -0600
+Subject: [squid-dev] 206 Partial Content Caching
+In-Reply-To: <1688790048.4227944.1536837782364@mail.yahoo.com>
+References: <1688790048.4227944.1536837782364.ref@mail.yahoo.com>
+ <1688790048.4227944.1536837782364@mail.yahoo.com>
+Message-ID: <9783a0de-f754-09b4-ae8b-58e6a06a7fec@measurement-factory.com>
+
+On 09/13/2018 05:23 AM, Benson Kwok wrote:
+
+> I have successfully implemented caching of 206 Partial Content as a
+> project at my job and want to know if you guys are interested in pulling
+> it into main branch.
+
+Yes, of course! If you are willing to make the changes necessary for the
+official inclusion, please submit an official pull request:
+https://wiki.squid-cache.org/MergeProcedure
+
+I did not review your changes, but here are a few high-level problems
+that jumped at me:
+
+1. The changes add support for single-range caching without merging, not
+general 206 caching. The added feature alone _is_ useful, but its
+scope/limits need to be clearly specified in the PR description.
+
+2. The changes add new data fields to the StoreEntry class. If possible,
+those fields should be moved to MemObject. The former class exists for
+all UFS-cached entries (and more). There can be billions of them! The
+latter class is primarily for the entries currently in use. We should
+not waste memory on the former if we can use the memory of the latter.
+
+3a. With the proposed range-in-key approach, cached range objects cannot
+be removed when such removal is required by URL-based HTTP rules (e.g.,
+an HTTP DELETE request). Squid will simply not know what ranges to use
+to find the objects for a given URL. IIRC, Squid has a similar problem
+for request methods, but there Squid can enumerate all currently
+cachable methods because that list is hard-coded (GET and HEAD).
+
+3b. The proposed range-in-key approach probably clashes with the
+ultimate goal of supporting caching (and merging/fetching) of arbitrary
+range sets.
+
+3c. With the proposed range-in-key approach, ten requests fetching ten
+different ranges will create ten cache objects. IIRC, it is common for
+applications such as PDF readers to request several ranges for a single
+document. The current approach could result in lots of objects being
+cached instead of one. Is that a good idea, especially as the default
+behavior?
+
+
+Looking at items 3x combined, we need to discuss whether that
+range-in-key design is the right approach. Right now, I do not think it
+is. It certainly makes things simpler short-term, but it immediately
+leads to  dangerous HTTP violations and probably contradicts long-term
+goals. This discussion should probably happen here on the mailing list.
+
+
+Thanks a lot,
+
+Alex.
+
+
+
+> - adding range_offset and range_length to StoreEntry
+> - caching single ranged requests by adding the range offset and length
+> to store key hash function so they can be lookup by another request with
+> the same range offset and length
+> - offset and length are also added to StoreMeta so after a restart, the
+> offset and range can be restored
+> - enhancing HTCP so the range header from a peer is parsed and the
+> offset and length are used during HIT/MISS lookup
+> - skip ICP for range request since ICP cannot include range header
+> - adjust store_client.cc copyInfo.offset by range_offset
+> - adjust store_swapout.cc mem->swapout.queue_offset by range_offset
+> - adjust trimSwappable() new_mem_lo by range_offset
+
+> https://github.com/squid-cache/squid/compare/master...bkwzwz:206_partial_content_caching
+
+From bkwok at yahoo.com  Fri Sep 14 08:07:04 2018
+From: bkwok at yahoo.com (Benson Kwok)
+Date: Fri, 14 Sep 2018 08:07:04 +0000 (UTC)
+Subject: [squid-dev] 206 Partial Content Caching
+In-Reply-To: <9783a0de-f754-09b4-ae8b-58e6a06a7fec@measurement-factory.com>
+References: <1688790048.4227944.1536837782364.ref@mail.yahoo.com>
+ <1688790048.4227944.1536837782364@mail.yahoo.com>
+ <9783a0de-f754-09b4-ae8b-58e6a06a7fec@measurement-factory.com>
+Message-ID: <1435458345.4839097.1536912424438@mail.yahoo.com>
+
+ Hi Alex,
+I agree adding additional functionality to merge smaller range objects into larger ones is a better approach. However, it requires an additional module and file structure to bookkeep cached ranges of each URL and a way to rebuild the bookkeeping index after a restart.  I am not sure if the additional effort will worth it since squid already supports partial content from cache if the full file is loaded in cache.
+Thanks for pointing out that some use cases may not work with my implementation. Now I know my solution is good for a limited use case (repeating requests with similar ranges) but not at a global scale. In that case, I think it will be better not to merge it into the main branch.
+
+
+
+
+Thank your very much for your detailed explanation.
+Benson
+  
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <http://lists.squid-cache.org/pipermail/squid-dev/attachments/20180914/82c1cf57/attachment.html>
+
+From rousskov at measurement-factory.com  Fri Sep 14 14:31:38 2018
+From: rousskov at measurement-factory.com (Alex Rousskov)
+Date: Fri, 14 Sep 2018 08:31:38 -0600
+Subject: [squid-dev] 206 Partial Content Caching
+In-Reply-To: <1435458345.4839097.1536912424438@mail.yahoo.com>
+References: <1688790048.4227944.1536837782364.ref@mail.yahoo.com>
+ <1688790048.4227944.1536837782364@mail.yahoo.com>
+ <9783a0de-f754-09b4-ae8b-58e6a06a7fec@measurement-factory.com>
+ <1435458345.4839097.1536912424438@mail.yahoo.com>
+Message-ID: <a406d909-ec27-0645-69e5-b2f17d8594c3@measurement-factory.com>
+
+On 09/14/2018 02:07 AM, Benson Kwok wrote:
+
+> I agree adding additional functionality to merge smaller range objects
+> into larger ones is a better approach. 
+
+Please note that I have not requested that (or any other) optional
+functionality. There is nothing wrong per se with providing partial
+support for a complex feature (e.g., caching of single-range responses
+without merging). Whether such a partial implementation can be useful
+_and_ HTTP-compliant while remaining much simpler than, say, a
+multi-range caching implementation (without merging) is an open question.
+
+
+> Now I know my solution is good for a limited use case
+> (repeating requests with similar ranges)
+
+... where URL-based cache purges never happen. It is difficult to
+imagine a real-world environment where URL-based purging never occurs,
+but perhaps your Squids do operate in such a unique environment.
+
+
+> I think it will be better not to merge it into the main branch.
+
+This is your call. We are happy to help if you want to work on making
+your code suitable for the official adoption.
+
+
+Cheers,
+
+Alex.
+
+From huaraz at moeller.plus.com  Sat Sep 15 17:47:52 2018
+From: huaraz at moeller.plus.com (Markus Moeller)
+Date: Sat, 15 Sep 2018 18:47:52 +0100
+Subject: [squid-dev] Heimdal 7.5.0 memory leaks
+Message-ID: <9907EC78D4F0491D942F98DFF418C16F@Ultrabook1>
+
+Hi,
+
+   I looked at memory leaks for the squid negotiate_kerberos helper and found issues with the following in the heimdal code:
+
+==9424== 16 bytes in 1 blocks are definitely lost in loss record 13 of 64
+==9424==    at 0x4C2A110: malloc (in /usr/lib64/valgrind/vgpreload_memcheck-amd64-linux.so)
+==9424==    by 0x52ACF9C: set_etypes (context.c:74)
+==9424==    by 0x52ADE8F: init_context_from_config_file (context.c:161)
+==9424==    by 0x52ADE8F: krb5_set_config_files (context.c:692)
+==9424==    by 0x52AE49C: krb5_init_context (context.c:451)
+==9424==    by 0x4023C1: main (negotiate_kerberos_auth.cc:549)
+
+which should be fixed with
+
+--- lib/krb5/context.c  2017-12-07 04:11:23.000000000 +0000
++++ lib/krb5/context_new.c      2018-09-15 18:45:40.715744342 +0100
+@@ -622,6 +622,9 @@
+     free(context->etypes);
+     free(context->cfg_etypes);
+     free(context->etypes_des);
++    free(context->permitted_enctypes);
++    free(context->tgs_etypes);
++    free(context->as_etypes);
+     krb5_free_host_realm (context, context->default_realms);
+     krb5_config_file_free (context, context->cf);
+     free_error_table (context->et_list);
+
+and 
+
+==9424== 13,200 bytes in 6 blocks are definitely lost in loss record 63 of 64
+==9424==    at 0x4C2C240: calloc (in /usr/lib64/valgrind/vgpreload_memcheck-amd64-linux.so)
+==9424==    by 0x4E5E01A: _gss_ntlm_allocate_ctx (accept_sec_context.c:52)
+==9424==    by 0x4E5E5B4: _gss_ntlm_acquire_cred (acquire_cred.c:60)
+==9424==    by 0x4E55779: gss_acquire_cred (gss_acquire_cred.c:125)
+==9424==    by 0x4E635AB: _gss_spnego_acquire_cred (cred_stubs.c:109)
+==9424==    by 0x4E55779: gss_acquire_cred (gss_acquire_cred.c:125)
+==9424==    by 0x403227: main (negotiate_kerberos_auth.cc:721)
+
+Which could be fixed with
+
+--- ./lib/gssapi/ntlm/acquire_cred.c    2016-12-20 14:23:06.000000000 +0000
++++ ./lib/gssapi/ntlm/acquire_cred_new.c        2018-09-15 18:09:04.436985518 +0100
+@@ -58,8 +58,10 @@
+     if (cred_usage == GSS_C_BOTH || cred_usage == GSS_C_ACCEPT) {
+
+        maj_stat = _gss_ntlm_allocate_ctx(min_stat, &ctx);
+-       if (maj_stat != GSS_S_COMPLETE)
++       if (maj_stat != GSS_S_COMPLETE) {
++           if (ctx) free(ctx);
+            return maj_stat;
++        }
+
+         domain = name != NULL ? name->domain : NULL;
+        maj_stat = (*ctx->server->nsi_probe)(min_stat, ctx->ictx, domain);
+
+
+Markus
+
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <http://lists.squid-cache.org/pipermail/squid-dev/attachments/20180915/60575bc5/attachment.html>
+
+From silamael at coronamundi.de  Tue Sep 18 06:01:57 2018
+From: silamael at coronamundi.de (Silamael)
+Date: Tue, 18 Sep 2018 08:01:57 +0200
+Subject: [squid-dev] Heimdal 7.5.0 memory leaks
+In-Reply-To: <9907EC78D4F0491D942F98DFF418C16F@Ultrabook1>
+References: <9907EC78D4F0491D942F98DFF418C16F@Ultrabook1>
+Message-ID: <2772028f-94d7-ac44-5935-a59637acd70b@coronamundi.de>
+
+
+On 09/15/2018 07:47 PM, Markus Moeller wrote:
+> Hi,
+>     I looked at memory leaks for the squid negotiate_kerberos helper and 
+> found issues with the following in the heimdal code:
+> ==9424== 16 bytes in 1 blocks are definitely lost in loss record 13 of 64
+> ==9424==    at 0x4C2A110: malloc (in 
+> /usr/lib64/valgrind/vgpreload_memcheck-amd64-linux.so)
+> ==9424==    by 0x52ACF9C: set_etypes (context.c:74)
+> ==9424==    by 0x52ADE8F: init_context_from_config_file (context.c:161)
+> ==9424==    by 0x52ADE8F: krb5_set_config_files (context.c:692)
+> ==9424==    by 0x52AE49C: krb5_init_context (context.c:451)
+> ==9424==    by 0x4023C1: main (negotiate_kerberos_auth.cc:549)
+> which should be fixed with
+> --- lib/krb5/context.c  2017-12-07 04:11:23.000000000 +0000
+> +++ lib/krb5/context_new.c      2018-09-15 18:45:40.715744342 +0100
+> @@ -622,6 +622,9 @@
+>       free(context->etypes);
+>       free(context->cfg_etypes);
+>       free(context->etypes_des);
+> +    free(context->permitted_enctypes);
+> +    free(context->tgs_etypes);
+> +    free(context->as_etypes);
+>       krb5_free_host_realm (context, context->default_realms);
+>       krb5_config_file_free (context, context->cf);
+>       free_error_table (context->et_list);
+> and
+> ==9424== 13,200 bytes in 6 blocks are definitely lost in loss record 63 
+> of 64
+> ==9424==    at 0x4C2C240: calloc (in 
+> /usr/lib64/valgrind/vgpreload_memcheck-amd64-linux.so)
+> ==9424==    by 0x4E5E01A: _gss_ntlm_allocate_ctx (accept_sec_context.c:52)
+> ==9424==    by 0x4E5E5B4: _gss_ntlm_acquire_cred (acquire_cred.c:60)
+> ==9424==    by 0x4E55779: gss_acquire_cred (gss_acquire_cred.c:125)
+> ==9424==    by 0x4E635AB: _gss_spnego_acquire_cred (cred_stubs.c:109)
+> ==9424==    by 0x4E55779: gss_acquire_cred (gss_acquire_cred.c:125)
+> ==9424==    by 0x403227: main (negotiate_kerberos_auth.cc:721)
+> Which could be fixed with
+> --- ./lib/gssapi/ntlm/acquire_cred.c    2016-12-20 14:23:06.000000000 +0000
+> +++ ./lib/gssapi/ntlm/acquire_cred_new.c 2018-09-15 18:09:04.436985518 +0100
+> @@ -58,8 +58,10 @@
+>       if (cred_usage == GSS_C_BOTH || cred_usage == GSS_C_ACCEPT) {
+>          maj_stat = _gss_ntlm_allocate_ctx(min_stat, &ctx);
+> -       if (maj_stat != GSS_S_COMPLETE)
+> +       if (maj_stat != GSS_S_COMPLETE) {
+> +           if (ctx) free(ctx);
+>              return maj_stat;
+> +        }
+>           domain = name != NULL ? name->domain : NULL;
+>          maj_stat = (*ctx->server->nsi_probe)(min_stat, ctx->ictx, domain);
+> Markus
+
+Hi Markus,
+
+Thanks a lot for your diff. I applied and tested it.
+No more memory leaking :)
+
+Greetings,
+Matthias
+
+From gkinkie at gmail.com  Tue Sep 25 15:46:20 2018
+From: gkinkie at gmail.com (Francesco Chemolli)
+Date: Tue, 25 Sep 2018 16:46:20 +0100
+Subject: [squid-dev] Anubis documentation
+Message-ID: <CA+Y8hcNtUyfyBp5cSnuPwEOc5iaKTDsPnoE77GHUWHO7h6S59w@mail.gmail.com>
+
+Hi all,
+  recent discussions on github led me to understand that information
+on Anubis' interfaces is in peoples' heads and not on a bit of paper.
+Would it be possible to write a brief wiki page with some info about
+what is the FSM driving it and what are the tags it uses to store
+state?
+Thanks!
+-- 
+    Francesco
+
+From rousskov at measurement-factory.com  Tue Sep 25 16:46:44 2018
+From: rousskov at measurement-factory.com (Alex Rousskov)
+Date: Tue, 25 Sep 2018 10:46:44 -0600
+Subject: [squid-dev] Anubis documentation
+In-Reply-To: <CA+Y8hcNtUyfyBp5cSnuPwEOc5iaKTDsPnoE77GHUWHO7h6S59w@mail.gmail.com>
+References: <CA+Y8hcNtUyfyBp5cSnuPwEOc5iaKTDsPnoE77GHUWHO7h6S59w@mail.gmail.com>
+Message-ID: <42366381-c470-6387-0471-ead6ac3792a6@measurement-factory.com>
+
+On 09/25/2018 09:46 AM, Francesco Chemolli wrote:
+
+>   recent discussions on github led me to understand that information
+> on Anubis' interfaces is in peoples' heads and not on a bit of paper.
+> Would it be possible to write a brief wiki page with some info about
+> what is the FSM driving it and what are the tags it uses to store
+> state?
+
+I can assure you that Anubis is not driven by the Flying Spaghetti
+Monster. The two deities are not even related!
+
+Anubis logic and tags are pretty well documented at
+https://github.com/measurement-factory/anubis#readme
+
+Squid Project configuration for Anubis is documented at
+https://wiki.squid-cache.org/MergeProcedure#Automation
+
+Fixes/updates/additions are welcomed, of course. If you have questions
+not answered by the above documents, please do not hesitate to ask.
+
+We are still working on one big change/improvement -- support for
+concurrent processing of multiple PRs. That change will affect some of
+the existing documentation and should end the current "trial run" or
+"careful testing" stage. After that, I do not anticipate significant
+changes to Anubis algorithms unless somebody else contributes them.
+
+Alex.
+
+From gkinkie at gmail.com  Tue Sep 25 17:07:55 2018
+From: gkinkie at gmail.com (Francesco Chemolli)
+Date: Tue, 25 Sep 2018 18:07:55 +0100
+Subject: [squid-dev] Anubis documentation
+In-Reply-To: <42366381-c470-6387-0471-ead6ac3792a6@measurement-factory.com>
+References: <CA+Y8hcNtUyfyBp5cSnuPwEOc5iaKTDsPnoE77GHUWHO7h6S59w@mail.gmail.com>
+ <42366381-c470-6387-0471-ead6ac3792a6@measurement-factory.com>
+Message-ID: <CA+Y8hcPO8mMz-66az2hk_XM5HS294pEvBUs6U53FENZKfUpjOQ@mail.gmail.com>
+
+Lovely! I was not aware of the documentation you mention. I did a brief
+search but I was too brief I guess.
+All praise the Flying Spaghetti Monster and his holy finite state machines !
+
+On Tue, 25 Sep 2018 at 17:46, Alex Rousskov <
+rousskov at measurement-factory.com> wrote:
+
+> On 09/25/2018 09:46 AM, Francesco Chemolli wrote:
+>
+> >   recent discussions on github led me to understand that information
+> > on Anubis' interfaces is in peoples' heads and not on a bit of paper.
+> > Would it be possible to write a brief wiki page with some info about
+> > what is the FSM driving it and what are the tags it uses to store
+> > state?
+>
+> I can assure you that Anubis is not driven by the Flying Spaghetti
+> Monster. The two deities are not even related!
+>
+> Anubis logic and tags are pretty well documented at
+> https://github.com/measurement-factory/anubis#readme
+>
+> Squid Project configuration for Anubis is documented at
+> https://wiki.squid-cache.org/MergeProcedure#Automation
+>
+> Fixes/updates/additions are welcomed, of course. If you have questions
+> not answered by the above documents, please do not hesitate to ask.
+>
+> We are still working on one big change/improvement -- support for
+> concurrent processing of multiple PRs. That change will affect some of
+> the existing documentation and should end the current "trial run" or
+> "careful testing" stage. After that, I do not anticipate significant
+> changes to Anubis algorithms unless somebody else contributes them.
+>
+> Alex.
+> _______________________________________________
+> squid-dev mailing list
+> squid-dev at lists.squid-cache.org
+> http://lists.squid-cache.org/listinfo/squid-dev
+>
+-- 
+@mobile
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <http://lists.squid-cache.org/pipermail/squid-dev/attachments/20180925/cd283d35/attachment.html>
+
+From rousskov at measurement-factory.com  Tue Sep 25 17:47:30 2018
+From: rousskov at measurement-factory.com (Alex Rousskov)
+Date: Tue, 25 Sep 2018 11:47:30 -0600
+Subject: [squid-dev] Anubis documentation
+In-Reply-To: <CA+Y8hcPO8mMz-66az2hk_XM5HS294pEvBUs6U53FENZKfUpjOQ@mail.gmail.com>
+References: <CA+Y8hcNtUyfyBp5cSnuPwEOc5iaKTDsPnoE77GHUWHO7h6S59w@mail.gmail.com>
+ <42366381-c470-6387-0471-ead6ac3792a6@measurement-factory.com>
+ <CA+Y8hcPO8mMz-66az2hk_XM5HS294pEvBUs6U53FENZKfUpjOQ@mail.gmail.com>
+Message-ID: <f8635f0f-cee5-169e-e7c0-77d9797bfa9a@measurement-factory.com>
+
+On 09/25/2018 11:07 AM, Francesco Chemolli wrote:
+> Lovely! I was not aware of the documentation you mention.
+
+FWIW, those documentation links were published here earlier:
+
+* http://lists.squid-cache.org/pipermail/squid-dev/2018-February/009366.html
+
+* http://lists.squid-cache.org/pipermail/squid-dev/2018-April/009387.html
+
+Alex.
+
+
+> On Tue, 25 Sep 2018 at 17:46, Alex Rousskov wrote:
+> 
+>     On 09/25/2018 09:46 AM, Francesco Chemolli wrote:
+> 
+>     >   recent discussions on github led me to understand that information
+>     > on Anubis' interfaces is in peoples' heads and not on a bit of paper.
+>     > Would it be possible to write a brief wiki page with some info about
+>     > what is the FSM driving it and what are the tags it uses to store
+>     > state?
+> 
+>     I can assure you that Anubis is not driven by the Flying Spaghetti
+>     Monster. The two deities are not even related!
+> 
+>     Anubis logic and tags are pretty well documented at
+>     https://github.com/measurement-factory/anubis#readme
+> 
+>     Squid Project configuration for Anubis is documented at
+>     https://wiki.squid-cache.org/MergeProcedure#Automation
+> 
+>     Fixes/updates/additions are welcomed, of course. If you have questions
+>     not answered by the above documents, please do not hesitate to ask.
+> 
+>     We are still working on one big change/improvement -- support for
+>     concurrent processing of multiple PRs. That change will affect some of
+>     the existing documentation and should end the current "trial run" or
+>     "careful testing" stage. After that, I do not anticipate significant
+>     changes to Anubis algorithms unless somebody else contributes them.
+> 
+>     Alex.
+
+

@@ -1,0 +1,142 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Fix ICAP transactions that read a lot of	data
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Fix%20ICAP%20transactions%20that%20read%20a%20lot%20of%0A%09data&In-Reply-To=%3C55B2EA82.7090504%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="002852.html">
+   <LINK REL="Next"  HREF="002860.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Fix ICAP transactions that read a lot of	data</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Fix%20ICAP%20transactions%20that%20read%20a%20lot%20of%0A%09data&In-Reply-To=%3C55B2EA82.7090504%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] Fix ICAP transactions that read a lot of	data">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Sat Jul 25 01:46:42 UTC 2015</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002852.html">[squid-dev] [PATCH] Fix ICAP transactions that read a lot of data
+</A></li>
+        <LI>Next message: <A HREF="002860.html">[squid-dev] [PATCH] Fix ICAP transactions that read a lot of data
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2855">[ date ]</a>
+              <a href="thread.html#2855">[ thread ]</a>
+              <a href="subject.html#2855">[ subject ]</a>
+              <a href="author.html#2855">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 25/07/2015 10:51 a.m., Alex Rousskov wrote:
+&gt;<i> Hello,
+</I>&gt;<i> 
+</I>&gt;<i>     Trunk r13995 (Parser-NG: Convert the ICAP read buffer to an SBuf)
+</I>&gt;<i> broke ICAP transactions that read a lot of data because the new
+</I>&gt;<i> SBuf::consume() method often does not free buffer space, unlike the old
+</I>&gt;<i> MemBuf::consume(). Trunk r14173 (Parser-NG: Transfer-Encoding:chunked
+</I>&gt;<i> Parser) did not have a material effect on this bug AFAICT, even though
+</I>&gt;<i> it replaced at least one new explicit consume() call with an SBuf
+</I>&gt;<i> assignment. I think that just effectively moved the consume() call(s)
+</I>&gt;<i> elsewhere.
+</I>&gt;<i> 
+</I>&gt;<i> Affected transactions fail with mayReadMore() exceptions because their
+</I>&gt;<i> readBuf.spaceSize() is zero while they need to read more data.
+</I>&gt;<i> 
+</I>&gt;<i> Any append,parse,consume;append,parse,consume;... user of SBuf cannot
+</I>&gt;<i> rely on SBuf::spaceSize() to be meaningful because even consuming the
+</I>&gt;<i> entire SBuf contents may leave spaceSize() at zero! Instead such code
+</I>&gt;<i> has to use SBuf::length() to keep buffer from growing too big and
+</I>&gt;<i> SBuf::rawSpace(1) to ensure some space is available for reading when the
+</I>&gt;<i> buffer is not too big.
+</I>
+If you were using rawSpace(1) to avoid the possible reallocation by
+reserveSpace() it was not worth it. The reserveCapacity() used above it
+is what reserveSpace() uses internally and causes that reallocation. So
+its happening anyway.
+
+It is probably better to do:
+   rawSpace(SQUID_TCP_SO_RCVBUF - readBuf.length());
+
+Which guarantees the requested size, without triggering as many
+reallocates as reserveCapacity().
+
+&gt;<i> 
+</I>&gt;<i> The attached patch fixes this bug in code based on trunk r14083. Judging
+</I>&gt;<i> by cache.log, the same patch has the right effect on the current trunk
+</I>&gt;<i> (r14173) as well. However, the current trunk seems to be broken in other
+</I>&gt;<i> (non-ICAP) places [related to large transaction handling?] so I am
+</I>&gt;<i> unable to fully test the patch there right now.
+</I>
+I've checked the other client_side.cc/http.cc uses of Comm::ReadNow
+which should be roughly equivalent to this part of ICAP and make use of
+spaceSize() in buffer growth.
+
+They use length() to calculate size, and spaceSize() to determine if the
+grow() calculations are necessary. That was left out of the ICAP logic
+on the assumption that ICAP peristent connections would operate better
+on full SQUID_TCP_SO_RCVBUF sized buffers instead of small dynamically
+grown ones.
+
+
+client_side.cc/http.cc both also use reserveSpace(N) instead of
+rawSpace(N). Which may reallocate a lot more. Seems like a mistake to
+avoid the SBuf API marked &quot;EXTREME caution&quot;. At least for I/O.
+
+So lots more reading into many smaller buffers. That was one of the
+goals right ? :-P
+
+But I'm not sure *how much* smaller than 64K buffers was optimal. We may
+be going too far down now on server connections.
+
+&gt;<i> 
+</I>&gt;<i> I have not carefully checked whether other new SBuf::consume() users are
+</I>&gt;<i> affected. If somebody has the time, I recommend analyzing all
+</I>&gt;<i> SBuf::spaceSize() uses.
+</I>
+
+Checked spaceSize(). Outside the client_side.cc and http.cc calculations
+for I/O buffers it is actually the old MemBuf::spaceSize() or just
+buffer size display. Nothing broken.
+
+Not sure exactly what to look for on consume() uses. It will be all
+Parser in Squid though. And where read buffer feed into BodyPipe.
+
+
+Anyhow:
+  +1, Please apply ASAP after considering the above mentioned alteration
+of rawSpace(1).
+
+Amos
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002852.html">[squid-dev] [PATCH] Fix ICAP transactions that read a lot of data
+</A></li>
+	<LI>Next message: <A HREF="002860.html">[squid-dev] [PATCH] Fix ICAP transactions that read a lot of data
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2855">[ date ]</a>
+              <a href="thread.html#2855">[ thread ]</a>
+              <a href="subject.html#2855">[ subject ]</a>
+              <a href="author.html#2855">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

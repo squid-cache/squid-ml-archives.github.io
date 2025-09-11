@@ -1,0 +1,157 @@
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2015-01-01 08:57:18 +0000
++++ src/client_side.cc	2015-01-07 11:28:41 +0000
+@@ -2588,57 +2588,40 @@
+         assert(context->http->out.offset == 0);
+         context->pullData();
+         clientProcessRequestFinished(conn, request);
+         return;
+     }
+ 
+     if (!chunked && !clientIsContentLengthValid(request.getRaw())) {
+         clientStreamNode *node = context->getClientReplyContext();
+         clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+         assert (repContext);
+         conn->quitAfterError(request.getRaw());
+         repContext->setReplyToError(ERR_INVALID_REQ,
+                                     Http::scLengthRequired, request->method, NULL,
+                                     conn->clientConnection->remote, request.getRaw(), NULL, NULL);
+         assert(context->http->out.offset == 0);
+         context->pullData();
+         clientProcessRequestFinished(conn, request);
+         return;
+     }
+ 
+-    if (request->header.has(HDR_EXPECT)) {
+-        const String expect = request->header.getList(HDR_EXPECT);
+-        const bool supportedExpect = (expect.caseCmp("100-continue") == 0);
+-        if (!supportedExpect) {
+-            clientStreamNode *node = context->getClientReplyContext();
+-            clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
+-            assert (repContext);
+-            conn->quitAfterError(request.getRaw());
+-            repContext->setReplyToError(ERR_INVALID_REQ, Http::scExpectationFailed, request->method, http->uri,
+-                                        conn->clientConnection->remote, request.getRaw(), NULL, NULL);
+-            assert(context->http->out.offset == 0);
+-            context->pullData();
+-            clientProcessRequestFinished(conn, request);
+-            return;
+-        }
+-    }
+-
+     clientSetKeepaliveFlag(http);
+     // Let tunneling code be fully responsible for CONNECT requests
+     if (http->request->method == Http::METHOD_CONNECT) {
+         context->mayUseConnection(true);
+         conn->flags.readMore = false;
+     }
+ 
+ #if USE_OPENSSL
+     if (conn->switchedToHttps() && conn->serveDelayedError(context)) {
+         clientProcessRequestFinished(conn, request);
+         return;
+     }
+ #endif
+ 
+     /* Do we expect a request-body? */
+     expectBody = chunked || request->content_length > 0;
+     if (!context->mayUseConnection() && expectBody) {
+         request->body_pipe = conn->expectRequestBody(
+                                  chunked ? -1 : request->content_length);
+ 
+
+=== modified file 'src/servers/HttpServer.cc'
+--- src/servers/HttpServer.cc	2014-12-20 12:12:02 +0000
++++ src/servers/HttpServer.cc	2015-01-07 11:18:41 +0000
+@@ -231,56 +231,76 @@
+ 
+     http->request = request.getRaw();
+     HTTPMSGLOCK(http->request);
+ 
+     return true;
+ }
+ 
+ void
+ Http::Server::proceedAfterBodyContinuation(ClientSocketContext::Pointer context)
+ {
+     debugs(33, 5, "Body Continuation written");
+     clientProcessRequest(this, parser_, context.getRaw());
+ }
+ 
+ void
+ Http::Server::processParsedRequest(ClientSocketContext *context)
+ {
+     if (!buildHttpRequest(context))
+         return;
+ 
+-    if (Config.accessList.forceRequestBodyContinuation) {
+-        ClientHttpRequest *http = context->http;
+-        HttpRequest *request = http->request;
+-        ACLFilledChecklist bodyContinuationCheck(Config.accessList.forceRequestBodyContinuation, request, NULL);
+-        if (bodyContinuationCheck.fastCheck() == ACCESS_ALLOWED) {
+-            debugs(33, 5, "Body Continuation forced");
+-            request->forcedBodyContinuation = true;
+-            //sendControlMsg
+-            HttpReply::Pointer rep = new HttpReply;
+-            rep->sline.set(Http::ProtocolVersion(), Http::scContinue);
+-
+-            typedef UnaryMemFunT<Http::Server, ClientSocketContext::Pointer> CbDialer;
+-            const AsyncCall::Pointer cb = asyncCall(11, 3,  "Http::Server::proceedAfterBodyContinuation", CbDialer(this, &Http::Server::proceedAfterBodyContinuation, ClientSocketContext::Pointer(context)));
+-            sendControlMsg(HttpControlMsg(rep, cb));
++    ClientHttpRequest *http = context->http;
++    HttpRequest::Pointer request = http->request;
++
++    if (request->header.has(HDR_EXPECT)) {
++        const String expect = request->header.getList(HDR_EXPECT);
++        const bool supportedExpect = (expect.caseCmp("100-continue") == 0);
++        if (!supportedExpect) {
++            clientStreamNode *node = context->getClientReplyContext();
++            quitAfterError(request.getRaw());
++            // setLogUri should called before repContext->setReplyToError
++            setLogUri(http, urlCanonicalClean(request.getRaw()));
++            clientReplyContext *repContext = dynamic_cast<clientReplyContext *>(node->data.getRaw());
++            assert (repContext);
++            repContext->setReplyToError(ERR_INVALID_REQ, Http::scExpectationFailed, request->method, http->uri,
++                                        clientConnection->remote, request.getRaw(), NULL, NULL);
++            assert(context->http->out.offset == 0);
++            context->pullData();
++            clientProcessRequestFinished(this, request);
+             return;
+         }
++
++        if (Config.accessList.forceRequestBodyContinuation) {
++            ACLFilledChecklist bodyContinuationCheck(Config.accessList.forceRequestBodyContinuation, request.getRaw(), NULL);
++            if (bodyContinuationCheck.fastCheck() == ACCESS_ALLOWED) {
++                debugs(33, 5, "Body Continuation forced");
++                request->forcedBodyContinuation = true;
++                //sendControlMsg
++                HttpReply::Pointer rep = new HttpReply;
++                rep->sline.set(Http::ProtocolVersion(), Http::scContinue);
++
++                typedef UnaryMemFunT<Http::Server, ClientSocketContext::Pointer> CbDialer;
++                const AsyncCall::Pointer cb = asyncCall(11, 3,  "Http::Server::proceedAfterBodyContinuation", CbDialer(this, &Http::Server::proceedAfterBodyContinuation, ClientSocketContext::Pointer(context)));
++                sendControlMsg(HttpControlMsg(rep, cb));
++                return;
++            }
++        }
+     }
+     clientProcessRequest(this, parser_, context);
+ }
+ 
+ void
+ Http::Server::noteBodyConsumerAborted(BodyPipe::Pointer ptr)
+ {
+     ConnStateData::noteBodyConsumerAborted(ptr);
+     stopReceiving("virgin request body consumer aborted"); // closes ASAP
+ }
+ 
+ void
+ Http::Server::handleReply(HttpReply *rep, StoreIOBuffer receivedData)
+ {
+     // the caller guarantees that we are dealing with the current context only
+     ClientSocketContext::Pointer context = getCurrentContext();
+     Must(context != NULL);
+     const ClientHttpRequest *http = context->http;
+     Must(http != NULL);
+ 
+

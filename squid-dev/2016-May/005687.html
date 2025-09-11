@@ -1,0 +1,201 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] mime unfolding
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20mime%20unfolding&In-Reply-To=%3C573D1DED.7010707%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005661.html">
+   <LINK REL="Next"  HREF="005692.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] mime unfolding</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20mime%20unfolding&In-Reply-To=%3C573D1DED.7010707%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] mime unfolding">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Thu May 19 01:59:09 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005661.html">[squid-dev] [PATCH] mime unfolding
+</A></li>
+        <LI>Next message: <A HREF="005692.html">[squid-dev] [PATCH] mime unfolding
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5687">[ date ]</a>
+              <a href="thread.html#5687">[ thread ]</a>
+              <a href="subject.html#5687">[ subject ]</a>
+              <a href="author.html#5687">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 05/14/2016 06:42 AM, Amos Jeffries wrote:
+
+
+&gt;<i> One of the parsers you will find attached (MIME_UNFOLD_SLOW) is that
+</I>&gt;<i> loop expanded into functions so each if statement gets its own named
+</I>&gt;<i> function and so non-genius people can avoid reading the description of
+</I>&gt;<i> unfoldMime.
+</I>
+I am afraid you misunderstand the problem I am trying to solve. IMO, the
+parsing code, as it was written before, was impossible for a human with
+average abilities to fully comprehend. The number of if statements is
+not the problem on its own. Moving an if statement into a function does
+not solve the problem. There is just too much persistent state and state
+change/interaction complexity. We have seen many examples of similar
+code leading to bugs because nobody could fully comprehend the complex
+interactions happening in loops like that.
+
+With very few exceptions that neither of us, sadly, qualify for, humans
+are incapable of writing low-level non-trivial parsing code correctly. I
+have seen so many bugs in such code (in Squid and elsewhere) that I am
+quite convinced that this is a nearly &quot;universal truth&quot;.
+
+Until we have better parsing tools at our disposal, we should use
+tokenizers and similar safety helpers when writing parsing code, and we
+should keep it simple. This will not fully protect us from bugs (nothing
+will!), but it will reduce the number of bugs and will protect us from
+most CVEs.
+
+During this particular project, as you know, it took several private
+review iterations to replace unsafe (and immediately buggy!) low-level
+code with tokenizers. Reducing that loop complexity is the final step. I
+was hoping that providing a sketch of how to do that would allow for a
+quick and painless finale, but I was obviously wrong.
+
+I tried again below, and I hope you will like the final result more. I
+am leaving intermediate steps in case you would want to stop sooner than
+I did. They are short.
+
+
+The simplest implementation I can think of would look like this:
+
+    while (!tk.atEnd()) {
+        if (skipObsFolds(tk))
+            result += ' '; // replace obs-folds with SP
+        else
+            result += tk.chars(1); // advance one character
+    }
+
+but we do not want to append one character at a time, so we optimize to
+append more characters (while watching for the obs-fold start). That
+&quot;more characters&quot; optimization is where the complexity and bugs come in.
+
+I would start with appending all characters until CR or LF because
+obs-fold has to start with CR or LF. This algorithm is not going to
+catch all longest sequences, but it will be reasonably efficient while
+remaining simple:
+
+    while (!tk.atEnd()) {
+        if (skipObsFolds(tk))
+            result += ' '; // replaced all obs-folds with one SP
+        else
+            result += tokenUntilCrLf(tk); // advance one or more chars
+    }
+
+    /// always extracts the first character;
+    /// extracts more characters if they are not CR or LF
+    SBuf
+    tokenUntilCrLf(Tokenizer &amp;tk) {
+        const SBuf buf = tk.remaining();
+        const auto skipped = tk.skipOne(ANY) + tk.skipAll(notCRLF);
+        return buf.substr(0, skipped);
+    }
+
+
+Furthermore, we can observe that skipping the leading CR?LF? is always
+safe _after_ our skipObsFolds() check. Thus, we can replace that
+&quot;skipped = ...&quot; line above with the one that may skip even more:
+
+  // this will skip at least one character (CR, LF, and/or notCRLF)
+  const auto skipped =
+      tk.skipOne(CR) + tk.skipOne(LF) + tk.skipAll(notCRLF);
+
+
+Now you may notice that skipObsFolds() has to _start_ with a similar
+CR?LF skipping sequence, so we can extract that common code from both
+helper functions to arrive at something like this:
+
+    while (!tk.atEnd()) {
+        const SBuf all = tk.remaining();
+        const auto crLen = tk.skipOne(CR); // may not be there
+        const auto lfLen = tk.skipOne(LF); // may not be there
+        if (lfLen &amp;&amp; tk.skipAll(WSP)) // obs-fold!
+            result += ' '; // replace one obs-fold with one SP
+        else
+            result += all.substr(0, crLen+lfLen + tk.skipAll(notCRLF));
+    }
+
+The above is a little too complex for my taste but is probably close to
+optimal performance, given the tools that we have to use. &quot;A little too
+complex&quot; because it is not _obvious_ that the loop is always making
+progress. The somewhat hidden fact here is that if crLen+lfLen is zero
+(i.e., no progress yet), then tk.skipAll(notCRLF) has to succeed
+(progress!) since the next character has to be CR, LF, or none of those.
+
+The usual &quot;this is a sketch&quot; disclaimer applies.
+
+
+
+&gt;<i>  this is C/C++ not one of those formal proofing languages, and
+</I>&gt;<i> *can* implement the faster parser without compromising readability.
+</I>
+Agreed, but you did not accomplish that goal IMHO.
+
+
+&gt;&gt;<i> The delimiter is obs-fold, not CRLF.
+</I>
+&gt;<i> It is neither.
+</I>
+Here I obviously disagree. The delimiter is obs-fold. No grammar
+complexities and ambiguities change that fact.
+
+
+I am skipping the rest of the discussion about the types of parsers we
+are writing. To reach any consensus there would require the level of
+accuracy in terminology and methodology that I have never seen on this
+mailing list. If you think that I sketched a recursive descent parser,
+we both can survive that misunderstanding. At the end of the day, a
+parser category consensus would not solve any important problems.
+
+Alex.
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005661.html">[squid-dev] [PATCH] mime unfolding
+</A></li>
+	<LI>Next message: <A HREF="005692.html">[squid-dev] [PATCH] mime unfolding
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5687">[ date ]</a>
+              <a href="thread.html#5687">[ thread ]</a>
+              <a href="subject.html#5687">[ subject ]</a>
+              <a href="author.html#5687">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

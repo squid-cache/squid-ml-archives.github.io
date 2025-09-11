@@ -1,0 +1,297 @@
+=== modified file 'doc/release-notes/release-4.sgml'
+--- doc/release-notes/release-4.sgml	2017-06-01 12:38:26 +0000
++++ doc/release-notes/release-4.sgml	2017-06-09 11:07:46 +0000
+@@ -165,10 +165,9 @@
+    integration with daemon managers such as Upstart or systemd which assume the
+    process they initiated is the daemon with a PID to control.
+ 
+-<p>The squid binary now has a new <em>--foreground</em> command line option
+-   which prevents the process from exiting early while background workers
+-   continue their processing. When run with this option Squid will now wait
+-   for the worker(s) to finish before exiting. Unlike the old <em>-N</em> option
++<p>The squid binary now has a new <em>--foreground</em> command line option,
++   which prevents the process from daemonizing, i.e., launches only one process,
++   which will become the master process. Unlike the old <em>-N</em> option,
+    <em>--foreground</em> supports SMP workers and multi-process features.
+    <em>--foreground</em> is particularly useful for use with <em>-z</em> (disk
+    cache structures creation), as it allows the caller to wait until Squid has
+
+=== modified file 'src/CpuAffinity.cc'
+--- src/CpuAffinity.cc	2017-01-01 00:14:42 +0000
++++ src/CpuAffinity.cc	2017-06-09 08:39:22 +0000
+@@ -27,7 +27,7 @@
+ {
+     Must(!TheCpuAffinitySet);
+     if (Config.cpuAffinityMap) {
+-        const int processNumber = InDaemonMode() ? KidIdentifier : 1;
++        const int processNumber = UsingDedicatedMaster() ? KidIdentifier : 1;
+         TheCpuAffinitySet = Config.cpuAffinityMap->calculateSet(processNumber);
+         if (TheCpuAffinitySet)
+             TheCpuAffinitySet->apply();
+@@ -55,7 +55,7 @@
+                               Config.cpuAffinityMap->processes().end());
+ 
+         // in no-deamon mode, there is one process regardless of squid.conf
+-        const int numberOfProcesses = InDaemonMode() ? NumberOfKids() : 1;
++        const int numberOfProcesses = UsingDedicatedMaster() ? NumberOfKids() : 1;
+ 
+         if (maxProcess > numberOfProcesses) {
+             debugs(54, DBG_IMPORTANT, "WARNING: 'cpu_affinity_map' has "
+
+=== modified file 'src/cache_cf.cc'
+--- src/cache_cf.cc	2017-05-07 20:16:59 +0000
++++ src/cache_cf.cc	2017-06-09 08:39:58 +0000
+@@ -622,7 +622,7 @@
+         /* Memory-only cache probably in effect. */
+         /* turn off the cache rebuild delays... */
+         StoreController::store_dirs_rebuilding = 0;
+-    } else if (InDaemonMode()) { // no diskers in non-daemon mode
++    } else if (UsingDedicatedMaster()) { // no diskers without dedicated master
+         for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+             const RefCount<SwapDir> sd = Config.cacheSwap.swapDirs[i];
+             if (sd->needsDiskStrand())
+
+=== modified file 'src/fs/rock/RockSwapDir.cc'
+--- src/fs/rock/RockSwapDir.cc	2017-01-01 00:14:42 +0000
++++ src/fs/rock/RockSwapDir.cc	2017-06-09 08:46:09 +0000
+@@ -338,7 +338,7 @@
+ {
+     const bool wontEvenWorkWithoutDisker = Config.workers > 1;
+     const bool wouldWorkBetterWithDisker = DiskIOModule::Find("IpcIo");
+-    return InDaemonMode() && (wontEvenWorkWithoutDisker ||
++    return UsingDedicatedMaster() && (wontEvenWorkWithoutDisker ||
+                               wouldWorkBetterWithDisker);
+ }
+ 
+
+=== modified file 'src/globals.h'
+--- src/globals.h	2017-01-01 00:14:42 +0000
++++ src/globals.h	2017-06-09 08:44:15 +0000
+@@ -109,7 +109,7 @@
+ 
+ extern const char *external_acl_message;      /* NULL */
+ extern int opt_send_signal; /* -1 */
+-extern int opt_no_daemon; /* 0 */
++extern int opt_use_single_process; /* 0 */
+ extern int opt_parse_cfg_only; /* 0 */
+ 
+ /// current Squid process number (e.g., 4).
+
+=== modified file 'src/ipc.cc'
+--- src/ipc.cc	2017-01-01 00:14:42 +0000
++++ src/ipc.cc	2017-06-09 08:42:44 +0000
+@@ -409,7 +409,7 @@
+         close(x);
+ 
+ #if HAVE_SETSID
+-    if (opt_no_daemon)
++    if (opt_use_single_process)
+         setsid();
+ #endif
+ 
+
+=== modified file 'src/ipc/mem/Segment.cc'
+--- src/ipc/mem/Segment.cc	2017-01-01 00:14:42 +0000
++++ src/ipc/mem/Segment.cc	2017-06-09 08:42:31 +0000
+@@ -388,7 +388,7 @@
+ 
+     // we assume that master process does not need shared segments
+     // unless it is also a worker
+-    if (!InDaemonMode() || !IamMasterProcess())
++    if (!UsingDedicatedMaster() || !IamMasterProcess())
+         open();
+ }
+ 
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2017-05-29 03:19:47 +0000
++++ src/main.cc	2017-06-09 10:57:12 +0000
+@@ -387,9 +387,10 @@
+             "       -C        Do not catch fatal signals.\n"
+             "       -D        OBSOLETE. Scheduled for removal.\n"
+             "       -F        Don't serve any requests until store is rebuilt.\n"
+-            "       -N        No daemon mode.\n"
++            "       -N        Use a single process (combining master/worker) running in "
++            "                 foreground; incompatible with --foreground.\n"
+             "       --foreground\n"
+-            "                 Parent process does not exit until its children have finished.\n"
++            "                 \"No daemon\" mode: master process stays in foreground.\n"
+ #if USE_WIN32_SERVICE
+             "       -O options\n"
+             "                 Set Windows Service Command line options in Registry.\n"
+@@ -453,8 +454,8 @@
+ 
+         case 'N':
+             /** \par N
+-             * Set global option for 'no_daemon' mode. opt_no_daemon */
+-            opt_no_daemon = 1;
++             * Set global option for using a single process, combining master/worker. opt_use_single_process */
++            opt_use_single_process = 1;
+             break;
+ 
+ #if USE_WIN32_SERVICE
+@@ -1362,7 +1363,7 @@
+         return WIN32_StartService(argc, argv);
+     else {
+         WIN32_run_mode = _WIN_SQUID_RUN_MODE_INTERACTIVE;
+-        opt_no_daemon = 1;
++        opt_use_single_process = 1;
+     }
+ #endif
+ 
+@@ -1467,7 +1468,7 @@
+ 
+     mainParseOptions(argc, argv);
+ 
+-    if (opt_foreground && opt_no_daemon) {
++    if (opt_foreground && opt_use_single_process) {
+         debugs(1, DBG_CRITICAL, "WARNING: --foreground command-line option has no effect with -N.");
+     }
+ 
+@@ -1579,7 +1580,7 @@
+     RunRegisteredHere(RegisteredRunner::finalizeConfig);
+ 
+     if (IamMasterProcess()) {
+-        if (InDaemonMode()) {
++        if (UsingDedicatedMaster()) {
+             watch_child(argv);
+             // NOTREACHED
+         } else {
+@@ -1610,7 +1611,7 @@
+     /* init comm module */
+     comm_init();
+ 
+-    if (opt_no_daemon) {
++    if (opt_use_single_process) {
+         /* we have to init fdstat here. */
+         fd_open(0, FD_LOG, "stdin");
+         fd_open(1, FD_LOG, "stdout");
+@@ -1767,7 +1768,7 @@
+ {
+ #if !_SQUID_WINDOWS_
+     char *prog;
+-    PidStatus status_f, status;
++    PidStatus status;
+     pid_t pid;
+ #ifdef TIOCNOTTY
+ 
+@@ -1780,24 +1781,20 @@
+ 
+     openlog(APP_SHORTNAME, LOG_PID | LOG_NDELAY | LOG_CONS, LOG_LOCAL4);
+ 
+-    if ((pid = fork()) < 0) {
+-        int xerrno = errno;
+-        syslog(LOG_ALERT, "fork failed: %s", xstrerr(xerrno));
+-    } else if (pid > 0) {
+-        // parent
+-        if (opt_foreground) {
+-            if (WaitForAnyPid(status_f, 0) < 0) {
+-                int xerrno = errno;
+-                syslog(LOG_ALERT, "WaitForAnyPid failed: %s", xstrerr(xerrno));
+-            }
+-        }
+-
+-        exit(0);
+-    }
+-
+-    if (setsid() < 0) {
+-        int xerrno = errno;
+-        syslog(LOG_ALERT, "setsid failed: %s", xstrerr(xerrno));
++    if (!opt_foreground) {
++        if ((pid = fork()) < 0) {
++            int xerrno = errno;
++            syslog(LOG_ALERT, "fork failed: %s", xstrerr(xerrno));
++        } else if (pid > 0) {
++            // finished daemonizing
++            exit(0);
++        }
++
++        // makes only sense after daemonizing
++        if (setsid() < 0) {
++            int xerrno = errno;
++            syslog(LOG_ALERT, "setsid failed: %s", xstrerr(xerrno));
++        }
+     }
+ 
+     closelog();
+
+=== modified file 'src/tests/stub_tools.cc'
+--- src/tests/stub_tools.cc	2017-05-29 01:05:25 +0000
++++ src/tests/stub_tools.cc	2017-06-09 08:40:19 +0000
+@@ -53,7 +53,7 @@
+ }
+ 
+ bool IamDiskProcess() STUB_RETVAL_NOP(false)
+-bool InDaemonMode() STUB_RETVAL_NOP(false)
++bool UsingDedicatedMaster() STUB_RETVAL_NOP(false)
+ bool UsingSmp() STUB_RETVAL_NOP(false)
+ bool IamCoordinatorProcess() STUB_RETVAL(false)
+ bool IamPrimaryProcess() STUB_RETVAL(false)
+
+=== modified file 'src/tools.cc'
+--- src/tools.cc	2017-05-29 01:05:25 +0000
++++ src/tools.cc	2017-06-09 08:44:52 +0000
+@@ -635,7 +635,7 @@
+ IamWorkerProcess()
+ {
+     // when there is only one process, it has to be the worker
+-    if (opt_no_daemon || Config.workers == 0)
++    if (opt_use_single_process)
+         return true;
+ 
+     return TheProcessKind == pkWorker;
+@@ -648,15 +648,15 @@
+ }
+ 
+ bool
+-InDaemonMode()
++UsingDedicatedMaster()
+ {
+-    return !opt_no_daemon && Config.workers > 0;
++    return !opt_use_single_process;
+ }
+ 
+ bool
+ UsingSmp()
+ {
+-    return InDaemonMode() && NumberOfKids() > 1;
++    return UsingDedicatedMaster() && NumberOfKids() > 1;
+ }
+ 
+ bool
+@@ -669,7 +669,7 @@
+ IamPrimaryProcess()
+ {
+     // when there is only one process, it has to be primary
+-    if (opt_no_daemon || Config.workers == 0)
++    if (opt_use_single_process || Config.workers == 0)
+         return true;
+ 
+     // when there is a master and worker process, the master delegates
+@@ -684,8 +684,8 @@
+ int
+ NumberOfKids()
+ {
+-    // no kids in no-daemon mode
+-    if (!InDaemonMode())
++    // if not using a dedicated master process, there won't be any kids
++    if (!UsingDedicatedMaster())
+         return 0;
+ 
+     // XXX: detect and abort when called before workers/cache_dirs are parsed
+
+=== modified file 'src/tools.h'
+--- src/tools.h	2017-05-29 01:05:25 +0000
++++ src/tools.h	2017-06-09 08:40:39 +0000
+@@ -67,8 +67,8 @@
+ bool IamWorkerProcess();
+ /// whether the current process is dedicated to managing a cache_dir
+ bool IamDiskProcess();
+-/// Whether we are running in daemon mode
+-bool InDaemonMode(); // try using specific Iam*() checks above first
++/// Whether we are running with a dedicated master managing the other processes 
++bool UsingDedicatedMaster(); // try using specific Iam*() checks above first
+ /// Whether there should be more than one worker process running
+ bool UsingSmp(); // try using specific Iam*() checks above first
+ /// number of Kid processes as defined in src/ipc/Kid.h
+

@@ -1,0 +1,1194 @@
+Added ssl_bump_resuming_sessions to control treatment of resuming sessions
+by SslBump.
+
+This patch adds the "ssl_bump_resuming_sessions" directive that controls
+SslBump behavior when dealing with "resuming SSL/TLS sessions". Without
+these changes, SslBump usually terminates all resuming sessions with an
+error because such sessions do not include server certificates, preventing
+Squid from successfully validating the server identity.
+
+After these changes, Squid either terminates or splices resuming sessions,
+depending on configuration. Splicing is the right default because Squid
+most likely has spliced the original connections that the client and server
+are trying to resume now. Most likely, the splicing decision would not
+change now (but the lack of the server certificate information means we cannot
+repeat the original ACL checks and need a special directive to tell Squid what
+to do). Also, without SslBump, session resumption would just work, and SslBump
+default should approach that ideal.
+
+In many deployment scenarios, this straightforward "splice or terminate
+resuming sessions" implementation is exactly what the admin wants. Future
+projects may add more complex algorithms, including maintaining an SMP-shared
+cache of sessions that may be resumed in the future and evaluating
+client/server attempts to resume a session using that cache.
+
+
+Example:
+  # splice all resuming sessions [this is the default]
+  ssl_bump_resuming_sessions allow all
+
+
+This patch also makes SSL client Hello message parsing more robust and
+adds an SSL server Hello message parser.
+
+This patch also prevents occasional segfaults when dealing with SSL
+cache_peer negotiation failures.
+
+
+Technical details
+-----------------
+
+In Peek mode, the old Squid code would forward the client Hello message to the
+server. If the server tries to resume the previous (spliced) SSL session with
+the client, then Squid SSL code gets an ssl/PeerConnector.cc "ccs received
+early" error (or similar) because the Squid SSL object expects a server
+certificate and does not know anything about the session being resumed.
+
+With this patch, Squid detects session resumption attempts and consults the
+ssl_bump_resuming_sessions access list to decide whether to splice or honor
+the error. Honoring the error would usually terminate the client and server
+connections.
+
+
+Session resumption detection
+----------------------------
+
+There are two mechanism in SSL/TLS for resuming sessions. The traditional
+shared session IDs and the TLS ticket extensions:
+
+* If Squid detects a shared ID in both client and server Hello messages, then
+Squid decides whether the session is being resumed by comparing those client
+and server shared IDs. If (and only if) the IDs are the same, then Squid
+assumes that it is dealing with a resuming session (using session IDs).
+
+* If Squid detects a TLS ticket in the client Hello message and TLS ticket
+support in the server Hello message as well as a Change Cipher Spec or a New
+TLS Ticket message (following the server Hello message), then (and only then)
+Squid assumes that it is dealing with a resuming session (using TLS tickets).
+
+The TLS tickets check is not performed if Squid detects a shared session ID
+in both client and server Hello messages.
+
+This is a Measurement Factory project.
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2015-02-15 19:42:55 +0000
++++ src/SquidConfig.h	2015-02-25 11:15:04 +0000
+@@ -349,40 +349,41 @@
+         acl_access *stats_collection;
+ #if SQUID_SNMP
+ 
+         acl_access *snmp;
+ #endif
+ #if USE_HTTP_VIOLATIONS
+         acl_access *brokenPosts;
+ #endif
+         acl_access *redirector;
+         acl_access *store_id;
+         acl_access *reply;
+         Acl::Address *outgoing_address;
+ #if USE_HTCP
+ 
+         acl_access *htcp;
+         acl_access *htcp_clr;
+ #endif
+ 
+ #if USE_OPENSSL
+         acl_access *ssl_bump;
++        acl_access *sslBumpResumingSessions;
+ #endif
+ #if FOLLOW_X_FORWARDED_FOR
+         acl_access *followXFF;
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+ 
+         /// acceptible PROXY protocol clients
+         acl_access *proxyProtocol;
+ 
+         /// spoof_client_ip squid.conf acl.
+         /// nil unless configured
+         acl_access* spoof_client_ip;
+         acl_access *on_unsupported_protocol;
+ 
+         acl_access *ftp_epsv;
+ 
+         acl_access *forceRequestBodyContinuation;
+     } accessList;
+     AclDenyInfoList *denyInfoList;
+ 
+     struct {
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2015-02-23 06:34:49 +0000
++++ src/cf.data.pre	2015-03-11 16:09:41 +0000
+@@ -2649,40 +2649,53 @@
+ 	steps.  Rules with actions that are impossible at the current step are
+ 	ignored. The first matching ssl_bump action wins and is applied at the
+ 	end of the current step. If no rules match, the splice action is used.
+ 	See the at_step ACL for a list of the supported SslBump steps.
+ 
+ 	This clause supports both fast and slow acl types.
+ 	See http://wiki.squid-cache.org/SquidFaq/SquidAcl for details.
+ 
+ 	See also: http_port ssl-bump, https_port ssl-bump, and acl at_step.
+ 
+ 
+ 	# Example: Bump all requests except those originating from
+ 	# localhost or those going to example.com.
+ 
+ 	acl broken_sites dstdomain .example.com
+ 	ssl_bump splice localhost
+ 	ssl_bump splice broken_sites
+ 	ssl_bump bump all
+ DOC_END
+ 
++NAME: ssl_bump_resuming_sessions
++IFDEF: USE_OPENSSL
++TYPE: acl_access
++LOC: Config.accessList.sslBumpResumingSessions
++DEFAULT_DOC: splice all resuming SSL sessions
++DEFAULT: none
++DOC_START
++	Whether to splice resuming SSL sessions (that most likely came from
++	the previously spliced SSL connections). Resuming SSL sessions lack
++	server certificates, preventing SslBump from performing its regular
++	server certificate validation procedures.
++DOC_END
++
+ NAME: sslproxy_flags
+ IFDEF: USE_OPENSSL
+ DEFAULT: none
+ LOC: Config.ssl_client.flags
+ TYPE: string
+ DOC_START
+ 	Various flags modifying the use of SSL while proxying https:// URLs:
+ 	    DONT_VERIFY_PEER	Accept certificates that fail verification.
+ 				For refined control, see sslproxy_cert_error.
+ 	    NO_DEFAULT_CA	Don't use the default CA list built in
+ 				to OpenSSL.
+ DOC_END
+ 
+ NAME: sslproxy_cert_error
+ IFDEF: USE_OPENSSL
+ DEFAULT: none
+ DEFAULT_DOC: Server certificate errors terminate the transaction.
+ LOC: Config.ssl_client.cert_error
+ TYPE: acl_access
+ DOC_START
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2015-02-15 19:42:55 +0000
++++ src/ssl/PeerConnector.cc	2015-03-11 17:13:19 +0000
+@@ -28,41 +28,42 @@
+ #include "ssl/helper.h"
+ #include "ssl/PeerConnector.h"
+ #include "ssl/ServerBump.h"
+ #include "ssl/support.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeerConnector);
+ 
+ Ssl::PeerConnector::PeerConnector(
+     HttpRequestPointer &aRequest,
+     const Comm::ConnectionPointer &aServerConn,
+     const Comm::ConnectionPointer &aClientConn,
+     AsyncCall::Pointer &aCallback,
+     const time_t timeout):
+     AsyncJob("Ssl::PeerConnector"),
+     request(aRequest),
+     serverConn(aServerConn),
+     clientConn(aClientConn),
+     callback(aCallback),
+     negotiationTimeout(timeout),
+     startTime(squid_curtime),
+-    splice(false)
++    splice(false),
++    resumingSession(false)
+ {
+     // if this throws, the caller's cb dialer is not our CbDialer
+     Must(dynamic_cast<CbDialer*>(callback->getDialer()));
+ }
+ 
+ Ssl::PeerConnector::~PeerConnector()
+ {
+     debugs(83, 5, "Peer connector " << this << " gone");
+ }
+ 
+ bool Ssl::PeerConnector::doneAll() const
+ {
+     return (!callback || callback->canceled()) && AsyncJob::doneAll();
+ }
+ 
+ /// Preps connection and SSL state. Calls negotiate().
+ void
+ Ssl::PeerConnector::start()
+ {
+     AsyncJob::start();
+@@ -253,40 +254,45 @@
+ 
+     if (serverConnection()->getPeer() && !SSL_session_reused(ssl)) {
+         if (serverConnection()->getPeer()->sslSession)
+             SSL_SESSION_free(serverConnection()->getPeer()->sslSession);
+ 
+         serverConnection()->getPeer()->sslSession = SSL_get1_session(ssl);
+     }
+ 
+     if (!sslFinalized())
+         return;
+ 
+     callBack();
+ }
+ 
+ bool
+ Ssl::PeerConnector::sslFinalized()
+ {
+     const int fd = serverConnection()->fd;
+     SSL *ssl = fd_table[fd].ssl;
+ 
++    // In the case the session is resuming, the certificates does not exist and
++    // we did not do any cert validation
++    if (resumingSession)
++        return true;
++
+     if (request->clientConnectionManager.valid()) {
+         // remember the server certificate from the ErrorDetail object
+         if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
+             serverBump->serverCert.reset(SSL_get_peer_certificate(ssl));
+ 
+             // remember validation errors, if any
+             if (Ssl::CertErrors *errs = static_cast<Ssl::CertErrors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors)))
+                 serverBump->sslErrors = cbdataReference(errs);
+         }
+     }
+ 
+     if (Ssl::TheConfig.ssl_crt_validator) {
+         Ssl::CertValidationRequest validationRequest;
+         // WARNING: Currently we do not use any locking for any of the
+         // members of the Ssl::CertValidationRequest class. In this code the
+         // Ssl::CertValidationRequest object used only to pass data to
+         // Ssl::CertValidationHelper::submit method.
+         validationRequest.ssl = ssl;
+         validationRequest.domainName = request->GetHost();
+         if (Ssl::CertErrors *errs = static_cast<Ssl::CertErrors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors)))
+@@ -520,65 +526,83 @@
+     unsigned long ssl_lib_error = SSL_ERROR_NONE;
+     SSL *ssl = fd_table[fd].ssl;
+     int ssl_error = SSL_get_error(ssl, ret);
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
+ 
+ #ifdef EPROTO
+     int sysErrNo = EPROTO;
+ #else
+     int sysErrNo = EACCES;
+ #endif
+ 
+     switch (ssl_error) {
+ 
+     case SSL_ERROR_WANT_READ:
+         setReadTimeout();
+         Comm::SetSelect(fd, COMM_SELECT_READ, &NegotiateSsl, this, 0);
+         return;
+ 
+     case SSL_ERROR_WANT_WRITE:
+-        if ((request->clientConnectionManager->sslBumpMode == Ssl::bumpPeek || request->clientConnectionManager->sslBumpMode == Ssl::bumpStare) && srvBio->holdWrite()) {
++        if ((srvBio->bumpMode() == Ssl::bumpPeek || srvBio->bumpMode() == Ssl::bumpStare) && srvBio->holdWrite()) {
+             debugs(81, DBG_IMPORTANT, "hold write on SSL connection on FD " << fd);
+             checkForPeekAndSplice();
+             return;
+         }
+         Comm::SetSelect(fd, COMM_SELECT_WRITE, &NegotiateSsl, this, 0);
+         return;
+ 
+     case SSL_ERROR_SSL:
+     case SSL_ERROR_SYSCALL:
+         ssl_lib_error = ERR_get_error();
+ 
++        // In Peek mode, the client Hello message sent to the server. If the
++        // server resuming a previous (spliced) SSL session with the client,
++        // then probably we are here because local SSL object does not know
++        // anything about the session being resumed.
++        // In this case, consult ssl_bump_resuming_sessions.
++        // 
++        if (srvBio->bumpMode() == Ssl::bumpPeek && (resumingSession = srvBio->resumingSession())) {
++            bool doSplice = true;
++            if (::Config.accessList.sslBumpResumingSessions) {
++                ACLFilledChecklist ch(::Config.accessList.sslBumpResumingSessions, request.getRaw(), NULL);
++                doSplice = (ch.fastCheck() == ACCESS_ALLOWED);
++            }
++            if (doSplice) {
++                checkForPeekAndSpliceDone(Ssl::bumpSplice);
++                return;
++            }
++        }
++
+         // If we are in peek-and-splice mode and still we did not write to
+         // server yet, try to see if we should splice.
+         // In this case the connection can be saved.
+         // If the checklist decision is do not splice a new error will
+         // occure in the next SSL_connect call, and we will fail again.
+         // Abort on certificate validation errors to avoid splicing and
+         // thus hiding them.
+         // Abort if no certificate found probably because of malformed or
+         // unsupported server Hello message (TODO: make configurable).
+ #if 1
+         if (!SSL_get_ex_data(ssl, ssl_ex_index_ssl_error_detail) &&
+                 SSL_get_peer_certificate(ssl) &&
+-                (request->clientConnectionManager->sslBumpMode == Ssl::bumpPeek  || request->clientConnectionManager->sslBumpMode == Ssl::bumpStare) && srvBio->holdWrite()) {
++                (srvBio->bumpMode() == Ssl::bumpPeek  || srvBio->bumpMode() == Ssl::bumpStare) && srvBio->holdWrite()) {
+             debugs(81, 3, "Error ("  << ERR_error_string(ssl_lib_error, NULL) <<  ") but, hold write on SSL connection on FD " << fd);
+             checkForPeekAndSplice();
+             return;
+         }
+ #endif
+ 
+         // store/report errno when ssl_error is SSL_ERROR_SYSCALL, ssl_lib_error is 0, and ret is -1
+         if (ssl_error == SSL_ERROR_SYSCALL && ret == -1 && ssl_lib_error == 0)
+             sysErrNo = errno;
+ 
+         debugs(83, DBG_IMPORTANT, "Error negotiating SSL on FD " << fd <<
+                ": " << ERR_error_string(ssl_lib_error, NULL) << " (" <<
+                ssl_error << "/" << ret << "/" << errno << ")");
+ 
+         break; // proceed to the general error handling code
+ 
+     default:
+         break; // no special error handling for all other errors
+     }
+ 
+
+=== modified file 'src/ssl/PeerConnector.h'
+--- src/ssl/PeerConnector.h	2015-01-13 07:25:36 +0000
++++ src/ssl/PeerConnector.h	2015-03-11 16:00:01 +0000
+@@ -156,28 +156,29 @@
+     /// Check SSL errors returned from cert validator against sslproxy_cert_error access list
+     Ssl::CertErrors *sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &, Ssl::ErrorDetail *&);
+ 
+     /// Callback function called when squid receive message from cert validator helper
+     static void sslCrtvdHandleReplyWrapper(void *data, Ssl::CertValidationResponse const &);
+ 
+     /// A wrapper function for negotiateSsl for use with Comm::SetSelect
+     static void NegotiateSsl(int fd, void *data);
+ 
+     /// A wrapper function for checkForPeekAndSpliceDone for use with acl
+     static void cbCheckForPeekAndSpliceDone(allow_t answer, void *data);
+ 
+     HttpRequestPointer request; ///< peer connection trigger or cause
+     Comm::ConnectionPointer serverConn; ///< TCP connection to the peer
+     Comm::ConnectionPointer clientConn; ///< TCP connection to the client
+     AsyncCall::Pointer callback; ///< we call this with the results
+     AsyncCall::Pointer closeHandler; ///< we call this when the connection closed
+     time_t negotiationTimeout; ///< the ssl connection timeout to use
+     time_t startTime; ///< when the peer connector negotiation started
+     bool splice; ///< Whether we are going to splice or not
++    bool resumingSession; ///< whether it is an SSL resuming session connection
+ };
+ 
+ std::ostream &operator <<(std::ostream &os, const Ssl::PeerConnectorAnswer &a);
+ 
+ } // namespace Ssl
+ 
+ #endif /* SQUID_PEER_CONNECTOR_H */
+ 
+
+=== modified file 'src/ssl/bio.cc'
+--- src/ssl/bio.cc	2015-01-16 16:18:05 +0000
++++ src/ssl/bio.cc	2015-03-16 17:58:03 +0000
+@@ -192,119 +192,107 @@
+ Ssl::ClientBio::read(char *buf, int size, BIO *table)
+ {
+     if (helloState < atHelloReceived) {
+ 
+         if (rbuf.isNull())
+             rbuf.init(1024, 16384);
+ 
+         size = rbuf.spaceSize() > size ? size : rbuf.spaceSize();
+ 
+         if (!size)
+             return 0;
+ 
+         int bytes = Ssl::Bio::read(buf, size, table);
+         if (bytes <= 0)
+             return bytes;
+         rbuf.append(buf, bytes);
+         debugs(83, 7, "rbuf size: " << rbuf.contentSize());
+     }
+ 
+     if (helloState == atHelloNone) {
+-
+-        const unsigned char *head = (const unsigned char *)rbuf.content();
+-        const char *s = objToString(head, rbuf.contentSize());
+-        debugs(83, 7, "SSL Header: " << s);
+-        if (rbuf.contentSize() < 5) {
++        helloSize = features.parseMsgHead(rbuf);
++        if (helloSize == 0) {
++            // Not enough bytes to get hello message size
+             BIO_set_retry_read(table);
+-            return 0;
+-        }
+-
+-        if (head[0] == 0x16) {
+-            debugs(83, 7, "SSL version 3 handshake message");
+-            helloSize = (head[3] << 8) + head[4];
+-            debugs(83, 7, "SSL Header Size: " << helloSize);
+-            helloSize +=5;
+-#if defined(DO_SSLV23)
+-        } else if ((head[0] & 0x80) && head[2] == 0x01 && head[3] == 0x03) {
+-            debugs(83, 7, "SSL version 2 handshake message with v3 support");
+-            helloSize = head[1];
+-            helloSize +=5;
+-#endif
+-        } else {
+-            debugs(83, 7, "Not an SSL acceptable handshake message (SSLv2 message?)");
++            return -1;
++        } else if (helloSize < 0) {
+             wrongProtocol = true;
+             return -1;
+         }
+ 
+         helloState = atHelloStarted; //Next state
+     }
+ 
+     if (helloState == atHelloStarted) {
+         const unsigned char *head = (const unsigned char *)rbuf.content();
+         const char *s = objToString(head, rbuf.contentSize());
+         debugs(83, 7, "SSL Header: " << s);
+ 
+         if (helloSize > rbuf.contentSize()) {
+             BIO_set_retry_read(table);
+             return -1;
+         }
+-        features.get((const unsigned char *)rbuf.content());
++        features.get(rbuf);
+         helloState = atHelloReceived;
+     }
+ 
+     if (holdRead_) {
+         debugs(83, 7, "Hold flag is set, retry latter. (Hold " << size << "bytes)");
+         BIO_set_retry_read(table);
+         return -1;
+     }
+ 
+     if (helloState == atHelloReceived) {
+         if (rbuf.hasContent()) {
+             int bytes = (size <= rbuf.contentSize() ? size : rbuf.contentSize());
+             memcpy(buf, rbuf.content(), bytes);
+             rbuf.consume(bytes);
+             return bytes;
+         } else
+             return Ssl::Bio::read(buf, size, table);
+     }
+ 
+     return -1;
+ }
+ 
+ void
+ Ssl::ServerBio::stateChanged(const SSL *ssl, int where, int ret)
+ {
+     Ssl::Bio::stateChanged(ssl, where, ret);
+ }
+ 
+ void
+ Ssl::ServerBio::setClientFeatures(const Ssl::Bio::sslFeatures &features)
+ {
+     clientFeatures.sslVersion = features.sslVersion;
+     clientFeatures.compressMethod = features.compressMethod;
++    clientFeatures.helloMsgSize = features.helloMsgSize;
+     clientFeatures.serverName = features.serverName;
+     clientFeatures.clientRequestedCiphers = features.clientRequestedCiphers;
+     clientFeatures.unknownCiphers = features.unknownCiphers;
+     memcpy(clientFeatures.client_random, features.client_random, SSL3_RANDOM_SIZE);
+     clientFeatures.helloMessage.clear();
+     clientFeatures.helloMessage.append(features.helloMessage.rawContent(), features.helloMessage.length());
++    clientFeatures.sessionId.assign(features.sessionId);
+     clientFeatures.doHeartBeats = features.doHeartBeats;
++    clientFeatures.tlsTicketsExtension = features.tlsTicketsExtension;
++    clientFeatures.hasTlsTicket = features.hasTlsTicket;
+     clientFeatures.extensions = features.extensions;
+     featuresSet = true;
+ };
+ 
+ int
+ Ssl::ServerBio::read(char *buf, int size, BIO *table)
+ {
+     int bytes = Ssl::Bio::read(buf, size, table);
+ 
+     if (bytes > 0 && record_) {
+         if (rbuf.isNull())
+             rbuf.init(1024, 16384);
+         rbuf.append(buf, bytes);
+         debugs(83, 5, "Record is enabled store " << bytes << " bytes");
+     }
+     debugs(83, 5, "Read " << bytes << " from " << size << " bytes");
+     return bytes;
+ }
+ 
+ // This function makes the required checks to examine if the client hello
+@@ -498,40 +486,61 @@
+         }
+ 
+         // Sending hello message complete. Do not send more data for now...
+         holdWrite_ = true;
+ 
+         // spoof openSSL that we write what it ask us to write
+         return size;
+     } else
+         return Ssl::Bio::write(buf, size, table);
+ }
+ 
+ void
+ Ssl::ServerBio::flush(BIO *table)
+ {
+     if (!helloMsg.isEmpty()) {
+         int ret = Ssl::Bio::write(helloMsg.rawContent(), helloMsg.length(), table);
+         helloMsg.consume(ret);
+     }
+ }
+ 
++bool
++Ssl::ServerBio::resumingSession()
++{
++
++    if (!serverFeaturesSet) {
++        serverFeatures.get(rbuf, false);
++        serverFeaturesSet = true;
++    }
++
++    if (!clientFeatures.sessionId.isEmpty() && !serverFeatures.sessionId.isEmpty())
++        return clientFeatures.sessionId == serverFeatures.sessionId;
++
++    // is this a session resuming attempt using TLS tickets?
++    if (clientFeatures.hasTlsTicket &&
++        serverFeatures.tlsTicketsExtension &&
++        serverFeatures.hasCcsOrNst)
++        return true;
++
++    return false;
++}
++
+ /// initializes BIO table after allocation
+ static int
+ squid_bio_create(BIO *bi)
+ {
+     bi->init = 0; // set when we store Bio object and socket fd (BIO_C_SET_FD)
+     bi->num = 0;
+     bi->ptr = NULL;
+     bi->flags = 0;
+     return 1;
+ }
+ 
+ /// cleans BIO table before deallocation
+ static int
+ squid_bio_destroy(BIO *table)
+ {
+     delete static_cast<Ssl::Bio*>(table->ptr);
+     table->ptr = NULL;
+     return 1;
+ }
+ 
+@@ -617,41 +626,41 @@
+         case BIO_CTRL_WPENDING:
+     */
+     default:
+         return 0;
+ 
+     }
+ 
+     return 0; /* NOTREACHED */
+ }
+ 
+ /// wrapper for Bio::stateChanged()
+ static void
+ squid_ssl_info(const SSL *ssl, int where, int ret)
+ {
+     if (BIO *table = SSL_get_rbio(ssl)) {
+         if (Ssl::Bio *bio = static_cast<Ssl::Bio*>(table->ptr))
+             bio->stateChanged(ssl, where, ret);
+     }
+ }
+ 
+-Ssl::Bio::sslFeatures::sslFeatures(): sslVersion(-1), compressMethod(-1), unknownCiphers(false), doHeartBeats(true)
++Ssl::Bio::sslFeatures::sslFeatures(): sslVersion(-1), compressMethod(-1), helloMsgSize(0), unknownCiphers(false), doHeartBeats(true), tlsTicketsExtension(false), hasTlsTicket(false)
+ {
+     memset(client_random, 0, SSL3_RANDOM_SIZE);
+ }
+ 
+ int Ssl::Bio::sslFeatures::toSquidSSLVersion() const
+ {
+     if (sslVersion == SSL2_VERSION)
+         return 2;
+     else if (sslVersion == SSL3_VERSION)
+         return 3;
+     else if (sslVersion == TLS1_VERSION)
+         return 4;
+ #if OPENSSL_VERSION_NUMBER >= 0x10001000L
+     else if (sslVersion == TLS1_1_VERSION)
+         return 5;
+     else if (sslVersion == TLS1_2_VERSION)
+         return 6;
+ #endif
+     else
+         return 1;
+@@ -727,158 +736,325 @@
+     }
+     // TLSEXT_TYPE_opaque_prf_input
+     p = NULL;
+     if (ssl->server) {
+         if (ssl->s3 &&  ssl->s3->client_opaque_prf_input) {
+             p = (unsigned char *)ssl->s3->client_opaque_prf_input;
+             len = ssl->s3->client_opaque_prf_input_len;
+         }
+     } else {
+         p = (unsigned char *)ssl->tlsext_opaque_prf_input;
+         len = ssl->tlsext_opaque_prf_input_len;
+     }
+     if (p) {
+         debugs(83, 7, "tlsExtension client-opaque-prf-input of length " << len);
+         opaquePrf = objToString(p, len);
+     }
+ #endif
+     return true;
+ }
+ 
++int
++Ssl::Bio::sslFeatures::parseMsgHead(const MemBuf &buf)
++{
++    const unsigned char *head = (const unsigned char *)buf.content();
++    const char *s = objToString(head, buf.contentSize());
++    debugs(83, 7, "SSL Header: " << s);
++    if (buf.contentSize() < 5)
++        return 0;
++
++    if (helloMsgSize > 0)
++        return helloMsgSize;
++
++    if (head[0] == 0x16) {
++        debugs(83, 7, "SSL version 3 handshake message");
++        // The SSL version exist in the 2nd and 3rd bytes
++        sslVersion = (head[1] << 8) | head[2];
++        debugs(83, 7, "SSL Version :" << std::hex << std::setw(8) << std::setfill('0')<< sslVersion);
++        // The hello message size exist in 4th and 5th bytes
++        helloMsgSize = (head[3] << 8) + head[4];
++        debugs(83, 7, "SSL Header Size: " << helloMsgSize);
++        helloMsgSize +=5;
++#if defined(DO_SSLV23)
++    } else if ((head[0] & 0x80) && head[2] == 0x01 && head[3] == 0x03) {
++        debugs(83, 7, "SSL version 2 handshake message with v3 support");
++        sslVersion = (hello[3] << 8) | hello[4];
++        debugs(83, 7, "SSL Version :" << std::hex << std::setw(8) << std::setfill('0')<< sslVersion);
++        // The hello message size exist in 2nd byte
++        helloMsgSize = head[1];
++        helloMsgSize +=2;
++#endif
++    } else {
++        debugs(83, 7, "Not an SSL acceptable handshake message (SSLv2 message?)");
++        return (helloMsgSize = -1);
++    }
++    return helloMsgSize;
++}
++
+ bool
+-Ssl::Bio::sslFeatures::get(const unsigned char *hello)
++Ssl::Bio::sslFeatures::checkForCcsOrNst(const unsigned char *msg, size_t size)
+ {
+-    // The SSL handshake message should starts with a 0x16 byte
+-    if (hello[0] == 0x16) {
+-        return parseV3Hello(hello);
++    while (size > 5) {
++        int msgType = msg[0];
++        int msgSslVersion = (msg[1] << 8) | msg[2];
++        debugs(83, 7, "SSL Message Version :" << std::hex << std::setw(8) << std::setfill('0')<< msgSslVersion);
++        if (msgType == 0x14) {// Change Cipher Spec message found
++            debugs(83, 7, "SSL  Change Cipher Spec message found");
++            return true;
++        }
++        if (msgType == 0x04) {// Change Cipher Spec message found
++            debugs(83, 7, "SSL  New Session Ticket message found");
++            return true;
++        }
++        // The hello message size exist in 4th and 5th bytes
++        size_t msgLength = (msg[3] << 8) + msg[4];
++        debugs(83, 7, "SSL Message Size: " << msgLength);
++        msgLength += 5;
++
++        if (msgLength <= size) {
++            msg += msgLength;
++            size -= msgLength;
++        } else
++            size = 0;
++    }
++    return false;
++}
++
++bool
++Ssl::Bio::sslFeatures::get(const MemBuf &buf, bool record)
++{
++    int msgSize;
++    if ((msgSize = parseMsgHead(buf)) <= 0) {
++        debugs(83, 7, "Not a known SSL handshake message");
++        return false;
++    }
++
++    if (msgSize > buf.contentSize()) {
++        debugs(83, 2, "Partial SSL handshake message, can not parse!");
++        return false;
++    }
++
++    if (record) {
++        helloMessage.clear();
++        helloMessage.append(buf.content(), buf.contentSize());
++    }
++
++
++    const unsigned char *msg = (const unsigned char *)buf.content();
+ #if defined(DO_SSLV23)
+-    } else if ((hello[0] & 0x80) && hello[2] == 0x01 && hello[3] == 0x03) {
+-        return parseV23Hello(hello);
++    if (msg[0] & 0x80)
++        return parseV23Hello(msg, (size_t)msgSize);
++    else
+ #endif
++    {
++        if (msg[5] == 0x2) { // Server Hello message
++            if (parseV3ServerHello(msg, (size_t)msgSize)) {
++                hasCcsOrNst = checkForCcsOrNst(msg + msgSize,  buf.contentSize() - msgSize);
++                return true;
++            }
++        } else if (msg[5] == 0x1) // Client Hello message
++            return parseV3Hello(msg, (size_t)msgSize);
+     }
+ 
+-    debugs(83, 7, "Not a known SSL handshake message");
+     return false;
+ }
+ 
+ bool
+-Ssl::Bio::sslFeatures::parseV3Hello(const unsigned char *hello)
++Ssl::Bio::sslFeatures::parseV3ServerHello(const unsigned char *hello, size_t size)
++{
++    size_t helloSize = (hello[6] << 16) | (hello[7] << 8) | hello[8];
++    debugs(83, 7, "Server Hello size: " << helloSize);
++    // helloSize should be msgSize + hello Header (4 bytes)
++    if (helloSize + 4 > size) {
++        debugs(83, 2, "Server hello parse error");
++        return false;
++    }
++
++    // helloSize should be at least 38 bytes long:
++    // (SSL Version + Random + SessionId Length + Cipher Suite + Compression Method)
++    if (helloSize < 38) {
++        debugs(83, 2, "Too short server hello message");
++        return false;
++    }
++
++    debugs(83, 7, "Get fake features from v3 server hello message.");
++    // Get the correct version of the sub-hello message
++    sslVersion = (hello[9] << 8) | hello[10];
++    // At the position 43 (MsgHeader(5 bytes) + HelloHeader (6bytes) + SSL3_RANDOM_SIZE (32bytes))
++    size_t sessIdLen = (size_t)hello[43];
++    debugs(83, 7, "Session ID Length: " <<  sessIdLen);
++
++    // The size should be enough to hold at least the following 
++    // 5 MsgHelloHeader + 4 (hello header) 
++    // + 2 (SSL Version) + 32 (random) + 1 (sessionId length) 
++    // + sessIdLength + 2 (cipher suite) + 1 (compression method)
++    // = 47 + sessIdLength
++    if (47 + sessIdLen > size )
++        return false;
++
++    // The sessionID stored art 44 position, after sessionID length field
++    sessionId.assign((const char *)(hello + 44), sessIdLen);
++
++    // Check if there are extensions in hello message
++    if (size > 47 + sessIdLen + 2) {
++        // 47 + sessIdLen 
++        const unsigned char *pToExtensions = hello + 47 + sessIdLen;
++        size_t extensionsLen = (pToExtensions[0] << 8) | pToExtensions[1];
++        // Check if the hello size can hold extensions
++        if (47 + 2 + sessIdLen + extensionsLen > size )
++            return false;
++
++        const unsigned char *ext = pToExtensions + 2;
++        while (ext < pToExtensions + extensionsLen) {
++            short extType = (ext[0] << 8) | ext[1];
++            ext += 2;
++            short extLen = (ext[0] << 8) | ext[1];
++            ext += 2;
++            debugs(83, 7, "SSL Exntension: " << std::hex << extType << " of size:" << extLen);
++            if (extType == 0x23) {
++                tlsTicketsExtension = true;
++            }
++            ext += extLen;
++        }
++    }
++    return true;
++}
++
++bool
++Ssl::Bio::sslFeatures::parseV3Hello(const unsigned char *hello, size_t size)
+ {
+     debugs(83, 7, "Get fake features from v3 hello message.");
+-    // The SSL version exist in the 2nd and 3rd bytes
+-    sslVersion = (hello[1] << 8) | hello[2];
+-    debugs(83, 7, "Get fake features. Version :" << std::hex << std::setw(8) << std::setfill('0')<< sslVersion);
+-
+-    // The following hello message size exist in 4th and 5th bytes
+-    int helloSize = (hello[3] << 8) | hello[4];
+-    helloSize += 5; //Include the 5 header bytes.
+-    helloMessage.clear();
+-    helloMessage.append((const char *)hello, helloSize);
++    size_t helloSize = (hello[6] << 16) | (hello[7] << 8) | hello[8];
++    debugs(83, 7, "Client Hello message size: " << helloSize);
++    // helloSize should be size + hello Header (4 bytes)
++    if (helloSize + 4 > size) {
++        debugs(83, 2, "Client hello parse error");
++        return false;
++    }
++
++    // helloSize should be at least 38 bytes long:
++    // (SSL Version(2) + Random(32) + SessionId Length(1) + Cipher Suite Length(2) + Compression Method Length(1))
++    if (helloSize < 38) {
++        debugs(83, 2, "Too short client hello message");
++        return false;
++    }
+ 
+     //For SSLv3 or TLSv1.* protocols we can get some more informations
+     if (hello[1] == 0x3 && hello[5] == 0x1 /*HELLO A message*/) {
+         // Get the correct version of the sub-hello message
+         sslVersion = (hello[9] << 8) | hello[10];
+         //Get Client Random number. It starts on the position 11 of hello message
+         memcpy(client_random, hello + 11, SSL3_RANDOM_SIZE);
+         debugs(83, 7, "Client random: " <<  objToString(client_random, SSL3_RANDOM_SIZE));
+ 
+         // At the position 43 (11+SSL3_RANDOM_SIZE)
+-        int sessIDLen = (int)hello[43];
++        size_t sessIDLen = (size_t)hello[43];
+         debugs(83, 7, "Session ID Length: " <<  sessIDLen);
+ 
++        // The size should be enough to hold at least the following 
++        // 5 MsgHelloHeader + 4 (hello header) 
++        // + 2 (SSL Version) + 32 (random) + 1 (sessionId length) 
++        // + sessIdLength + 2 (cipher suite length) + 1 (compression method length)
++        // = 47 + sessIdLength
++        if (47 + sessIDLen > size )
++            return false;
++
++        // The sessionID stored art 44 position, after sessionID length field
++        sessionId.assign((const char *)(hello + 44), sessIDLen);
++
+         //Ciphers list. It is stored after the Session ID.
+         const unsigned char *ciphers = hello + 44 + sessIDLen;
+-        int ciphersLen = (ciphers[0] << 8) | ciphers[1];
++        size_t ciphersLen = (ciphers[0] << 8) | ciphers[1];
++        if (47 + sessIDLen + ciphersLen > size )
++            return false;
++
+         ciphers += 2;
+         if (ciphersLen) {
+             const SSL_METHOD *method = SSLv3_method();
+             int cs = method->put_cipher_by_char(NULL, NULL);
+             assert(cs > 0);
+-            for (int i = 0; i < ciphersLen; i += cs) {
++            for (size_t i = 0; i < ciphersLen; i += cs) {
+                 const SSL_CIPHER *c = method->get_cipher_by_char((ciphers + i));
+                 if (c != NULL) {
+                     if (!clientRequestedCiphers.empty())
+                         clientRequestedCiphers.append(":");
+                     clientRequestedCiphers.append(c->name);
+                 } else
+                     unknownCiphers = true;
+             }
+         }
+         debugs(83, 7, "Ciphers requested by client: " << clientRequestedCiphers);
+ 
+         // Compression field: 1 bytes the number of compression methods and
+         // 1 byte for each compression method
+         const unsigned char *compression = ciphers + ciphersLen;
+         if (compression[0] > 1)
+             compressMethod = 1;
+         else
+             compressMethod = 0;
+         debugs(83, 7, "SSL compression methods number: " << (int)compression[0]);
+ 
+         const unsigned char *pToExtensions = compression + 1 + (int)compression[0];
+-        if (pToExtensions <  hello + helloSize) {
+-            int extensionsLen = (pToExtensions[0] << 8) | pToExtensions[1];
++        if ((size_t)((pToExtensions - hello) + 2) <  size) {
++            size_t extensionsLen = (pToExtensions[0] << 8) | pToExtensions[1];
++            if ((pToExtensions - hello) + 2 + extensionsLen > size)
++                return false;
++
+             const unsigned char *ext = pToExtensions + 2;
+-            while (ext < pToExtensions + extensionsLen) {
++            while (ext <= pToExtensions + extensionsLen) {
+                 short extType = (ext[0] << 8) | ext[1];
+                 ext += 2;
+                 short extLen = (ext[0] << 8) | ext[1];
+                 ext += 2;
+                 debugs(83, 7, "SSL Exntension: " << std::hex << extType << " of size:" << extLen);
+                 //The SNI extension has the type 0 (extType == 0)
+                 // The two first bytes indicates the length of the SNI data (should be extLen-2)
+                 // The next byte is the hostname type, it should be '0' for normal hostname (ext[2] == 0)
+                 // The 3rd and 4th bytes are the length of the hostname
+                 if (extType == 0 && ext[2] == 0) {
+                     int hostLen = (ext[3] << 8) | ext[4];
+                     serverName.assign((const char *)(ext+5), hostLen);
+                     debugs(83, 7, "Found server name: " << serverName);
+                 } else if (extType == 15 && ext[0] != 0) {
+                     // The heartBeats are the type 15
+                     doHeartBeats = true;
++                } else if (extType == 0x23) {
++                    tlsTicketsExtension = true;
++                    if (extLen != 0)
++                        hasTlsTicket = true;
+                 } else
+                     extensions.push_back(extType);
+ 
+                 ext += extLen;
+             }
+         }
+     }
+     return true;
+ }
+ 
+ bool
+-Ssl::Bio::sslFeatures::parseV23Hello(const unsigned char *hello)
++Ssl::Bio::sslFeatures::parseV23Hello(const unsigned char *hello, size_t size)
+ {
+ #if defined(DO_SSLV23)
+     debugs(83, 7, "Get fake features from v23 hello message.");
+-    sslVersion = (hello[3] << 8) | hello[4];
+-    debugs(83, 7, "Get fake features. Version :" << std::hex << std::setw(8) << std::setfill('0')<< sslVersion);
+-
+-    // The following hello message size exist in 2nd byte
+-    int helloSize = hello[1];
+-    helloSize += 2; //Include the 2 header bytes.
+-    helloMessage.clear();
+-    helloMessage.append((char *)hello, helloSize);
+ 
+     //Ciphers list. It is stored after the Session ID.
+-
+     int ciphersLen = (hello[5] << 8) | hello[6];
+     const unsigned char *ciphers = hello + 11;
+     if (ciphersLen) {
+         const SSL_METHOD *method = SSLv23_method();
+         int cs = method->put_cipher_by_char(NULL, NULL);
+         assert(cs > 0);
+         for (int i = 0; i < ciphersLen; i += cs) {
+             // The v2 hello messages cipher has 3 bytes.
+             // The v2 cipher has the first byte not null
+             // Because we are going to sent only v3 message we
+             // are ignoring these ciphers
+             if (ciphers[i] != 0)
+                 continue;
+             const SSL_CIPHER *c = method->get_cipher_by_char((ciphers + i + 1));
+             if (c != NULL) {
+                 if (!clientRequestedCiphers.empty())
+                     clientRequestedCiphers.append(":");
+                 clientRequestedCiphers.append(c->name);
+             }
+         }
+
+=== modified file 'src/ssl/bio.h'
+--- src/ssl/bio.h	2015-01-16 16:18:05 +0000
++++ src/ssl/bio.h	2015-03-11 17:46:54 +0000
+@@ -20,61 +20,80 @@
+ #include <string>
+ 
+ namespace Ssl
+ {
+ 
+ /// BIO source and sink node, handling socket I/O and monitoring SSL state
+ class Bio
+ {
+ public:
+     enum Type {
+         BIO_TO_CLIENT = 6000,
+         BIO_TO_SERVER
+     };
+ 
+     /// Class to store SSL connection features
+     class sslFeatures
+     {
+     public:
+         sslFeatures();
+         bool get(const SSL *ssl); ///< Retrieves the features from SSL object
+-        bool get(const unsigned char *hello); ///< Retrieves the features from raw SSL hello message
+-        bool parseV3Hello(const unsigned char *hello);
+-        bool parseV23Hello(const unsigned char *hello);
++        /// Retrieves features from raw SSL Hello message.
++        /// \param record  whether to store Message to the helloMessage member
++        bool get(const MemBuf &, bool record = true);
++        bool parseV3Hello(const unsigned char *hello, size_t helloSize);
++        bool parseV23Hello(const unsigned char *hello, size_t helloSize);
++        /// Parses a v3 server Hello A message.
++        bool parseV3ServerHello(const unsigned char *hello, size_t helloSize);
+         /// Prints to os stream a human readable form of sslFeatures object
+         std::ostream & print(std::ostream &os) const;
+         /// Converts to the internal squid SSL version form the sslVersion
+         int toSquidSSLVersion() const;
+         /// Configure the SSL object with the SSL features of the sslFeatures object
+         void applyToSSL(SSL *ssl) const;
++        /// Parses an SSL Message header. It returns the ssl Message size.
++        /// \retval >0 if the hello size is retrieved
++        /// \retval 0 if the contents of the buffer are not enough
++        /// \retval <0 if the contents of buf are not SSL hello message
++        int parseMsgHead(const MemBuf &);
++        /// Parses msg buffer and return true if one of the Change Cipher Spec
++        /// or New Session Ticket messages found
++        bool checkForCcsOrNst(const unsigned char *msg, size_t size);
+     public:
+         int sslVersion; ///< The requested/used SSL version
+         int compressMethod; ///< The requested/used compressed  method
++        int helloMsgSize; ///< the hello message size
+         mutable SBuf serverName; ///< The SNI hostname, if any
+         std::string clientRequestedCiphers; ///< The client requested ciphers
+         bool unknownCiphers; ///< True if one or more ciphers are unknown
+         std::string ecPointFormatList;///< tlsExtension ecPointFormatList
+         std::string ellipticCurves; ///< tlsExtension ellipticCurveList
+         std::string opaquePrf; ///< tlsExtension opaquePrf
+         bool doHeartBeats;
++        bool tlsTicketsExtension; ///< whether TLS tickets extension is enabled
++        bool hasTlsTicket; ///< whether a TLS ticket is included
++        /// whether Change Cipher Spec message included in server Hello 
++        /// handshake message
++        bool hasCcsOrNst;
+         /// The client random number
+         unsigned char client_random[SSL3_RANDOM_SIZE];
++        SBuf sessionId;
+         std::list<int> extensions;
+         SBuf helloMessage;
+     };
+     explicit Bio(const int anFd);
+     virtual ~Bio();
+ 
+     /// Writes the given data to socket
+     virtual int write(const char *buf, int size, BIO *table);
+ 
+     /// Reads data from socket
+     virtual int read(char *buf, int size, BIO *table);
+ 
+     /// Flushes any buffered data to socket.
+     /// The Ssl::Bio does not buffer any data, so this method has nothing to do
+     virtual void flush(BIO *table) {}
+ 
+     int fd() const { return fd_; } ///< The SSL socket descriptor
+ 
+     /// Called by linked SSL connection whenever state changes, an alert
+     /// appears, or an error occurs. See SSL_set_info_callback().
+@@ -96,110 +115,113 @@
+ /// If bumping is enabled  this Bio detects and analyses client hello message
+ /// to retrieve the SSL features supported by the client
+ class ClientBio: public Bio
+ {
+ public:
+     /// The ssl hello message read states
+     typedef enum {atHelloNone = 0, atHelloStarted, atHelloReceived} HelloReadState;
+     explicit ClientBio(const int anFd): Bio(anFd), holdRead_(false), holdWrite_(false), helloState(atHelloNone), helloSize(0), wrongProtocol(false) {}
+ 
+     /// The ClientBio version of the Ssl::Bio::stateChanged method
+     /// When the client hello message retrieved, fill the
+     /// "features" member with the client provided informations.
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+     /// The ClientBio version of the Ssl::Bio::write method
+     virtual int write(const char *buf, int size, BIO *table);
+     /// The ClientBio version of the Ssl::Bio::read method
+     /// If the holdRead flag is true then it does not write any data
+     /// to socket and sets the "read retry" flag of the BIO to true
+     virtual int read(char *buf, int size, BIO *table);
+     /// Return true if the client hello message received and analized
+-    bool gotHello() {return features.sslVersion != -1;}
++    bool gotHello() { return (helloState == atHelloReceived); }
+     /// Return the SSL features requested by SSL client
+     const Bio::sslFeatures &getFeatures() const {return features;}
+     /// Prevents or allow writting on socket.
+     void hold(bool h) {holdRead_ = holdWrite_ = h;}
+     /// True if client does not looks like an SSL client
+     bool noSslClient() {return wrongProtocol;}
+ private:
+     /// True if the SSL state corresponds to a hello message
+     bool isClientHello(int state);
+     /// The futures retrieved from client SSL hello message
+     Bio::sslFeatures features;
+     bool holdRead_; ///< The read hold state of the bio.
+     bool holdWrite_;  ///< The write hold state of the bio.
+     HelloReadState helloState; ///< The SSL hello read state
+     int helloSize; ///< The SSL hello message sent by client size
+     bool wrongProtocol; ///< true if client SSL hello parsing failed
+ };
+ 
+ /// BIO node to handle socket IO for squid server side
+ /// If bumping is enabled, analyses the SSL hello message sent by squid OpenSSL
+ /// subsystem (step3 bumping step) against bumping mode:
+ ///   * Peek mode:  Send client hello message instead of the openSSL generated
+ ///                 hello message and normaly denies bumping and allow only
+ ///                 splice or terminate the SSL connection
+ ///   * Stare mode: Sends the openSSL generated hello message and normaly
+ ///                 denies splicing and allow bump or terminate the SSL
+ ///                 connection
+ ///  If SQUID_USE_OPENSSL_HELLO_OVERWRITE_HACK is enabled also checks if the
+ ///  openSSL library features are compatible with the features reported in
+ ///  web client SSL hello message and if it is, overwrites the openSSL SSL
+ ///  object members to replace hello message with web client hello message.
+ ///  This is may allow bumping in peek mode and splicing in stare mode after
+ ///  the server hello message received.
+ class ServerBio: public Bio
+ {
+ public:
+-    explicit ServerBio(const int anFd): Bio(anFd), featuresSet(false), helloMsgSize(0), helloBuild(false), allowSplice(false), allowBump(false), holdWrite_(false), record_(false), bumpMode_(bumpNone) {}
++    explicit ServerBio(const int anFd): Bio(anFd), featuresSet(false), serverFeaturesSet(false), helloMsgSize(0), helloBuild(false), allowSplice(false), allowBump(false), holdWrite_(false), record_(false), bumpMode_(bumpNone) {}
+     /// The ServerBio version of the Ssl::Bio::stateChanged method
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+     /// The ServerBio version of the Ssl::Bio::write method
+     /// If a clientRandom number is set then rewrites the raw hello message
+     /// "client random" field with the provided random number.
+     /// It may buffer the output packets.
+     virtual int write(const char *buf, int size, BIO *table);
+     /// The ServerBio version of the Ssl::Bio::read method
+     /// If the record flag is set then append the data to the rbuf member
+     virtual int read(char *buf, int size, BIO *table);
+     /// The ServerBio version of the Ssl::Bio::flush method.
+     /// Flushes any buffered data
+     virtual void flush(BIO *table);
+     /// Sets the random number to use in client SSL HELLO message
+     void setClientFeatures(const sslFeatures &features);
+ 
++    bool resumingSession();
+     /// The write hold state
+     bool holdWrite() const {return holdWrite_;}
+     /// Enables or disables the write hold state
+     void holdWrite(bool h) {holdWrite_ = h;}
+     /// Enables or disables the input data recording, for internal analysis.
+     void recordInput(bool r) {record_ = r;}
+     /// Whether we can splice or not the SSL stream
+     bool canSplice() {return allowSplice;}
+     /// Whether we can bump or not the SSL stream
+     bool canBump() {return allowBump;}
+     /// The bumping mode
+     void mode(Ssl::BumpMode m) {bumpMode_ = m;}
++    Ssl::BumpMode bumpMode() {return bumpMode_;} ///< return the bumping mode
+ private:
+-    /// A random number to use as "client random" in client hello message
+-    sslFeatures clientFeatures;
++    sslFeatures clientFeatures; ///< SSL client features extracted from hello message or SSL object
+     bool featuresSet; ///< True if the clientFeatures member is set and can be used
++    sslFeatures serverFeatures; ///< SSL server features extracted from Hello message
++    bool serverFeaturesSet;  ///< whether the serverFeatures member is set and usable
+     SBuf helloMsg; ///< Used to buffer output data.
+     mb_size_t  helloMsgSize;
+     bool helloBuild; ///< True if the client hello message sent to the server
+     bool allowSplice; ///< True if the SSL stream can be spliced
+     bool allowBump;  ///< True if the SSL stream can be bumped
+     bool holdWrite_;  ///< The write hold state of the bio.
+     bool record_; ///< If true the input data recorded to rbuf for internal use
+     Ssl::BumpMode bumpMode_;
+ };
+ 
+ inline
+ std::ostream &operator <<(std::ostream &os, Ssl::Bio::sslFeatures const &f)
+ {
+     return f.print(os);
+ }
+ 
+ } // namespace Ssl
+ 
+ #endif /* SQUID_SSL_BIO_H */
+ 
+

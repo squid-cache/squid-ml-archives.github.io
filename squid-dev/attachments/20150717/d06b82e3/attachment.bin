@@ -1,0 +1,1316 @@
+Add received_encrypted ACL
+
+The new received_encrypted ACL matches transactions where all HTTP
+messages were received over TLS or SSL transport connections, including
+messages received from ICAP servers.
+
+Some eCAP services receive data from unencrypted sources. Some eCAP
+services are "secure", but we assume that all are not "secure" until we
+add a configuration option to mark secure eCAP services.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/AclRegs.cc'
+--- src/AclRegs.cc	2015-04-10 08:54:13 +0000
++++ src/AclRegs.cc	2015-06-15 15:45:43 +0000
+@@ -43,40 +43,41 @@
+ #include "acl/HierCode.h"
+ #include "acl/HierCodeData.h"
+ #include "acl/HttpHeaderData.h"
+ #include "acl/HttpRepHeader.h"
+ #include "acl/HttpReqHeader.h"
+ #include "acl/HttpStatus.h"
+ #include "acl/IntRange.h"
+ #include "acl/Ip.h"
+ #include "acl/LocalIp.h"
+ #include "acl/LocalPort.h"
+ #include "acl/MaxConnection.h"
+ #include "acl/Method.h"
+ #include "acl/MethodData.h"
+ #include "acl/MyPortName.h"
+ #include "acl/Note.h"
+ #include "acl/NoteData.h"
+ #include "acl/PeerName.h"
+ #include "acl/Protocol.h"
+ #include "acl/ProtocolData.h"
+ #include "acl/Random.h"
++#include "acl/ReceivedEncrypted.h"
+ #include "acl/Referer.h"
+ #include "acl/RegexData.h"
+ #include "acl/ReplyHeaderStrategy.h"
+ #include "acl/ReplyMimeType.h"
+ #include "acl/RequestHeaderStrategy.h"
+ #include "acl/RequestMimeType.h"
+ #include "acl/SourceAsn.h"
+ #include "acl/SourceDomain.h"
+ #include "acl/SourceIp.h"
+ #include "acl/SquidError.h"
+ #include "acl/SquidErrorData.h"
+ #if USE_OPENSSL
+ #include "acl/Certificate.h"
+ #include "acl/CertificateData.h"
+ #include "acl/ServerName.h"
+ #include "acl/SslError.h"
+ #include "acl/SslErrorData.h"
+ #endif
+ #include "acl/Strategised.h"
+ #include "acl/Strategy.h"
+@@ -213,20 +214,22 @@
+ ACL::Prototype ACLTag::RegistryProtoype(&ACLTag::RegistryEntry_, "tag");
+ ACLStrategised<const char *> ACLTag::RegistryEntry_(new ACLStringData, ACLTagStrategy::Instance(), "tag");
+ 
+ ACL::Prototype Acl::AnyOf::RegistryProtoype(&Acl::AnyOf::RegistryEntry_, "any-of");
+ Acl::AnyOf Acl::AnyOf::RegistryEntry_;
+ 
+ ACL::Prototype Acl::AllOf::RegistryProtoype(&Acl::AllOf::RegistryEntry_, "all-of");
+ Acl::AllOf Acl::AllOf::RegistryEntry_;
+ 
+ ACL::Prototype ACLNote::RegistryProtoype(&ACLNote::RegistryEntry_, "note");
+ ACLStrategised<HttpRequest *> ACLNote::RegistryEntry_(new ACLNoteData, ACLNoteStrategy::Instance(), "note");
+ 
+ #if USE_ADAPTATION
+ ACL::Prototype ACLAdaptationService::RegistryProtoype(&ACLAdaptationService::RegistryEntry_, "adaptation_service");
+ ACLStrategised<const char *> ACLAdaptationService::RegistryEntry_(new ACLAdaptationServiceData, ACLAdaptationServiceStrategy::Instance(), "adaptation_service");
+ #endif
+ 
+ ACL::Prototype ACLSquidError::RegistryProtoype(&ACLSquidError::RegistryEntry_, "squid_error");
+ ACLStrategised<err_type> ACLSquidError::RegistryEntry_(new ACLSquidErrorData, ACLSquidErrorStrategy::Instance(), "squid_error");
+ 
++ACL::Prototype ACLReceivedEncrypted::RegistryProtoype(&ACLReceivedEncrypted::RegistryEntry_, "received_encrypted");
++ACLReceivedEncrypted ACLReceivedEncrypted::RegistryEntry_("received_encrypted");
+
+=== modified file 'src/HttpMsg.cc'
+--- src/HttpMsg.cc	2015-04-27 05:31:56 +0000
++++ src/HttpMsg.cc	2015-06-26 15:49:21 +0000
+@@ -6,41 +6,42 @@
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 74    HTTP Message */
+ 
+ #include "squid.h"
+ #include "Debug.h"
+ #include "HttpHeaderTools.h"
+ #include "HttpMsg.h"
+ #include "MemBuf.h"
+ #include "mime_header.h"
+ #include "profiler/Profiler.h"
+ #include "SquidConfig.h"
+ 
+ HttpMsg::HttpMsg(http_hdr_owner_type owner):
+     http_ver(Http::ProtocolVersion()),
+     header(owner),
+     cache_control(NULL),
+     hdr_sz(0),
+     content_length(0),
+-    pstate(psReadyToParseStartLine)
++    pstate(psReadyToParseStartLine),
++    sources(0)
+ {}
+ 
+ HttpMsg::~HttpMsg()
+ {
+     assert(!body_pipe);
+ }
+ 
+ HttpMsgParseState &operator++ (HttpMsgParseState &aState)
+ {
+     int tmp = (int)aState;
+     aState = (HttpMsgParseState)(++tmp);
+     return aState;
+ }
+ 
+ /* find end of headers */
+ static int
+ httpMsgIsolateHeaders(const char **parse_start, int l, const char **blk_start, const char **blk_end)
+ {
+     /*
+      * parse_start points to the first line of HTTP message *headers*,
+
+=== modified file 'src/HttpMsg.h'
+--- src/HttpMsg.h	2015-04-26 16:41:06 +0000
++++ src/HttpMsg.h	2015-07-09 14:23:57 +0000
+@@ -5,40 +5,60 @@
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_HTTPMSG_H
+ #define SQUID_HTTPMSG_H
+ 
+ #include "base/Lock.h"
+ #include "BodyPipe.h"
+ #include "http/forward.h"
+ #include "http/ProtocolVersion.h"
+ #include "http/StatusCode.h"
+ #include "HttpHeader.h"
+ 
+ /// common parts of HttpRequest and HttpReply
+ class HttpMsg : public RefCountable
+ {
+ 
+ public:
+     typedef RefCount<HttpMsg> Pointer;
++    /// Who may have created or modified this message?
++    enum Sources {
++        srcUnknown = 0,
++
++        /* flags in 0xFFFF zone are for "secure" or "encrypted" sources */
++        srcHttps = 1 << 0, ///< https_port or bumped http_port tunnel; HTTPS server
++        srcFtps = 1 << 1, ///< ftps_port or SFTP server; currently unused
++        srcIcaps = 1 << 2, ///< Secure ICAP service
++        srcEcaps = 1 << 3, ///< eCAP service that is considered secure; currently unused
++
++        /* these flags "taint" the message: it may have been observed or mangled outside Squid */
++        srcHttp = 1 << (16 + 0), ///< http_port or HTTP server
++        srcFtp = 1 << (16 + 1), ///< ftp_port or FTP server
++        srcIcap = 1 << (16 + 2), ///< traditional ICAP service without encryption
++        srcEcap = 1 << (16 + 3), ///< eCAP service that uses insecure libraries/daemons
++        srcGopher = 1 << (16 + 14), ///< Gopher server
++        srcWhois = 1 << (16 + 15), ///< Whois server
++        srcUnsafe = 0xFFFF0000,  ///< Unsafe sources mask
++        srcSafe = 0x0000FFFF ///< Safe sources mask
++    };
+ 
+     HttpMsg(http_hdr_owner_type owner);
+     virtual ~HttpMsg();
+ 
+     virtual void reset() = 0; // will have body when http*Clean()s are gone
+ 
+     void packInto(Packable * p, bool full_uri) const;
+ 
+     ///< produce a message copy, except for a few connection-specific settings
+     virtual HttpMsg *clone() const = 0; ///< \todo rename: not a true copy?
+ 
+     /// [re]sets Content-Length header and cached value
+     void setContentLength(int64_t clen);
+ 
+     /**
+      * \retval true  the message sender asks to keep the connection open.
+      * \retval false the message sender will close the connection.
+      *
+      * Factors other than the headers may result in connection closure.
+      */
+@@ -47,40 +67,42 @@
+ public:
+     /// HTTP-Version field in the first line of the message.
+     /// see RFC 7230 section 3.1
+     AnyP::ProtocolVersion http_ver;
+ 
+     HttpHeader header;
+ 
+     HttpHdrCc *cache_control;
+ 
+     /* Unsupported, writable, may disappear/change in the future
+      * For replies, sums _stored_ status-line, headers, and <CRLF>.
+      * Also used to report parsed header size if parse() is successful */
+     int hdr_sz;
+ 
+     int64_t content_length;
+ 
+     HttpMsgParseState pstate;   /* the current parsing state */
+ 
+     BodyPipe::Pointer body_pipe; // optional pipeline to receive message body
+ 
++    uint32_t sources; ///< The message sources 
++
+     // returns true and sets hdr_sz on success
+     // returns false and sets *error to zero when needs more data
+     // returns false and sets *error to a positive Http::StatusCode on error
+     bool parse(const char *buf, const size_t sz, bool eol, Http::StatusCode *error);
+ 
+     bool parseCharBuf(const char *buf, ssize_t end);
+ 
+     int httpMsgParseStep(const char *buf, int len, int atEnd);
+ 
+     virtual int httpMsgParseError();
+ 
+     virtual bool expectingBody(const HttpRequestMethod&, int64_t&) const = 0;
+ 
+     void firstLineBuf(MemBuf&);
+ 
+     virtual bool inheritProperties(const HttpMsg *aMsg) = 0;
+ 
+ protected:
+     /**
+      * Validate the message start line is syntactically correct.
+
+=== modified file 'src/HttpReply.cc'
+--- src/HttpReply.cc	2015-04-27 05:31:56 +0000
++++ src/HttpReply.cc	2015-06-25 15:54:12 +0000
+@@ -570,40 +570,41 @@
+ {
+     HttpReply *rep = new HttpReply();
+     rep->sline = sline; // used in hdrCacheInit() call below
+     rep->header.append(&header);
+     rep->hdrCacheInit();
+     rep->hdr_sz = hdr_sz;
+     rep->http_ver = http_ver;
+     rep->pstate = pstate;
+     rep->body_pipe = body_pipe;
+ 
+     // keep_alive is handled in hdrCacheInit()
+     return rep;
+ }
+ 
+ bool HttpReply::inheritProperties(const HttpMsg *aMsg)
+ {
+     const HttpReply *aRep = dynamic_cast<const HttpReply*>(aMsg);
+     if (!aRep)
+         return false;
+     keep_alive = aRep->keep_alive;
++    sources = aRep->sources;
+     return true;
+ }
+ 
+ void HttpReply::removeStaleWarnings()
+ {
+     String warning;
+     if (header.getList(HDR_WARNING, &warning)) {
+         const String newWarning = removeStaleWarningValues(warning);
+         if (warning.size() && warning.size() == newWarning.size())
+             return; // some warnings are there and none changed
+         header.delById(HDR_WARNING);
+         if (newWarning.size()) { // some warnings left
+             HttpHeaderEntry *const e =
+                 new HttpHeaderEntry(HDR_WARNING, NULL, newWarning.termedBuf());
+             header.addEntry(e);
+         }
+     }
+ }
+ 
+ /**
+
+=== modified file 'src/HttpRequest.cc'
+--- src/HttpRequest.cc	2015-05-25 14:02:29 +0000
++++ src/HttpRequest.cc	2015-06-10 13:25:27 +0000
+@@ -242,40 +242,42 @@
+     // This may be too conservative for the 204 No Content case
+     // may eventually need cloneNullAdaptationImmune() for that.
+     flags = aReq->flags.cloneAdaptationImmune();
+ 
+     errType = aReq->errType;
+     errDetail = aReq->errDetail;
+ #if USE_AUTH
+     auth_user_request = aReq->auth_user_request;
+     extacl_user = aReq->extacl_user;
+     extacl_passwd = aReq->extacl_passwd;
+ #endif
+ 
+     myportname = aReq->myportname;
+ 
+     forcedBodyContinuation = aReq->forcedBodyContinuation;
+ 
+     // main property is which connection the request was received on (if any)
+     clientConnectionManager = aReq->clientConnectionManager;
+ 
+     notes = aReq->notes;
++
++    sources = aReq->sources;
+     return true;
+ }
+ 
+ /**
+  * Checks the first line of an HTTP request is valid
+  * currently just checks the request method is present.
+  *
+  * NP: Other errors are left for detection later in the parse.
+  */
+ bool
+ HttpRequest::sanityCheckStartLine(const char *buf, const size_t hdr_len, Http::StatusCode *error)
+ {
+     // content is long enough to possibly hold a reply
+     // 2 being magic size of a 1-byte request method plus space delimiter
+     if (hdr_len < 2) {
+         // this is ony a real error if the headers apparently complete.
+         if (hdr_len > 0) {
+             debugs(58, 3, HERE << "Too large request header (" << hdr_len << " bytes)");
+             *error = Http::scInvalidHeader;
+         }
+
+=== modified file 'src/acl/Makefile.am'
+--- src/acl/Makefile.am	2015-04-10 10:30:20 +0000
++++ src/acl/Makefile.am	2015-06-11 15:40:13 +0000
+@@ -143,41 +143,43 @@
+ ## TODO: move these to their respectful dirs when those dirs are created
+ 
+ EXTRA_libacls_la_SOURCES =
+ 
+ SSL_ACLS = \
+ 	AtStep.cc \
+ 	AtStep.h \
+ 	AtStepData.cc \
+ 	AtStepData.h \
+         CertificateData.cc \
+         CertificateData.h  \
+         Certificate.cc \
+         Certificate.h  \
+ 	ServerCertificate.cc \
+ 	ServerCertificate.h \
+ 	ServerName.cc \
+ 	ServerName.h \
+         SslError.cc \
+         SslError.h \
+         SslErrorData.cc \
+-        SslErrorData.h
++        SslErrorData.h \
++	ReceivedEncrypted.cc \
++	ReceivedEncrypted.h
+ 
+ if ENABLE_SSL
+ libacls_la_SOURCES += $(SSL_ACLS)
+ endif
+ 
+ if USE_ADAPTATION
+ libacls_la_SOURCES += AdaptationService.h \
+ 	AdaptationService.cc \
+ 	AdaptationServiceData.h \
+ 	AdaptationServiceData.cc
+ endif
+ 
+ 
+ EXTRA_libacls_la_SOURCES += $(SSL_ACLS)
+ 
+ 
+ ARP_ACLS = Arp.cc Arp.h Eui64.cc Eui64.h
+ 
+ if USE_SQUID_EUI
+ libacls_la_SOURCES += $(ARP_ACLS)
+
+=== added file 'src/acl/ReceivedEncrypted.cc'
+--- src/acl/ReceivedEncrypted.cc	1970-01-01 00:00:00 +0000
++++ src/acl/ReceivedEncrypted.cc	2015-06-26 15:50:21 +0000
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++/* DEBUG: section 28    Access Control */
++
++#include "squid.h"
++#include "acl/FilledChecklist.h"
++#include "acl/ReceivedEncrypted.h"
++#include "Debug.h"
++#include "HttpRequest.h"
++#include "HttpReply.h"
++#include "SquidConfig.h"
++
++ACL *
++ACLReceivedEncrypted::clone() const
++{
++    return new ACLReceivedEncrypted(*this);
++}
++
++ACLReceivedEncrypted::ACLReceivedEncrypted (char const *theClass) : class_ (theClass)
++{}
++
++ACLReceivedEncrypted::ACLReceivedEncrypted (ACLReceivedEncrypted const & old) :class_ (old.class_)
++{}
++
++ACLReceivedEncrypted::~ACLReceivedEncrypted()
++{}
++
++char const *
++ACLReceivedEncrypted::typeString() const
++{
++    return class_;
++}
++
++bool
++ACLReceivedEncrypted::empty () const
++{
++    return false;
++}
++
++void
++ACLReceivedEncrypted::parse()
++{
++    if (ConfigParser::strtokFile()) {
++        debugs(89, DBG_CRITICAL, "WARNING: received_encrypted does not accepts any value.");
++    }
++}
++
++int
++ACLReceivedEncrypted::match(ACLChecklist *checklist)
++{
++    if (!checklist->hasRequest()) {
++        debugs(28, DBG_IMPORTANT, "WARNING: " << name << " ACL is used in " <<
++               "context without an HTTP request. Assuming mismatch.");
++        return 0;
++    }
++
++    ACLFilledChecklist *filled = Filled((ACLChecklist*)checklist);
++    
++    if (!(filled->request->sources & HttpMsg::srcUnsafe)  ||
++        (filled->reply && !(filled->reply->sources & HttpMsg::srcUnsafe)))
++        return 1;
++
++    return 0;
++}
++
++SBufList
++ACLReceivedEncrypted::dump() const
++{
++    SBufList sl;
++    return sl;
++}
++
+
+=== added file 'src/acl/ReceivedEncrypted.h'
+--- src/acl/ReceivedEncrypted.h	1970-01-01 00:00:00 +0000
++++ src/acl/ReceivedEncrypted.h	2015-06-11 15:59:12 +0000
+@@ -0,0 +1,40 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_ACLRECEIVED_ENTRYPTED_H
++#define SQUID_ACLRECEIVED_ENCRYPTED_H
++
++#include "acl/Acl.h"
++#include "acl/Checklist.h"
++
++/// \ingroup ACLAPI
++class ACLReceivedEncrypted : public ACL
++{
++    MEMPROXY_CLASS(ACLReceivedEncrypted);
++
++public:
++    ACLReceivedEncrypted(char const *);
++    ACLReceivedEncrypted(ACLReceivedEncrypted const &);
++    ~ACLReceivedEncrypted();
++    ACLReceivedEncrypted &operator=(ACLReceivedEncrypted const &);
++
++    virtual ACL *clone()const;
++    virtual char const *typeString() const;
++    virtual void parse();
++    virtual int match(ACLChecklist *checklist);
++    virtual SBufList dump() const;
++    virtual bool empty () const;
++
++protected:
++    static Prototype RegistryProtoype;
++    static ACLReceivedEncrypted RegistryEntry_;
++    char const *class_;
++};
++
++#endif /* SQUID_ACLRECEIVED_ENCRYPTED_H */
++
+
+=== modified file 'src/adaptation/ecap/XactionRep.cc'
+--- src/adaptation/ecap/XactionRep.cc	2015-05-29 10:16:18 +0000
++++ src/adaptation/ecap/XactionRep.cc	2015-07-01 16:49:00 +0000
+@@ -403,40 +403,41 @@
+     preserveVb("useVirgin");
+ 
+     HttpMsg *clone = theVirginRep.raw().header->clone();
+     // check that clone() copies the pipe so that we do not have to
+     Must(!theVirginRep.raw().header->body_pipe == !clone->body_pipe);
+ 
+     updateHistory(clone);
+     sendAnswer(Answer::Forward(clone));
+     Must(done());
+ }
+ 
+ void
+ Adaptation::Ecap::XactionRep::useAdapted(const libecap::shared_ptr<libecap::Message> &m)
+ {
+     debugs(93,3, HERE << status());
+     Must(m);
+     theAnswerRep = m;
+     Must(proxyingAb == opUndecided);
+ 
+     HttpMsg *msg = answer().header;
++    updateSources(msg);
+     if (!theAnswerRep->body()) { // final, bodyless answer
+         proxyingAb = opNever;
+         updateHistory(msg);
+         sendAnswer(Answer::Forward(msg));
+     } else { // got answer headers but need to handle body
+         proxyingAb = opOn;
+         Must(!msg->body_pipe); // only host can set body pipes
+         MessageRep *rep = dynamic_cast<MessageRep*>(theAnswerRep.get());
+         Must(rep);
+         rep->tieBody(this); // sets us as a producer
+         Must(msg->body_pipe != NULL); // check tieBody
+ 
+         updateHistory(msg);
+         sendAnswer(Answer::Forward(msg));
+ 
+         debugs(93,4, HERE << "adapter will produce body" << status());
+         theMaster->abMake(); // libecap will produce
+     }
+ }
+ 
+@@ -716,20 +717,25 @@
+ 
+     if (proxyingAb == opOn) {
+         MessageRep *rep = dynamic_cast<MessageRep*>(theAnswerRep.get());
+         Must(rep);
+         const BodyPipePointer &ap = rep->raw().body_pipe;
+         if (!ap)
+             buf.append(" !A", 3);
+         else if (ap->stillProducing(const_cast<XactionRep*>(this)))
+             buf.append(" Ap", 3);
+         else
+             buf.append(" A?", 3);
+     }
+ 
+     buf.appendf(" %s%u]", id.Prefix, id.value);
+ 
+     buf.terminate();
+ 
+     return buf.content();
+ }
+ 
++void
++Adaptation::Ecap::XactionRep::updateSources(HttpMsg *adapted)
++{
++    adapted->sources |= HttpMsg::srcEcap;
++}
+
+=== modified file 'src/adaptation/ecap/XactionRep.h'
+--- src/adaptation/ecap/XactionRep.h	2015-01-13 07:25:36 +0000
++++ src/adaptation/ecap/XactionRep.h	2015-06-15 17:19:21 +0000
+@@ -77,40 +77,41 @@
+     // AsyncJob API (via Initiate)
+     virtual void start();
+     virtual bool doneAll() const;
+     virtual void swanSong();
+     virtual const char *status() const;
+ 
+ protected:
+     Service &service();
+ 
+     Adaptation::Message &answer();
+ 
+     void sinkVb(const char *reason);
+     void preserveVb(const char *reason);
+     void forgetVb(const char *reason);
+ 
+     void moveAbContent();
+ 
+     void updateHistory(HttpMsg *adapted);
+     void terminateMaster();
+     void scheduleStop(const char *reason);
++    void updateSources(HttpMsg *adapted);
+ 
+     const libecap::Area clientIpValue() const;
+     const libecap::Area usernameValue() const;
+     const libecap::Area masterxSharedValue(const libecap::Name &name) const;
+     /// Return the adaptation meta header value for the given header "name"
+     const libecap::Area metaValue(const libecap::Name &name) const;
+     /// Return the adaptation meta headers and their values
+     void visitEachMetaHeader(libecap::NamedValueVisitor &visitor) const;
+ 
+     void doResume();
+ 
+ private:
+     AdapterXaction theMaster; // the actual adaptation xaction we represent
+     Adaptation::ServicePointer theService; ///< xaction's adaptation service
+ 
+     MessageRep theVirginRep;
+     MessageRep *theCauseRep;
+ 
+     typedef libecap::shared_ptr<libecap::Message> MessagePtr;
+     MessagePtr theAnswerRep;
+
+=== modified file 'src/adaptation/icap/ModXact.cc'
+--- src/adaptation/icap/ModXact.cc	2015-04-27 09:52:02 +0000
++++ src/adaptation/icap/ModXact.cc	2015-07-17 15:01:47 +0000
+@@ -754,40 +754,50 @@
+         parseHttpHead();
+     }
+ 
+     if (state.parsingHeaders()) { // need more data
+         Must(mayReadMore());
+         return;
+     }
+ 
+     startSending();
+ }
+ 
+ // called after parsing all headers or when bypassing an exception
+ void Adaptation::Icap::ModXact::startSending()
+ {
+     disableRepeats("sent headers");
+     disableBypass("sent headers", true);
+     sendAnswer(Answer::Forward(adapted.header));
+ 
+     if (state.sending == State::sendingVirgin)
+         echoMore();
++    else {
++        // If we are not using the virgin HTTP object update the 
++        // HttpMsg::sources flag.
++        // The state.sending may set to State::sendingVirgin in the case
++        // of 206 responses too, where we do not want to update HttpMsg::sources
++        // flag. However even for 206 responses the state.sending is 
++        // not set yet to sendingVirgin. This is done in later step 
++        // after the parseBody method called.
++        updateSources();
++    }
+ }
+ 
+ void Adaptation::Icap::ModXact::parseIcapHead()
+ {
+     Must(state.sending == State::sendingUndecided);
+ 
+     if (!parseHead(icapReply.getRaw()))
+         return;
+ 
+     if (httpHeaderHasConnDir(&icapReply->header, "close")) {
+         debugs(93, 5, HERE << "found connection close");
+         reuseConnection = false;
+     }
+ 
+     switch (icapReply->sline.status()) {
+ 
+     case Http::scContinue:
+         handle100Continue();
+         break;
+ 
+@@ -1946,40 +1956,46 @@
+     // if no adapted request, update virgin (and inherit its properties later)
+     // TODO: make this and HttpRequest::detailError constant, like adaptHistory
+     if (!request)
+         request = const_cast<HttpRequest*>(&virginRequest());
+ 
+     if (request)
+         request->detailError(ERR_ICAP_FAILURE, errDetail);
+ }
+ 
+ void Adaptation::Icap::ModXact::clearError()
+ {
+     HttpRequest *request = dynamic_cast<HttpRequest*>(adapted.header);
+     // if no adapted request, update virgin (and inherit its properties later)
+     if (!request)
+         request = const_cast<HttpRequest*>(&virginRequest());
+ 
+     if (request)
+         request->clearError();
+ }
+ 
++void Adaptation::Icap::ModXact::updateSources()
++{
++    Must(adapted.header);
++    adapted.header->sources |= (service().cfg().secure.encryptTransport ? HttpMsg::srcIcaps : HttpMsg::srcIcap);
++}
++
+ /* Adaptation::Icap::ModXactLauncher */
+ 
+ Adaptation::Icap::ModXactLauncher::ModXactLauncher(HttpMsg *virginHeader, HttpRequest *virginCause, AccessLogEntry::Pointer &alp, Adaptation::ServicePointer aService):
+     AsyncJob("Adaptation::Icap::ModXactLauncher"),
+     Adaptation::Icap::Launcher("Adaptation::Icap::ModXactLauncher", aService),
+     al(alp)
+ {
+     virgin.setHeader(virginHeader);
+     virgin.setCause(virginCause);
+     updateHistory(true);
+ }
+ 
+ Adaptation::Icap::Xaction *Adaptation::Icap::ModXactLauncher::createXaction()
+ {
+     Adaptation::Icap::ServiceRep::Pointer s =
+         dynamic_cast<Adaptation::Icap::ServiceRep*>(theService.getRaw());
+     Must(s != NULL);
+     return new Adaptation::Icap::ModXact(virgin.header, virgin.cause, al, s);
+ }
+ 
+
+=== modified file 'src/adaptation/icap/ModXact.h'
+--- src/adaptation/icap/ModXact.h	2015-01-13 07:25:36 +0000
++++ src/adaptation/icap/ModXact.h	2015-06-25 15:00:57 +0000
+@@ -205,40 +205,41 @@
+ 
+     void decideOnParsingBody();
+     void parseBody();
+     void maybeAllocateHttpMsg();
+ 
+     void handle100Continue();
+     bool validate200Ok();
+     void handle200Ok();
+     void handle204NoContent();
+     void handle206PartialContent();
+     void handleUnknownScode();
+ 
+     void bypassFailure();
+ 
+     void startSending();
+     void disableBypass(const char *reason, bool includeGroupBypass);
+ 
+     void prepEchoing();
+     void prepPartialBodyEchoing(uint64_t pos);
+     void echoMore();
++    void updateSources(); ///< Update the HttpMsg sources
+ 
+     virtual bool doneAll() const;
+     virtual void swanSong();
+ 
+     void stopReceiving();
+     void stopSending(bool nicely);
+     void stopWriting(bool nicely);
+     void stopParsing();
+     void stopBackup();
+ 
+     virtual void fillPendingStatus(MemBuf &buf) const;
+     virtual void fillDoneStatus(MemBuf &buf) const;
+     virtual bool fillVirginHttpHeader(MemBuf&) const;
+ 
+ private:
+     void packHead(MemBuf &httpBuf, const HttpMsg *head);
+     void encapsulateHead(MemBuf &icapBuf, const char *section, MemBuf &httpBuf, const HttpMsg *head);
+     bool gotEncapsulated(const char *section) const;
+     void checkConsuming();
+ 
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2015-06-02 12:04:00 +0000
++++ src/cf.data.pre	2015-06-15 18:15:36 +0000
+@@ -1206,40 +1206,44 @@
+ 	  # Never matches and should not be used outside the ssl_bump context.
+ 	  #
+ 	  # At each SslBump step, Squid evaluates ssl_bump directives to find
+ 	  # the next bumping action (e.g., peek or splice). Valid SslBump step
+ 	  # values and the corresponding ssl_bump evaluation moments are:
+ 	  #   SslBump1: After getting TCP-level and HTTP CONNECT info.
+ 	  #   SslBump2: After getting SSL Client Hello info.
+ 	  #   SslBump3: After getting SSL Server Hello info.
+ 
+ 	acl aclname ssl::server_name .foo.com ...
+ 	  # matches server name obtained from various sources [fast]
+ 	  #
+ 	  # The server name is obtained during Ssl-Bump steps from such sources
+ 	  # as CONNECT request URI, client SNI, and SSL server certificate CN.
+ 	  # During each Ssl-Bump step, Squid may improve its understanding of a
+ 	  # "true server name". Unlike dstdomain, this ACL does not perform
+ 	  # DNS lookups.
+ 
+ 	acl aclname ssl::server_name_regex [-i] \.foo\.com ...
+ 	  # regex matches server name obtained from various sources [fast]
++
++	acl aclname received_encrypted
++	  # matches transactions where all HTTP messages were received over TLS
++	  # or SSL transport connections. [fast]
+ ENDIF
+ 	acl aclname any-of acl1 acl2 ...
+ 	  # match any one of the acls [fast or slow]
+ 	  # The first matching ACL stops further ACL evaluation.
+ 	  #
+ 	  # ACLs from multiple any-of lines with the same name are ORed.
+ 	  # For example, A = (a1 or a2) or (a3 or a4) can be written as
+ 	  #   acl A any-of a1 a2
+ 	  #   acl A any-of a3 a4
+ 	  #
+ 	  # This group ACL is fast if all evaluated ACLs in the group are fast
+ 	  # and slow otherwise.
+ 
+ 	acl aclname all-of acl1 acl2 ... 
+ 	  # match all of the acls [fast or slow]
+ 	  # The first mismatching ACL stops further ACL evaluation.
+ 	  #
+ 	  # ACLs from multiple all-of lines with the same name are ORed.
+ 	  # For example, B = (b1 and b2) or (b3 and b4) can be written as
+ 	  #   acl B all-of b1 b2
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2015-06-03 10:42:08 +0000
++++ src/client_side.cc	2015-07-09 14:26:04 +0000
+@@ -2520,40 +2520,42 @@
+     // We already have the request parsed and checked, so we
+     // only need to go through the final body/conn setup to doCallouts().
+     assert(http->request);
+     HttpRequest::Pointer request = http->request;
+ 
+     // temporary hack to avoid splitting this huge function with sensitive code
+     const bool isFtp = !hp;
+ 
+     // Some blobs below are still HTTP-specific, but we would have to rewrite
+     // this entire function to remove them from the FTP code path. Connection
+     // setup and body_pipe preparation blobs are needed for FTP.
+ 
+     request->clientConnectionManager = conn;
+ 
+     request->flags.accelerated = http->flags.accel;
+     request->flags.sslBumped=conn->switchedToHttps();
+     request->flags.ignoreCc = conn->port->ignore_cc;
+     // TODO: decouple http->flags.accel from request->flags.sslBumped
+     request->flags.noDirect = (request->flags.accelerated && !request->flags.sslBumped) ?
+                               !conn->port->allow_direct : 0;
++    request->sources |= isFtp ? HttpMsg::srcFtp :
++        ((request->flags.sslBumped || conn->port->transport.protocol == AnyP::PROTO_HTTPS) ? HttpMsg::srcHttps : HttpMsg::srcHttp);
+ #if USE_AUTH
+     if (request->flags.sslBumped) {
+         if (conn->getAuth() != NULL)
+             request->auth_user_request = conn->getAuth();
+     }
+ #endif
+ 
+     /** \par
+      * If transparent or interception mode is working clone the transparent and interception flags
+      * from the port settings to the request.
+      */
+     if (http->clientConnection != NULL) {
+         request->flags.intercepted = ((http->clientConnection->flags & COMM_INTERCEPTION) != 0);
+         request->flags.interceptTproxy = ((http->clientConnection->flags & COMM_TRANSPARENT) != 0 ) ;
+         static const bool proxyProtocolPort = (conn->port != NULL) ? conn->port->flags.proxySurrogate : false;
+         if (request->flags.interceptTproxy && !proxyProtocolPort) {
+             if (Config.accessList.spoof_client_ip) {
+                 ACLFilledChecklist *checklist = clientAclChecklistCreate(Config.accessList.spoof_client_ip, http);
+                 request->flags.spoofClientIp = (checklist->fastCheck() == ACCESS_ALLOWED);
+                 delete checklist;
+
+=== modified file 'src/clients/FtpGateway.cc'
+--- src/clients/FtpGateway.cc	2015-05-26 18:12:08 +0000
++++ src/clients/FtpGateway.cc	2015-06-26 14:31:32 +0000
+@@ -2601,40 +2601,41 @@
+          * send REST if we know the theSize and if it is less than theSize.
+          */
+         debugs(0,DBG_CRITICAL,HERE << "Whoops! " <<
+                " current offset=" << getCurrentOffset() <<
+                ", but theSize=" << theSize <<
+                ".  assuming full content response");
+         reply->setHeaders(Http::scOkay, "Gatewaying", mime_type, theSize, mdtm, -2);
+     } else {
+         /* Partial reply */
+         HttpHdrRangeSpec range_spec;
+         range_spec.offset = getCurrentOffset();
+         range_spec.length = theSize - getCurrentOffset();
+         reply->setHeaders(Http::scPartialContent, "Gatewaying", mime_type, theSize - getCurrentOffset(), mdtm, -2);
+         httpHeaderAddContRange(&reply->header, range_spec, theSize);
+     }
+ 
+     /* additional info */
+     if (mime_enc)
+         reply->header.putStr(HDR_CONTENT_ENCODING, mime_enc);
+ 
++    reply->sources |= HttpMsg::srcFtp;
+     setVirginReply(reply);
+     adaptOrFinalizeReply();
+ }
+ 
+ void
+ Ftp::Gateway::haveParsedReplyHeaders()
+ {
+     Client::haveParsedReplyHeaders();
+ 
+     StoreEntry *e = entry;
+ 
+     e->timestampsSet();
+ 
+     if (flags.authenticated) {
+         /*
+          * Authenticated requests can't be cached.
+          */
+         e->release();
+     } else if (!EBIT_TEST(e->flags, RELEASE_REQUEST) && !getCurrentOffset()) {
+         e->setPublicKey();
+
+=== modified file 'src/clients/FtpRelay.cc'
+--- src/clients/FtpRelay.cc	2015-01-13 07:25:36 +0000
++++ src/clients/FtpRelay.cc	2015-06-26 14:25:54 +0000
+@@ -329,40 +329,41 @@
+ {
+     ::Client::handleRequestBodyProducerAborted();
+ 
+     failed(ERR_READ_ERROR);
+ }
+ 
+ bool
+ Ftp::Relay::mayReadVirginReplyBody() const
+ {
+     // TODO: move this method to the regular FTP server?
+     return Comm::IsConnOpen(data.conn);
+ }
+ 
+ void
+ Ftp::Relay::forwardReply()
+ {
+     assert(entry->isEmpty());
+     EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+ 
+     HttpReply *const reply = createHttpReply(Http::scNoContent);
++    reply->sources |= HttpMsg::srcFtp;
+ 
+     setVirginReply(reply);
+     adaptOrFinalizeReply();
+ 
+     serverComplete();
+ }
+ 
+ void
+ Ftp::Relay::forwardPreliminaryReply(const PreliminaryCb cb)
+ {
+     debugs(9, 5, "forwarding preliminary reply to client");
+ 
+     // we must prevent concurrent ConnStateData::sendControlMsg() calls
+     Must(thePreliminaryCb == NULL);
+     thePreliminaryCb = cb;
+ 
+     const HttpReply::Pointer reply = createHttpReply(Http::scContinue);
+ 
+     // the Sink will use this to call us back after writing 1xx to the client
+     typedef NullaryMemFunT<Relay> CbDialer;
+@@ -401,40 +402,42 @@
+     }
+     return reply;
+ }
+ 
+ void
+ Ftp::Relay::handleDataRequest()
+ {
+     data.addr(master().clientDataAddr);
+     connectDataChannel();
+ }
+ 
+ void
+ Ftp::Relay::startDataDownload()
+ {
+     assert(Comm::IsConnOpen(data.conn));
+ 
+     debugs(9, 3, "begin data transfer from " << data.conn->remote <<
+            " (" << data.conn->local << ")");
+ 
+     HttpReply *const reply = createHttpReply(Http::scOkay, -1);
++    reply->sources |= HttpMsg::srcFtp;
++
+     EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+     setVirginReply(reply);
+     adaptOrFinalizeReply();
+ 
+     maybeReadVirginBody();
+     state = READING_DATA;
+ }
+ 
+ void
+ Ftp::Relay::startDataUpload()
+ {
+     assert(Comm::IsConnOpen(data.conn));
+ 
+     debugs(9, 3, "begin data transfer to " << data.conn->remote <<
+            " (" << data.conn->local << ")");
+ 
+     if (!startRequestBodyFlow()) { // register to receive body data
+         failed();
+         return;
+     }
+
+=== modified file 'src/gopher.cc'
+--- src/gopher.cc	2015-01-13 07:25:36 +0000
++++ src/gopher.cc	2015-06-26 14:25:14 +0000
+@@ -72,71 +72,73 @@
+ /**
+  * Gopher Gateway Internals
+  *
+  * Gopher is somewhat complex and gross because it must convert from
+  * the Gopher protocol to HTTP.
+  */
+ class GopherStateData
+ {
+     CBDATA_CLASS(GopherStateData);
+ 
+ public:
+     GopherStateData(FwdState *aFwd) :
+         entry(aFwd->entry),
+         conversion(NORMAL),
+         HTML_header_added(0),
+         HTML_pre(0),
+         type_id(GOPHER_FILE /* '0' */),
+         cso_recno(0),
+         len(0),
+         buf(NULL),
+-        fwd(aFwd)
++        fwd(aFwd),
++        reply_(NULL)
+     {
+         *request = 0;
+         buf = (char *)memAllocate(MEM_4K_BUF);
+         entry->lock("gopherState");
+         *replybuf = 0;
+     }
+ 
+     /* AsyncJob API emulated */
+     void deleteThis(const char *aReason);
+     void swanSong();
+ 
+ public:
+     StoreEntry *entry;
+     enum {
+         NORMAL,
+         HTML_DIR,
+         HTML_INDEX_RESULT,
+         HTML_CSO_RESULT,
+         HTML_INDEX_PAGE,
+         HTML_CSO_PAGE
+     } conversion;
+     int HTML_header_added;
+     int HTML_pre;
+     char type_id;
+     char request[MAX_URL];
+     int cso_recno;
+     int len;
+     char *buf;          /* pts to a 4k page */
+     Comm::ConnectionPointer serverConn;
+     FwdState::Pointer fwd;
++    HttpReply *reply_;
+     char replybuf[BUFSIZ];
+ };
+ 
+ CBDATA_CLASS_INIT(GopherStateData);
+ 
+ static CLCB gopherStateFree;
+ static void gopherMimeCreate(GopherStateData *);
+ static void gopher_request_parse(const HttpRequest * req,
+                                  char *type_id,
+                                  char *request);
+ static void gopherEndHTML(GopherStateData *);
+ static void gopherToHTML(GopherStateData *, char *inbuf, int len);
+ static CTCB gopherTimeout;
+ static IOCB gopherReadReply;
+ static IOCB gopherSendComplete;
+ static PF gopherSendRequest;
+ 
+ static char def_gopher_bin[] = "www/unknown";
+ 
+ static char def_gopher_text[] = "text/plain";
+@@ -150,40 +152,42 @@
+         return;
+ 
+     gopherState->deleteThis("gopherStateFree");
+ }
+ 
+ void
+ GopherStateData::deleteThis(const char *)
+ {
+     swanSong();
+     delete this;
+ }
+ 
+ void
+ GopherStateData::swanSong()
+ {
+     if (entry)
+         entry->unlock("gopherState");
+ 
+     if (buf)
+         memFree(buf, MEM_4K_BUF);
++
++    HTTPMSGUNLOCK(reply_);
+ }
+ 
+ /**
+  * Create MIME Header for Gopher Data
+  */
+ static void
+ gopherMimeCreate(GopherStateData * gopherState)
+ {
+     StoreEntry *entry = gopherState->entry;
+     const char *mime_type = NULL;
+     const char *mime_enc = NULL;
+ 
+     switch (gopherState->type_id) {
+ 
+     case GOPHER_DIRECTORY:
+ 
+     case GOPHER_INDEX:
+ 
+     case GOPHER_HTML:
+ 
+@@ -222,46 +226,49 @@
+         mime_enc = mimeGetContentEncoding(gopherState->request);
+         mime_type = mimeGetContentType(gopherState->request);
+         if (!mime_type)
+             mime_type = def_gopher_bin;
+         break;
+ 
+     case GOPHER_FILE:
+ 
+     default:
+         mime_enc = mimeGetContentEncoding(gopherState->request);
+         mime_type = mimeGetContentType(gopherState->request);
+         if (!mime_type)
+             mime_type = def_gopher_text;
+         break;
+     }
+ 
+     assert(entry->isEmpty());
+     EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+ 
+     HttpReply *reply = new HttpReply;
++    
+     entry->buffer();
+     reply->setHeaders(Http::scOkay, "Gatewaying", mime_type, -1, -1, -2);
+     if (mime_enc)
+         reply->header.putStr(HDR_CONTENT_ENCODING, mime_enc);
+ 
+     entry->replaceHttpReply(reply);
++    gopherState->reply_ = reply;
++    HTTPMSGLOCK(gopherState->reply_);
+ }
+ 
+ /**
+  * Parse a gopher request into components.  By Anawat.
+  */
+ static void
+ gopher_request_parse(const HttpRequest * req, char *type_id, char *request)
+ {
+     const char *path = req->urlpath.termedBuf();
+ 
+     if (request)
+         request[0] = '\0';
+ 
+     if (path && (*path == '/'))
+         ++path;
+ 
+     if (!path || !*path) {
+         *type_id = GOPHER_DIRECTORY;
+         return;
+     }
+@@ -748,42 +755,45 @@
+         delayId.bytesIn(len);
+ #endif
+ 
+         kb_incr(&(statCounter.server.all.kbytes_in), len);
+         kb_incr(&(statCounter.server.other.kbytes_in), len);
+     }
+ 
+     debugs(10, 5, HERE << conn << " read len=" << len);
+ 
+     if (flag == Comm::OK && len > 0) {
+         AsyncCall::Pointer nil;
+         commSetConnTimeout(conn, Config.Timeout.read, nil);
+         ++IOStats.Gopher.reads;
+ 
+         for (clen = len - 1, bin = 0; clen; ++bin)
+             clen >>= 1;
+ 
+         ++IOStats.Gopher.read_hist[bin];
+ 
+         HttpRequest *req = gopherState->fwd->request;
+-        if (req->hier.bodyBytesRead < 0)
++        if (req->hier.bodyBytesRead < 0) {
+             req->hier.bodyBytesRead = 0;
++            // first bytes read, update Reply flags:
++            gopherState->reply_->sources |= HttpMsg::srcGopher;
++        }
+ 
+         req->hier.bodyBytesRead += len;
+     }
+ 
+     if (flag != Comm::OK) {
+         debugs(50, DBG_IMPORTANT, "gopherReadReply: error reading: " << xstrerror());
+ 
+         if (ignoreErrno(xerrno)) {
+             AsyncCall::Pointer call = commCbCall(5,4, "gopherReadReply",
+                                                  CommIoCbPtrFun(gopherReadReply, gopherState));
+             comm_read(conn, buf, read_sz, call);
+         } else {
+             ErrorState *err = new ErrorState(ERR_READ_ERROR, Http::scInternalServerError, gopherState->fwd->request);
+             err->xerrno = xerrno;
+             gopherState->fwd->fail(err);
+             gopherState->serverConn->close();
+         }
+     } else if (len == 0 && entry->isEmpty()) {
+         gopherState->fwd->fail(new ErrorState(ERR_ZERO_SIZE_OBJECT, Http::scServiceUnavailable, gopherState->fwd->request));
+         gopherState->serverConn->close();
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2015-04-27 09:52:02 +0000
++++ src/http.cc	2015-06-25 16:03:22 +0000
+@@ -760,40 +760,42 @@
+     //      We do that now to avoid performance regression from using SBuf::c_str()
+     newrep->sline.set(Http::ProtocolVersion(1,1), hp->messageStatus() /* , hp->reasonPhrase() */);
+     newrep->sline.protocol = newrep->sline.version.protocol = hp->messageProtocol().protocol;
+     newrep->sline.version.major = hp->messageProtocol().major;
+     newrep->sline.version.minor = hp->messageProtocol().minor;
+ 
+     // parse headers
+     newrep->pstate = psReadyToParseHeaders;
+     if (newrep->httpMsgParseStep(hp->mimeHeader().rawContent(), hp->mimeHeader().length(), true) < 0) {
+         // XXX: when Http::ProtocolVersion is a function, remove this hack. just set with messageProtocol()
+         newrep->sline.set(Http::ProtocolVersion(), Http::scInvalidHeader);
+         newrep->sline.version.protocol = hp->messageProtocol().protocol;
+         newrep->sline.version.major = hp->messageProtocol().major;
+         newrep->sline.version.minor = hp->messageProtocol().minor;
+         debugs(11, 2, "error parsing response headers mime block");
+     }
+ 
+     // done with Parser, now process using the HttpReply
+     hp = NULL;
+ 
++    newrep->sources |= request->url.getScheme() == AnyP::PROTO_HTTPS ? HttpMsg::srcHttps : HttpMsg::srcHttp;
++
+     newrep->removeStaleWarnings();
+ 
+     if (newrep->sline.protocol == AnyP::PROTO_HTTP && newrep->sline.status() >= 100 && newrep->sline.status() < 200) {
+         handle1xx(newrep);
+         ctx_exit(ctx);
+         return;
+     }
+ 
+     flags.chunked = false;
+     if (newrep->sline.protocol == AnyP::PROTO_HTTP && newrep->header.chunked()) {
+         flags.chunked = true;
+         httpChunkDecoder = new ChunkedCodingParser;
+     }
+ 
+     if (!peerSupportsConnectionPinning())
+         request->flags.connectionAuthDisabled = true;
+ 
+     HttpReply *vrep = setVirginReply(newrep);
+     flags.headers_parsed = true;
+ 
+
+=== modified file 'src/whois.cc'
+--- src/whois.cc	2015-01-13 07:25:36 +0000
++++ src/whois.cc	2015-06-26 09:38:03 +0000
+@@ -91,40 +91,41 @@
+ whoisTimeout(const CommTimeoutCbParams &io)
+ {
+     WhoisState *p = static_cast<WhoisState *>(io.data);
+     debugs(75, 3, HERE << io.conn << ", URL " << p->entry->url());
+     io.conn->close();
+ }
+ 
+ static void
+ whoisReadReply(const Comm::ConnectionPointer &conn, char *buf, size_t len, Comm::Flag flag, int xerrno, void *data)
+ {
+     WhoisState *p = (WhoisState *)data;
+     p->readReply(conn, buf, len, flag, xerrno);
+ }
+ 
+ void
+ WhoisState::setReplyToOK(StoreEntry *sentry)
+ {
+     HttpReply *reply = new HttpReply;
+     sentry->buffer();
+     reply->setHeaders(Http::scOkay, "Gatewaying", "text/plain", -1, -1, -2);
++    reply->sources |= HttpMsg::srcWhois;
+     sentry->replaceHttpReply(reply);
+ }
+ 
+ void
+ WhoisState::readReply(const Comm::ConnectionPointer &conn, char *aBuffer, size_t aBufferLength, Comm::Flag flag, int xerrno)
+ {
+     /* Bail out early on Comm::ERR_CLOSING - close handlers will tidy up for us */
+     if (flag == Comm::ERR_CLOSING)
+         return;
+ 
+     aBuffer[aBufferLength] = '\0';
+     debugs(75, 3, HERE << conn << " read " << aBufferLength << " bytes");
+     debugs(75, 5, "{" << aBuffer << "}");
+ 
+     if (flag != Comm::OK) {
+         debugs(50, 2, HERE  << conn << ": read failure: " << xstrerror() << ".");
+ 
+         if (ignoreErrno(errno)) {
+             AsyncCall::Pointer call = commCbCall(5,4, "whoisReadReply",
+                                                  CommIoCbPtrFun(whoisReadReply, this));
+

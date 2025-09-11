@@ -1,0 +1,159 @@
+sslproxy_options in peek-and-splice mode
+
+Problem description:
+  - Squid sslproxy_options deny the use of TLSv1_2 SSL protocol:
+     sslproxy_options NO_TLSv1_2
+  - Squid uses peek mode for bumped connections.
+  - Web client sends an TLSv1_2 hello message and squid in peek mode, forwards
+    the client hello message to server
+  - Web server respond with an TLSv1_2 hello message
+  - Squid while parsing server hello message aborts with an error because 
+    sslproxy_options deny the use ot TLSv1_2 protocol.
+  
+This patch fixes squid to ignore sslproxy_options in peek or stare bumping mode.
+
+This is a Measurement Factory project
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2015-02-02 16:20:11 +0000
++++ src/SquidConfig.h	2015-02-06 19:09:37 +0000
+@@ -487,40 +487,41 @@
+ 
+     wordlist *ext_methods;
+ 
+     struct {
+         int high_rptm;
+         int high_pf;
+         size_t high_memory;
+     } warnings;
+     char *store_dir_select_algorithm;
+     int sleep_after_fork;   /* microseconds */
+     time_t minimum_expiry_time; /* seconds */
+     external_acl *externalAclHelperList;
+ 
+ #if USE_OPENSSL
+ 
+     struct {
+         char *cert;
+         char *key;
+         int version;
+         char *options;
++        long parsedOptions;
+         char *cipher;
+         char *cafile;
+         char *capath;
+         char *crlfile;
+         char *flags;
+         acl_access *cert_error;
+         SSL_CTX *sslContext;
+         sslproxy_cert_sign *cert_sign;
+         sslproxy_cert_adapt *cert_adapt;
+     } ssl_client;
+ #endif
+ 
+     char *accept_filter;
+     int umask;
+     int max_filedescriptors;
+     int workers;
+     CpuAffinityMap *cpuAffinityMap;
+ 
+ #if USE_LOADABLE_MODULES
+     wordlist *loadable_module_names;
+
+=== modified file 'src/cache_cf.cc'
+--- src/cache_cf.cc	2015-02-02 20:02:55 +0000
++++ src/cache_cf.cc	2015-02-06 19:09:37 +0000
+@@ -869,41 +869,44 @@
+         Config2.effectiveGroupID = getegid();
+     }
+ 
+     if (NULL != Config.effectiveGroup) {
+ 
+         struct group *grp = getgrnam(Config.effectiveGroup);
+ 
+         if (NULL == grp) {
+             fatalf("getgrnam failed to find groupid for effective group '%s'",
+                    Config.effectiveGroup);
+             return;
+         }
+ 
+         Config2.effectiveGroupID = grp->gr_gid;
+     }
+ 
+ #if USE_OPENSSL
+ 
+     debugs(3, DBG_IMPORTANT, "Initializing https proxy context");
+ 
+-    Config.ssl_client.sslContext = sslCreateClientContext(Config.ssl_client.cert, Config.ssl_client.key, Config.ssl_client.version, Config.ssl_client.cipher, Config.ssl_client.options, Config.ssl_client.flags, Config.ssl_client.cafile, Config.ssl_client.capath, Config.ssl_client.crlfile);
++    Config.ssl_client.sslContext = sslCreateClientContext(Config.ssl_client.cert, Config.ssl_client.key, Config.ssl_client.version, Config.ssl_client.cipher, NULL, Config.ssl_client.flags, Config.ssl_client.cafile, Config.ssl_client.capath, Config.ssl_client.crlfile);
++    // Pre-parse SSL client options to be applied when the client SSL objects created.
++    // Options must not used in the case of peek or stare bump mode.
++    Config.ssl_client.parsedOptions = Ssl::parse_options(::Config.ssl_client.options);
+ 
+     for (CachePeer *p = Config.peers; p != NULL; p = p->next) {
+         if (p->use_ssl) {
+             debugs(3, DBG_IMPORTANT, "Initializing cache_peer " << p->name << " SSL context");
+             p->sslContext = sslCreateClientContext(p->sslcert, p->sslkey, p->sslversion, p->sslcipher, p->ssloptions, p->sslflags, p->sslcafile, p->sslcapath, p->sslcrlfile);
+         }
+     }
+ 
+     for (AnyP::PortCfgPointer s = HttpPortList; s != NULL; s = s->next) {
+         if (!s->flags.tunnelSslBumping)
+             continue;
+ 
+         debugs(3, DBG_IMPORTANT, "Initializing http_port " << s->s << " SSL context");
+         s->configureSslServerContext();
+     }
+ 
+     for (AnyP::PortCfgPointer s = HttpsPortList; s != NULL; s = s->next) {
+         debugs(3, DBG_IMPORTANT, "Initializing https_port " << s->s << " SSL context");
+         s->configureSslServerContext();
+     }
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2015-01-13 07:25:36 +0000
++++ src/ssl/PeerConnector.cc	2015-01-29 17:05:32 +0000
+@@ -155,40 +155,43 @@
+         const Ssl::Bio::sslFeatures &features = clnBio->getFeatures();
+         if (features.sslVersion != -1) {
+             features.applyToSSL(ssl);
+             // Should we allow it for all protocols?
+             if (features.sslVersion >= 3) {
+                 b = SSL_get_rbio(ssl);
+                 Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
+                 srvBio->setClientFeatures(features);
+                 srvBio->recordInput(true);
+                 srvBio->mode(request->clientConnectionManager->sslBumpMode);
+             }
+ 
+             const bool isConnectRequest = request->clientConnectionManager.valid() &&
+                                           !request->clientConnectionManager->port->flags.isIntercepted();
+             if (isConnectRequest)
+                 SSL_set_ex_data(ssl, ssl_ex_index_server, (void*)request->GetHost());
+             else if (!features.serverName.isEmpty())
+                 SSL_set_ex_data(ssl, ssl_ex_index_server, (void*)features.serverName.c_str());
+         }
+     } else {
++        // Set client SSL options
++        SSL_set_options(ssl, ::Config.ssl_client.parsedOptions);
++
+         // While we are peeking at the certificate, we may not know the server
+         // name that the client will request (after interception or CONNECT)
+         // unless it was the CONNECT request with a user-typed address.
+         const char *hostname = request->GetHost();
+         const bool hostnameIsIp = request->GetHostIsNumeric();
+         const bool isConnectRequest = request->clientConnectionManager.valid() &&
+                                       !request->clientConnectionManager->port->flags.isIntercepted();
+         if (!request->flags.sslPeek || isConnectRequest)
+             SSL_set_ex_data(ssl, ssl_ex_index_server, (void*)hostname);
+ 
+         // Use SNI TLS extension only when we connect directly
+         // to the origin server and we know the server host name.
+         if (!hostnameIsIp)
+             Ssl::setClientSNI(ssl, hostname);
+     }
+ 
+     // If CertValidation Helper used do not lookup checklist for errors,
+     // but keep a list of errors to send it to CertValidator
+     if (!Ssl::TheConfig.ssl_crt_validator) {
+         // Create the ACL check list now, while we have access to more info.
+

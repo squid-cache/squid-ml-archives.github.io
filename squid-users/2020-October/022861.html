@@ -1,0 +1,218 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-users] Suppressing authentication schemes
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20Suppressing%20authentication%20schemes&In-Reply-To=%3C20201020124115.GA4848%40crust.m.i2n%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="022862.html">
+   <LINK REL="Next"  HREF="022863.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-users] Suppressing authentication schemes</H1>
+    <B>Philipp Gesang</B> 
+    <A HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20Suppressing%20authentication%20schemes&In-Reply-To=%3C20201020124115.GA4848%40crust.m.i2n%3E"
+       TITLE="[squid-users] Suppressing authentication schemes">philipp.gesang at intra2net.com
+       </A><BR>
+    <I>Tue Oct 20 12:41:15 UTC 2020</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="022862.html">[squid-users] active directory 2008.
+</A></li>
+        <LI>Next message (by thread): <A HREF="022863.html">[squid-users] Suppressing authentication schemes
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22861">[ date ]</a>
+              <a href="thread.html#22861">[ thread ]</a>
+              <a href="subject.html#22861">[ subject ]</a>
+              <a href="author.html#22861">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi,
+
+a while back we received a report from a customer that Windows
+hosts will not fall back on conventional authentication
+mechanisms if Squid advertises Negotiate. That is unfortunate as
+not all systems in that customer&#8217;s network are Kerberos enabled;
+some of them should just continue using other authentication
+schemes. (We don&#8217;t do NTLM.)
+
+To deal with the situation we are patching Squid to selectively
+omit the Negotiate mechanism in the initial reply via the notes
+mechanism. That seems to do the job reasonably well judging by
+the silence from the customer since we rolled out the patch some
+time last year. A version of that patch against 5.0.1 is
+attached; it&#8217;s completely untested though as we&#8217;re still on
+3.5.28 but it should serve as example for what I mean.
+
+Naturally we would prefer a solution that doesn&#8217;t involve
+patching so if there&#8217;s already a built-in alternative that we
+could use instead, I&#8217;d appreciate a pointer. If not, what would
+have to be done to get this functionality into the official
+release?
+
+Thank you and stay healthy everyone,
+Philipp
+
+-------------- next part --------------
+From b61451421081a7c5233ac6b2e579a0576a7f8558 Mon Sep 17 00:00:00 2001
+From: Philipp Gesang &lt;<A HREF="https://lists.squid-cache.org/listinfo/squid-users">philipp.gesang at intra2net.com</A>&gt;
+Date: Fri, 12 Jul 2019 09:10:21 +0200
+Subject: [PATCH] allow blacklisting authentication mechanisms
+
+Abuse the ``notes'' ACL to tag connections to suppress SPNEGO.
+This must happen during the initial reply so the client never
+receives a Proxy-Authenticate: header offering negotiate in
+the first place.
+
+In squid.conf, use ``blacklistAuthSchemes'' as the note key to
+mark a connection:
+
+    acl no_spnego src 10.0.42.1/32
+    note blacklistAuthSchemes negotiate no_spnego
+
+If this ACL matches while Squid decides what authentication
+headers to send to the client, the ``negotiate'' scheme will be
+omitted for clients connecting from the given IP address.
+
+Multiple authentication schemes may be specified as a comma
+separated list like so:
+
+    note blacklistAuthSchemes negotiate,basic no_spnego
+
+[Patch ported from the original written against 3.5.28.]
+---
+ src/auth/UserRequest.cc | 62 +++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/src/auth/UserRequest.cc b/src/auth/UserRequest.cc
+index a921feb4e..322edda97 100644
+--- a/src/auth/UserRequest.cc
++++ b/src/auth/UserRequest.cc
+@@ -26,6 +26,9 @@
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;MemBuf.h&quot;
+ 
++#include &quot;SquidConfig.h&quot;
++#include &quot;Notes.h&quot;
++
+ /* Generic Functions */
+ 
+ char const *
+@@ -475,6 +478,52 @@ schemesConfig(HttpRequest *request, HttpReply *rep)
+     return Auth::TheConfig.schemes;
+ }
+ 
++static bool
++scheme_is_blacklisted (const char  *scheme_type,
++                       HttpReply   *reply,
++                       HttpRequest *request)
++{
++    Notes::iterator note;
++
++    if (scheme_type == NULL)
++    {
++        return false;
++    }
++
++    for (note = ::Config.notes.begin();
++         note != ::Config.notes.end();
++         ++note)
++    {
++        if ((*note)-&gt;key().cmp(&quot;blacklistAuthSchemes&quot;) == 0) {
++            SBuf value;
++
++            if (!(*note)-&gt;match(request, reply, AccessLogEntryPointer(), value)) {
++                continue;
++            }
++
++            const char *start = value.c_str();
++            while (true) {
++                const char *end = strchrnul (start, ',');
++                if (start == end) {
++                    break;
++                }
++
++                const size_t len = end - start;
++                if (strncmp (scheme_type, start, len) == 0) {
++                    /* Note indeed applies to the current request. */
++                    debugs(29, 9, HERE &lt;&lt; &quot;[i2n] note: match &quot; &lt;&lt; (*note)-&gt;key()
++                           &lt;&lt; &quot; in [&quot; &lt;&lt; value &lt;&lt; &quot;] =&gt; blacklisting [&quot; &lt;&lt; scheme_type &lt;&lt; &quot;]&quot;);
++                    return true;
++                }
++
++                start = end + 1;
++            }
++        }
++    }
++
++    return false;
++}
++
+ void
+ Auth::UserRequest::AddReplyAuthHeader(HttpReply * rep, Auth::UserRequest::Pointer auth_user_request, HttpRequest * request, int accelerated, int internal)
+ /* send the auth types we are configured to support (and have compiled in!) */
+@@ -515,15 +564,18 @@ Auth::UserRequest::AddReplyAuthHeader(HttpReply * rep, Auth::UserRequest::Pointe
+             Auth::ConfigVector &amp;configs = schemesConfig(request, rep);
+             for (auto *scheme : configs) {
+                 if (scheme-&gt;active()) {
+-                    if (auth_user_request != NULL &amp;&amp; auth_user_request-&gt;scheme()-&gt;type() == scheme-&gt;type())
+-                        scheme-&gt;fixHeader(auth_user_request, rep, type, request);
+-                    else
+-                        scheme-&gt;fixHeader(NULL, rep, type, request);
++                    if (scheme_is_blacklisted(scheme-&gt;type(), rep, request))
++                        debugs(29, 1, HERE &lt;&lt; &quot;Configured scheme &quot; &lt;&lt; scheme-&gt;type() &lt;&lt; &quot; suppressed by ACL&quot;);
++                    else {
++                        if (auth_user_request != NULL &amp;&amp; auth_user_request-&gt;scheme()-&gt;type() == scheme-&gt;type())
++                            scheme-&gt;fixHeader(auth_user_request, rep, type, request);
++                        else
++                            scheme-&gt;fixHeader(NULL, rep, type, request);
++                    }
+                 } else
+                     debugs(29, 4, HERE &lt;&lt; &quot;Configured scheme &quot; &lt;&lt; scheme-&gt;type() &lt;&lt; &quot; not Active&quot;);
+             }
+         }
+-
+     }
+ 
+     /*
+-- 
+2.26.2
+
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: signature.asc
+Type: application/pgp-signature
+Size: 833 bytes
+Desc: not available
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-users/attachments/20201020/b59edbdd/attachment.sig">http://lists.squid-cache.org/pipermail/squid-users/attachments/20201020/b59edbdd/attachment.sig</A>&gt;
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="022862.html">[squid-users] active directory 2008.
+</A></li>
+	<LI>Next message (by thread): <A HREF="022863.html">[squid-users] Suppressing authentication schemes
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#22861">[ date ]</a>
+              <a href="thread.html#22861">[ thread ]</a>
+              <a href="subject.html#22861">[ subject ]</a>
+              <a href="author.html#22861">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.squid-cache.org/listinfo/squid-users">More information about the squid-users
+mailing list</a><br>
+</body></html>

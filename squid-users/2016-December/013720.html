@@ -1,0 +1,170 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-users] SSL bump config or possible code issue
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20SSL%20bump%20config%20or%20possible%20code%20issue&In-Reply-To=%3C6348944B-9964-49FD-8FB5-F744842C3275%40net-virtual.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013712.html">
+   <LINK REL="Next"  HREF="013721.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-users] SSL bump config or possible code issue</H1>
+    <B>Greg Saylor</B> 
+    <A HREF="mailto:squid-users%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-users%5D%20SSL%20bump%20config%20or%20possible%20code%20issue&In-Reply-To=%3C6348944B-9964-49FD-8FB5-F744842C3275%40net-virtual.com%3E"
+       TITLE="[squid-users] SSL bump config or possible code issue">gregs at net-virtual.com
+       </A><BR>
+    <I>Thu Dec  8 16:15:41 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="013712.html">[squid-users] for people who suffer from https ssl pump and not	interested with caching it
+</A></li>
+        <LI>Next message (by thread): <A HREF="013721.html">[squid-users] SSL bump config or possible code issue
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13720">[ date ]</a>
+              <a href="thread.html#13720">[ thread ]</a>
+              <a href="subject.html#13720">[ subject ]</a>
+              <a href="author.html#13720">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+This is my first time looking at the squid code. I'm trying to debug a situation where squid 3.4 would return a ERR_ACCESS_DENIED and version 3.5 does not. I believe its somehow related to ssl peek/slice/bump, but being new to Squid I can't really understand that too well.
+
+So squid is configured with:
+
+configure options:  '--prefix=/usr' '--includedir=/usr/include' '--datadir=/usr/share' '--bindir=/usr/sbin' '--libexecdir=/usr/lib/squid' '--localstatedir=/var' '--sysconfdir=/etc/squid' '--with-logdir=/var/log/squid' '--with-openssl' '--enable-linux-netfilter' '--enable-ssl' '--enable-icap-client&#8217;
+
+Here&#8217;s the http_access rules which exhibit this behavior:
+
+
+acl socialnetworks dstdomain .facebook.com
+
+acl localnet src 10.0.0.0/8     # RFC1918 possible internal network
+acl localnet src 172.16.0.0/12  # RFC1918 possible internal network
+acl localnet src 192.168.0.0/16 # RFC1918 possible internal network
+
+acl SSL_ports port 443 8443
+acl Safe_ports port 80          # http
+acl Safe_ports port 443         # https
+acl Safe_ports port 8443         # https
+acl Safe_ports port 3128        # squid
+acl CONNECT method CONNECT
+
+http_access allow manager localhost
+http_access deny manager
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
+
+http_access allow socialnetworks
+
+icp_access deny all
+icp_port 4130
+
+
+Now in socat setup a proxy like so:
+
+socat TCP-LISTEN:8080,fork &quot;SSL,verify=0 | PROXY-CONNECT:www.facebook.com:443 | TCP:{squid host}:4130&quot;
+
+
+Then make a request to port 8080 which sets (which is some https service on localnet):
+
+Host: 172.16.0.10:443
+
+Then try one that is not running https:
+
+Host: 172.16.0.11:443
+
+You will see that in 3.5 172.16.0.10 responds with the response, 172.16.0.11 times out.  The 3.4 behavior was that both of these hosts would result in a ERR_ACCESS_DENIED.
+
+
+So, I started looking at the source code between 3.4 and 3.5. In 3.5 there is this code in src/client_side_request.cc.
+
+    if (calloutContext-&gt;error) {
+        const char *storeUri = request-&gt;storeId();
+        StoreEntry *e= storeCreateEntry(storeUri, storeUri, request-&gt;flags, request-&gt;method);
+#if USE_OPENSSL
+        if (sslBumpNeeded()) { 
+            // We have to serve an error, so bump the client first.
+            sslBumpNeed(Ssl::bumpClientFirst);
+            // set final error but delay sending until we bump 
+            Ssl::ServerBump *srvBump = new Ssl::ServerBump(request, e);
+            errorAppendEntry(e, calloutContext-&gt;error);
+            calloutContext-&gt;error = NULL; 
+            getConn()-&gt;setServerBump(srvBump);
+            e-&gt;unlock(&quot;ClientHttpRequest::doCallouts+sslBumpNeeded&quot;);
+        } else  
+#endif
+        {       
+            // send the error to the client now
+            clientStreamNode *node = (clientStreamNode *)client_stream.tail-&gt;prev-&gt;data;
+            clientReplyContext *repContext = dynamic_cast&lt;clientReplyContext *&gt;(node-&gt;data.getRaw());
+            assert (repContext);
+            repContext-&gt;setReplyToStoreEntry(e, &quot;immediate SslBump error&quot;);
+            errorAppendEntry(e, calloutContext-&gt;error);
+            calloutContext-&gt;error = NULL; 
+            if (calloutContext-&gt;readNextRequest &amp;&amp; getConn())
+                getConn()-&gt;flags.readMore = true; // resume any pipeline reads.
+            node = (clientStreamNode *)client_stream.tail-&gt;data;
+            clientStreamRead(node, this, node-&gt;readBuffer);
+            e-&gt;unlock(&quot;ClientHttpRequest::doCallouts-sslBumpNeeded&quot;);
+            return; 
+        }       
+    }
+
+
+If I change:
+
+if (sslBumpNeeded()) {
+
+to:
+
+if (sslBumpNeeded() &amp;&amp; 0) {
+
+Then it correctly responds with ERR_ACCESS_DENIED. Otherwise it seems to proceed along and actually process and return the request.
+
+I sincerely apologize for not, yet, being able to get my head around this new feature. But, it does seem like somehow calloutContext-&gt;error is getting lost or overridden by something else later in the processing chain.
+
+It looks to me as if something is taking precedence over calloutContext-&gt;error.  But even if it was not, because the request is actually being processed it would allow a security hole where an attacker could map a private internal network of https services based on the time it takes them to respond - even if it allowed the connection.
+
+Again, my apologies for the lack of detail.  This is my first time working with squid since late 1990&#8217;s, its obviously come a very long way since then.
+
+
+Any ideas?
+
+Regards,
+
+Greg Saylor
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="013712.html">[squid-users] for people who suffer from https ssl pump and not	interested with caching it
+</A></li>
+	<LI>Next message (by thread): <A HREF="013721.html">[squid-users] SSL bump config or possible code issue
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13720">[ date ]</a>
+              <a href="thread.html#13720">[ thread ]</a>
+              <a href="subject.html#13720">[ subject ]</a>
+              <a href="author.html#13720">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.squid-cache.org/listinfo/squid-users">More information about the squid-users
+mailing list</a><br>
+</body></html>

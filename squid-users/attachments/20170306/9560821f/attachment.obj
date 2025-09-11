@@ -1,0 +1,126 @@
+#!/usr/bin/perl
+#
+# Stress ssl_crtd by requesting new certificates
+
+use IO::Handle;
+use IPC::Open2;
+use strict;
+
+my $num_servers = 5;
+my $debug = 0;
+
+my $ssl_crtd_path = '/home/ghelmer/ssl_crtd';
+my $db_path = '/tmp/ssl_db';
+my $signing_cert_path = '/tmp/sslcrtd-cert';
+my $signing_cert;
+
+-d $db_path || die "${db_path} is not a directory\n";
+
+open(CERT, "< $signing_cert_path") || die "Could not open ${signing_cert_path}: $!\n";
+while (<CERT>) {
+    $signing_cert .= $_;
+}
+close(CERT);
+printf "Read %d bytes from %s\n", length($signing_cert), $signing_cert_path if $debug;
+
+my %children;
+for (my $i = 0; $i < $num_servers; $i++) {
+    my $server_pid = &run_server($i, sprintf('host=host%d-%%d.com', $i + 1));
+    if ($server_pid != -1) {
+	$children{$server_pid} = 1;
+    }
+}
+
+while (scalar(keys(%children)) > 0)
+{
+    my $kid = waitpid(-1, 0);
+    if (defined($children{$kid})) {
+	delete $children{$kid};
+    } else {
+	print STDERR "Unexpected waitpid result for PID ${kid}\n";
+    }
+}
+
+exit 0;
+
+sub run_server {
+    my ($server_num, $host_fmt) = @_;
+    my $pid = fork;
+    if ($pid == -1) {
+	print STDERR "Fork failed: $!\n";
+	return -1;
+    } elsif ($pid == 0) {
+	# Child: run ssl_crtd and send it requests.
+	my $in_fh = IO::Handle->new();
+	my $out_fh = IO::Handle->new();
+	print "Running ${ssl_crtd_path} -d -s ${db_path} -M 4MB -b 20\n";
+	my $ssl_crtd_pid = open2($out_fh, $in_fh, "${ssl_crtd_path} -d -s ${db_path} -M 4MB -b 20");
+	if (! $ssl_crtd_pid) {
+	    print stderr "open2() failed: $!\n";
+	    exit(1);
+	}
+	$out_fh->blocking(1);
+	my $done = 0;
+	while (! $done) {
+	    # Generate request
+	    my $host_req = sprintf($host_fmt, int(rand(10000)));
+	    $host_req .= "\n";
+	    $host_req .= $signing_cert;
+	    my $req = sprintf("new_certificate %d %s", length($host_req), $host_req);
+	    printf "Sending request:\n%s", $req if $debug;
+	    $in_fh->write($req);
+
+	    # Reponse: "OK 2851 ..."
+	    # Read characters until space.
+	    my $result;
+	    my $ch;
+	    while ($out_fh->sysread($ch, 1) == 1) {
+		if ($ch eq ' ') {
+		    last;
+		}
+		$result .= $ch;
+	    }
+	    if ($result !~ /OK/) {
+		printf STDERR "Invalid response from ssl_crtd: '%s' length=%d\n", $result, length($result);
+		$done = 1;
+		last;
+	    }
+	    # Read byte count
+	    my $total_bytes = '';
+	    while ($out_fh->sysread($ch, 1) == 1) {
+		if ($ch eq ' ') {
+		    last;
+		}
+		$total_bytes .= $ch;
+	    }
+	    my $output;
+	    my $bytes_remain = $total_bytes;
+	    while ($bytes_remain > 0) {
+		my $output_chunk;
+		my $bytes = $out_fh->sysread($output_chunk, $bytes_remain);
+		if ($bytes == 0) {
+		    print STDERR "End of file reading from child ${ssl_crtd_pid}\n";
+		    $done = 1;
+		    last;
+		}
+		printf "Read chunk length %d '%s'\n", length($output_chunk), $output_chunk if $debug;
+		$output .= $output_chunk;
+		$bytes_remain -= $bytes;
+	    }
+	    printf "Read certificate length %d bytes from pid %d\n", $total_bytes, $ssl_crtd_pid;
+	    if ($out_fh->sysread($ch, 1) != 1) {
+		print STDERR "Error: Failed to read terminating \\1\n";
+		$done = 1;
+	    } elsif (ord($ch) != 1) {
+		printf STDERRR "Error: Read character %d at end of response\n", ord($ch);
+		$done = 1;
+	    }
+	}
+	$in_fh->close();
+	$out_fh->close();
+	waitpid($ssl_crtd_pid, 0);
+	exit(0);
+    }
+    # Else: parent.
+    return $pid;
+}

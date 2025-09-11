@@ -1,0 +1,583 @@
+ssl::server_name options to control matching logic.
+
+Many popular servers use certificates with several "alternative subject
+names" (SubjectAltName). Many of those names are wildcards. For example,
+a www.youtube.com certificate currently includes *.google.com and 50+
+other subject names, most of which are wildcards.
+
+Often, admins want server_name to match any of the subject names. This
+is useful to match any server belonging to a large conglomerate of
+companies, all including some *.example.com name in their certificates.
+The existing server_name functionality addresses this use case well.
+
+The new ACL options address several other important use cases:
+
+--consensus allows matching a part of the conglomerate when the part's
+  subject name is included in certificates used by many other conglomerate
+  parts (e.g., matching Google but not Youtube).
+
+--client-requested allows both (a) SNI-based matching even after
+  Squid obtains the server certificate and (b) pinpointing a particular
+  server in a group of different servers all using the same wildcard
+  certificate (e.g., matching appengine.example.com but not
+  www.example.com when the certificate for has *.example.com subject).
+
+--server-provided allows matching only after Squid obtains the server
+  certificate and matches any of the conglomerate parts.
+
+Also this patch fixes squid to log client SNI when client-first bumping mode
+is used too.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/acl/ServerName.cc'
+--- src/acl/ServerName.cc	2017-05-14 18:19:54 +0000
++++ src/acl/ServerName.cc	2017-05-26 08:52:11 +0000
+@@ -75,44 +75,89 @@
+     char *s = reinterpret_cast<char *>(cn_data->data);
+     char *d = cn;
+     for (int i = 0; i < cn_data->length; ++i, ++d, ++s) {
+         if (*s == '\0')
+             return 1; // always a domain mismatch. contains 0x00
+         *d = *s;
+     }
+     cn[cn_data->length] = '\0';
+     debugs(28, 4, "Verifying certificate name/subjectAltName " << cn);
+     if (data->match(cn))
+         return 0;
+     return 1;
+ }
+ 
+ int
+ ACLServerNameStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
+ {
+     assert(checklist != NULL && checklist->request != NULL);
+ 
+     const char *serverName = nullptr;
+-    SBuf serverNameKeeper; // because c_str() is not constant
++    SBuf clientSniKeeper; // because c_str() is not constant
+     if (ConnStateData *conn = checklist->conn()) {
+-
+-        if (conn->serverBump()) {
+-            if (X509 *peer_cert = conn->serverBump()->serverCert.get())
+-                return Ssl::matchX509CommonNames(peer_cert, (void *)data, check_cert_domain<MatchType>);
+-        }
+-
+-        if (conn->sslCommonName().isEmpty()) {
++        const char *clientRequestedServerName = nullptr;
++        clientSniKeeper = conn->tlsClientSni();
++        if (clientSniKeeper.isEmpty()) {
+             const char *host = checklist->request->url.host();
+             if (host && *host) // paranoid first condition: host() is never nil
+-                serverName = host;
+-        } else {
+-            serverNameKeeper = conn->sslCommonName();
+-            serverName = serverNameKeeper.c_str();
++                clientRequestedServerName = host;
++        } else
++            clientRequestedServerName = clientSniKeeper.c_str();
++
++        if (useConsensus) {
++            X509 *peer_cert = conn->serverBump() ? conn->serverBump()->serverCert.get() : nullptr;
++            // use the client requested name if it matches the server
++            // certificate or if the certificate is not available
++            if (!peer_cert || Ssl::checkX509ServerValidity(peer_cert, clientRequestedServerName))
++                serverName = clientRequestedServerName;
++        } else if (useClientRequested)
++            serverName = clientRequestedServerName;
++        else { // either no options or useServerProvided
++            if (X509 *peer_cert = (conn->serverBump() ? conn->serverBump()->serverCert.get() : nullptr))
++                return Ssl::matchX509CommonNames(peer_cert, (void *)data, check_cert_domain<MatchType>);
++            if (!useServerProvided)
++                serverName = clientRequestedServerName;
+         }
+     }
+ 
+     if (!serverName)
+         serverName = "none";
+ 
+     return data->match(serverName);
+ }
+ 
++const Acl::Options &
++ACLServerNameStrategy::options()
++{
++    static const Acl::BooleanOption ClientRequested;
++    static const Acl::BooleanOption ServerProvided;
++    static const Acl::BooleanOption Consensus;
++    static const Acl::Options MyOptions = {
++        {"--client-requested", &ClientRequested},
++        {"--server-provided", &ServerProvided},
++        {"--consensus", &Consensus}
++    };
++
++    ClientRequested.linkWith(&useClientRequested);
++    ServerProvided.linkWith(&useServerProvided);
++    Consensus.linkWith(&useConsensus);
++    return MyOptions;
++}
++
++bool
++ACLServerNameStrategy::valid() const
++{
++    int optionCount = 0;
++
++    if (useClientRequested)
++        optionCount++;
++    if (useServerProvided)
++        optionCount++;
++    if (useConsensus)
++        optionCount++;
++
++    if (optionCount > 1) {
++        debugs(28, DBG_CRITICAL, "ERROR: Multiple options given for the server_name ACL");
++        return false;
++    }
++    return true;
++}
+
+=== modified file 'src/acl/ServerName.h'
+--- src/acl/ServerName.h	2017-05-14 18:19:54 +0000
++++ src/acl/ServerName.h	2017-05-26 08:51:21 +0000
+@@ -11,25 +11,31 @@
+ 
+ #include "acl/Acl.h"
+ #include "acl/DomainData.h"
+ #include "acl/Strategy.h"
+ 
+ class ACLServerNameData : public ACLDomainData {
+     MEMPROXY_CLASS(ACLServerNameData);
+ public:
+     ACLServerNameData() : ACLDomainData() {}
+     virtual bool match(const char *);
+     virtual ACLData<char const *> *clone() const;
+ };
+ 
+ class ACLServerNameStrategy : public ACLStrategy<char const *>
+ {
+ 
+ public:
+     /* ACLStrategy API */
+     virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
+     virtual bool requiresRequest() const {return true;}
++    virtual const Acl::Options &options();
++    virtual bool valid() const;
+ 
++private:
++    Acl::BooleanOptionValue useClientRequested; ///< Ignore server-supplied names?
++    Acl::BooleanOptionValue useServerProvided; ///< Ignore client-supplied names?
++    Acl::BooleanOptionValue useConsensus; ///< Ignore mismatching names?
+ };
+ 
+ #endif /* SQUID_ACLSERVERNAME_H */
+ 
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2017-05-24 08:24:11 +0000
++++ src/cf.data.pre	2017-05-26 10:01:53 +0000
+@@ -1324,51 +1324,81 @@
+ 	acl aclname server_cert_fingerprint [-sha1] fingerprint
+ 	  # match against server SSL certificate fingerprint [fast]
+ 	  #
+ 	  # The fingerprint is the digest of the DER encoded version 
+ 	  # of the whole certificate. The user should use the form: XX:XX:...
+ 	  # Optional argument specifies the digest algorithm to use.
+ 	  # The SHA1 digest algorithm is the default and is currently
+ 	  # the only algorithm supported (-sha1).
+ 
+ 	acl aclname at_step step
+ 	  # match against the current step during ssl_bump evaluation [fast]
+ 	  # Never matches and should not be used outside the ssl_bump context.
+ 	  #
+ 	  # At each SslBump step, Squid evaluates ssl_bump directives to find
+ 	  # the next bumping action (e.g., peek or splice). Valid SslBump step
+ 	  # values and the corresponding ssl_bump evaluation moments are:
+ 	  #   SslBump1: After getting TCP-level and HTTP CONNECT info.
+ 	  #   SslBump2: After getting SSL Client Hello info.
+ 	  #   SslBump3: After getting SSL Server Hello info.
+ 
+-	acl aclname ssl::server_name .foo.com ...
++	acl aclname ssl::server_name [option] .foo.com ...
+ 	  # matches server name obtained from various sources [fast]
+ 	  #
+-	  # The server name is obtained during Ssl-Bump steps from such sources
+-	  # as CONNECT request URI, client SNI, and SSL server certificate CN.
+-	  # During each Ssl-Bump step, Squid may improve its understanding of a
+-	  # "true server name". Unlike dstdomain, this ACL does not perform
+-	  # DNS lookups.
+-	  # The "none" name can be used to match transactions where Squid
++	  # The ACL computes server name(s) using such information sources as
++	  # CONNECT request URI, TLS client SNI, and TLS server certificate 
++	  # subject (CN and SubjectAltName). The computed server name(s) usually
++	  # change with each SslBump step, as more info becomes available:
++	  # * SNI is used as the server name instead of the request URI,
++	  # * subject name(s) from the server certificate (CN and
++	  #   SubjectAltName) are used as the server names instead of SNI.
++	  #
++	  # When the ACL computes multiple server names, matching any single
++	  # computed name is sufficient for the ACL to match.
++	  #
++	  # The "none" name can be used to match transactions where the ACL
+ 	  # could not compute the server name using any information source
+-	  # already available at the ACL evaluation time.
++	  # that was both available and allowed to be used by the ACL options at
++	  # the ACL evaluation time.
++	  #
++	  # Unlike dstdomain, this ACL does not perform DNS lookups.
++	  #
++	  # An ACL option below may be used to restrict what information 
++	  # sources are used to extract the server names from:
++	  #
++	  # --client-requested
++	  #   The server name is SNI regardless of what the server says.
++	  # --server-provided
++	  #   The server name(s) are the certificate subject name(s), regardless
++	  #   of what the client has requested. If the server certificate is
++	  #   unavailable, then the name is "none".
++	  # --consensus
++	  #   The server name is either SNI (if SNI matches at least one of the
++	  #   certificate subject names) or "none" (otherwise). When the server
++	  #   certificate is unavailable, the consensus server name is SNI.
++	  #
++	  # Combining multiple options in one ACL is a fatal configuration
++	  # error.
++	  #
++	  # For all options: If no SNI is available, then the CONNECT request
++	  # target (a.k.a. Host header or URI) is used instead of SNI (for an
++	  # intercepted connection, this target is the destination IP address).
+ 
+ 	acl aclname ssl::server_name_regex [-i] \.foo\.com ...
+ 	  # regex matches server name obtained from various sources [fast]
+ 
+ 	acl aclname connections_encrypted
+ 	  # matches transactions with all HTTP messages received over TLS
+ 	  # transport connections. [fast]
+ 	  #
+ 	  # The master transaction deals with HTTP messages received from
+ 	  # various sources. All sources used by the master transaction in the
+ 	  # past are considered by the ACL. The following rules define whether
+ 	  # a given message source taints the entire master transaction,
+ 	  # resulting in ACL mismatches:
+ 	  #
+ 	  #  * The HTTP client transport connection is not TLS.
+ 	  #  * An adaptation service connection-encryption flag is off.
+ 	  #  * The peer or origin server transport connection is not TLS.
+ 	  #
+ 	  # Caching currently does not affect these rules. This cache ignorance
+ 	  # implies that only the current HTTP client transport and REQMOD
+@@ -4403,43 +4433,41 @@
+ 		Sh	Squid hierarchy status (DEFAULT_PARENT etc)
+ 
+ 	SSL-related format codes:
+ 
+ 		ssl::bump_mode	SslBump decision for the transaction:
+ 
+ 				For CONNECT requests that initiated bumping of
+ 				a connection and for any request received on
+ 				an already bumped connection, Squid logs the
+ 				corresponding SslBump mode ("server-first" or
+ 				"client-first"). See the ssl_bump option for
+ 				more information about these modes.
+ 
+ 				A "none" token is logged for requests that
+ 				triggered "ssl_bump" ACL evaluation matching
+ 				either a "none" rule or no rules at all.
+ 
+ 				In all other cases, a single dash ("-") is
+ 				logged.
+ 
+-		ssl::>sni	SSL client SNI sent to Squid. Available only
+-				after the peek, stare, or splice SSL bumping
+-				actions.
++		ssl::>sni	SSL client SNI sent to Squid.
+ 
+ 		ssl::>cert_subject
+ 				The Subject field of the received client
+ 				SSL certificate or a dash ('-') if Squid has
+ 				received an invalid/malformed certificate or
+ 				no certificate at all. Consider encoding the
+ 				logged value because Subject often has spaces.
+ 
+ 		ssl::>cert_issuer
+ 				The Issuer field of the received client
+ 				SSL certificate or a dash ('-') if Squid has
+ 				received an invalid/malformed certificate or
+ 				no certificate at all. Consider encoding the
+ 				logged value because Issuer often has spaces.
+ 
+ 		ssl::<cert_errors
+ 				The list of certificate validation errors
+ 				detected by Squid (including OpenSSL and
+ 				certificate validation helper components). The
+ 				errors are listed in the discovery order. By
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2017-03-02 01:26:30 +0000
++++ src/client_side.cc	2017-05-25 08:47:53 +0000
+@@ -3138,42 +3138,41 @@
+             readSomeData();
+             return;
+         }
+     }
+     catch (const std::exception &ex) {
+         debugs(83, 2, "error on FD " << clientConnection->fd << ": " << ex.what());
+         unsupportedProtocol = true;
+     }
+ 
+     parsingTlsHandshake = false;
+ 
+     if (mayTunnelUnsupportedProto())
+         preservedClientData = inBuf;
+ 
+     // Even if the parser failed, each TLS detail should either be set
+     // correctly or still be "unknown"; copying unknown detail is a no-op.
+     Security::TlsDetails::Pointer const &details = tlsParser.details;
+     clientConnection->tlsNegotiations()->retrieveParsedInfo(details);
+     if (details && !details->serverName.isEmpty()) {
+         resetSslCommonName(details->serverName.c_str());
+-        if (sslServerBump)
+-            sslServerBump->clientSni = details->serverName;
++        tlsClientSni_ = details->serverName;
+     }
+ 
+     // We should disable read/write handlers
+     Comm::SetSelect(clientConnection->fd, COMM_SELECT_READ, NULL, NULL, 0);
+     Comm::SetSelect(clientConnection->fd, COMM_SELECT_WRITE, NULL, NULL, 0);
+ 
+     if (unsupportedProtocol) {
+         Http::StreamPointer context = pipeline.front();
+         Must(context && context->http);
+         HttpRequest::Pointer request = context->http->request;
+         debugs(83, 5, "Got something other than TLS Client Hello. Cannot SslBump.");
+         sslBumpMode = Ssl::bumpNone;
+         if (!clientTunnelOnError(this, context, request, HttpRequestMethod(), ERR_PROTOCOL_UNKNOWN))
+             clientConnection->close();
+         return;
+     }
+ 
+     if (!sslServerBump || sslServerBump->act.step1 == Ssl::bumpClientFirst) { // Either means client-first.
+         getSslContextStart();
+         return;
+@@ -3353,42 +3352,42 @@
+     debugs(33, 2, "Request tunneling for " << reason);
+     ClientHttpRequest *http = buildFakeRequest(method, connectHost, connectPort, payload);
+     HttpRequest::Pointer request = http->request;
+     request->flags.forceTunnel = true;
+     http->calloutContext = new ClientRequestContext(http);
+     http->doCallouts();
+     clientProcessRequestFinished(this, request);
+     return true;
+ }
+ 
+ bool
+ ConnStateData::fakeAConnectRequest(const char *reason, const SBuf &payload)
+ {
+     debugs(33, 2, "fake a CONNECT request to force connState to tunnel for " << reason);
+ 
+     SBuf connectHost;
+     assert(transparent());
+     const unsigned short connectPort = clientConnection->local.port();
+ 
+ #if USE_OPENSSL
+-    if (serverBump() && !serverBump()->clientSni.isEmpty())
+-        connectHost.assign(serverBump()->clientSni);
++    if (!tlsClientSni_.isEmpty())
++        connectHost.assign(tlsClientSni_);
+     else
+ #endif
+     {
+         static char ip[MAX_IPSTRLEN];
+         connectHost.assign(clientConnection->local.toStr(ip, sizeof(ip)));
+     }
+ 
+     ClientHttpRequest *http = buildFakeRequest(Http::METHOD_CONNECT, connectHost, connectPort, payload);
+ 
+     http->calloutContext = new ClientRequestContext(http);
+     HttpRequest::Pointer request = http->request;
+     http->doCallouts();
+     clientProcessRequestFinished(this, request);
+     return true;
+ }
+ 
+ ClientHttpRequest *
+ ConnStateData::buildFakeRequest(Http::MethodType const method, SBuf &useHost, unsigned short usePort, const SBuf &payload)
+ {
+     ClientHttpRequest *http = new ClientHttpRequest(this);
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2017-03-05 06:46:20 +0000
++++ src/client_side.h	2017-05-26 09:34:52 +0000
+@@ -227,40 +227,41 @@
+      * \param[in] isNew if generated certificate is new, so we need to add this certificate to storage.
+      */
+     void getSslContextDone(Security::ContextPointer &, bool isNew = false);
+     /// Callback function. It is called when squid receive message from ssl_crtd.
+     static void sslCrtdHandleReplyWrapper(void *data, const Helper::Reply &reply);
+     /// Proccess response from ssl_crtd.
+     void sslCrtdHandleReply(const Helper::Reply &reply);
+ 
+     void switchToHttps(HttpRequest *request, Ssl::BumpMode bumpServerMode);
+     void parseTlsHandshake();
+     bool switchedToHttps() const { return switchedToHttps_; }
+     Ssl::ServerBump *serverBump() {return sslServerBump;}
+     inline void setServerBump(Ssl::ServerBump *srvBump) {
+         if (!sslServerBump)
+             sslServerBump = srvBump;
+         else
+             assert(sslServerBump == srvBump);
+     }
+     const SBuf &sslCommonName() const {return sslCommonName_;}
+     void resetSslCommonName(const char *name) {sslCommonName_ = name;}
++    const SBuf &tlsClientSni() const { return tlsClientSni_; }
+     /// Fill the certAdaptParams with the required data for certificate adaptation
+     /// and create the key for storing/retrieve the certificate to/from the cache
+     void buildSslCertGenerationParams(Ssl::CertificateProperties &certProperties);
+     /// Called when the client sends the first request on a bumped connection.
+     /// Returns false if no [delayed] error should be written to the client.
+     /// Otherwise, writes the error to the client and returns true. Also checks
+     /// for SQUID_X509_V_ERR_DOMAIN_MISMATCH on bumped requests.
+     bool serveDelayedError(Http::Stream *);
+ 
+     Ssl::BumpMode sslBumpMode; ///< ssl_bump decision (Ssl::bumpEnd if n/a).
+ 
+     /// Tls parser to use for client HELLO messages parsing on bumped
+     /// connections.
+     Security::HandshakeParser tlsParser;
+ #else
+     bool switchedToHttps() const { return false; }
+ #endif
+ 
+     /// handle a control message received by context from a peer and call back
+     virtual bool writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call) = 0;
+@@ -356,40 +357,41 @@
+     bool proxyProtocolError(const char *reason);
+ 
+     /// whether PROXY protocol header is still expected
+     bool needProxyProtocolHeader_;
+ 
+ #if USE_AUTH
+     /// some user details that can be used to perform authentication on this connection
+     Auth::UserRequest::Pointer auth_;
+ #endif
+ 
+     /// the parser state for current HTTP/1.x input buffer processing
+     Http1::RequestParserPointer parser_;
+ 
+ #if USE_OPENSSL
+     bool switchedToHttps_;
+     bool parsingTlsHandshake; ///< whether we are getting/parsing TLS Hello bytes
+ 
+     /// The SSL server host name appears in CONNECT request or the server ip address for the intercepted requests
+     String sslConnectHostOrIp; ///< The SSL server host name as passed in the CONNECT request
+     SBuf sslCommonName_; ///< CN name for SSL certificate generation
++    SBuf tlsClientSni_; ///< the TLS client SNI name
+     String sslBumpCertKey; ///< Key to use to store/retrieve generated certificate
+ 
+     /// HTTPS server cert. fetching state for bump-ssl-server-first
+     Ssl::ServerBump *sslServerBump;
+     Ssl::CertSignAlgorithm signAlgorithm; ///< The signing algorithm to use
+ #endif
+ 
+     /// the reason why we no longer write the response or nil
+     const char *stoppedSending_;
+     /// the reason why we no longer read the request or nil
+     const char *stoppedReceiving_;
+     /// Connection annotations, clt_conn_tag and other tags are stored here.
+     /// If set, are propagated to the current and all future master transactions
+     /// on the connection.
+     NotePairs::Pointer theNotes;
+ };
+ 
+ void setLogUri(ClientHttpRequest * http, char const *uri, bool cleanUrl = false);
+ 
+ const char *findTrailingHTTPVersion(const char *uriAndHTTPVersion, const char *end = NULL);
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2017-03-03 12:12:01 +0000
++++ src/format/Format.cc	2017-05-26 09:36:03 +0000
+@@ -1219,43 +1219,45 @@
+         case LFT_SSL_USER_CERT_SUBJECT:
+             if (X509 *cert = al->cache.sslClientCert.get()) {
+                 if (X509_NAME *subject = X509_get_subject_name(cert)) {
+                     X509_NAME_oneline(subject, tmp, sizeof(tmp));
+                     out = tmp;
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_USER_CERT_ISSUER:
+             if (X509 *cert = al->cache.sslClientCert.get()) {
+                 if (X509_NAME *issuer = X509_get_issuer_name(cert)) {
+                     X509_NAME_oneline(issuer, tmp, sizeof(tmp));
+                     out = tmp;
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_CLIENT_SNI:
+             if (al->request && al->request->clientConnectionManager.valid()) {
+-                if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
+-                    if (!srvBump->clientSni.isEmpty())
+-                        out = srvBump->clientSni.c_str();
++                if (const ConnStateData *conn = al->request->clientConnectionManager.get()) {
++                    if (!conn->tlsClientSni().isEmpty()) {
++                        sb = conn->tlsClientSni();
++                        out = sb.c_str();
++                    }
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_SERVER_CERT_ERRORS:
+             if (al->request && al->request->clientConnectionManager.valid()) {
+                 if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
+                     const char *separator = fmt->data.string ? fmt->data.string : ":";
+                     for (const Security::CertErrors *sslError = srvBump->sslErrors(); sslError; sslError = sslError->next) {
+                         if (!sb.isEmpty())
+                             sb.append(separator);
+                         if (const char *errorName = Ssl::GetErrorName(sslError->element.code))
+                             sb.append(errorName);
+                         else
+                             sb.append(sslErrorName(sslError->element.code, tmp, sizeof(tmp)));
+                         if (sslError->element.depth >= 0)
+                             sb.appendf("@depth=%d", sslError->element.depth);
+                     }
+                     if (!sb.isEmpty())
+                         out = sb.c_str();
+
+=== modified file 'src/ssl/ServerBump.h'
+--- src/ssl/ServerBump.h	2017-01-12 13:26:45 +0000
++++ src/ssl/ServerBump.h	2017-05-25 08:42:05 +0000
+@@ -30,31 +30,30 @@
+     CBDATA_CLASS(ServerBump);
+ 
+ public:
+     explicit ServerBump(HttpRequest *fakeRequest, StoreEntry *e = NULL, Ssl::BumpMode mode = Ssl::bumpServerFirst);
+     ~ServerBump();
+     void attachServerSession(const Security::SessionPointer &); ///< Sets the server TLS session object
+     const Security::CertErrors *sslErrors() const; ///< SSL [certificate validation] errors
+ 
+     /// faked, minimal request; required by Client API
+     HttpRequest::Pointer request;
+     StoreEntry *entry; ///< for receiving Squid-generated error messages
+     /// HTTPS server certificate. Maybe it is different than the one
+     /// it is stored in serverSession object (error SQUID_X509_V_ERR_CERT_CHANGE)
+     Security::CertPointer serverCert;
+     struct {
+         Ssl::BumpMode step1; ///< The SSL bump mode at step1
+         Ssl::BumpMode step2; ///< The SSL bump mode at step2
+         Ssl::BumpMode step3; ///< The SSL bump mode at step3
+     } act; ///< bumping actions at various bumping steps
+     Ssl::BumpStep step; ///< The SSL bumping step
+-    SBuf clientSni; ///< the SSL client SNI name
+ 
+ private:
+     Security::SessionPointer serverSession; ///< The TLS session object on server side.
+     store_client *sc; ///< dummy client to prevent entry trimming
+ };
+ 
+ } // namespace Ssl
+ 
+ #endif
+ 
+

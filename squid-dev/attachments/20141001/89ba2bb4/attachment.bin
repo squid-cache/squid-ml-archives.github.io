@@ -1,0 +1,417 @@
+Validate server certificates without bumping
+
+This patch add support for the "Validate server certificates without bumping"
+use case described on the Peek and Splice wiki page:
+    http://wiki.squid-cache.org/Features/SslPeekAndSplice
+
+This patch send to the certificate validation helper the  certificates and
+errors found in SslBump3 step, even if the splicing mode selected.
+In the case the validation helper found errors in certificates an error
+page returned to the http client.
+
+The SSL error forwarding is controlled by ACLs along these lines:
+
+   sslproxy_cert_error allow sslBoringErrors
+   sslproxy_cert_error allow serversWithInvalidCerts
+   sslproxy_cert_error deny all
+
+This is a Measurement Factory project
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2014-10-01 12:46:44 +0000
++++ src/ssl/PeerConnector.cc	2014-10-01 12:48:20 +0000
+@@ -27,41 +27,42 @@
+ #include "ssl/ErrorDetail.h"
+ #include "ssl/helper.h"
+ #include "ssl/PeerConnector.h"
+ #include "ssl/ServerBump.h"
+ #include "ssl/support.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeerConnector);
+ 
+ Ssl::PeerConnector::PeerConnector(
+     HttpRequestPointer &aRequest,
+     const Comm::ConnectionPointer &aServerConn,
+     const Comm::ConnectionPointer &aClientConn,
+     AsyncCall::Pointer &aCallback,
+     const time_t timeout):
+         AsyncJob("Ssl::PeerConnector"),
+         request(aRequest),
+         serverConn(aServerConn),
+         clientConn(aClientConn),
+         callback(aCallback),
+         negotiationTimeout(timeout),
+-        startTime(squid_curtime)
++        startTime(squid_curtime),
++        splice(false)
+ {
+     // if this throws, the caller's cb dialer is not our CbDialer
+     Must(dynamic_cast<CbDialer*>(callback->getDialer()));
+ }
+ 
+ Ssl::PeerConnector::~PeerConnector()
+ {
+     debugs(83, 5, "Peer connector " << this << " gone");
+ }
+ 
+ bool Ssl::PeerConnector::doneAll() const
+ {
+     return (!callback || callback->canceled()) && AsyncJob::doneAll();
+ }
+ 
+ /// Preps connection and SSL state. Calls negotiate().
+ void
+ Ssl::PeerConnector::start()
+ {
+     AsyncJob::start();
+@@ -213,95 +214,106 @@
+     } else
+         timeToRead = ::Config.Timeout.read;
+     AsyncCall::Pointer nil;
+     commSetConnTimeout(serverConnection(), timeToRead, nil);
+ }
+ 
+ void
+ Ssl::PeerConnector::negotiateSsl()
+ {
+     if (!Comm::IsConnOpen(serverConnection()) || fd_table[serverConnection()->fd].closing())
+         return;
+ 
+     const int fd = serverConnection()->fd;
+     SSL *ssl = fd_table[fd].ssl;
+     const int result = SSL_connect(ssl);
+     if (result <= 0) {
+         handleNegotiateError(result);
+         return; // we might be gone by now
+     }
+ 
++    if (serverConnection()->getPeer() && !SSL_session_reused(ssl)) {
++        if (serverConnection()->getPeer()->sslSession)
++            SSL_SESSION_free(serverConnection()->getPeer()->sslSession);
++
++        serverConnection()->getPeer()->sslSession = SSL_get1_session(ssl);
++    }
++
++    if (!sslFinalized())
++        return;
++
++    callBack();
++}
++
++bool
++Ssl::PeerConnector::sslFinalized()
++{
++    const int fd = serverConnection()->fd;
++    SSL *ssl = fd_table[fd].ssl;
++
+     if (request->clientConnectionManager.valid()) {
+         // remember the server certificate from the ErrorDetail object
+         if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
+             serverBump->serverCert.reset(SSL_get_peer_certificate(ssl));
+ 
+             // remember validation errors, if any
+             if (Ssl::CertErrors *errs = static_cast<Ssl::CertErrors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors)))
+                 serverBump->sslErrors = cbdataReference(errs);
+         }
+     }
+ 
+-    if (serverConnection()->getPeer() && !SSL_session_reused(ssl)) {
+-        if (serverConnection()->getPeer()->sslSession)
+-            SSL_SESSION_free(serverConnection()->getPeer()->sslSession);
+-
+-        serverConnection()->getPeer()->sslSession = SSL_get1_session(ssl);
+-    }
+-
+     if (Ssl::TheConfig.ssl_crt_validator) {
+         Ssl::CertValidationRequest validationRequest;
+         // WARNING: Currently we do not use any locking for any of the
+         // members of the Ssl::CertValidationRequest class. In this code the
+         // Ssl::CertValidationRequest object used only to pass data to
+         // Ssl::CertValidationHelper::submit method.
+         validationRequest.ssl = ssl;
+         validationRequest.domainName = request->GetHost();
+         if (Ssl::CertErrors *errs = static_cast<Ssl::CertErrors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors)))
+             // validationRequest disappears on return so no need to cbdataReference
+             validationRequest.errors = errs;
+         else
+             validationRequest.errors = NULL;
+         try {
+             debugs(83, 5, "Sending SSL certificate for validation to ssl_crtvd.");
+             Ssl::CertValidationHelper::GetInstance()->sslSubmit(validationRequest, sslCrtvdHandleReplyWrapper, this);
+-            return;
++            return false;
+         } catch (const std::exception &e) {
+             debugs(83, DBG_IMPORTANT, "ERROR: Failed to compose ssl_crtvd " <<
+                    "request for " << validationRequest.domainName <<
+                    " certificate: " << e.what() << "; will now block to " <<
+                    "validate that certificate.");
+             // fall through to do blocking in-process generation.
+             ErrorState *anErr = new ErrorState(ERR_GATEWAY_FAILURE, Http::scInternalServerError, request.getRaw());
+             bail(anErr);
+             if (serverConnection()->getPeer()) {
+                 peerConnectFailed(serverConnection()->getPeer());
+             }
+             serverConn->close();
+-            return;
++            return true;
+         }
+     }
+-
+-    callBack();
++    return true;
+ }
+ 
+-void switchToTunnel(HttpRequest *request, int *status_ptr, Comm::ConnectionPointer & clientConn, Comm::ConnectionPointer &srvConn);
++void switchToTunnel(HttpRequest *request, Comm::ConnectionPointer & clientConn, Comm::ConnectionPointer &srvConn);
+ 
+ void
+ Ssl::PeerConnector::cbCheckForPeekAndSpliceDone(allow_t answer, void *data)
+ {
+     Ssl::PeerConnector *peerConnect = (Ssl::PeerConnector *) data;
+     peerConnect->checkForPeekAndSpliceDone((Ssl::BumpMode)answer.kind);
+ }
+ 
+ void
+ Ssl::PeerConnector::checkForPeekAndSplice()
+ {
+     SSL *ssl = fd_table[serverConn->fd].ssl;
+     // Mark Step3 of bumping
+     if (request->clientConnectionManager.valid()) {
+         if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
+             serverBump->step = Ssl::bumpStep3;
+             if (!serverBump->serverCert.get())
+                 serverBump->serverCert.reset(SSL_get_peer_certificate(ssl));
+         }
+     }
+@@ -329,72 +341,78 @@
+         finalAction = Ssl::bumpBump;
+     else if (finalAction == Ssl::bumpBump && !srvBio->canBump())
+         finalAction = Ssl::bumpSplice;
+ 
+     // Record final decision
+     if (request->clientConnectionManager.valid()) {
+         request->clientConnectionManager->sslBumpMode = finalAction;
+         request->clientConnectionManager->serverBump()->act.step3 = finalAction;
+     }
+ 
+     if (finalAction == Ssl::bumpTerminate) {
+         comm_close(serverConn->fd);
+         comm_close(clientConn->fd);
+     } else if (finalAction != Ssl::bumpSplice) {
+         //Allow write, proceed with the connection
+         srvBio->holdWrite(false);
+         srvBio->recordInput(false);
+         Comm::SetSelect(serverConn->fd, COMM_SELECT_WRITE, &NegotiateSsl, this, 0);
+         debugs(83,5, "Retry the fwdNegotiateSSL on FD " << serverConn->fd);
+     } else {
+-        static int status_code = 0;
+-        debugs(83,5, "Revert to tunnel FD " << clientConn->fd << " with FD " << serverConn->fd);
+-        switchToTunnel(request.getRaw(), &status_code, clientConn, serverConn);
++        splice = true;
++        // Ssl Negotiation stops here. Last SSL checks for valid certificates 
++        // and if done, switch to tunnel mode
++        if (sslFinalized())
++            switchToTunnel(request.getRaw(), clientConn, serverConn);
++        return false;
+     }
+ }
+ 
+ void
+ Ssl::PeerConnector::sslCrtvdHandleReplyWrapper(void *data, Ssl::CertValidationResponse const &validationResponse)
+ {
+     Ssl::PeerConnector *connector = (Ssl::PeerConnector *)(data);
+     connector->sslCrtvdHandleReply(validationResponse);
+ }
+ 
+ void
+ Ssl::PeerConnector::sslCrtvdHandleReply(Ssl::CertValidationResponse const &validationResponse)
+ {
+     Ssl::CertErrors *errs = NULL;
+     Ssl::ErrorDetail *errDetails = NULL;
+     bool validatorFailed = false;
+     if (!Comm::IsConnOpen(serverConnection())) {
+         return;
+     }
+ 
+     debugs(83,5, request->GetHost() << " cert validation result: " << validationResponse.resultCode);
+ 
+     if (validationResponse.resultCode == ::Helper::Error)
+         errs = sslCrtvdCheckForErrors(validationResponse, errDetails);
+     else if (validationResponse.resultCode != ::Helper::Okay)
+         validatorFailed = true;
+ 
+     if (!errDetails && !validatorFailed) {
+-        callBack();
++        if (splice)
++            switchToTunnel(request.getRaw(), clientConn, serverConn);
++        else
++            callBack();
+         return;
+     }
+ 
+     ErrorState *anErr = NULL;
+     if (validatorFailed) {
+         anErr = new ErrorState(ERR_GATEWAY_FAILURE, Http::scInternalServerError, request.getRaw());
+     }  else {
+ 
+         // Check the list error with
+         if (errDetails && request->clientConnectionManager.valid()) {
+             // remember the server certificate from the ErrorDetail object
+             if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
+                 // remember validation errors, if any
+                 if (errs) {
+                     if (serverBump->sslErrors)
+                         cbdataReferenceDone(serverBump->sslErrors);
+                     serverBump->sslErrors = cbdataReference(errs);
+                 }
+             }
+         }
+
+=== modified file 'src/ssl/PeerConnector.h'
+--- src/ssl/PeerConnector.h	2014-10-01 12:31:58 +0000
++++ src/ssl/PeerConnector.h	2014-10-01 12:39:03 +0000
+@@ -99,40 +99,45 @@
+     void commCloseHandler(const CommCloseCbParams &params);
+ 
+     /// Inform us that the connection is closed. Does the required clean-up.
+     void connectionClosed(const char *reason);
+ 
+     /// Sets up TCP socket-related notification callbacks if things go wrong.
+     /// If socket already closed return false, else install the comm_close
+     /// handler to monitor the socket.
+     bool prepareSocket();
+ 
+     /// Sets the read timeout to avoid getting stuck while reading from a
+     /// silent server
+     void setReadTimeout();
+ 
+     void initializeSsl(); ///< Initializes SSL state
+ 
+     /// Performs a single secure connection negotiation step.
+     /// It is called multiple times untill the negotiation finish or aborted.
+     void negotiateSsl();
+ 
++    /// Called after SSL negotiations have finished. Cleans up SSL state.
++    /// Returns false if we are now waiting for the certs validation job.
++    /// Otherwise, returns true, regardless of negotiation success/failure.
++    bool sslFinalized();
++
+     /// Initiates the ssl_bump acl check in step3 SSL bump step to decide
+     /// about bumping, splicing or terminating the connection.
+     void checkForPeekAndSplice();
+ 
+     /// Callback function for ssl_bump acl check in step3  SSL bump step.
+     /// Handles the final bumping decision.
+     void checkForPeekAndSpliceDone(Ssl::BumpMode const);
+ 
+     /// Called when the SSL negotiation step aborted because data needs to
+     /// be transferred to/from SSL server or on error. In the first case
+     /// setups the appropriate Comm::SetSelect handler. In second case
+     /// fill an error and report to the PeerConnector caller.
+     void handleNegotiateError(const int result);
+ 
+ private:
+     PeerConnector(const PeerConnector &); // not implemented
+     PeerConnector &operator =(const PeerConnector &); // not implemented
+ 
+     /// mimics FwdState to minimize changes to FwdState::initiate/negotiateSsl
+     Comm::ConnectionPointer const &serverConnection() const { return serverConn; }
+@@ -148,29 +153,30 @@
+ 
+     /// Check SSL errors returned from cert validator against sslproxy_cert_error access list
+     Ssl::CertErrors *sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &, Ssl::ErrorDetail *&);
+ 
+     /// Callback function called when squid receive message from cert validator helper
+     static void sslCrtvdHandleReplyWrapper(void *data, Ssl::CertValidationResponse const &);
+ 
+     /// A wrapper function for negotiateSsl for use with Comm::SetSelect
+     static void NegotiateSsl(int fd, void *data);
+ 
+     /// A wrapper function for checkForPeekAndSpliceDone for use with acl
+     static void cbCheckForPeekAndSpliceDone(allow_t answer, void *data);
+ 
+     HttpRequestPointer request; ///< peer connection trigger or cause
+     Comm::ConnectionPointer serverConn; ///< TCP connection to the peer
+     Comm::ConnectionPointer clientConn; ///< TCP connection to the client
+     AsyncCall::Pointer callback; ///< we call this with the results
+     AsyncCall::Pointer closeHandler; ///< we call this when the connection closed
+     time_t negotiationTimeout; ///< the ssl connection timeout to use
+     time_t startTime; ///< when the peer connector negotiation started
++    bool splice; ///< Whether we are going to splice or not
+ 
+     CBDATA_CLASS2(PeerConnector);
+ };
+ 
+ std::ostream &operator <<(std::ostream &os, const Ssl::PeerConnectorAnswer &a);
+ 
+ } // namespace Ssl
+ 
+ #endif /* SQUID_PEER_CONNECTOR_H */
+
+=== modified file 'src/tunnel.cc'
+--- src/tunnel.cc	2014-09-13 13:59:43 +0000
++++ src/tunnel.cc	2014-09-30 16:59:38 +0000
+@@ -1076,56 +1076,59 @@
+ 
+ CBDATA_CLASS_INIT(TunnelStateData);
+ 
+ bool
+ TunnelStateData::noConnections() const
+ {
+     return !Comm::IsConnOpen(server.conn) && !Comm::IsConnOpen(client.conn);
+ }
+ 
+ #if USE_DELAY_POOLS
+ void
+ TunnelStateData::Connection::setDelayId(DelayId const &newDelay)
+ {
+     delayId = newDelay;
+ }
+ 
+ #endif
+ 
+ #if USE_OPENSSL
+ void
+-switchToTunnel(HttpRequest *request, int *status_ptr, Comm::ConnectionPointer &clientConn, Comm::ConnectionPointer &srvConn)
++switchToTunnel(HttpRequest *request, Comm::ConnectionPointer &clientConn, Comm::ConnectionPointer &srvConn)
+ {
+-    debugs(26, 3, HERE);
++    debugs(26,5, "Revert to tunnel FD " << clientConn->fd << " with FD " << srvConn->fd);
+     /* Create state structure. */
+     TunnelStateData *tunnelState = NULL;
+     const char *url = urlCanonical(request);
+ 
+     debugs(26, 3, request->method << " " << url << " " << request->http_ver);
+     ++statCounter.server.all.requests;
+     ++statCounter.server.other.requests;
+ 
+     tunnelState = new TunnelStateData;
+     tunnelState->url = xstrdup(url);
+     tunnelState->request = request;
+     tunnelState->server.size_ptr = NULL; //Set later if ClientSocketContext is available
+-    tunnelState->status_ptr = status_ptr;
++
++    // Temporary static variable to store the unneeded for our case status code 
++    static int status_code = 0;
++    tunnelState->status_ptr = &status_code;
+     tunnelState->client.conn = clientConn;
+ 
+     ConnStateData *conn;
+     if ((conn = request->clientConnectionManager.get())) {
+         ClientSocketContext::Pointer context = conn->getCurrentContext();
+         if (context != NULL && context->http != NULL) {
+             tunnelState->logTag_ptr = &context->http->logType;
+             tunnelState->server.size_ptr = &context->http->out.size;
+ 
+ #if USE_DELAY_POOLS
+             /* no point using the delayIsNoDelay stuff since tunnel is nice and simple */
+             if (srvConn->getPeer() && srvConn->getPeer()->options.no_delay)
+                 tunnelState->server.setDelayId(DelayId::DelayClient(context->http));
+ #endif
+         }
+     }
+ 
+     comm_add_close_handler(tunnelState->client.conn->fd,
+                            tunnelClientClosed,
+                            tunnelState);
+

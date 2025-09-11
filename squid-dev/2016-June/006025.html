@@ -1,0 +1,181 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] LockingPointer API update
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20LockingPointer%20API%20update&In-Reply-To=%3C7bbe07af-239d-4d21-1429-d08d9753c83b%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006024.html">
+   <LINK REL="Next"  HREF="006028.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] LockingPointer API update</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20LockingPointer%20API%20update&In-Reply-To=%3C7bbe07af-239d-4d21-1429-d08d9753c83b%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] LockingPointer API update">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Wed Jun 22 11:29:27 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006024.html">[squid-dev] [PATCH] LockingPointer API update
+</A></li>
+        <LI>Next message: <A HREF="006028.html">[squid-dev] [PATCH] LockingPointer API update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6025">[ date ]</a>
+              <a href="thread.html#6025">[ thread ]</a>
+              <a href="subject.html#6025">[ subject ]</a>
+              <a href="author.html#6025">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 22/06/2016 10:42 p.m., Christos Tsantilas wrote:
+&gt;<i> On 06/22/2016 07:32 AM, Amos Jeffries wrote:
+</I>&gt;&gt;<i> On 22/06/2016 1:02 p.m., Alex Rousskov wrote:
+</I>&gt;&gt;&gt;<i> On 06/21/2016 04:00 AM, Amos Jeffries wrote:
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> The two I saw were:
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> 1) PeekingPeerConnector::handleServerCertificate() doing
+</I>&gt;&gt;<i> serverBump-&gt;serverCert.reset(serverCert.release())
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> On much closer inspection it appears not a bug. But is doing move
+</I>&gt;&gt;<i> semantics without a move operator relying heavily on specific
+</I>&gt;&gt;<i> implementation detail of TidyPointer API exposure.
+</I>&gt;<i> 
+</I>&gt;<i> This is not bug. The call
+</I>&gt;<i> newServerCertPointer.reset(oldServerCertPointer.release())
+</I>&gt;<i> just moves the X509 object with the current locks to the
+</I>&gt;<i> newServerCertPointer.
+</I>
+Yeah. Thats move semantics.
+
+LockingPointer has a move assignment operator for doing that in clearer
+way now in trunk - and 3.5 when built with C++11 compiler.
+
+
+
+&gt;&gt;<i>
+</I>&gt;&gt;<i> 2) PeekingPeerConnector::serverCertificateVerified() doing two different
+</I>&gt;&gt;<i> reset() vs resetAndLock() depending on the data source.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> The OpenSSL docs do say the call increments a reference count itself.
+</I>&gt;&gt;<i> But I still think this is leaking. Since we explicitly unlock on
+</I>&gt;&gt;<i> destruct as well as calling the necessary free API method in OpenSSL.
+</I>&gt;<i> 
+</I>&gt;<i> I do not think that this is leaking here.
+</I>&gt;<i> The code is the following:
+</I>&gt;<i> 
+</I>&gt;<i>   Security::CertPointer serverCert;
+</I>&gt;<i>    if (...) {
+</I>&gt;<i>            // We need to lock here because the destructor of
+</I>&gt;<i>        // serverCert will call X509_free and will
+</I>&gt;<i>            // decrease the lock of the
+</I>&gt;<i>            serverCert.resetAndLock(serverBump-&gt;serverCert.get());
+</I>&gt;<i>    } else {
+</I>&gt;<i>            // We do not need to lock here, the SSL_get_peer_certificate
+</I>&gt;<i>            // already increases the clock counter and we have to
+</I>&gt;<i>            // free with X509_free.
+</I>&gt;<i>            serverCert.reset(SSL_get_peer_certificate(ssl));
+</I>&gt;<i>    }
+</I>&gt;<i>    // serverCert::~serverCert() called on function
+</I>&gt;<i>    // leave, calling X509_free.
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> For LockingCounter we need both a reset and a resetAndLock method to
+</I>&gt;<i> correctly using it with openSSL library. There are cases where an
+</I>&gt;<i> openSSL call increases the locking counter for the object it returns and
+</I>&gt;<i> other cases where it doesn't.
+</I>
+In the patch I'm working on now its looking very much like we can drop
+the reset() method for these instances and just use a temporary local
+object. Like so:
+
+The above code becomes:
+
+  Security::CertPointer serverCert;
+  if (...) {
+    // We need to lock here because the destructor of
+    // serverCert will call X509_free and decrease the lock
+
+    // operator =() copy-assign does the lock stuff
+
+    serverCert = serverBump-&gt;serverCert;
+
+  } else {
+    // We do not need to lock here, the SSL_get_peer_certificate
+    // already increases the clock counter and we have to
+    // free with X509_free.
+
+    // CertPointer() constructor builds object without locking it
+    // assuming SSL_get_peer_certificate() did the lock for it.
+
+    // operator =() move-assign or copy-assign does the lock stuff
+
+    serverCert = Security::CertPointer(SSL_get_peer_certificate(ssl)));
+  }
+  // serverCert::~serverCert() called on function
+  // leave, calling X509_free.
+
+
+So long as we only construct LockingPointer from freshly minted OpenSSL
+raw-pointers that have an OpenSSL set lock. Then we do not need the
+non-locking reset() operation.
+We do need the locking reset*() method for the cases where the raw
+pointer is not locked by the library.
+
+&gt;<i> 
+</I>&gt;<i> The LockingPointer is not perfect. But it is a class used and adjusted
+</I>&gt;<i> to be used for openSSL related objects. OpenSSL is a C library and it is
+</I>&gt;<i> not easy to convert openSSL objects to equivalent C++ objects.
+</I>&gt;<i> 
+</I>&gt;<i> I must also note that the locking pointer is not used only for X509
+</I>&gt;<i> objects but for other objects too.
+</I>&gt;<i> 
+</I>&gt;<i> In a point of view the LockingPointer should never moved under the
+</I>&gt;<i> Security and should be used only for openSSL related code.
+</I>
+Yes and no.
+
+It got moved to src/security/ so objects of its type could be used by
+the src/security/ code in builds where the src/ssl/ path is not compiled.
+
+If this attempt to get TidyPointer able to be used as a seamless
+replacement in the generic libsecurity API then LockingPointer can
+probably go back there. But not until that is true.
+
+But, the GnuTLS builds will need an equivalent Pointer with a different
+lock action to handle session pointers.
+
+Amos
+
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006024.html">[squid-dev] [PATCH] LockingPointer API update
+</A></li>
+	<LI>Next message: <A HREF="006028.html">[squid-dev] [PATCH] LockingPointer API update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6025">[ date ]</a>
+              <a href="thread.html#6025">[ thread ]</a>
+              <a href="subject.html#6025">[ subject ]</a>
+              <a href="author.html#6025">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

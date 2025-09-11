@@ -1,0 +1,559 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] SBuf conversion of vary_headers
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20SBuf%20conversion%20of%20vary_headers&In-Reply-To=%3C56EFA704.6080805%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005463.html">
+   <LINK REL="Next"  HREF="005488.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] SBuf conversion of vary_headers</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20SBuf%20conversion%20of%20vary_headers&In-Reply-To=%3C56EFA704.6080805%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] SBuf conversion of vary_headers">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Mon Mar 21 07:47:16 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005463.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » gcc,d-ubuntu-vivid #593
+</A></li>
+        <LI>Next message: <A HREF="005488.html">[squid-dev] [PATCH] NotePairs, SSL and Cert Validation memory leaks
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5462">[ date ]</a>
+              <a href="thread.html#5462">[ thread ]</a>
+              <a href="subject.html#5462">[ subject ]</a>
+              <a href="author.html#5462">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>This is the major part of the planned long-term fix for the Vary header
+issues with String that have been bugging us recently.
+
+It converts the makeVaryMark() function to generate its output in an
+SBuf instead of String, and removes one use of strListAdd.
+
+It also converts the MemObject and HttpRequest vary_headers members from
+char* to SBuf to reduce the amount of data copying and simplify memory
+management done on the resulting variant key.
+
+
+Future Work:
+
+* The remaining part of this patch is to SBuf convert the
+HttpHeaders::getList API to avoid the remaining String. That is still
+waiting on conversion of the ICAP and mime header parse logics.
+
+* An additional optimisation that could be made to strengthen against
+the known attacks is to ensure Vary header list entries are unique in
+the generated key. Ignoring repeated header names.
+
+Amos
+
+-------------- next part --------------
+=== modified file 'src/HttpRequest.cc'
+--- src/HttpRequest.cc	2016-03-17 03:28:14 +0000
++++ src/HttpRequest.cc	2016-03-20 22:36:15 +0000
+@@ -89,7 +89,7 @@
+     peer_login = NULL;      // not allocated/deallocated by this class
+     peer_domain = NULL;     // not allocated/deallocated by this class
+     peer_host = NULL;
+-    vary_headers = NULL;
++    vary_headers = SBuf();
+     myportname = null_string;
+     tag = null_string;
+ #if USE_AUTH
+@@ -121,8 +121,7 @@
+ #if USE_AUTH
+     auth_user_request = NULL;
+ #endif
+-    safe_free(vary_headers);
+-
++    vary_headers.clear();
+     url.clear();
+ 
+     header.clean();
+@@ -197,7 +196,7 @@
+ 
+     copy-&gt;lastmod = lastmod;
+     copy-&gt;etag = etag;
+-    copy-&gt;vary_headers = vary_headers ? xstrdup(vary_headers) : NULL;
++    copy-&gt;vary_headers = vary_headers;
+     // XXX: what to do with copy-&gt;peer_domain?
+ 
+     copy-&gt;tag = tag;
+
+=== modified file 'src/HttpRequest.h'
+--- src/HttpRequest.h	2016-03-17 03:28:14 +0000
++++ src/HttpRequest.h	2016-03-20 22:36:47 +0000
+@@ -148,7 +148,8 @@
+ 
+     time_t lastmod;     /* Used on refreshes */
+ 
+-    const char *vary_headers;   /* Used when varying entities are detected. Changes how the store key is calculated */
++    ///&lt; Used when varying entities are detected. Changes how the store key is calculated
++    SBuf vary_headers;
+ 
+     char *peer_domain;      /* Configured peer forceddomain */
+ 
+
+=== modified file 'src/MemObject.cc'
+--- src/MemObject.cc	2016-01-01 00:12:18 +0000
++++ src/MemObject.cc	2016-03-20 22:33:37 +0000
+@@ -101,11 +101,10 @@
+     ircb_data(nullptr),
+     id(0),
+     object_sz(-1),
+-    swap_hdr_sz(0),
++    swap_hdr_sz(0)
+ #if URL_CHECKSUM_DEBUG
+-    chksum(0),
++    ,chksum(0)
+ #endif
+-    vary_headers(nullptr)
+ {
+     debugs(20, 3, &quot;new MemObject &quot; &lt;&lt; this);
+     memset(&amp;start_ping, 0, sizeof(start_ping));
+@@ -145,8 +144,6 @@
+     HTTPMSGUNLOCK(request);
+ 
+     ctx_exit(ctx);              /* must exit before we free mem-&gt;url */
+-
+-    safe_free(vary_headers);
+ }
+ 
+ void
+@@ -230,8 +227,8 @@
+ MemObject::stat(MemBuf * mb) const
+ {
+     mb-&gt;appendf(&quot;\t&quot; SQUIDSBUFPH &quot; %s\n&quot;, SQUIDSBUFPRINT(method.image()), logUri());
+-    if (vary_headers)
+-        mb-&gt;appendf(&quot;\tvary_headers: %s\n&quot;, vary_headers);
++    if (!vary_headers.isEmpty())
++        mb-&gt;appendf(&quot;\tvary_headers: &quot; SQUIDSBUFPH &quot;\n&quot;, SQUIDSBUFPRINT(vary_headers));
+     mb-&gt;appendf(&quot;\tinmem_lo: %&quot; PRId64 &quot;\n&quot;, inmem_lo);
+     mb-&gt;appendf(&quot;\tinmem_hi: %&quot; PRId64 &quot;\n&quot;, data_hdr.endOffset());
+     mb-&gt;appendf(&quot;\tswapout: %&quot; PRId64 &quot; bytes queued\n&quot;, swapout.queue_offset);
+
+=== modified file 'src/MemObject.h'
+--- src/MemObject.h	2016-02-24 18:12:43 +0000
++++ src/MemObject.h	2016-03-20 22:34:30 +0000
+@@ -13,6 +13,7 @@
+ #include &quot;dlink.h&quot;
+ #include &quot;http/RequestMethod.h&quot;
+ #include &quot;RemovalPolicy.h&quot;
++#include &quot;sbuf/SBuf.h&quot;
+ #include &quot;SquidString.h&quot;
+ #include &quot;stmem.h&quot;
+ #include &quot;StoreIOBuffer.h&quot;
+@@ -170,7 +171,7 @@
+     unsigned int chksum;
+ #endif
+ 
+-    const char *vary_headers;
++    SBuf vary_headers;
+ 
+     void delayRead(DeferredRead const &amp;);
+     void kickReads();
+
+=== modified file 'src/MemStore.cc'
+--- src/MemStore.cc	2016-03-11 18:00:51 +0000
++++ src/MemStore.cc	2016-03-20 22:37:00 +0000
+@@ -618,7 +618,7 @@
+ 
+     assert(e.mem_obj);
+ 
+-    if (e.mem_obj-&gt;vary_headers) {
++    if (!e.mem_obj-&gt;vary_headers.isEmpty()) {
+         // XXX: We must store/load SerialisedMetaData to cache Vary in RAM
+         debugs(20, 5, &quot;Vary not yet supported: &quot; &lt;&lt; e.mem_obj-&gt;vary_headers);
+         return false;
+
+=== modified file 'src/StoreMetaVary.cc'
+--- src/StoreMetaVary.cc	2016-01-01 00:12:18 +0000
++++ src/StoreMetaVary.cc	2016-03-21 00:30:43 +0000
+@@ -18,14 +18,14 @@
+ {
+     assert (getType() == STORE_META_VARY_HEADERS);
+ 
+-    if (!e-&gt;mem_obj-&gt;vary_headers) {
++    if (e-&gt;mem_obj-&gt;vary_headers.isEmpty()) {
+         /* XXX separate this mutator from the query */
+         /* Assume the object is OK.. remember the vary request headers */
+-        e-&gt;mem_obj-&gt;vary_headers = xstrdup((char *)value);
++        e-&gt;mem_obj-&gt;vary_headers = static_cast&lt;char *&gt;(value);
+         return true;
+     }
+ 
+-    if (strcmp(e-&gt;mem_obj-&gt;vary_headers, (char *)value) != 0)
++    if (e-&gt;mem_obj-&gt;vary_headers.cmp(static_cast&lt;char *&gt;(value)) != 0)
+         return false;
+ 
+     return true;
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-03-10 06:55:17 +0000
++++ src/client_side.cc	2016-03-20 22:39:49 +0000
+@@ -3570,7 +3570,7 @@
+ int
+ varyEvaluateMatch(StoreEntry * entry, HttpRequest * request)
+ {
+-    const char *vary = request-&gt;vary_headers;
++    SBuf vary(request-&gt;vary_headers);
+     int has_vary = entry-&gt;getReply()-&gt;header.has(Http::HdrType::VARY);
+ #if X_ACCELERATOR_VARY
+ 
+@@ -3578,12 +3578,12 @@
+         entry-&gt;getReply()-&gt;header.has(Http::HdrType::HDR_X_ACCELERATOR_VARY);
+ #endif
+ 
+-    if (!has_vary || !entry-&gt;mem_obj-&gt;vary_headers) {
+-        if (vary) {
++    if (!has_vary || entry-&gt;mem_obj-&gt;vary_headers.isEmpty()) {
++        if (!vary.isEmpty()) {
+             /* Oops... something odd is going on here.. */
+             debugs(33, DBG_IMPORTANT, &quot;varyEvaluateMatch: Oops. Not a Vary object on second attempt, '&quot; &lt;&lt;
+                    entry-&gt;mem_obj-&gt;urlXXX() &lt;&lt; &quot;' '&quot; &lt;&lt; vary &lt;&lt; &quot;'&quot;);
+-            safe_free(request-&gt;vary_headers);
++            request-&gt;vary_headers.clear();
+             return VARY_CANCEL;
+         }
+ 
+@@ -3597,8 +3597,8 @@
+          */
+         vary = httpMakeVaryMark(request, entry-&gt;getReply());
+ 
+-        if (vary) {
+-            request-&gt;vary_headers = xstrdup(vary);
++        if (!vary.isEmpty()) {
++            request-&gt;vary_headers = vary;
+             return VARY_OTHER;
+         } else {
+             /* Ouch.. we cannot handle this kind of variance */
+@@ -3606,18 +3606,18 @@
+             return VARY_CANCEL;
+         }
+     } else {
+-        if (!vary) {
++        if (vary.isEmpty()) {
+             vary = httpMakeVaryMark(request, entry-&gt;getReply());
+ 
+-            if (vary)
+-                request-&gt;vary_headers = xstrdup(vary);
++            if (!vary.isEmpty())
++                request-&gt;vary_headers = vary;
+         }
+ 
+-        if (!vary) {
++        if (vary.isEmpty()) {
+             /* Ouch.. we cannot handle this kind of variance */
+             /* XXX This cannot really happen, but just to be complete */
+             return VARY_CANCEL;
+-        } else if (strcmp(vary, entry-&gt;mem_obj-&gt;vary_headers) == 0) {
++        } else if (vary == entry-&gt;mem_obj-&gt;vary_headers) {
+             return VARY_MATCH;
+         } else {
+             /* Oops.. we have already been here and still haven't
+
+=== modified file 'src/client_side_reply.cc'
+--- src/client_side_reply.cc	2016-03-11 18:00:51 +0000
++++ src/client_side_reply.cc	2016-03-20 22:44:41 +0000
+@@ -1007,9 +1007,8 @@
+     }
+ 
+     /* And for Vary, release the base URI if none of the headers was included in the request */
+-
+-    if (http-&gt;request-&gt;vary_headers
+-            &amp;&amp; !strstr(http-&gt;request-&gt;vary_headers, &quot;=&quot;)) {
++    if (!http-&gt;request-&gt;vary_headers.isEmpty()
++            &amp;&amp; http-&gt;request-&gt;vary_headers.find('=') != SBuf::npos) {
+         // XXX: performance regression, c_str() reallocates
+         SBuf tmp(http-&gt;request-&gt;effectiveRequestUri());
+         StoreEntry *entry = storeGetPublic(tmp.c_str(), Http::METHOD_GET);
+
+=== modified file 'src/http.cc'
+--- src/http.cc	2016-03-11 18:00:51 +0000
++++ src/http.cc	2016-03-20 22:45:07 +0000
+@@ -578,7 +578,7 @@
+  * virtual headers in the reply
+  * Returns false if the variance cannot be stored
+  */
+-const char *
++SBuf
+ httpMakeVaryMark(HttpRequest * request, HttpReply const * reply)
+ {
+     String vary, hdr;
+@@ -586,20 +586,21 @@
+     const char *item;
+     const char *value;
+     int ilen;
+-    static String vstr;
++    SBuf vstr;
+ 
+-    vstr.clean();
+     vary = reply-&gt;header.getList(Http::HdrType::VARY);
+ 
+     while (strListGetItem(&amp;vary, ',', &amp;item, &amp;ilen, &amp;pos)) {
+         static const SBuf asterisk(&quot;*&quot;);
+         SBuf name(item, ilen);
+         if (name == asterisk) {
+-            vstr.clean();
++            vstr.clear();
+             break;
+         }
+         name.toLower();
+-        strListAdd(&amp;vstr, name.c_str(), ',');
++        if (!vstr.isEmpty())
++            vstr.append(&quot;, &quot;, 2);
++        vstr.append(name);
+         hdr = request-&gt;header.getByName(name);
+         value = hdr.termedBuf();
+         if (value) {
+@@ -622,7 +623,9 @@
+         char *name = (char *)xmalloc(ilen + 1);
+         xstrncpy(name, item, ilen + 1);
+         Tolower(name);
+-        strListAdd(&amp;vstr, name, ',');
++        if (!vstr.isEmpty())
++            vstr.append(&quot;, &quot;, 2);
++        vstr.append(name);
+         hdr = request-&gt;header.getByName(name);
+         safe_free(name);
+         value = hdr.termedBuf();
+@@ -640,8 +643,8 @@
+     vary.clean();
+ #endif
+ 
+-    debugs(11, 3, &quot;httpMakeVaryMark: &quot; &lt;&lt; vstr);
+-    return vstr.termedBuf();
++    debugs(11, 3, vstr);
++    return vstr;
+ }
+ 
+ void
+@@ -942,15 +945,15 @@
+             || rep-&gt;header.has(Http::HdrType::HDR_X_ACCELERATOR_VARY)
+ #endif
+        ) {
+-        const char *vary = httpMakeVaryMark(request, rep);
++        const SBuf vary(httpMakeVaryMark(request, rep));
+ 
+-        if (!vary) {
++        if (vary.isEmpty()) {
+             entry-&gt;makePrivate();
+             if (!fwd-&gt;reforwardableStatus(rep-&gt;sline.status()))
+                 EBIT_CLR(entry-&gt;flags, ENTRY_FWD_HDR_WAIT);
+             varyFailure = true;
+         } else {
+-            entry-&gt;mem_obj-&gt;vary_headers = xstrdup(vary);
++            entry-&gt;mem_obj-&gt;vary_headers = vary;
+         }
+     }
+ 
+
+=== modified file 'src/http.h'
+--- src/http.h	2016-01-25 17:54:50 +0000
++++ src/http.h	2016-03-21 00:06:34 +0000
+@@ -13,6 +13,7 @@
+ #include &quot;comm.h&quot;
+ #include &quot;http/forward.h&quot;
+ #include &quot;HttpStateFlags.h&quot;
++#include &quot;sbuf/SBuf.h&quot;
+ 
+ class FwdState;
+ class HttpHeader;
+@@ -132,7 +133,7 @@
+ 
+ int httpCachable(const HttpRequestMethod&amp;);
+ void httpStart(FwdState *);
+-const char *httpMakeVaryMark(HttpRequest * request, HttpReply const * reply);
++SBuf httpMakeVaryMark(HttpRequest * request, HttpReply const * reply);
+ 
+ #endif /* SQUID_HTTP_H */
+ 
+
+=== modified file 'src/store.cc'
+--- src/store.cc	2016-02-19 15:06:42 +0000
++++ src/store.cc	2016-03-20 22:48:37 +0000
+@@ -658,31 +658,28 @@
+     if (mem_obj-&gt;request) {
+         HttpRequest *request = mem_obj-&gt;request;
+ 
+-        if (!mem_obj-&gt;vary_headers) {
++        if (mem_obj-&gt;vary_headers.isEmpty()) {
+             /* First handle the case where the object no longer varies */
+-            safe_free(request-&gt;vary_headers);
++            request-&gt;vary_headers.clear();
+         } else {
+-            if (request-&gt;vary_headers &amp;&amp; strcmp(request-&gt;vary_headers, mem_obj-&gt;vary_headers) != 0) {
++            if (!request-&gt;vary_headers.isEmpty() &amp;&amp; request-&gt;vary_headers != mem_obj-&gt;vary_headers) {
+                 /* Oops.. the variance has changed. Kill the base object
+                  * to record the new variance key
+                  */
+-                safe_free(request-&gt;vary_headers);       /* free old &quot;bad&quot; variance key */
++                request-&gt;vary_headers.clear();       /* free old &quot;bad&quot; variance key */
+                 if (StoreEntry *pe = storeGetPublic(mem_obj-&gt;storeId(), mem_obj-&gt;method))
+                     pe-&gt;release();
+             }
+ 
+             /* Make sure the request knows the variance status */
+-            if (!request-&gt;vary_headers) {
+-                const char *vary = httpMakeVaryMark(request, mem_obj-&gt;getReply());
+-
+-                if (vary)
+-                    request-&gt;vary_headers = xstrdup(vary);
++            if (request-&gt;vary_headers.isEmpty()) {
++                request-&gt;vary_headers = httpMakeVaryMark(request, mem_obj-&gt;getReply());
+             }
+         }
+ 
+         // TODO: storeGetPublic() calls below may create unlocked entries.
+         // We should add/use storeHas() API or lock/unlock those entries.
+-        if (mem_obj-&gt;vary_headers &amp;&amp; !storeGetPublic(mem_obj-&gt;storeId(), mem_obj-&gt;method)) {
++        if (!mem_obj-&gt;vary_headers.isEmpty() &amp;&amp; !storeGetPublic(mem_obj-&gt;storeId(), mem_obj-&gt;method)) {
+             /* Create &quot;vary&quot; base object */
+             String vary;
+             StoreEntry *pe = storeCreateEntry(mem_obj-&gt;storeId(), mem_obj-&gt;logUri(), request-&gt;flags, request-&gt;method);
+
+=== modified file 'src/store_key_md5.cc'
+--- src/store_key_md5.cc	2016-01-01 00:12:18 +0000
++++ src/store_key_md5.cc	2016-03-20 22:49:17 +0000
+@@ -124,8 +124,8 @@
+     SquidMD5Update(&amp;M, &amp;m, sizeof(m));
+     SquidMD5Update(&amp;M, (unsigned char *) url.rawContent(), url.length());
+ 
+-    if (request-&gt;vary_headers) {
+-        SquidMD5Update(&amp;M, (unsigned char *) request-&gt;vary_headers, strlen(request-&gt;vary_headers));
++    if (!request-&gt;vary_headers.isEmpty()) {
++        SquidMD5Update(&amp;M, request-&gt;vary_headers.rawContent(), request-&gt;vary_headers.length());
+         debugs(20, 3, &quot;updating public key by vary headers: &quot; &lt;&lt; request-&gt;vary_headers &lt;&lt; &quot; for: &quot; &lt;&lt; url);
+     }
+ 
+
+=== modified file 'src/store_swapmeta.cc'
+--- src/store_swapmeta.cc	2016-03-11 17:24:13 +0000
++++ src/store_swapmeta.cc	2016-03-20 22:51:48 +0000
+@@ -39,7 +39,6 @@
+ {
+     tlv *TLV = NULL;        /* we'll return this */
+     tlv **T = &TLV;
+-    const char *vary;
+     assert(e-&gt;mem_obj != NULL);
+     const int64_t objsize = e-&gt;mem_obj-&gt;expectedReplySize();
+ 
+@@ -87,10 +86,11 @@
+     }
+ 
+     T = StoreMeta::Add(T, t);
+-    vary = e-&gt;mem_obj-&gt;vary_headers;
++    SBuf vary = e-&gt;mem_obj-&gt;vary_headers;
+ 
+-    if (vary) {
+-        t =StoreMeta::Factory(STORE_META_VARY_HEADERS, strlen(vary) + 1, vary);
++    if (!vary.isEmpty()) {
++        // XXX: do we still need +1 here?
++        t = StoreMeta::Factory(STORE_META_VARY_HEADERS, vary.length() + 1, vary.c_str());
+ 
+         if (!t) {
+             storeSwapTLVFree(TLV);
+
+=== modified file 'src/tests/stub_MemObject.cc'
+--- src/tests/stub_MemObject.cc	2016-01-01 00:12:18 +0000
++++ src/tests/stub_MemObject.cc	2016-03-20 22:35:17 +0000
+@@ -38,7 +38,6 @@
+     id(0),
+     object_sz(-1),
+     swap_hdr_sz(0),
+-    vary_headers(NULL),
+     _reply(NULL)
+ {
+     memset(&amp;clients, 0, sizeof(clients));
+
+=== modified file 'src/tests/stub_http.cc'
+--- src/tests/stub_http.cc	2016-01-01 00:12:18 +0000
++++ src/tests/stub_http.cc	2016-03-20 20:36:54 +0000
+@@ -7,12 +7,12 @@
+  */
+ 
+ #include &quot;squid.h&quot;
+-
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
++#include &quot;SBuf.h&quot;
+ 
+ #define STUB_API &quot;http.cc&quot;
+ #include &quot;tests/STUB.h&quot;
+ 
+-const char * httpMakeVaryMark(HttpRequest * request, HttpReply const * reply) STUB_RETVAL(NULL)
++SBuf httpMakeVaryMark(HttpRequest * request, HttpReply const * reply) STUB_RETVAL(SBuf())
+ 
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005463.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » gcc,d-ubuntu-vivid #593
+</A></li>
+	<LI>Next message: <A HREF="005488.html">[squid-dev] [PATCH] NotePairs, SSL and Cert Validation memory leaks
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5462">[ date ]</a>
+              <a href="thread.html#5462">[ thread ]</a>
+              <a href="subject.html#5462">[ subject ]</a>
+              <a href="author.html#5462">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

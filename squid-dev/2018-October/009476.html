@@ -1,0 +1,158 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] Incremental parsing of chunked quoted extensions
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20Incremental%20parsing%20of%20chunked%20quoted%20extensions&In-Reply-To=%3Cfb5ae31e-3910-b8dd-8ab3-5e4e61d8cad5%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="009475.html">
+   <LINK REL="Next"  HREF="009477.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] Incremental parsing of chunked quoted extensions</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20Incremental%20parsing%20of%20chunked%20quoted%20extensions&In-Reply-To=%3Cfb5ae31e-3910-b8dd-8ab3-5e4e61d8cad5%40measurement-factory.com%3E"
+       TITLE="[squid-dev] Incremental parsing of chunked quoted extensions">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Fri Oct  5 15:34:52 UTC 2018</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009475.html">[squid-dev] Incremental parsing of chunked quoted extensions
+</A></li>
+        <LI>Next message: <A HREF="009477.html">[squid-dev] Incremental parsing of chunked quoted extensions
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9476">[ date ]</a>
+              <a href="thread.html#9476">[ thread ]</a>
+              <a href="subject.html#9476">[ subject ]</a>
+              <a href="author.html#9476">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 10/04/2018 12:30 PM, Eduard Bagdasaryan wrote:
+&gt;<i> Hello all,
+</I>&gt;<i> 
+</I>&gt;<i> There is a bug in Squid during incremental parsing of quoted chunked
+</I>&gt;<i> extensions, resulting in unexpected throwing in
+</I>&gt;<i> One::Parser::skipLineTerminator(). The underlying problem comes from
+</I>&gt;<i> the fact that Http::One::Tokenizer::qdText() cannot parse
+</I>&gt;<i> incrementally because it cannot distinguish &quot;an invalid input&quot; from
+</I>&gt;<i> &quot;need more data&quot; case.
+</I>&gt;<i> 
+</I>&gt;<i> I see two approaches for fixing this problem:
+</I>&gt;<i> 
+</I>&gt;<i> * Low-level.
+</I>&gt;<i>   Supply Parser::Tokenizer and its children with incremental parsing
+</I>&gt;<i>   functionality. It looks like this would require much non-trivial work.
+</I>&gt;<i> 
+</I>&gt;<i> * High-level.
+</I>&gt;<i>   Avoid incremental parsing of chunked extensions and parse them all
+</I>&gt;<i>   at once. 
+</I>
+&gt;<i> Is the incremental parsing of chunked extensions all-important here?
+</I>
+IMO, it is not important: The vast majority of chunks have no extensions
+at all, and the vast majority of chunks with extensions have small
+extensions. Thus, the performance improvement from incremental parsing
+would be an extremely rare event. Such improvements are never &quot;all
+important&quot; (and are often not worth their complexity).
+
+Parsing of chunked extensions does not need to be incremental. However,
+parsing of chunked encoding as a whole has to be incremental --
+reparsing data chunks _is_ expensive, and we should not wait for the end
+of the message body (or even for the end of the chunk) even if reparsing
+were cheap. Thus, TeChunkedParser has to be incremental.
+
+Whether the incremental pieces of TeChunkedParser should be used when
+parsing chunk extensions is a separate question. I will partially answer
+it further below.
+
+
+&gt;<i>   In other words, we need to adjust the Tokenizer caller
+</I>&gt;<i>   to buffer the whole chunk extension line before passing it to the
+</I>&gt;<i>   Tokenizer in order to avoid &quot;need more data&quot; case, causing that bug.
+</I>
+I doubt that writing code to explicitly buffer the whole line before
+parsing extensions is necessary. It is definitely not desirable because
+it slows things down in _common_ cases. I would adjust the code to
+follow this sketch instead:
+
+    while (!atEof()) {
+        if (skipLineTerminator())
+            return true; // reached the end of extensions (if any)
+        if (parseChunkExtension())
+            continue; // got one extension; there may be more
+        if (tok.skipAll(NotLF) &amp;&amp; skip(LF))
+            throw &quot;cannot parse chunk extension&quot;; // &lt;garbage&gt; CR*LF
+        return false; // need more data to finish parsing extension
+    }
+    return false; // need data to start parsing extension or CRLF
+
+where skipLineTerminator() is, essentially,
+
+    return tok.skip(CRLF)) || (relaxed_parser &amp;&amp; tok.skipOne(LF));
+
+
+As you can see, the above sketch is optimized for the common cases and
+blindly seeks to the end of the line only in rare cases of partially
+received or malformed extensions.
+
+Please note that whether the above sketch is used incrementally is an
+_orthogonal_ question:
+
+* In incremental parsing, a successful parseChunkExtension() would
+update object state to remember the parsed extension and advance the
+parsing position to never come back to the same spot. The loop caller
+would advance the parsing position/state if (and only if) the loop
+returns true.
+
+* In non-incremental parsing, a successful parseChunkExtension() would
+update its parameter (not shown) to remember the parsed extension. The
+loop caller would update object state (&quot;committing&quot; that not shown
+parameter info) and advance the parsing position if (and only if) the
+loop returns true. [ Alternatively, a successful parseChunkExtension()
+would update object state directly, sometimes overwriting the previous
+(identical) value many times. The current useOriginBody code uses that
+simpler scheme. However, even with this simpler alternative, the
+advancement is controlled by the loop caller. ]
+
+Should we fix and continue to use incremental parsing here or abandon
+it? The answer probably depends on overall code simplicity. Since we
+have to use incremental parsing for parsing chunked encoding as a whole
+(as discussed in the beginning of this email), we may continue to use it
+for parsing extensions if (and only if) doing so does not complicate things.
+
+
+HTH,
+
+Alex.
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009475.html">[squid-dev] Incremental parsing of chunked quoted extensions
+</A></li>
+	<LI>Next message: <A HREF="009477.html">[squid-dev] Incremental parsing of chunked quoted extensions
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9476">[ date ]</a>
+              <a href="thread.html#9476">[ thread ]</a>
+              <a href="subject.html#9476">[ subject ]</a>
+              <a href="author.html#9476">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

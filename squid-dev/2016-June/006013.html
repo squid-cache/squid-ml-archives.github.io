@@ -1,0 +1,769 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] LockingPointer API update
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20LockingPointer%20API%20update&In-Reply-To=%3C01e3afdb-be62-e807-305d-bc706f8a5327%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006012.html">
+   <LINK REL="Next"  HREF="006015.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] LockingPointer API update</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20LockingPointer%20API%20update&In-Reply-To=%3C01e3afdb-be62-e807-305d-bc706f8a5327%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] LockingPointer API update">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Tue Jun 21 10:00:11 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006012.html">[squid-dev] Build failed in Jenkins: trunk-full-matrix » gcc,d-centos-7 #185
+</A></li>
+        <LI>Next message: <A HREF="006015.html">[squid-dev] [PATCH] LockingPointer API update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6013">[ date ]</a>
+              <a href="thread.html#6013">[ thread ]</a>
+              <a href="subject.html#6013">[ subject ]</a>
+              <a href="author.html#6013">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>With GnuTLS support it is sometimes more useful to use a TidyPointer
+where a LockingPointer is used by OpenSSL.
+
+This patch converts the LockingPointer resetAndLock() to a virtual
+reset() so callers can use the right one without needing to care which
+type of pointer they are handling.
+
+Doing this has already uncovered two instances of the
+TidyPointer::reset() being wrongly used on cert LockingPointer objects.
+There may be more hidden away, I only noticed the ones that were being
+used near a resetAndLock() on the same variable. That could have been
+leading to early unexpected free'ing of those certs in some code paths.
+
+This change needs to be checked by someone with an OpenSSL bumping
+installation please.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/base/TidyPointer.h'
+--- src/base/TidyPointer.h	2016-03-31 23:33:45 +0000
++++ src/base/TidyPointer.h	2016-06-20 22:24:54 +0000
+@@ -12,53 +12,53 @@
+ /**
+  * A pointer that deletes the object it points to when the pointer's owner or
+  * context is gone. Similar to std::unique_ptr but without confusing assignment
+  * and with a customizable cleanup method. Prevents memory leaks in
+  * the presence of exceptions and processing short cuts.
+ */
+ template &lt;typename T, void (*DeAllocator)(T *t)&gt; class TidyPointer
+ {
+ public:
+     /// Delete callback.
+     typedef void DCB (T *t);
+     TidyPointer(T *t = NULL)
+         :   raw(t) {}
+ public:
+     bool operator !() const { return !raw; }
+     explicit operator bool() const { return raw; }
+     /// Returns raw and possibly NULL pointer
+     T *get() const { return raw; }
+ 
+     /// Reset raw pointer - delete last one and save new one.
+-    void reset(T *t) {
++    virtual void reset(T *t) {
+         deletePointer();
+         raw = t;
+     }
+ 
+     /// Forget the raw pointer without freeing it. Become a nil pointer.
+     T *release() {
+         T *ret = raw;
+         raw = NULL;
+         return ret;
+     }
+     /// Deallocate raw pointer.
+-    ~TidyPointer() {
++    virtual ~TidyPointer() {
+         deletePointer();
+     }
+ private:
+     /// Forbidden copy constructor.
+     TidyPointer(TidyPointer&lt;T, DeAllocator&gt; const &amp;);
+     /// Forbidden assigment operator.
+     TidyPointer &lt;T, DeAllocator&gt; &amp; operator = (TidyPointer&lt;T, DeAllocator&gt; const &amp;);
+     /// Deallocate raw pointer. Become a nil pointer.
+     void deletePointer() {
+         if (raw) {
+             DeAllocator(raw);
+         }
+         raw = NULL;
+     }
+     T *raw; ///&lt; pointer to T object or NULL
+ };
+ 
+ /// DeAllocator for pointers that need free(3) from the std C library
+ template&lt;typename T&gt; void tidyFree(T *p)
+ {
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-05-20 13:20:27 +0000
++++ src/client_side.cc	2016-06-20 22:36:29 +0000
+@@ -2879,55 +2879,55 @@
+                     SSL_CTX *sslContext = SSL_get_SSL_CTX(ssl);
+                     Ssl::configureUnconfiguredSslContext(sslContext, signAlgorithm, *port);
+                 } else {
+                     auto ctx = Ssl::generateSslContextUsingPkeyAndCertFromMemory(reply_message.getBody().c_str(), *port);
+                     getSslContextDone(ctx, true);
+                 }
+                 return;
+             }
+         }
+     }
+     getSslContextDone(NULL);
+ }
+ 
+ void ConnStateData::buildSslCertGenerationParams(Ssl::CertificateProperties &amp;certProperties)
+ {
+     certProperties.commonName =  sslCommonName_.isEmpty() ? sslConnectHostOrIp.termedBuf() : sslCommonName_.c_str();
+ 
+     // fake certificate adaptation requires bump-server-first mode
+     if (!sslServerBump) {
+         assert(port-&gt;signingCert.get());
+-        certProperties.signWithX509.resetAndLock(port-&gt;signingCert.get());
++        certProperties.signWithX509.reset(port-&gt;signingCert.get());
+         if (port-&gt;signPkey.get())
+-            certProperties.signWithPkey.resetAndLock(port-&gt;signPkey.get());
++            certProperties.signWithPkey.reset(port-&gt;signPkey.get());
+         certProperties.signAlgorithm = Ssl::algSignTrusted;
+         return;
+     }
+ 
+     // In case of an error while connecting to the secure server, use a fake
+     // trusted certificate, with no mimicked fields and no adaptation
+     // algorithms. There is nothing we can mimic so we want to minimize the
+     // number of warnings the user will have to see to get to the error page.
+     assert(sslServerBump-&gt;entry);
+     if (sslServerBump-&gt;entry-&gt;isEmpty()) {
+         if (X509 *mimicCert = sslServerBump-&gt;serverCert.get())
+-            certProperties.mimicCert.resetAndLock(mimicCert);
++            certProperties.mimicCert.reset(mimicCert);
+ 
+         ACLFilledChecklist checklist(NULL, sslServerBump-&gt;request.getRaw(),
+                                      clientConnection != NULL ? clientConnection-&gt;rfc931 : dash_str);
+         checklist.sslErrors = cbdataReference(sslServerBump-&gt;sslErrors());
+ 
+         for (sslproxy_cert_adapt *ca = Config.ssl_client.cert_adapt; ca != NULL; ca = ca-&gt;next) {
+             // If the algorithm already set, then ignore it.
+             if ((ca-&gt;alg == Ssl::algSetCommonName &amp;&amp; certProperties.setCommonName) ||
+                     (ca-&gt;alg == Ssl::algSetValidAfter &amp;&amp; certProperties.setValidAfter) ||
+                     (ca-&gt;alg == Ssl::algSetValidBefore &amp;&amp; certProperties.setValidBefore) )
+                 continue;
+ 
+             if (ca-&gt;aclList &amp;&amp; checklist.fastCheck(ca-&gt;aclList) == ACCESS_ALLOWED) {
+                 const char *alg = Ssl::CertAdaptAlgorithmStr[ca-&gt;alg];
+                 const char *param = ca-&gt;param;
+ 
+                 // For parameterless CN adaptation, use hostname from the
+                 // CONNECT request.
+                 if (ca-&gt;alg == Ssl::algSetCommonName) {
+                     if (!param)
+@@ -2946,48 +2946,48 @@
+ 
+         certProperties.signAlgorithm = Ssl::algSignEnd;
+         for (sslproxy_cert_sign *sg = Config.ssl_client.cert_sign; sg != NULL; sg = sg-&gt;next) {
+             if (sg-&gt;aclList &amp;&amp; checklist.fastCheck(sg-&gt;aclList) == ACCESS_ALLOWED) {
+                 certProperties.signAlgorithm = (Ssl::CertSignAlgorithm)sg-&gt;alg;
+                 break;
+             }
+         }
+     } else {// if (!sslServerBump-&gt;entry-&gt;isEmpty())
+         // Use trusted certificate for a Squid-generated error
+         // or the user would have to add a security exception
+         // just to see the error page. We will close the connection
+         // so that the trust is not extended to non-Squid content.
+         certProperties.signAlgorithm = Ssl::algSignTrusted;
+     }
+ 
+     assert(certProperties.signAlgorithm != Ssl::algSignEnd);
+ 
+     if (certProperties.signAlgorithm == Ssl::algSignUntrusted) {
+         assert(port-&gt;untrustedSigningCert.get());
+-        certProperties.signWithX509.resetAndLock(port-&gt;untrustedSigningCert.get());
+-        certProperties.signWithPkey.resetAndLock(port-&gt;untrustedSignPkey.get());
++        certProperties.signWithX509.reset(port-&gt;untrustedSigningCert.get());
++        certProperties.signWithPkey.reset(port-&gt;untrustedSignPkey.get());
+     } else {
+         assert(port-&gt;signingCert.get());
+-        certProperties.signWithX509.resetAndLock(port-&gt;signingCert.get());
++        certProperties.signWithX509.reset(port-&gt;signingCert.get());
+ 
+         if (port-&gt;signPkey.get())
+-            certProperties.signWithPkey.resetAndLock(port-&gt;signPkey.get());
++            certProperties.signWithPkey.reset(port-&gt;signPkey.get());
+     }
+     signAlgorithm = certProperties.signAlgorithm;
+ 
+     certProperties.signHash = Ssl::DefaultSignHash;
+ }
+ 
+ void
+ ConnStateData::getSslContextStart()
+ {
+     // XXX starting SSL with a pipeline of requests still waiting for non-SSL replies?
+     assert(pipeline.count() &lt; 2); // the CONNECT is okay for now. Anything else is a bug.
+     pipeline.terminateAll(0);
+     /* careful: terminateAll(0) above frees request, host, etc. */
+ 
+     if (port-&gt;generateHostCertificates) {
+         Ssl::CertificateProperties certProperties;
+         buildSslCertGenerationParams(certProperties);
+         sslBumpCertKey = certProperties.dbKey().c_str();
+         assert(sslBumpCertKey.size() &gt; 0 &amp;&amp; sslBumpCertKey[0] != '\0');
+ 
+
+=== modified file 'src/security/LockingPointer.h'
+--- src/security/LockingPointer.h	2016-03-31 23:33:45 +0000
++++ src/security/LockingPointer.h	2016-06-20 22:54:50 +0000
+@@ -32,58 +32,61 @@
+         extern &quot;C++&quot; inline void function ## _cpp(argument a) { \
+             function(a); \
+         }
+ 
+ namespace Security
+ {
+ 
+ /**
+  * Add SSL locking (a.k.a. reference counting) and assignment to TidyPointer
+  */
+ template &lt;typename T, void (*DeAllocator)(T *t), int lock&gt;
+ class LockingPointer: public TidyPointer&lt;T, DeAllocator&gt;
+ {
+ public:
+     typedef TidyPointer&lt;T, DeAllocator&gt; Parent;
+     typedef LockingPointer&lt;T, DeAllocator, lock&gt; SelfType;
+ 
+     explicit LockingPointer(T *t = nullptr): Parent(t) {}
+ 
+     explicit LockingPointer(const SelfType &amp;o): Parent() {
+-        resetAndLock(o.get());
++        reset(o.get());
+     }
++    virtual ~LockingPointer() = default;
+ 
+     SelfType &amp;operator =(const SelfType &amp; o) {
+-        resetAndLock(o.get());
++        reset(o.get());
+         return *this;
+     }
+ 
+ #if __cplusplus &gt;= 201103L
+     explicit LockingPointer(LockingPointer&lt;T, DeAllocator, lock&gt; &amp;&amp;o): Parent(o.release()) {
+     }
+ 
+     LockingPointer&lt;T, DeAllocator, lock&gt; &amp;operator =(LockingPointer&lt;T, DeAllocator, lock&gt; &amp;&amp;o) {
+         if (o.get() != this-&gt;get())
+             this-&gt;reset(o.release());
+         return *this;
+     }
+ #endif
+ 
+-    void resetAndLock(T *t) {
++    virtual void reset(T *t) override {
+         if (t != this-&gt;get()) {
+-            this-&gt;reset(t);
++            // initial part must match TidyPointer::reset
++            this-&gt;TidyPointer&lt;T, DeAllocator&gt;::reset(t);
++            // then the locking
+ #if USE_OPENSSL
+             if (t)
+                 CRYPTO_add(&amp;t-&gt;references, 1, lock);
+ #elif USE_GNUTLS
+             // XXX: GnuTLS does not provide locking ?
+ #else
+             assert(false);
+ #endif
+         }
+     }
+ };
+ 
+ } // namespace Security
+ 
+ #endif /* SQUID_SRC_SECURITY_LOCKINGPOINTER_H */
+ 
+
+=== modified file 'src/ssl/ErrorDetail.cc'
+--- src/ssl/ErrorDetail.cc	2016-01-01 00:12:18 +0000
++++ src/ssl/ErrorDetail.cc	2016-06-20 22:39:28 +0000
+@@ -611,48 +611,48 @@
+         code_len = convert(++p, &amp;t);
+         if (code_len)
+             errDetailStr.append(t);
+         else
+             errDetailStr.append(&quot;%&quot;);
+         s = p + code_len;
+     }
+     errDetailStr.append(s, strlen(s));
+ }
+ 
+ const String &amp;Ssl::ErrorDetail::toString() const
+ {
+     if (errDetailStr.size() == 0)
+         buildDetail();
+     return errDetailStr;
+ }
+ 
+ Ssl::ErrorDetail::ErrorDetail( Ssl::ssl_error_t err_no, X509 *cert, X509 *broken, const char *aReason): error_no (err_no), lib_error_no(SSL_ERROR_NONE), errReason(aReason)
+ {
+     if (cert)
+-        peer_cert.resetAndLock(cert);
++        peer_cert.reset(cert);
+ 
+     if (broken)
+-        broken_cert.resetAndLock(broken);
++        broken_cert.reset(broken);
+     else
+-        broken_cert.resetAndLock(cert);
++        broken_cert.reset(cert);
+ 
+     detailEntry.error_no = SSL_ERROR_NONE;
+ }
+ 
+ Ssl::ErrorDetail::ErrorDetail(Ssl::ErrorDetail const &amp;anErrDetail)
+ {
+     error_no = anErrDetail.error_no;
+     request = anErrDetail.request;
+ 
+     if (anErrDetail.peer_cert.get()) {
+-        peer_cert.resetAndLock(anErrDetail.peer_cert.get());
++        peer_cert.reset(anErrDetail.peer_cert.get());
+     }
+ 
+     if (anErrDetail.broken_cert.get()) {
+-        broken_cert.resetAndLock(anErrDetail.broken_cert.get());
++        broken_cert.reset(anErrDetail.broken_cert.get());
+     }
+ 
+     detailEntry = anErrDetail.detailEntry;
+ 
+     lib_error_no = anErrDetail.lib_error_no;
+ }
+ 
+
+=== modified file 'src/ssl/PeekingPeerConnector.cc'
+--- src/ssl/PeekingPeerConnector.cc	2016-05-18 16:35:36 +0000
++++ src/ssl/PeekingPeerConnector.cc	2016-06-20 22:40:27 +0000
+@@ -212,41 +212,41 @@
+         }
+     }
+ 
+     return ssl;
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::noteNegotiationDone(ErrorState *error)
+ {
+     Security::SessionPtr ssl = fd_table[serverConnection()-&gt;fd].ssl.get();
+ 
+     // Check the list error with
+     if (!request-&gt;clientConnectionManager.valid() || ! ssl)
+         return;
+ 
+     // remember the server certificate from the ErrorDetail object
+     if (Ssl::ServerBump *serverBump = request-&gt;clientConnectionManager-&gt;serverBump()) {
+         if (!serverBump-&gt;serverCert.get()) {
+             // remember the server certificate from the ErrorDetail object
+             if (error &amp;&amp; error-&gt;detail &amp;&amp; error-&gt;detail-&gt;peerCert())
+-                serverBump-&gt;serverCert.resetAndLock(error-&gt;detail-&gt;peerCert());
++                serverBump-&gt;serverCert.reset(error-&gt;detail-&gt;peerCert());
+             else {
+                 handleServerCertificate();
+             }
+         }
+ 
+         if (error) {
+             // For intercepted connections, set the host name to the server
+             // certificate CN. Otherwise, we just hope that CONNECT is using
+             // a user-entered address (a host name or a user-entered IP).
+             const bool isConnectRequest = !request-&gt;clientConnectionManager-&gt;port-&gt;flags.isIntercepted();
+             if (request-&gt;flags.sslPeek &amp;&amp; !isConnectRequest) {
+                 if (X509 *srvX509 = serverBump-&gt;serverCert.get()) {
+                     if (const char *name = Ssl::CommonHostName(srvX509)) {
+                         request-&gt;url.host(name);
+                         debugs(83, 3, &quot;reset request host: &quot; &lt;&lt; name);
+                     }
+                 }
+             }
+         }
+     }
+@@ -333,41 +333,41 @@
+         Security::SessionPtr ssl = fd_table[fd].ssl.get();
+         Security::CertPointer serverCert(SSL_get_peer_certificate(ssl));
+         if (!serverCert.get())
+             return;
+ 
+         serverCertificateHandled = true;
+ 
+         // remember the server certificate for later use
+         if (Ssl::ServerBump *serverBump = csd-&gt;serverBump()) {
+             serverBump-&gt;serverCert.reset(serverCert.release());
+         }
+     }
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::serverCertificateVerified()
+ {
+     if (ConnStateData *csd = request-&gt;clientConnectionManager.valid()) {
+         Security::CertPointer serverCert;
+         if(Ssl::ServerBump *serverBump = csd-&gt;serverBump())
+-            serverCert.resetAndLock(serverBump-&gt;serverCert.get());
++            serverCert.reset(serverBump-&gt;serverCert.get());
+         else {
+             const int fd = serverConnection()-&gt;fd;
+             Security::SessionPtr ssl = fd_table[fd].ssl.get();
+             serverCert.reset(SSL_get_peer_certificate(ssl));
+         }
+         if (serverCert.get()) {
+             csd-&gt;resetSslCommonName(Ssl::CommonHostName(serverCert.get()));
+             debugs(83, 5, &quot;HTTPS server CN: &quot; &lt;&lt; csd-&gt;sslCommonName() &lt;&lt;
+                    &quot; bumped: &quot; &lt;&lt; *serverConnection());
+         }
+     }
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::tunnelInsteadOfNegotiating()
+ {
+     Must(callback != NULL);
+     CbDialer *dialer = dynamic_cast&lt;CbDialer*&gt;(callback-&gt;getDialer());
+     Must(dialer);
+     dialer-&gt;answer().tunneled = true;
+
+=== modified file 'src/ssl/ServerBump.cc'
+--- src/ssl/ServerBump.cc	2016-02-13 12:12:10 +0000
++++ src/ssl/ServerBump.cc	2016-06-20 22:41:30 +0000
+@@ -40,33 +40,33 @@
+     // later, but an entry without any client will trim all its contents away.
+     sc = storeClientListAdd(entry, this);
+ }
+ 
+ Ssl::ServerBump::~ServerBump()
+ {
+     debugs(33, 4, HERE &lt;&lt; &quot;destroying&quot;);
+     if (entry) {
+         debugs(33, 4, HERE &lt;&lt; *entry);
+         storeUnregister(sc, entry, this);
+         entry-&gt;unlock(&quot;Ssl::ServerBump&quot;);
+     }
+ }
+ 
+ void
+ Ssl::ServerBump::attachServerSSL(SSL *ssl)
+ {
+     if (serverSSL.get())
+         return;
+ 
+-    serverSSL.resetAndLock(ssl);
++    serverSSL.reset(ssl);
+ }
+ 
+ const Ssl::CertErrors *
+ Ssl::ServerBump::sslErrors() const
+ {
+     if (!serverSSL.get())
+         return NULL;
+ 
+     const Ssl::CertErrors *errs = static_cast&lt;const Ssl::CertErrors*&gt;(SSL_get_ex_data(serverSSL.get(), ssl_ex_index_ssl_errors));
+     return errs;
+ }
+ 
+
+=== modified file 'src/ssl/cert_validate_message.cc'
+--- src/ssl/cert_validate_message.cc	2016-01-05 10:55:14 +0000
++++ src/ssl/cert_validate_message.cc	2016-06-20 22:41:38 +0000
+@@ -199,52 +199,52 @@
+     id = old.id;
+     error_no = old.error_no;
+     error_reason = old.error_reason;
+     error_depth = old.error_depth;
+     setCert(old.cert.get());
+ }
+ 
+ Ssl::CertValidationResponse::RecvdError &amp; Ssl::CertValidationResponse::RecvdError::operator = (const RecvdError &amp;old)
+ {
+     id = old.id;
+     error_no = old.error_no;
+     error_reason = old.error_reason;
+     error_depth = old.error_depth;
+     setCert(old.cert.get());
+     return *this;
+ }
+ 
+ void
+ Ssl::CertValidationResponse::RecvdError::setCert(X509 *aCert)
+ {
+-    cert.resetAndLock(aCert);
++    cert.reset(aCert);
+ }
+ 
+ Ssl::CertValidationMsg::CertItem::CertItem(const CertItem &amp;old)
+ {
+     name = old.name;
+     setCert(old.cert.get());
+ }
+ 
+ Ssl::CertValidationMsg::CertItem &amp; Ssl::CertValidationMsg::CertItem::operator = (const CertItem &amp;old)
+ {
+     name = old.name;
+     setCert(old.cert.get());
+     return *this;
+ }
+ 
+ void
+ Ssl::CertValidationMsg::CertItem::setCert(X509 *aCert)
+ {
+-    cert.resetAndLock(aCert);
++    cert.reset(aCert);
+ }
+ 
+ const std::string Ssl::CertValidationMsg::code_cert_validate(&quot;cert_validate&quot;);
+ const std::string Ssl::CertValidationMsg::param_domain(&quot;domain&quot;);
+ const std::string Ssl::CertValidationMsg::param_cert(&quot;cert_&quot;);
+ const std::string Ssl::CertValidationMsg::param_error_name(&quot;error_name_&quot;);
+ const std::string Ssl::CertValidationMsg::param_error_reason(&quot;error_reason_&quot;);
+ const std::string Ssl::CertValidationMsg::param_error_cert(&quot;error_cert_&quot;);
+ const std::string Ssl::CertValidationMsg::param_error_depth(&quot;error_depth_&quot;);
+ const std::string Ssl::CertValidationMsg::param_proto_version(&quot;proto_version&quot;);
+ const std::string Ssl::CertValidationMsg::param_cipher(&quot;cipher&quot;);
+ 
+
+=== modified file 'src/ssl/gadgets.cc'
+--- src/ssl/gadgets.cc	2016-06-14 18:12:14 +0000
++++ src/ssl/gadgets.cc	2016-06-20 22:41:58 +0000
+@@ -492,41 +492,41 @@
+                 if (X509_add_ext(cert.get(), ext, -1))
+                     ++addedExtensions;
+             }
+         }
+ 
+         addedExtensions += mimicExtensions(cert, properties.mimicCert, properties.signWithX509);
+ 
+         // According to RFC 5280, using extensions requires v3 certificate.
+         if (addedExtensions)
+             X509_set_version(cert.get(), 2); // value 2 means v3
+     }
+ 
+     return true;
+ }
+ 
+ static bool generateFakeSslCertificate(Security::CertPointer &amp; certToStore, Ssl::EVP_PKEY_Pointer &amp; pkeyToStore, Ssl::CertificateProperties const &amp;properties,  Ssl::BIGNUM_Pointer const &amp;serial)
+ {
+     Ssl::EVP_PKEY_Pointer pkey;
+     // Use signing certificates private key as generated certificate private key
+     if (properties.signWithPkey.get())
+-        pkey.resetAndLock(properties.signWithPkey.get());
++        pkey.reset(properties.signWithPkey.get());
+     else // if not exist generate one
+         pkey.reset(Ssl::createSslPrivateKey());
+ 
+     if (!pkey)
+         return false;
+ 
+     Security::CertPointer cert(X509_new());
+     if (!cert)
+         return false;
+ 
+     // Set pub key and serial given by the caller
+     if (!X509_set_pubkey(cert.get(), pkey.get()))
+         return false;
+     if (!setSerialNumber(X509_get_serialNumber(cert.get()), serial.get()))
+         return false;
+ 
+     // Fill the certificate with the required properties
+     if (!buildCertificate(cert, properties))
+         return false;
+ 
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2016-06-02 09:52:43 +0000
++++ src/ssl/support.cc	2016-06-20 22:43:17 +0000
+@@ -289,41 +289,41 @@
+             if (!SSL_set_ex_data(ssl, ssl_ex_index_ssl_errors,  (void *)errs)) {
+                 debugs(83, 2, &quot;Failed to set ssl error_no in ssl_verify_cb: Certificate &quot; &lt;&lt; buffer);
+                 delete errs;
+                 errs = NULL;
+             }
+         } else // remember another error number
+             errs-&gt;push_back_unique(Ssl::CertError(error_no, broken_cert));
+ 
+         if (const char *err_descr = Ssl::GetErrorDescr(error_no))
+             debugs(83, 5, err_descr &lt;&lt; &quot;: &quot; &lt;&lt; buffer);
+         else
+             debugs(83, DBG_IMPORTANT, &quot;SSL unknown certificate error &quot; &lt;&lt; error_no &lt;&lt; &quot; in &quot; &lt;&lt; buffer);
+ 
+         // Check if the certificate error can be bypassed.
+         // Infinity validation loop errors can not bypassed.
+         if (error_no != SQUID_X509_V_ERR_INFINITE_VALIDATION) {
+             if (check) {
+                 ACLFilledChecklist *filledCheck = Filled(check);
+                 assert(!filledCheck-&gt;sslErrors);
+                 filledCheck-&gt;sslErrors = new Ssl::CertErrors(Ssl::CertError(error_no, broken_cert));
+-                filledCheck-&gt;serverCert.resetAndLock(peer_cert);
++                filledCheck-&gt;serverCert.reset(peer_cert);
+                 if (check-&gt;fastCheck() == ACCESS_ALLOWED) {
+                     debugs(83, 3, &quot;bypassing SSL error &quot; &lt;&lt; error_no &lt;&lt; &quot; in &quot; &lt;&lt; buffer);
+                     ok = 1;
+                 } else {
+                     debugs(83, 5, &quot;confirming SSL error &quot; &lt;&lt; error_no);
+                 }
+                 delete filledCheck-&gt;sslErrors;
+                 filledCheck-&gt;sslErrors = NULL;
+                 filledCheck-&gt;serverCert.reset(NULL);
+             }
+             // If the certificate validator is used then we need to allow all errors and
+             // pass them to certficate validator for more processing
+             else if (Ssl::TheConfig.ssl_crt_validator) {
+                 ok = 1;
+             }
+         }
+     }
+ 
+     if (Ssl::TheConfig.ssl_crt_validator) {
+         // Check if we have stored certificates chain. Store if not.
+@@ -1282,42 +1282,42 @@
+ }
+ 
+ bool Ssl::generateUntrustedCert(Security::CertPointer &amp;untrustedCert, EVP_PKEY_Pointer &amp;untrustedPkey, Security::CertPointer const  &amp;cert, EVP_PKEY_Pointer const &amp; pkey)
+ {
+     // Generate the self-signed certificate, using a hard-coded subject prefix
+     Ssl::CertificateProperties certProperties;
+     if (const char *cn = CommonHostName(cert.get())) {
+         certProperties.commonName = &quot;Not trusted by \&quot;&quot;;
+         certProperties.commonName += cn;
+         certProperties.commonName += &quot;\&quot;&quot;;
+     } else if (const char *org = getOrganization(cert.get())) {
+         certProperties.commonName =  &quot;Not trusted by \&quot;&quot;;
+         certProperties.commonName += org;
+         certProperties.commonName += &quot;\&quot;&quot;;
+     } else
+         certProperties.commonName =  &quot;Not trusted&quot;;
+     certProperties.setCommonName = true;
+     // O, OU, and other CA subject fields will be mimicked
+     // Expiration date and other common properties will be mimicked
+     certProperties.signAlgorithm = Ssl::algSignSelf;
+-    certProperties.signWithPkey.resetAndLock(pkey.get());
+-    certProperties.mimicCert.resetAndLock(cert.get());
++    certProperties.signWithPkey.reset(pkey.get());
++    certProperties.mimicCert.reset(cert.get());
+     return Ssl::generateSslCertificate(untrustedCert, untrustedPkey, certProperties);
+ }
+ 
+ SSL *
+ SslCreate(Security::ContextPtr sslContext, const int fd, Ssl::Bio::Type type, const char *squidCtx)
+ {
+     if (fd &lt; 0) {
+         debugs(83, DBG_IMPORTANT, &quot;Gone connection&quot;);
+         return NULL;
+     }
+ 
+     const char *errAction = NULL;
+     int errCode = 0;
+     if (auto ssl = SSL_new(sslContext)) {
+         // without BIO, we would call SSL_set_fd(ssl, fd) instead
+         if (BIO *bio = Ssl::Bio::Create(fd, type)) {
+             Ssl::Bio::Link(ssl, bio); // cannot fail
+ 
+             fd_table[fd].ssl.reset(ssl);
+             fd_table[fd].read_method = &amp;ssl_read_method;
+@@ -1335,53 +1335,53 @@
+ 
+     debugs(83, DBG_IMPORTANT, &quot;ERROR: &quot; &lt;&lt; squidCtx &lt;&lt; ' ' &lt;&lt; errAction &lt;&lt;
+            &quot;: &quot; &lt;&lt; ERR_error_string(errCode, NULL));
+     return NULL;
+ }
+ 
+ SSL *
+ Ssl::CreateClient(Security::ContextPtr sslContext, const int fd, const char *squidCtx)
+ {
+     return SslCreate(sslContext, fd, Ssl::Bio::BIO_TO_SERVER, squidCtx);
+ }
+ 
+ SSL *
+ Ssl::CreateServer(Security::ContextPtr sslContext, const int fd, const char *squidCtx)
+ {
+     return SslCreate(sslContext, fd, Ssl::Bio::BIO_TO_CLIENT, squidCtx);
+ }
+ 
+ Ssl::CertError::CertError(ssl_error_t anErr, X509 *aCert, int aDepth): code(anErr), depth(aDepth)
+ {
+-    cert.resetAndLock(aCert);
++    cert.reset(aCert);
+ }
+ 
+ Ssl::CertError::CertError(CertError const &amp;err): code(err.code), depth(err.depth)
+ {
+-    cert.resetAndLock(err.cert.get());
++    cert.reset(err.cert.get());
+ }
+ 
+ Ssl::CertError &amp;
+ Ssl::CertError::operator = (const CertError &amp;old)
+ {
+     code = old.code;
+-    cert.resetAndLock(old.cert.get());
++    cert.reset(old.cert.get());
+     return *this;
+ }
+ 
+ bool
+ Ssl::CertError::operator == (const CertError &amp;ce) const
+ {
+     return code == ce.code &amp;&amp; cert.get() == ce.cert.get();
+ }
+ 
+ bool
+ Ssl::CertError::operator != (const CertError &amp;ce) const
+ {
+     return code != ce.code || cert.get() != ce.cert.get();
+ }
+ 
+ static int
+ store_session_cb(SSL *ssl, SSL_SESSION *session)
+ {
+     if (!Ssl::SessionCache)
+         return 0;
+
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006012.html">[squid-dev] Build failed in Jenkins: trunk-full-matrix » gcc,d-centos-7 #185
+</A></li>
+	<LI>Next message: <A HREF="006015.html">[squid-dev] [PATCH] LockingPointer API update
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6013">[ date ]</a>
+              <a href="thread.html#6013">[ thread ]</a>
+              <a href="subject.html#6013">[ subject ]</a>
+              <a href="author.html#6013">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

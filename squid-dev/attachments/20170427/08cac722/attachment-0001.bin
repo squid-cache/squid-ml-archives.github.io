@@ -1,0 +1,652 @@
+=== modified file 'src/security/Session.cc'
+--- src/security/Session.cc	2017-04-25 22:32:50 +0000
++++ src/security/Session.cc	2017-04-26 00:04:26 +0000
+@@ -6,40 +6,45 @@
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 83    TLS session management */
+ 
+ #include "squid.h"
+ #include "anyp/PortCfg.h"
+ #include "base/RunnersRegistry.h"
+ #include "CachePeer.h"
+ #include "Debug.h"
+ #include "fd.h"
+ #include "fde.h"
+ #include "ipc/MemMap.h"
+ #include "security/Session.h"
+ #include "SquidConfig.h"
+ #include "ssl/bio.h"
+ 
+ #define SSL_SESSION_ID_SIZE 32
+ #define SSL_SESSION_MAX_SIZE 10*1024
+ 
++#if USE_OPENSSL // while Ssl:: bits in use
++static const char *SessionCacheName = "tls_session_cache";
++static Ipc::MemMap *SessionCache = nullptr;
++#endif
++
+ bool
+ Security::SessionIsResumed(const Security::ConnectionPointer &s)
+ {
+     bool result = false;
+ #if USE_OPENSSL
+     result = SSL_session_reused(s.get()) == 1;
+ #elif USE_GNUTLS
+     result = gnutls_session_is_resumed(s.get()) != 0;
+ #endif
+     debugs(83, 7, "session=" << (void*)s.get() << ", query? answer: " << (result ? 'T' : 'F') );
+     return result;
+ }
+ 
+ void
+ Security::MaybeGetSessionResumeData(const Security::ConnectionPointer &s, Security::SessionStatePointer &data)
+ {
+     if (!SessionIsResumed(s)) {
+ #if USE_OPENSSL
+         // nil is valid for SSL_get1_session(), it cannot fail.
+         data.reset(SSL_get1_session(s.get()));
+@@ -66,107 +71,220 @@
+             const auto ssl_error = ERR_get_error();
+             debugs(83, 3, "handle=" << (void*)s.get() << " data=" << (void*)data.get() <<
+                    " resume error: " << Security::ErrorString(ssl_error));
+         }
+ #elif USE_GNUTLS
+         const auto x = gnutls_session_set_data(s.get(), data->data, data->size);
+         if (x != GNUTLS_E_SUCCESS) {
+             debugs(83, 3, "handle=" << (void*)s.get() << " data=" << (void*)data.get() <<
+                    " resume error: " << Security::ErrorString(x));
+         }
+ #else
+         // critical because, how did it get here?
+         debugs(83, DBG_CRITICAL, "no TLS library. handle=" << (void*)s.get() << " data=" << (void*)data.get());
+ #endif
+         debugs(83, 5, "handle=" << (void*)s.get() << " data=" << (void*)data.get());
+     } else {
+         debugs(83, 5, "handle=" << (void*)s.get() << " no resume data");
+     }
+ }
+ 
++#if USE_OPENSSL
++static int
++store_session_cb(SSL *ssl, SSL_SESSION *session)
++{
++    if (!SessionCache)
++        return 0;
++
++    debugs(83, 5, "Request to store TLS Session");
++
++    SSL_SESSION_set_timeout(session, Config.SSL.session_ttl);
++
++#if (OPENSSL_VERSION_NUMBER < 0x10100000L)
++    unsigned char *id = session->session_id;
++    unsigned int idlen = session->session_id_length;
++#else
++    unsigned int idlen;
++    const unsigned char *id = SSL_SESSION_get_id(session, &idlen);
++#endif
++    unsigned char key[MEMMAP_SLOT_KEY_SIZE];
++    // Session ids are of size 32bytes. They should always fit to a
++    // MemMap::Slot::key
++    assert(idlen <= MEMMAP_SLOT_KEY_SIZE);
++    memset(key, 0, sizeof(key));
++    memcpy(key, id, idlen);
++    int pos;
++    if (auto *slotW = SessionCache->openForWriting((const cache_key*)key, pos)) {
++        int lenRequired =  i2d_SSL_SESSION(session, nullptr);
++        if (lenRequired <  MEMMAP_SLOT_DATA_SIZE) {
++            unsigned char *p = (unsigned char *)slotW->p;
++            lenRequired = i2d_SSL_SESSION(session, &p);
++            slotW->set(key, nullptr, lenRequired, squid_curtime + Config.SSL.session_ttl);
++        }
++        SessionCache->closeForWriting(pos);
++        debugs(83, 5, "wrote TLS session entry of size " << lenRequired << " at pos " << pos);
++    }
++    return 0;
++}
++#endif
++
++#if USE_OPENSSL
++static void
++remove_session_cb(SSL_CTX *, SSL_SESSION *sessionID)
++{
++    if (!SessionCache)
++        return ;
++
++    debugs(83, 5, "Request to remove corrupted or not valid TLS Session");
++    int pos;
++    if (SessionCache->openForReading((const cache_key*)sessionID, pos)) {
++        SessionCache->closeForReading(pos);
++        // TODO:
++        // What if we are not able to remove the session?
++        // Maybe schedule a job to remove it later?
++        // For now we just have an invalid entry in cache until will be expired
++        // The openSSL will reject it when we try to use it
++        SessionCache->free(pos);
++    }
++}
++#endif
++
++#if USE_OPENSSL
++static SSL_SESSION *
++#if (OPENSSL_VERSION_NUMBER < 0x10100000L)
++get_session_cb(SSL *, unsigned char *sessionID, int len, int *copy)
++#else
++get_session_cb(SSL *, const unsigned char *sessionID, int len, int *copy)
++#endif
++{
++    if (!SessionCache)
++        return nullptr;
++
++    SSL_SESSION *session = nullptr;
++    const unsigned int *p;
++    p = (unsigned int *)sessionID;
++    debugs(83, 5, "Request to search for TLS Session of len:" <<
++           len << p[0] << ":" << p[1]);
++
++    int pos;
++    if (const auto *slot = SessionCache->openForReading((const cache_key*)sessionID, pos)) {
++        if (slot->expire > squid_curtime) {
++            const unsigned char *ptr = slot->p;
++            session = d2i_SSL_SESSION(nullptr, &ptr, slot->pSize);
++            debugs(83, 5, "Session retrieved from cache at pos " << pos);
++        } else
++            debugs(83, 5, "Session in cache expired");
++        SessionCache->closeForReading(pos);
++    }
++
++    if (!session)
++        debugs(83, 5, "Failed to retrieved from cache\n");
++
++    // With the parameter copy the callback can require the SSL engine
++    // to increment the reference count of the SSL_SESSION object, Normally
++    // the reference count is not incremented and therefore the session must
++    // not be explicitly freed with SSL_SESSION_free(3).
++    *copy = 0;
++    return session;
++}
++#endif
++
++void
++Security::SetSessionCallbacks(Security::ContextPointer &ctx)
++{
++#if USE_OPENSSL
++    if (SessionCache) {
++        SSL_CTX_set_session_cache_mode(ctx.get(), SSL_SESS_CACHE_SERVER|SSL_SESS_CACHE_NO_INTERNAL);
++        SSL_CTX_sess_set_new_cb(ctx.get(), store_session_cb);
++        SSL_CTX_sess_set_remove_cb(ctx.get(), remove_session_cb);
++        SSL_CTX_sess_set_get_cb(ctx.get(), get_session_cb);
++    }
++#endif
++}
++
+ static bool
+ isTlsServer()
+ {
+     for (AnyP::PortCfgPointer s = HttpPortList; s != nullptr; s = s->next) {
+         if (s->secure.encryptTransport)
+             return true;
+         if (s->flags.tunnelSslBumping)
+             return true;
+     }
+ 
+     return false;
+ }
+ 
+ void
+ initializeSessionCache()
+ {
+ #if USE_OPENSSL
+     // Check if the MemMap keys and data are enough big to hold
+     // session ids and session data
+     assert(SSL_SESSION_ID_SIZE >= MEMMAP_SLOT_KEY_SIZE);
+     assert(SSL_SESSION_MAX_SIZE >= MEMMAP_SLOT_DATA_SIZE);
+ 
+     int configuredItems = ::Config.SSL.sessionCacheSize / sizeof(Ipc::MemMap::Slot);
+     if (IamWorkerProcess() && configuredItems)
+-        Ssl::SessionCache = new Ipc::MemMap(Ssl::SessionCacheName);
++        SessionCache = new Ipc::MemMap(SessionCacheName);
+     else {
+-        Ssl::SessionCache = nullptr;
++        SessionCache = nullptr;
+         return;
+     }
+ 
+     for (AnyP::PortCfgPointer s = HttpPortList; s != nullptr; s = s->next) {
+         if (s->secure.staticContext)
+-            Ssl::SetSessionCallbacks(s->secure.staticContext);
++            Security::SetSessionCallbacks(s->secure.staticContext);
+     }
+ #endif
+ }
+ 
+ /// initializes shared memory segments used by MemStore
+ class SharedSessionCacheRr: public Ipc::Mem::RegisteredRunner
+ {
+ public:
+     /* RegisteredRunner API */
+     SharedSessionCacheRr(): owner(nullptr) {}
+     virtual void useConfig();
+     virtual ~SharedSessionCacheRr();
+ 
+ protected:
+     virtual void create();
+ 
+ private:
+     Ipc::MemMap::Owner *owner;
+ };
+ 
+ RunnerRegistrationEntry(SharedSessionCacheRr);
+ 
+ void
+ SharedSessionCacheRr::useConfig()
+ {
+ #if USE_OPENSSL // while Ssl:: bits in use
+-    if (Ssl::SessionCache || !isTlsServer()) //no need to configure ssl session cache.
++    if (SessionCache || !isTlsServer()) //no need to configure ssl session cache.
+         return;
+ 
+     Ipc::Mem::RegisteredRunner::useConfig();
+     initializeSessionCache();
+ #endif
+ }
+ 
+ void
+ SharedSessionCacheRr::create()
+ {
+     if (!isTlsServer()) //no need to configure ssl session cache.
+         return;
+ 
+ #if USE_OPENSSL // while Ssl:: bits in use
+     if (int items = Config.SSL.sessionCacheSize / sizeof(Ipc::MemMap::Slot))
+-        owner = Ipc::MemMap::Init(Ssl::SessionCacheName, items);
++        owner = Ipc::MemMap::Init(SessionCacheName, items);
+ #endif
+ }
+ 
+ SharedSessionCacheRr::~SharedSessionCacheRr()
+ {
+     // XXX: Enable after testing to reduce at-exit memory "leaks".
+-    // delete Ssl::SessionCache;
++    // delete SessionCache;
+ 
+     delete owner;
+ }
+ 
+
+=== modified file 'src/security/Session.h'
+--- src/security/Session.h	2017-04-25 22:32:50 +0000
++++ src/security/Session.h	2017-04-25 23:46:07 +0000
+@@ -10,40 +10,42 @@
+ #define SQUID_SRC_SECURITY_SESSION_H
+ 
+ #include "base/HardFun.h"
+ #include "comm/forward.h"
+ #include "security/Connection.h"
+ 
+ namespace Security {
+ 
+ #if USE_OPENSSL
+ typedef std::unique_ptr<SSL_SESSION, HardFun<void, SSL_SESSION*, &SSL_SESSION_free>> SessionStatePointer;
+ 
+ #elif USE_GNUTLS
+ // wrapper function to get around gnutls_free being a typedef
+ inline void squid_gnutls_free(void *d) {gnutls_free(d);}
+ typedef std::unique_ptr<gnutls_datum_t, HardFun<void, void*, &Security::squid_gnutls_free>> SessionStatePointer;
+ 
+ #else
+ typedef std::unique_ptr<int> SessionStatePointer;
+ #endif
+ 
++void SetSessionCallbacks(Security::ContextPointer &);
++
+ /// whether the session is a resumed one
+ bool SessionIsResumed(const Security::ConnectionPointer &);
+ 
+ /**
+  * When the session is not a resumed session, retrieve the details needed to
+  * resume a later connection and store them in 'data'. This may result in 'data'
+  * becoming a nil Pointer if no details exist or an error occurs.
+  *
+  * When the session is already a resumed session, do nothing and leave 'data'
+  * unhanged.
+  * XXX: is this latter behaviour always correct?
+  */
+ void MaybeGetSessionResumeData(const Security::ConnectionPointer &, Security::SessionStatePointer &data);
+ 
+ /// Set the data for resuming a previous session.
+ /// Needs to be done before using the ConnectionPointer for a handshake.
+ void SetSessionResumeData(const Security::ConnectionPointer &, const Security::SessionStatePointer &);
+ 
+ } // namespace Security
+ 
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2017-04-25 22:32:50 +0000
++++ src/ssl/support.cc	2017-04-25 23:46:49 +0000
+@@ -4,60 +4,56 @@
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 83    SSL accelerator support */
+ 
+ #include "squid.h"
+ 
+ /* MS Visual Studio Projects are monolithic, so we need the following
+  * #if to exclude the SSL code from compile process when not needed.
+  */
+ #if USE_OPENSSL
+ 
+ #include "acl/FilledChecklist.h"
+ #include "anyp/PortCfg.h"
+ #include "fatal.h"
+ #include "fd.h"
+ #include "fde.h"
+ #include "globals.h"
+-#include "ipc/MemMap.h"
+ #include "security/CertError.h"
+ #include "security/Session.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "ssl/bio.h"
+ #include "ssl/Config.h"
+ #include "ssl/ErrorDetail.h"
+ #include "ssl/gadgets.h"
+ #include "ssl/support.h"
+ #include "URL.h"
+ 
+ #include <cerrno>
+ 
+ // TODO: Move ssl_ex_index_* global variables from global.cc here.
+ int ssl_ex_index_ssl_untrusted_chain = -1;
+ 
+-Ipc::MemMap *Ssl::SessionCache = NULL;
+-const char *Ssl::SessionCacheName = "ssl_session_cache";
+-
+ static Ssl::CertsIndexedList SquidUntrustedCerts;
+ 
+ const EVP_MD *Ssl::DefaultSignHash = NULL;
+ 
+ std::vector<const char *> Ssl::BumpModeStr = {
+     "none",
+     "client-first",
+     "server-first",
+     "peek",
+     "stare",
+     "bump",
+     "splice",
+     "terminate"
+     /*,"err"*/
+ };
+ 
+ /**
+  \defgroup ServerProtocolSSLInternal Server-Side SSL Internals
+  \ingroup ServerProtocolSSLAPI
+  */
+@@ -547,41 +543,41 @@
+         }
+ 
+         if (port.secure.parsedFlags & SSL_FLAG_DELAYED_AUTH) {
+             debugs(83, 9, "Not requesting client certificates until acl processing requires one");
+             SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, NULL);
+         } else {
+             debugs(83, 9, "Requiring client certificates.");
+             SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ssl_verify_cb);
+         }
+ 
+         port.secure.updateContextCrl(ctx);
+ 
+     } else {
+         debugs(83, 9, "Not requiring any client certificates");
+         SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, NULL);
+     }
+ 
+     if (port.secure.parsedFlags & SSL_FLAG_DONT_VERIFY_DOMAIN)
+         SSL_CTX_set_ex_data(ctx.get(), ssl_ctx_ex_index_dont_verify_domain, (void *) -1);
+ 
+-    Ssl::SetSessionCallbacks(ctx);
++    Security::SetSessionCallbacks(ctx);
+ 
+     return true;
+ }
+ 
+ bool
+ Ssl::InitServerContext(Security::ContextPointer &ctx, AnyP::PortCfg &port)
+ {
+     if (!ctx)
+         return false;
+ 
+     if (!SSL_CTX_use_certificate(ctx.get(), port.signingCert.get())) {
+         const int ssl_error = ERR_get_error();
+         const auto &keys = port.secure.certs.front();
+         debugs(83, DBG_CRITICAL, "ERROR: Failed to acquire TLS certificate '" << keys.certFile << "': " << Security::ErrorString(ssl_error));
+         return false;
+     }
+ 
+     if (!SSL_CTX_use_PrivateKey(ctx.get(), port.signPkey.get())) {
+         const int ssl_error = ERR_get_error();
+         const auto &keys = port.secure.certs.front();
+@@ -1362,130 +1358,22 @@
+     Ssl::CertificateProperties certProperties;
+     if (const char *cn = CommonHostName(cert.get())) {
+         certProperties.commonName = "Not trusted by \"";
+         certProperties.commonName += cn;
+         certProperties.commonName += "\"";
+     } else if (const char *org = getOrganization(cert.get())) {
+         certProperties.commonName =  "Not trusted by \"";
+         certProperties.commonName += org;
+         certProperties.commonName += "\"";
+     } else
+         certProperties.commonName =  "Not trusted";
+     certProperties.setCommonName = true;
+     // O, OU, and other CA subject fields will be mimicked
+     // Expiration date and other common properties will be mimicked
+     certProperties.signAlgorithm = Ssl::algSignSelf;
+     certProperties.signWithPkey.resetAndLock(pkey.get());
+     certProperties.mimicCert.resetAndLock(cert.get());
+     return Ssl::generateSslCertificate(untrustedCert, untrustedPkey, certProperties);
+ }
+ 
+-static int
+-store_session_cb(SSL *ssl, SSL_SESSION *session)
+-{
+-    if (!Ssl::SessionCache)
+-        return 0;
+-
+-    debugs(83, 5, "Request to store SSL Session ");
+-
+-    SSL_SESSION_set_timeout(session, Config.SSL.session_ttl);
+-
+-#if (OPENSSL_VERSION_NUMBER < 0x10100000L)
+-    unsigned char *id = session->session_id;
+-    unsigned int idlen = session->session_id_length;
+-#else
+-    unsigned int idlen;
+-    const unsigned char *id = SSL_SESSION_get_id(session, &idlen);
+-#endif
+-    unsigned char key[MEMMAP_SLOT_KEY_SIZE];
+-    // Session ids are of size 32bytes. They should always fit to a
+-    // MemMap::Slot::key
+-    assert(idlen <= MEMMAP_SLOT_KEY_SIZE);
+-    memset(key, 0, sizeof(key));
+-    memcpy(key, id, idlen);
+-    int pos;
+-    Ipc::MemMap::Slot *slotW = Ssl::SessionCache->openForWriting((const cache_key*)key, pos);
+-    if (slotW) {
+-        int lenRequired =  i2d_SSL_SESSION(session, NULL);
+-        if (lenRequired <  MEMMAP_SLOT_DATA_SIZE) {
+-            unsigned char *p = (unsigned char *)slotW->p;
+-            lenRequired = i2d_SSL_SESSION(session, &p);
+-            slotW->set(key, NULL, lenRequired, squid_curtime + Config.SSL.session_ttl);
+-        }
+-        Ssl::SessionCache->closeForWriting(pos);
+-        debugs(83, 5, "wrote an ssl session entry of size " << lenRequired << " at pos " << pos);
+-    }
+-    return 0;
+-}
+-
+-static void
+-remove_session_cb(SSL_CTX *, SSL_SESSION *sessionID)
+-{
+-    if (!Ssl::SessionCache)
+-        return ;
+-
+-    debugs(83, 5, "Request to remove corrupted or not valid SSL Session ");
+-    int pos;
+-    Ipc::MemMap::Slot const *slot = Ssl::SessionCache->openForReading((const cache_key*)sessionID, pos);
+-    if (slot == NULL)
+-        return;
+-    Ssl::SessionCache->closeForReading(pos);
+-    // TODO:
+-    // What if we are not able to remove the session?
+-    // Maybe schedule a job to remove it later?
+-    // For now we just have an invalid entry in cache until will be expired
+-    // The openSSL will reject it when we try to use it
+-    Ssl::SessionCache->free(pos);
+-}
+-
+-static SSL_SESSION *
+-#if (OPENSSL_VERSION_NUMBER < 0x10100000L)
+-get_session_cb(SSL *, unsigned char *sessionID, int len, int *copy)
+-#else
+-get_session_cb(SSL *, const unsigned char *sessionID, int len, int *copy)
+-#endif
+-{
+-    if (!Ssl::SessionCache)
+-        return NULL;
+-
+-    SSL_SESSION *session = NULL;
+-    const unsigned int *p;
+-    p = (unsigned int *)sessionID;
+-    debugs(83, 5, "Request to search for SSL Session of len:" <<
+-           len << p[0] << ":" << p[1]);
+-
+-    int pos;
+-    Ipc::MemMap::Slot const *slot = Ssl::SessionCache->openForReading((const cache_key*)sessionID, pos);
+-    if (slot != NULL) {
+-        if (slot->expire > squid_curtime) {
+-            const unsigned char *ptr = slot->p;
+-            session = d2i_SSL_SESSION(NULL, &ptr, slot->pSize);
+-            debugs(83, 5, "Session retrieved from cache at pos " << pos);
+-        } else
+-            debugs(83, 5, "Session in cache expired");
+-        Ssl::SessionCache->closeForReading(pos);
+-    }
+-
+-    if (!session)
+-        debugs(83, 5, "Failed to retrieved from cache\n");
+-
+-    // With the parameter copy the callback can require the SSL engine
+-    // to increment the reference count of the SSL_SESSION object, Normally
+-    // the reference count is not incremented and therefore the session must
+-    // not be explicitly freed with SSL_SESSION_free(3).
+-    *copy = 0;
+-    return session;
+-}
+-
+-void
+-Ssl::SetSessionCallbacks(Security::ContextPointer &ctx)
+-{
+-    if (Ssl::SessionCache) {
+-        SSL_CTX_set_session_cache_mode(ctx.get(), SSL_SESS_CACHE_SERVER|SSL_SESS_CACHE_NO_INTERNAL);
+-        SSL_CTX_sess_set_new_cb(ctx.get(), store_session_cb);
+-        SSL_CTX_sess_set_remove_cb(ctx.get(), remove_session_cb);
+-        SSL_CTX_sess_set_get_cb(ctx.get(), get_session_cb);
+-    }
+-}
+-
+ #endif /* USE_OPENSSL */
+ 
+
+=== modified file 'src/ssl/support.h'
+--- src/ssl/support.h	2017-01-12 13:26:45 +0000
++++ src/ssl/support.h	2017-04-25 23:38:08 +0000
+@@ -56,44 +56,40 @@
+ namespace AnyP
+ {
+ class PortCfg;
+ };
+ 
+ namespace Ipc
+ {
+ class MemMap;
+ }
+ 
+ namespace Ssl
+ {
+ /// initialize the SSL library global state.
+ /// call before generating any SSL context
+ void Initialize();
+ 
+ class ErrorDetail;
+ class CertValidationResponse;
+ typedef RefCount<CertValidationResponse> CertValidationResponsePointer;
+ 
+-void SetSessionCallbacks(Security::ContextPointer &);
+-extern Ipc::MemMap *SessionCache;
+-extern const char *SessionCacheName;
+-
+ /// initialize a TLS server context with OpenSSL specific settings
+ bool InitServerContext(Security::ContextPointer &, AnyP::PortCfg &);
+ 
+ /// initialize a TLS client context with OpenSSL specific settings
+ bool InitClientContext(Security::ContextPointer &, Security::PeerOptions &, long flags);
+ 
+ #if defined(CRYPTO_LOCK_X509)
+ // portability wrapper for OpenSSL 1.0 vs 1.1
+ // use Security::CertPointer instead where possible
+ inline int X509_up_ref(X509 *t) {if (t) CRYPTO_add(&t->references, 1, CRYPTO_LOCK_X509); return 0;}
+ #endif
+ 
+ } //namespace Ssl
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ const char *sslGetUserEmail(SSL *ssl);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ const char *sslGetUserAttribute(SSL *ssl, const char *attribute_name);
+ 
+
+=== modified file 'src/tests/stub_libsecurity.cc'
+--- src/tests/stub_libsecurity.cc	2017-04-25 22:32:50 +0000
++++ src/tests/stub_libsecurity.cc	2017-04-26 11:25:51 +0000
+@@ -78,34 +78,35 @@
+ Security::ContextPointer Security::PeerOptions::createClientContext(bool) STUB_RETVAL(Security::ContextPointer())
+ void Security::PeerOptions::updateTlsVersionLimits() STUB
+ Security::ContextPointer Security::PeerOptions::createBlankContext() const STUB_RETVAL(Security::ContextPointer())
+ void Security::PeerOptions::updateContextCa(Security::ContextPointer &) STUB
+ void Security::PeerOptions::updateContextCrl(Security::ContextPointer &) STUB
+ void Security::PeerOptions::updateSessionOptions(Security::ConnectionPointer &) STUB
+ void Security::PeerOptions::dumpCfg(Packable*, char const*) const STUB
+ void Security::PeerOptions::parseOptions() STUB
+ void parse_securePeerOptions(Security::PeerOptions *) STUB
+ 
+ #include "security/ServerOptions.h"
+ //Security::ServerOptions::ServerOptions(const Security::ServerOptions &) STUB
+ void Security::ServerOptions::parse(const char *) STUB
+ void Security::ServerOptions::dumpCfg(Packable *, const char *) const STUB
+ Security::ContextPointer Security::ServerOptions::createBlankContext() const STUB_RETVAL(Security::ContextPointer())
+ bool Security::ServerOptions::createStaticServerContext(AnyP::PortCfg &) STUB_RETVAL(false)
+ void Security::ServerOptions::updateContextEecdh(Security::ContextPointer &) STUB
+ 
+ #include "security/Session.h"
+ namespace Security {
++void SetSessionCallbacks(Security::ContextPointer &) STUB
+ bool SessionIsResumed(const Security::ConnectionPointer &) STUB_RETVAL(false)
+ void MaybeGetSessionResumeData(const Security::ConnectionPointer &, Security::SessionStatePointer &) STUB
+ void SetSessionResumeData(const Security::ConnectionPointer &, const Security::SessionStatePointer &) STUB
+ } // namespace Security
+ 
+ #include "security/Connection.h"
+ namespace Security {
+ bool CreateClient(const Security::ContextPointer &, const Comm::ConnectionPointer &, const char *) STUB_RETVAL(false)
+ bool CreateServer(const Security::ContextPointer &, const Comm::ConnectionPointer &, const char *) STUB_RETVAL(false)
+ void SendGoodbye(const Security::ConnectionPointer &) STUB
+ #if USE_OPENSSL
+ Security::ConnectionPointer NewSslObject(const Security::ContextPointer &) STUB_RETVAL(nullptr)
+ #endif
+ } // namespace Security
+

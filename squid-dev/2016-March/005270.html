@@ -1,0 +1,239 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Bug 7: Headers are not updated on disk after	304s
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Bug%207%3A%20Headers%20are%20not%20updated%20on%20disk%20after%0A%09304s&In-Reply-To=%3C56E2268C.8090900%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005493.html">
+   <LINK REL="Next"  HREF="005281.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Bug 7: Headers are not updated on disk after	304s</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Bug%207%3A%20Headers%20are%20not%20updated%20on%20disk%20after%0A%09304s&In-Reply-To=%3C56E2268C.8090900%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] Bug 7: Headers are not updated on disk after	304s">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Fri Mar 11 01:59:40 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005493.html">[squid-dev] [PREVIEW] Free AccessLogEntry::url when needed
+</A></li>
+        <LI>Next message: <A HREF="005281.html">[squid-dev] [PATCH] Bug 7: Headers are not updated on disk after 304s
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5270">[ date ]</a>
+              <a href="thread.html#5270">[ thread ]</a>
+              <a href="subject.html#5270">[ subject ]</a>
+              <a href="author.html#5270">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+    The attached compressed patch fixes a 15+ years old Bug #7 [1] for
+the shared memory cache and rock cache_dirs. I am not aware of anybody
+working on ufs-based cache_dirs, but this patch provides a Store API and
+a cache_dir example on how to fix those as well.
+
+  [1] <A HREF="http://bugs.squid-cache.org/show_bug.cgi?id=7">http://bugs.squid-cache.org/show_bug.cgi?id=7</A>
+
+Besides unavoidable increase in rock-based caching code complexity, the
+[known] costs of this fix are:
+
+1. 8 additional bytes per cache entry for shared memory cache and rock
+cache_dirs. Much bigger but short-lived RAM _savings_ for rock
+cache_dirs (due to less RAM-hungry index rebuild code) somewhat mitigate
+this RAM usage increase.
+
+2. Increased slot fragmentation when updated headers are slightly larger
+than old ones. This can probably be optimized away later if needed by
+padding HTTP headers or StoreEntry metadata.
+
+3. Somewhat slower rock cache_dir index rebuild time. IMO, this should
+eventually be dealt with by not rebuilding the index on most startups at
+all (rather than focusing on the index rebuild optimization).
+
+
+The patch preamble (also quoted below) contains more technical details,
+including a list of side changes that, ideally, should go in as separate
+commits. The posted patch is based on our bug7 branch on lp[2] which has
+many intermediate commits. I am not yet sure whether it makes sense to
+_merge_ that branch into trunk or simply commit it as a single/atomic
+change (except for those side changes). Opinions welcomed.
+
+  [2] <A HREF="https://code.launchpad.net/~measurement-factory/squid/bug7">https://code.launchpad.net/~measurement-factory/squid/bug7</A>
+
+
+-------
+Bug 7: Update cached entries on 304 responses
+
+New Store API to update entry metadata and headers on 304s.
+Support entry updates in shared memory cache and rock cache_dirs.
+
+* Highlights:
+
+1. Atomic StoreEntry metadata updating
+
+   StoreEntry metadata (swap_file_sz, timestamps, etc.) is used
+   throughout Squid code. Metadata cannot be updated atomically because
+   it has many fields, but a partial update to those fields causes
+   assertions. Still, we must update metadata when updating HTTP
+   headers. Locking the entire entry for a rewrite does not work well
+   because concurrent requests will attempt to download a new entry
+   copy, defeating the very HTTP 304 optimization we want to support.
+
+   Ipc::StoreMap index now uses an extra level of indirection (the
+   StoreMap::fileNos index) which allows StoreMap control which
+   anchor/fileno is associated with a given StoreEntry key. The entry
+   updating code creates a disassociated (i.e., entry/key-less) anchor,
+   writes new metadata and headers using that new anchor, and then
+   _atomically_ switches the map to use that new anchor. This allows old
+   readers to continue reading using the stale anchor/fileno as if
+   nothing happened while a new reader gets the new anchor/fileno.
+
+   Shared memory usage increase: 8 additional bytes per cache entry: 4
+   for the extra level of indirection (StoreMapFileNos) plus 4 for
+   splicing fresh chain prefix with the stale chain suffix
+   (StoreMapAnchor::splicingPoint). However, if the updated headers are
+   larger than the stale ones, Squid will allocate shared memory pages
+   to accommodate for the increase, leading to shared memory
+   fragmentation/waste for small increases.
+
+2. Revamped rock index rebuild process
+
+   The index rebuild process had to be completely revamped because
+   splicing fresh and stale entry slot chain segments implies tolerating
+   multiple entry versions in a single chain and the old code was based
+   on the assumption that different slot versions are incompatible. We
+   were also uncomfortable with the old cavalier approach to accessing
+   two differently indexed layers of information (entry vs. slot) using
+   the same set of class fields, making it trivial to accidentally
+   access entry data while using slot index.
+
+   During the rewrite of the index rebuilding code, we also discovered a
+   way to significantly reduce RAM usage for the index build map (a
+   temporary object that is allocated in the beginning and freed at the
+   end of the index build process). The savings depend on the cache
+   size: A small cache saves about 30% (17 vs 24 bytes per entry/slot)
+   while a 1TB cache_dir with 32KB slots (which implies uneven
+   entry/slot indexes) saves more than 50% (~370MB vs. ~800MB).
+
+   Adjusted how invalid slots are counted. The code was sometimes
+   counting invalid entries and sometimes invalid entry slots. We should
+   always count _slots_ now because progress is measured in the number
+   of slots scanned, not entries loaded. This accounting change may
+   surprise users with much higher &quot;Invalid entries&quot; count in cache.log
+   upon startup, but at least the new reports are meaningful.
+
+   This rewrite does not attempt to solve all rock index build problems.
+   For example, the code still assumes that StoreEntry metadata fits a
+   single slot which is not always true for very small slots.
+
+
+* Side-changes to be committed separately, to the extent possible:
+
+1. Do not prohibit updating Last-Modified on 304 responses. RFC 7232
+   Section 4.1 says sending Last-Modified in 304 might be useful and RFC
+   7234 Section 4.3.3 requires updating all non-Warning headers.
+
+2. Added missing const qualifiers to HTTP message packing methods.
+
+3. Removed SWAPOUT_WRITING assertion from storeSwapMetaBuild().
+
+   I do not see any strong dependency of that code on that state and we
+   need to be able to build swap metadata when updating a stale entry
+   (which would not normally be in the SWAPOUT_WRITING state).
+
+   The biggest danger is that somebody calls storeSwapMetaBuild() when
+   the entry metadata is not yet stable. I am not sure we have a way of
+   detecting that without using something as overly strong as
+   SWAPOUT_WRITING.
+
+-------
+
+
+Thank you,
+
+Alex.
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: bug7-rock-r14403.patch.gz
+Type: application/gzip
+Size: 48195 bytes
+Desc: not available
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/attachments/20160310/3f4e435d/attachment-0001.bin">http://lists.squid-cache.org/pipermail/squid-dev/attachments/20160310/3f4e435d/attachment-0001.bin</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005493.html">[squid-dev] [PREVIEW] Free AccessLogEntry::url when needed
+</A></li>
+	<LI>Next message: <A HREF="005281.html">[squid-dev] [PATCH] Bug 7: Headers are not updated on disk after 304s
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5270">[ date ]</a>
+              <a href="thread.html#5270">[ thread ]</a>
+              <a href="subject.html#5270">[ subject ]</a>
+              <a href="author.html#5270">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,366 @@
+Fix URI scheme case-sensitivity treatment broken since r14802.
+
+A parsed value for the AnyP::UriScheme image constructor parameter was
+stored without toLower() canonicalization for known protocols (e.g.,
+after successful "HTTP://EXAMPLE.COM/" parsing in urlParseFinish).
+Without that canonicalization step, Squid violated various HTTP caching
+rules related to URI comparison (and served fewer hits) when dealing
+with absolute URLs containing non-lowercase HTTP scheme.
+
+According to my limited tests, URL-based ACLs are not affected by this
+bug, but I have not investigated how URL-based ACL code differs from
+caching code when it comes to stored URL access and whether some ACLs
+are actually affected in some environments.
+
+=== modified file 'src/anyp/UriScheme.cc'
+--- src/anyp/UriScheme.cc	2017-01-01 00:12:22 +0000
++++ src/anyp/UriScheme.cc	2017-02-01 14:26:36 +0000
+@@ -1,61 +1,81 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 23    URL Scheme parsing */
+ 
+ #include "squid.h"
+ #include "anyp/UriScheme.h"
+ 
++std::vector<SBuf> AnyP::UriScheme::LowercaseSchemeNames;
++
+ AnyP::UriScheme::UriScheme(AnyP::ProtocolType const aScheme, const char *img) :
+     theScheme_(aScheme)
+ {
+-    if (img)
+-        // image could be provided explicitly (case-sensitive)
+-        image_ = img;
+-
++    // RFC 3986 section 3.1: schemes are case-insensitive.
++
++    // To improve diagnostic, remember exactly how an unsupported scheme looks like.
++    // XXX: Object users may rely on toLower() canonicalization that we refuse to provide.
++    if (img && theScheme_ == AnyP::PROTO_UNKNOWN)
++         image_ = img;
++
++    // XXX: A broken caller supplies an image of an absent scheme?
++    // XXX: We assume that the caller is using a lower-case image.
++    else if (img && theScheme_ == AnyP::PROTO_NONE)
++         image_ = img;
++
++    // the caller knows nothing about the scheme
++    // TODO: Avoid special casing by storing this string in the generated ProtocolType_str?
+     else if (theScheme_ == AnyP::PROTO_UNKNOWN)
+-        // image could be actually unknown and not provided
+         image_ = "(unknown)";
+ 
+-    else if (theScheme_ > AnyP::PROTO_NONE && theScheme_ < AnyP::PROTO_MAX) {
+-        // image could be implied by a registered transfer protocol
+-        // which use upper-case labels, so down-case for scheme image
+-        image_ = AnyP::ProtocolType_str[theScheme_];
+-        image_.toLower();
++    else if (theScheme_ > AnyP::PROTO_NONE && theScheme_ < AnyP::PROTO_MAX)
++        image_ = LowercaseSchemeNames.at(theScheme_);
++    // else, the image remains empty (e.g., "://example.com/")
++    // hopefully, theScheme_ is PROTO_NONE here
++}
++
++void
++AnyP::UriScheme::Init()
++{
++    if (LowercaseSchemeNames.empty()) {
++        for (int i = AnyP::PROTO_NONE; i < AnyP::PROTO_MAX; ++i) {
++            SBuf image(ProtocolType_str[i]);
++            image.toLower();
++            LowercaseSchemeNames.push_back(image);
++        }
+     }
+-    // else, image is an empty string ("://example.com/")
+ }
+ 
+ unsigned short
+ AnyP::UriScheme::defaultPort() const
+ {
+     switch (theScheme_) {
+ 
+     case AnyP::PROTO_HTTP:
+         return 80;
+ 
+     case AnyP::PROTO_HTTPS:
+         return 443;
+ 
+     case AnyP::PROTO_FTP:
+         return 21;
+ 
+     case AnyP::PROTO_COAP:
+     case AnyP::PROTO_COAPS:
+         // coaps:// default is TBA as of draft-ietf-core-coap-08.
+         // Assuming IANA policy of allocating same port for base and TLS protocol versions will occur.
+         return 5683;
+ 
+     case AnyP::PROTO_GOPHER:
+         return 70;
+ 
+     case AnyP::PROTO_WAIS:
+         return 210;
+ 
+     case AnyP::PROTO_CACHE_OBJECT:
+         return CACHE_HTTP_PORT;
+
+=== modified file 'src/anyp/UriScheme.h'
+--- src/anyp/UriScheme.h	2017-01-01 00:12:22 +0000
++++ src/anyp/UriScheme.h	2017-02-01 14:24:44 +0000
+@@ -1,68 +1,76 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ANYP_URISCHEME_H
+ #define SQUID_ANYP_URISCHEME_H
+ 
+ #include "anyp/ProtocolType.h"
+ #include "sbuf/SBuf.h"
+ 
+ #include <iosfwd>
+ 
+ namespace AnyP
+ {
+ 
+ /** This class represents a URI Scheme such as http:// https://, wais://, urn: etc.
+  * It does not represent the PROTOCOL that such schemes refer to.
+  */
+ class UriScheme
+ {
+ public:
+     UriScheme() : theScheme_(AnyP::PROTO_NONE) {}
++    /// \param img Explicit scheme representation for unknown/none schemes.
+     UriScheme(AnyP::ProtocolType const aScheme, const char *img = nullptr);
+     UriScheme(const AnyP::UriScheme &o) : theScheme_(o.theScheme_), image_(o.image_) {}
+     UriScheme(AnyP::UriScheme &&) = default;
+     ~UriScheme() {}
+ 
+     AnyP::UriScheme& operator=(const AnyP::UriScheme &o) {
+         theScheme_ = o.theScheme_;
+         image_ = o.image_;
+         return *this;
+     }
+     AnyP::UriScheme& operator=(AnyP::UriScheme &&) = default;
+ 
+     operator AnyP::ProtocolType() const { return theScheme_; }
+     // XXX: does not account for comparison of unknown schemes (by image)
+     bool operator != (AnyP::ProtocolType const & aProtocol) const { return theScheme_ != aProtocol; }
+ 
+     /** Get a char string representation of the scheme.
+      * Does not include the ':' or "://" terminators.
+      */
+     SBuf image() const {return image_;}
+ 
+     unsigned short defaultPort() const;
+ 
++    /// fills down-cased protocol scheme names
++    static void Init();
++
+ private:
++    /// optimization: stores down-cased protocol scheme names from
++    /// AnyP::ProtocolType_str
++    static std::vector<SBuf> LowercaseSchemeNames;
++
+     /// This is a typecode pointer into the enum/registry of protocols handled.
+     AnyP::ProtocolType theScheme_;
+ 
+     /// the string representation
+     SBuf image_;
+ };
+ 
+ } // namespace AnyP
+ 
+ inline std::ostream &
+ operator << (std::ostream &os, AnyP::UriScheme const &scheme)
+ {
+     os << scheme.image();
+     return os;
+ }
+ 
+ #endif /* SQUID_ANYP_URISCHEME_H */
+ 
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2017-01-01 00:12:22 +0000
++++ src/main.cc	2017-02-01 14:24:37 +0000
+@@ -1,44 +1,45 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 01    Startup and Main Loop */
+ 
+ #include "squid.h"
+ #include "AccessLogEntry.h"
+ #include "acl/Acl.h"
+ #include "acl/Asn.h"
++#include "anyp/UriScheme.h"
+ #include "auth/Config.h"
+ #include "auth/Gadgets.h"
+ #include "AuthReg.h"
+ #include "base/RunnersRegistry.h"
+ #include "base/Subscription.h"
+ #include "base/TextException.h"
+ #include "cache_cf.h"
+ #include "CachePeer.h"
+ #include "carp.h"
+ #include "client_db.h"
+ #include "client_side.h"
+ #include "comm.h"
+ #include "ConfigParser.h"
+ #include "CpuAffinity.h"
+ #include "DiskIO/DiskIOModule.h"
+ #include "dns/forward.h"
+ #include "errorpage.h"
+ #include "event.h"
+ #include "EventLoop.h"
+ #include "ExternalACL.h"
+ #include "fd.h"
+ #include "format/Token.h"
+ #include "fqdncache.h"
+ #include "fs/Module.h"
+ #include "fs_io.h"
+ #include "FwdState.h"
+ #include "globals.h"
+ #include "htcp.h"
+ #include "http/Stream.h"
+ #include "HttpHeader.h"
+@@ -1176,60 +1177,61 @@
+ #if USE_AUTH
+     authenticateInit(&Auth::TheConfig.schemes);
+ #endif
+     externalAclInit();
+ 
+     httpHeaderInitModule(); /* must go before any header processing (e.g. the one in errorInitialize) */
+ 
+     errorInitialize();
+ 
+     accessLogInit();
+ 
+ #if ICAP_CLIENT
+     icapLogOpen();
+ #endif
+ 
+ #if USE_IDENT
+     Ident::Init();
+ #endif
+ 
+ #if SQUID_SNMP
+ 
+     snmpInit();
+ 
+ #endif
+ #if MALLOC_DBG
+ 
+     malloc_debug(0, malloc_debug_level);
+ 
+ #endif
+ 
++
+     if (!configured_once) {
+         if (unlinkdNeeded())
+             unlinkdInit();
+ 
+         urlInitialize();
+         statInit();
+         storeInit();
+         mainSetCwd();
+         mimeInit(Config.mimeTablePathname);
+         refreshInit();
+ #if USE_DELAY_POOLS
+         DelayPools::Init();
+ #endif
+ 
+         FwdState::initModule();
+         /* register the modules in the cache manager menus */
+ 
+         cbdataRegisterWithCacheManager();
+         SBufStatsAction::RegisterWithCacheManager();
+ 
+         /* These use separate calls so that the comm loops can eventually
+          * coexist.
+          */
+ 
+         eventInit();
+ 
+         // TODO: pconn is a good candidate for new-style registration
+         // PconnModule::GetInstance()->registerWithCacheManager();
+         //   moved to PconnModule::PconnModule()
+     }
+@@ -1489,60 +1491,61 @@
+ 
+     /* parse configuration file
+      * note: in "normal" case this used to be called from mainInitialize() */
+     {
+         int parse_err;
+ 
+         if (!ConfigFile)
+             ConfigFile = xstrdup(DefaultConfigFile);
+ 
+         assert(!configured_once);
+ 
+         Mem::Init();
+ 
+         storeFsInit();      /* required for config parsing */
+ 
+         /* TODO: call the FS::Clean() in shutdown to do Fs cleanups */
+         Fs::Init();
+ 
+         /* May not be needed for parsing, have not audited for such */
+         DiskIOModule::SetupAllModules();
+ 
+         /* Shouldn't be needed for config parsing, but have not audited for such */
+         StoreFileSystem::SetupAllFs();
+ 
+         /* we may want the parsing process to set this up in the future */
+         Store::Init();
+         Auth::Init();      /* required for config parsing. NOP if !USE_AUTH */
+         Ip::ProbeTransport(); // determine IPv4 or IPv6 capabilities before parsing.
+ 
+         Format::Token::Init(); // XXX: temporary. Use a runners registry of pre-parse runners instead.
++        AnyP::UriScheme::Init();
+ 
+         try {
+             parse_err = parseConfigFile(ConfigFile);
+         } catch (...) {
+             // for now any errors are a fatal condition...
+             debugs(1, DBG_CRITICAL, "FATAL: Unhandled exception parsing config file." <<
+                    (opt_parse_cfg_only ? " Run squid -k parse and check for errors." : ""));
+             parse_err = 1;
+         }
+ 
+         Mem::Report();
+ 
+         if (opt_parse_cfg_only || parse_err > 0)
+             return parse_err;
+     }
+     setUmask(Config.umask);
+     if (-1 == opt_send_signal)
+         if (checkRunningPid())
+             exit(0);
+ 
+ #if TEST_ACCESS
+ 
+     comm_init();
+ 
+     mainInitialize();
+ 
+     test_access();
+ 
+     return 0;
+ 
+

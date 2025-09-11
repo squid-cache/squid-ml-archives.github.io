@@ -1,0 +1,161 @@
+Fix ICAP transactions that read a lot of data
+by ensuring the read buffer has space [unless it is really full].
+
+Trunk r13995 (Parser-NG: Convert the ICAP read buffer to an SBuf)
+broke ICAP transactions that read a lot of data because the new
+SBuf::consume() method often does not free buffer space, unlike the
+old MemBuf::consume(). Affected transactions failed with mayReadMore()
+exceptions because their readBuf.spaceSize() was zero while they
+needed to read more data.
+
+Any append,parse,consume;append,parse,consume;... user of SBuf cannot
+rely on SBuf::spaceSize() to be meaningful because even consuming the
+entire SBuf contents may leave spaceSize() at zero! Instead such code
+has to use SBuf::length() to keep buffer from growing too big and
+SBuf::rawSpace(1) to ensure some space is available for reading when
+the buffer is not too big.
+
+=== modified file 'src/adaptation/icap/ModXact.cc'
+--- src/adaptation/icap/ModXact.cc	2015-01-25 15:05:23 +0000
++++ src/adaptation/icap/ModXact.cc	2015-07-24 21:16:32 +0000
+@@ -540,44 +540,44 @@ void Adaptation::Icap::ModXact::startRea
+     Must(!adapted.body_pipe);
+ 
+     // we use the same buffer for headers and body and then consume headers
+     readMore();
+ }
+ 
+ void Adaptation::Icap::ModXact::readMore()
+ {
+     if (reader != NULL || doneReading()) {
+         debugs(93,3,HERE << "returning from readMore because reader or doneReading()");
+         return;
+     }
+ 
+     // do not fill readBuf if we have no space to store the result
+     if (adapted.body_pipe != NULL &&
+             !adapted.body_pipe->buf().hasPotentialSpace()) {
+         debugs(93,3,HERE << "not reading because ICAP reply pipe is full");
+         return;
+     }
+ 
+-    if (readBuf.spaceSize())
++    if (readBuf.length() < SQUID_TCP_SO_RCVBUF)
+         scheduleRead();
+     else
+-        debugs(93,3,HERE << "nothing to do because !readBuf.spaceSize()");
++        debugs(93,3,HERE << "cannot read with a full buffer");
+ }
+ 
+ // comm module read a portion of the ICAP response for us
+ void Adaptation::Icap::ModXact::handleCommRead(size_t)
+ {
+     Must(!state.doneParsing());
+     icap_tio_finish = current_time;
+     parseMore();
+     readMore();
+ }
+ 
+ void Adaptation::Icap::ModXact::echoMore()
+ {
+     Must(state.sending == State::sendingVirgin);
+     Must(adapted.body_pipe != NULL);
+     Must(virginBodySending.active());
+ 
+     const size_t sizeMax = virginContentSize(virginBodySending);
+     debugs(93,5, HERE << "will echo up to " << sizeMax << " bytes from " <<
+            virgin.body_pipe->status());
+
+=== modified file 'src/adaptation/icap/Xaction.cc'
+--- src/adaptation/icap/Xaction.cc	2015-06-02 21:35:51 +0000
++++ src/adaptation/icap/Xaction.cc	2015-07-24 21:29:25 +0000
+@@ -439,40 +439,45 @@ void Adaptation::Icap::Xaction::schedule
+     Must(haveConnection());
+     Must(!reader);
+     Must(readBuf.length() < SQUID_TCP_SO_RCVBUF); // will expand later if needed
+ 
+     typedef CommCbMemFunT<Adaptation::Icap::Xaction, CommIoCbParams> Dialer;
+     reader = JobCallback(93, 3, Dialer, this, Adaptation::Icap::Xaction::noteCommRead);
+     Comm::Read(connection, reader);
+     updateTimeout();
+ }
+ 
+ // comm module read a portion of the ICAP response for us
+ void Adaptation::Icap::Xaction::noteCommRead(const CommIoCbParams &io)
+ {
+     Must(reader != NULL);
+     reader = NULL;
+ 
+     Must(io.flag == Comm::OK);
+ 
+     // TODO: tune this better to expected message sizes
+     readBuf.reserveCapacity(SQUID_TCP_SO_RCVBUF);
++    // we are not asked to grow beyond the allowed maximum
++    Must(readBuf.length() < SQUID_TCP_SO_RCVBUF);
++    // now we can ensure that there is space to read new data,
++    // even if readBuf.spaceSize() currently returns zero.
++    readBuf.rawSpace(1);
+ 
+     CommIoCbParams rd(this); // will be expanded with ReadNow results
+     rd.conn = io.conn;
+ 
+     switch (Comm::ReadNow(rd, readBuf)) {
+     case Comm::INPROGRESS:
+         if (readBuf.isEmpty())
+             debugs(33, 2, io.conn << ": no data to process, " << xstrerr(rd.xerrno));
+         scheduleRead();
+         return;
+ 
+     case Comm::OK:
+         al.icap.bytesRead += rd.size;
+ 
+         updateTimeout();
+ 
+         debugs(93, 3, "read " << rd.size << " bytes");
+ 
+         disableRetries(); // because pconn did not fail
+ 
+@@ -517,41 +522,41 @@ bool Adaptation::Icap::Xaction::parseHtt
+ 
+     Http::StatusCode error = Http::scNone;
+     // XXX: performance regression c_str() data copies
+     const char *buf = readBuf.c_str();
+     const bool parsed = msg->parse(buf, readBuf.length(), commEof, &error);
+     Must(parsed || !error); // success or need more data
+ 
+     if (!parsed) {  // need more data
+         Must(mayReadMore());
+         msg->reset();
+         return false;
+     }
+ 
+     readBuf.consume(msg->hdr_sz);
+     return true;
+ }
+ 
+ bool Adaptation::Icap::Xaction::mayReadMore() const
+ {
+     return !doneReading() && // will read more data
+-           readBuf.spaceSize();  // have space for more data
++           readBuf.length() < SQUID_TCP_SO_RCVBUF;  // have space for more data
+ }
+ 
+ bool Adaptation::Icap::Xaction::doneReading() const
+ {
+     return commEof;
+ }
+ 
+ bool Adaptation::Icap::Xaction::doneWriting() const
+ {
+     return !writer;
+ }
+ 
+ bool Adaptation::Icap::Xaction::doneWithIo() const
+ {
+     return haveConnection() &&
+            !connector && !reader && !writer && // fast checks, some redundant
+            doneReading() && doneWriting();
+ }
+ 
+ bool Adaptation::Icap::Xaction::haveConnection() const
+

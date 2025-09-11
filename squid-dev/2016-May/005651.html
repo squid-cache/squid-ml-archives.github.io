@@ -1,0 +1,468 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] mime unfolding
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20mime%20unfolding&In-Reply-To=%3Cb299ced8-7758-2a7b-3d0b-bc166d976793%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005650.html">
+   <LINK REL="Next"  HREF="005652.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] mime unfolding</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20mime%20unfolding&In-Reply-To=%3Cb299ced8-7758-2a7b-3d0b-bc166d976793%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] mime unfolding">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Wed May 11 11:32:06 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005650.html">[squid-dev] [PATCH] Anticipated connection closure disables chunking
+</A></li>
+        <LI>Next message: <A HREF="005652.html">[squid-dev] [PATCH] mime unfolding
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5651">[ date ]</a>
+              <a href="thread.html#5651">[ thread ]</a>
+              <a href="subject.html#5651">[ subject ]</a>
+              <a href="author.html#5651">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>[taking this out of squid-bugs now that we are no longer focusing on the
+security changes.]
+
+To summarize for those not in the loop already. Squid does not yet do
+obs-fold removal as required by RFC 7230.
+
+There are three options that are compliant:
+1) reject requests containing obs-fold with a 4xx error.
+2) replace the fold CR*LF characters with a series of SP
+3) replace the whole CR*LF WSP sequence with a single SP
+
+Attached patch implements #3.
+
+I've done some basic benchmarking of both options #2 and #3. The #2
+unfold using an optimized reverse-iteration over the mime block is
+consistently a little (1-4 RPS) faster than #3 using a Tokenizer and
+SBuf::append().
+
+But the savings is not enough to be bothered with AFAICS. Mime block
+size also has a strong influence on the impact of each approach. The gap
+between approaches rapidly becomes even smaller as the MemBlob
+reallocation count reduces.
+
+Amos
+
+-------------- next part --------------
+=== modified file 'src/http/one/Parser.cc'
+--- src/http/one/Parser.cc	2016-04-12 18:12:15 +0000
++++ src/http/one/Parser.cc	2016-05-11 11:18:40 +0000
+@@ -16,6 +16,12 @@
+ /// RFC 7230 section 2.6 - 7 magic octets
+ const SBuf Http::One::Parser::Http1magic(&quot;HTTP/1.&quot;);
+ 
++const SBuf &amp;Http::One::CrLf()
++{
++    static const SBuf crlf(&quot;\r\n&quot;);
++    return crlf;
++}
++
+ void
+ Http::One::Parser::clear()
+ {
+@@ -25,11 +31,34 @@
+     mimeHeaderBlock_.clear();
+ }
+ 
++/// characters HTTP permits tolerant parsers to accept as delimiters
++static const CharacterSet &amp;
++RelaxedDelimiterCharacters()
++{
++    // RFC 7230 section 3.5
++    // tolerant parser MAY accept any of SP, HTAB, VT (%x0B), FF (%x0C),
++    // or bare CR as whitespace between request-line fields
++    static const CharacterSet RelaxedDels =
++        (CharacterSet::SP +
++         CharacterSet::HTAB +
++         CharacterSet(&quot;VT,FF&quot;,&quot;\x0B\x0C&quot;) +
++         CharacterSet::CR).rename(&quot;relaxed-WSP&quot;);
++
++    return RelaxedDels;
++}
++
++/// characters used to separate HTTP fields
++const CharacterSet &amp;
++Http::One::Parser::DelimiterCharacters()
++{
++    return Config.onoff.relaxed_header_parser ?
++           RelaxedDelimiterCharacters() : CharacterSet::SP;
++}
++
+ bool
+ Http::One::Parser::skipLineTerminator(Http1::Tokenizer &amp;tok) const
+ {
+-    static const SBuf crlf(&quot;\r\n&quot;);
+-    if (tok.skip(crlf))
++    if (tok.skip(Http1::CrLf()))
+         return true;
+ 
+     if (Config.onoff.relaxed_header_parser &amp;&amp; tok.skipOne(CharacterSet::LF))
+@@ -38,6 +67,72 @@
+     return false;
+ }
+ 
++/// all characters except the LF line terminator
++static const CharacterSet &amp;
++LineCharacters()
++{
++    static const CharacterSet line = CharacterSet::LF.complement(&quot;non-LF&quot;);
++    return line;
++}
++
++/**
++ * Replace all obs-fold with an SP.
++ *
++ * NOTE 1: Also has the side effect of replacing all bare-LF with CRLF.
++ *
++ * RFC 7230 section 3.2.4
++ * &quot;A server that receives an obs-fold in a request message that is not
++ *  within a message/http container MUST ... replace
++ *  each received obs-fold with one or more SP octets prior to
++ *  interpreting the field value or forwarding the message downstream.&quot;
++ *
++ * &quot;A proxy or gateway that receives an obs-fold in a response message
++ *  that is not within a message/http container MUST ... replace each
++ *  received obs-fold with one or more SP octets prior to interpreting
++ *  the field value or forwarding the message downstream.&quot;
++ */
++void
++Http::One::Parser::unfoldMime()
++{
++    // Unfolding requires a CRLF terminator. Restore CRLF if needed.
++    if (mimeHeaderBlock_.length() &lt; 2) {
++        if (mimeHeaderBlock_[0] == '\n')
++            mimeHeaderBlock_ = Http1::CrLf();
++        else
++            mimeHeaderBlock_.append(Http1::CrLf());
++    }
++    // now mimeHeaderBlock_ has 0+ fields followed by the CRLF terminator
++
++    static const CharacterSet nonCRLF = (CharacterSet::CR + CharacterSet::LF).complement().rename(&quot;non-CRLF&quot;);
++    Http1::Tokenizer tok(mimeHeaderBlock_);
++    mimeHeaderBlock_.clear();
++
++    do {
++        SBuf line;
++        if (tok.prefix(line, nonCRLF))
++            mimeHeaderBlock_.append(line);
++
++        // the skipAll() might erase bare-CR not part of a CR*LF
++        SBuf savePoint(tok.remaining());
++        auto crLen = tok.skipAll(CharacterSet::CR);
++
++        if (tok.skipOne(CharacterSet::LF)) {
++            if (tok.skipAll(CharacterSet::WSP))
++                mimeHeaderBlock_.append(' ');
++            else
++                mimeHeaderBlock_.append(Http1::CrLf());
++
++        } else if (crLen) {
++            // TODO: it might be better to replace the CR with one SP, but for now preserve
++            // preserve the bare-CR
++            tok.reset(savePoint);
++            if (tok.prefix(line, CharacterSet::CR))
++                mimeHeaderBlock_.append(line);
++        }
++
++    } while (!tok.atEnd());
++}
++
+ bool
+ Http::One::Parser::grabMimeBlock(const char *which, const size_t limit)
+ {
+@@ -51,8 +146,8 @@
+          *       So the rest of the code will need to deal with '0'-byte headers
+          *       (ie, none, so don't try parsing em)
+          */
+-        // XXX: c_str() reallocates. performance regression.
+-        if (SBuf::size_type mimeHeaderBytes = headersEnd(buf_.c_str(), buf_.length())) {
++        bool containsObsFold = false;
++        if (SBuf::size_type mimeHeaderBytes = headersEnd(buf_, containsObsFold)) {
+ 
+             // Squid could handle these headers, but admin does not want to
+             if (firstLineSize() + mimeHeaderBytes &gt;= limit) {
+@@ -64,6 +159,36 @@
+             }
+ 
+             mimeHeaderBlock_ = buf_.consume(mimeHeaderBytes);
++
++            /* RFC 7230 section 3:
++             * &quot;A recipient that receives whitespace between the start-line and
++             * the first header field MUST ... consume each whitespace-preceded
++             * line without further processing of it.&quot;
++             *
++             * We need to always use the relaxed delimiters here to prevent
++             * line smuggling through strict parsers.
++             * Note that 'whitespace' in RFC 7230 includes CR. So that means
++             * sequences of CRLF will be pruned, but not sequences of bare-LF.
++             */
++            Http1::Tokenizer tok(mimeHeaderBlock_);
++            while (tok.skipOne(RelaxedDelimiterCharacters())) {
++                (void)tok.skipAll(LineCharacters()); // optional line content
++                // LF terminator is required.
++                // trust headersEnd() to ensure that we have at least one LF
++                (void)tok.skipOne(CharacterSet::LF);
++            }
++            // If mimeHeaderBlock_ had just whitespace line(s) followed by CRLF,
++            // then we skipped everything, including that terminating LF.
++            // Restore the terminating CRLF if needed.
++            if (tok.atEnd())
++                mimeHeaderBlock_ = Http1::CrLf();
++            else
++                mimeHeaderBlock_ = tok.remaining();
++            // now mimeHeaderBlock_ has 0+ fields followed by the LF terminator
++
++            if (containsObsFold)
++                unfoldMime();
++
+             debugs(74, 5, &quot;mime header (0-&quot; &lt;&lt; mimeHeaderBytes &lt;&lt; &quot;) {&quot; &lt;&lt; mimeHeaderBlock_ &lt;&lt; &quot;}&quot;);
+ 
+         } else { // headersEnd() == 0
+@@ -102,12 +227,10 @@
+     debugs(25, 5, &quot;looking for &quot; &lt;&lt; name);
+ 
+     // while we can find more LF in the SBuf
+-    static CharacterSet iso8859Line = CharacterSet(&quot;non-LF&quot;,'\0','\n'-1) + CharacterSet(NULL, '\n'+1, (unsigned char)0xFF);
+     Http1::Tokenizer tok(mimeHeaderBlock_);
+     SBuf p;
+-    static const SBuf crlf(&quot;\r\n&quot;);
+ 
+-    while (tok.prefix(p, iso8859Line)) {
++    while (tok.prefix(p, LineCharacters())) {
+         if (!tok.skipOne(CharacterSet::LF)) // move tokenizer past the LF
+             break; // error. reached invalid octet or end of buffer insted of an LF ??
+ 
+@@ -120,7 +243,7 @@
+             continue;
+ 
+         // drop any trailing *CR sequence
+-        p.trim(crlf, false, true);
++        p.trim(Http1::CrLf(), false, true);
+ 
+         debugs(25, 5, &quot;checking &quot; &lt;&lt; p);
+         p.consume(namelen + 1);
+
+=== modified file 'src/http/one/Parser.h'
+--- src/http/one/Parser.h	2016-04-12 15:07:13 +0000
++++ src/http/one/Parser.h	2016-05-06 13:45:26 +0000
+@@ -111,6 +111,10 @@
+     /// consume from the tokenizer and return true only if found
+     bool skipLineTerminator(Http1::Tokenizer &amp;tok) const;
+ 
++    /// the characters which are to be considered valid whitespace
++    /// (WSP / BSP / OWS)
++    static const CharacterSet &amp;DelimiterCharacters();
++
+     /**
+      * Scan to find the mime headers block for current message.
+      *
+@@ -139,6 +143,9 @@
+ 
+     /// Whether the invalid HTTP as HTTP/0.9 hack expects a mime header block
+     bool hackExpectsMime_;
++
++private:
++    void unfoldMime();
+ };
+ 
+ } // namespace One
+
+=== modified file 'src/http/one/RequestParser.cc'
+--- src/http/one/RequestParser.cc	2016-01-01 00:12:18 +0000
++++ src/http/one/RequestParser.cc	2016-05-06 13:45:26 +0000
+@@ -114,30 +114,6 @@
+     return UriChars;
+ }
+ 
+-/// characters HTTP permits tolerant parsers to accept as delimiters
+-static const CharacterSet &amp;
+-RelaxedDelimiterCharacters()
+-{
+-    // RFC 7230 section 3.5
+-    // tolerant parser MAY accept any of SP, HTAB, VT (%x0B), FF (%x0C),
+-    // or bare CR as whitespace between request-line fields
+-    static const CharacterSet RelaxedDels =
+-        CharacterSet::SP +
+-        CharacterSet::HTAB +
+-        CharacterSet(&quot;VT,FF&quot;,&quot;\x0B\x0C&quot;) +
+-        CharacterSet::CR;
+-
+-    return RelaxedDels;
+-}
+-
+-/// characters used to separate HTTP fields
+-const CharacterSet &amp;
+-Http::One::RequestParser::DelimiterCharacters()
+-{
+-    return Config.onoff.relaxed_header_parser ?
+-           RelaxedDelimiterCharacters() : CharacterSet::SP;
+-}
+-
+ /// characters which Squid will accept in the HTTP request-target (URI)
+ const CharacterSet &amp;
+ Http::One::RequestParser::RequestTargetCharacters()
+
+=== modified file 'src/http/one/RequestParser.h'
+--- src/http/one/RequestParser.h	2016-01-01 00:12:18 +0000
++++ src/http/one/RequestParser.h	2016-05-06 13:45:26 +0000
+@@ -56,7 +56,6 @@
+     bool skipTrailingCrs(Http1::Tokenizer &amp;tok);
+ 
+     bool http0() const {return !msgProtocol_.major;}
+-    static const CharacterSet &amp;DelimiterCharacters();
+     static const CharacterSet &amp;RequestTargetCharacters();
+ 
+     /// what request method has been found on the first line
+
+=== modified file 'src/http/one/forward.h'
+--- src/http/one/forward.h	2016-01-01 00:12:18 +0000
++++ src/http/one/forward.h	2016-05-06 13:45:26 +0000
+@@ -10,6 +10,7 @@
+ #define SQUID_SRC_HTTP_ONE_FORWARD_H
+ 
+ #include &quot;base/RefCount.h&quot;
++#include &quot;sbuf/forward.h&quot;
+ 
+ namespace Http {
+ namespace One {
+@@ -27,6 +28,9 @@
+ class ResponseParser;
+ typedef RefCount&lt;Http::One::ResponseParser&gt; ResponseParserPointer;
+ 
++/// CRLF textual representation
++const SBuf &amp;CrLf();
++
+ } // namespace One
+ } // namespace Http
+ 
+
+=== modified file 'src/mime_header.cc'
+--- src/mime_header.cc	2016-01-01 00:12:18 +0000
++++ src/mime_header.cc	2016-05-08 10:00:42 +0000
+@@ -13,7 +13,7 @@
+ #include &quot;profiler/Profiler.h&quot;
+ 
+ size_t
+-headersEnd(const char *mime, size_t l)
++headersEnd(const char *mime, size_t l, bool &amp;containsObsFold)
+ {
+     size_t e = 0;
+     int state = 1;
+@@ -35,7 +35,10 @@
+                 state = 2;
+             else if ('\n' == mime[e])
+                 state = 3;
+-            else
++            else if (' ' == mime[e] || '\t' == mime[e]) {
++                containsObsFold = true;
++                state = 0;
++            } else
+                 state = 0;
+ 
+             break;
+
+=== modified file 'src/mime_header.h'
+--- src/mime_header.h	2016-01-01 00:12:18 +0000
++++ src/mime_header.h	2016-05-10 12:20:08 +0000
+@@ -11,7 +11,35 @@
+ #ifndef SQUID_MIME_HEADER_H_
+ #define SQUID_MIME_HEADER_H_
+ 
+-size_t headersEnd(const char *, size_t);
++/**
++ * Scan for the end of mime header block.
++ *
++ * Which is one of the following octet patterns:
++ * - CRLF CRLF, or
++ * - CRLF LF, or
++ * - LF CRLF, or
++ * - LF LF
++ *
++ * Also detects whether a obf-fold pattern exists within the mime block
++ * - CR*LF (SP / HTAB)
++ *
++ * \param containsObsFold will be set to true if obs-fold pattern is found. Otherwise not changed.
++ */
++size_t headersEnd(const char *, size_t, bool &amp;containsObsFold);
++
++inline size_t
++headersEnd(const SBuf &amp;buf, bool &amp;containsObsFold)
++{
++    return headersEnd(buf.rawContent(), buf.length(), containsObsFold);
++}
++
++/// \deprecated caller needs to be fixed to handle obs-fold
++inline size_t
++headersEnd(const char *buf, size_t sz)
++{
++    bool ignored;
++    return headersEnd(buf, sz, ignored);
++}
+ 
+ #endif /* SQUID_MIME_HEADER_H_ */
+ 
+
+=== modified file 'src/tests/stub_mime.cc'
+--- src/tests/stub_mime.cc	2016-01-01 00:12:18 +0000
++++ src/tests/stub_mime.cc	2016-05-06 13:45:26 +0000
+@@ -11,5 +11,5 @@
+ #define STUB_API &quot;mime.cc&quot;
+ #include &quot;tests/STUB.h&quot;
+ 
+-size_t headersEnd(const char *mime, size_t l) STUB_RETVAL(0)
++size_t headersEnd(const char *, size_t, bool &amp;) STUB_RETVAL(0)
+ 
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005650.html">[squid-dev] [PATCH] Anticipated connection closure disables chunking
+</A></li>
+	<LI>Next message: <A HREF="005652.html">[squid-dev] [PATCH] mime unfolding
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5651">[ date ]</a>
+              <a href="thread.html#5651">[ thread ]</a>
+              <a href="subject.html#5651">[ subject ]</a>
+              <a href="author.html#5651">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

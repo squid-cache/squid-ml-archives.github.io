@@ -1,0 +1,659 @@
+Cert Validation memory leaks
+
+In the case SSL errors detected by certificate validator helper the objects
+stored in Ssl::ServerBump::sslErrors  member and will never released.
+This member normally points to an Ssl::CertErrors list attached to the related
+SSL object which is responsible to release this list.
+When the cert validator detects errors a new errors list created and attached
+to the related Ssl::ServerBump::sslErrors member but the SSL objects still hold
+the old one. The old list released but not the new one.
+
+This patch also fixes the case the cbdata protected  Ssl::CertErrors list,
+still is used through the related Ssl::ServerBump object but it is not valid
+any more, because the SSL object which hold it gone.
+
+This patch instead of storing the Ssl::CertErrors list to Ssl::ServerBump
+object stores the SSL object and increases its reference to avoid be released
+
+This is a Measurement Factory project
+
+=== modified file 'src/acl/FilledChecklist.h'
+--- src/acl/FilledChecklist.h	2016-01-01 00:12:18 +0000
++++ src/acl/FilledChecklist.h	2016-02-09 16:11:04 +0000
+@@ -68,41 +68,41 @@
+ public:
+     Ip::Address src_addr;
+     Ip::Address dst_addr;
+     Ip::Address my_addr;
+     SBuf dst_peer_name;
+     char *dst_rdns;
+ 
+     HttpRequest *request;
+     HttpReply *reply;
+ 
+     char rfc931[USER_IDENT_SZ];
+ #if USE_AUTH
+     Auth::UserRequest::Pointer auth_user_request;
+ #endif
+ #if SQUID_SNMP
+     char *snmp_community;
+ #endif
+ 
+ #if USE_OPENSSL
+     /// SSL [certificate validation] errors, in undefined order
+-    Ssl::CertErrors *sslErrors;
++    const Ssl::CertErrors *sslErrors;
+     /// The peer certificate
+     Security::CertPointer serverCert;
+ #endif
+ 
+     AccessLogEntry::Pointer al; ///< info for the future access.log, and external ACL
+ 
+     ExternalACLEntryPointer extacl_entry;
+ 
+     err_type requestErrorType;
+ 
+ private:
+     ConnStateData * conn_;          /**< hack for ident and NTLM */
+     int fd_;                        /**< may be available when conn_ is not */
+     bool destinationDomainChecked_;
+     bool sourceDomainChecked_;
+     /// not implemented; will cause link failures if used
+     ACLFilledChecklist(const ACLFilledChecklist &);
+     /// not implemented; will cause link failures if used
+     ACLFilledChecklist &operator=(const ACLFilledChecklist &);
+ };
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-02-02 15:39:23 +0000
++++ src/client_side.cc	2016-02-09 16:11:04 +0000
+@@ -2882,41 +2882,41 @@
+     if (!sslServerBump) {
+         assert(port->signingCert.get());
+         certProperties.signWithX509.resetAndLock(port->signingCert.get());
+         if (port->signPkey.get())
+             certProperties.signWithPkey.resetAndLock(port->signPkey.get());
+         certProperties.signAlgorithm = Ssl::algSignTrusted;
+         return;
+     }
+ 
+     // In case of an error while connecting to the secure server, use a fake
+     // trusted certificate, with no mimicked fields and no adaptation
+     // algorithms. There is nothing we can mimic so we want to minimize the
+     // number of warnings the user will have to see to get to the error page.
+     assert(sslServerBump->entry);
+     if (sslServerBump->entry->isEmpty()) {
+         if (X509 *mimicCert = sslServerBump->serverCert.get())
+             certProperties.mimicCert.resetAndLock(mimicCert);
+ 
+         ACLFilledChecklist checklist(NULL, sslServerBump->request.getRaw(),
+                                      clientConnection != NULL ? clientConnection->rfc931 : dash_str);
+-        checklist.sslErrors = cbdataReference(sslServerBump->sslErrors);
++        checklist.sslErrors = cbdataReference(sslServerBump->sslErrors());
+ 
+         for (sslproxy_cert_adapt *ca = Config.ssl_client.cert_adapt; ca != NULL; ca = ca->next) {
+             // If the algorithm already set, then ignore it.
+             if ((ca->alg == Ssl::algSetCommonName && certProperties.setCommonName) ||
+                     (ca->alg == Ssl::algSetValidAfter && certProperties.setValidAfter) ||
+                     (ca->alg == Ssl::algSetValidBefore && certProperties.setValidBefore) )
+                 continue;
+ 
+             if (ca->aclList && checklist.fastCheck(ca->aclList) == ACCESS_ALLOWED) {
+                 const char *alg = Ssl::CertAdaptAlgorithmStr[ca->alg];
+                 const char *param = ca->param;
+ 
+                 // For parameterless CN adaptation, use hostname from the
+                 // CONNECT request.
+                 if (ca->alg == Ssl::algSetCommonName) {
+                     if (!param)
+                         param = sslConnectHostOrIp.termedBuf();
+                     certProperties.commonName = param;
+                     certProperties.setCommonName = true;
+                 } else if (ca->alg == Ssl::algSetValidAfter)
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2016-02-02 15:39:23 +0000
++++ src/format/Format.cc	2016-02-09 16:11:04 +0000
+@@ -1226,41 +1226,41 @@
+                 if (X509_NAME *issuer = X509_get_issuer_name(cert)) {
+                     X509_NAME_oneline(issuer, tmp, sizeof(tmp));
+                     out = tmp;
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_CLIENT_SNI:
+             if (al->request && al->request->clientConnectionManager.valid()) {
+                 if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
+                     if (!srvBump->clientSni.isEmpty())
+                         out = srvBump->clientSni.c_str();
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_SERVER_CERT_ERRORS:
+             if (al->request && al->request->clientConnectionManager.valid()) {
+                 if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
+                     const char *separator = fmt->data.string ? fmt->data.string : ":";
+-                    for (Ssl::CertErrors *sslError = srvBump->sslErrors; sslError != NULL;  sslError = sslError->next) {
++                    for (Ssl::CertErrors const *sslError = srvBump->sslErrors(); sslError != NULL;  sslError = sslError->next) {
+                         if (sb.size())
+                             sb.append(separator);
+                         if (const char *errorName = Ssl::GetErrorName(sslError->element.code))
+                             sb.append(errorName);
+                         else
+                             sb.append(sslErrorName(sslError->element.code, tmp, sizeof(tmp)));
+                         if (sslError->element.depth >= 0) {
+                             snprintf(tmp, sizeof(tmp), "@depth=%d", sslError->element.depth);
+                             sb.append(tmp);
+                         }
+                     }
+                     if (sb.size())
+                         out = sb.termedBuf();
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_SERVER_CERT_ISSUER:
+         case LFT_SSL_SERVER_CERT_SUBJECT:
+             if (al->request && al->request->clientConnectionManager.valid()) {
+
+=== modified file 'src/security/Session.h'
+--- src/security/Session.h	2016-01-26 21:02:00 +0000
++++ src/security/Session.h	2016-02-10 16:06:35 +0000
+@@ -7,52 +7,47 @@
+  */
+ 
+ #ifndef SQUID_SRC_SECURITY_SESSION_H
+ #define SQUID_SRC_SECURITY_SESSION_H
+ 
+ // LockingPointer.h instead of TidyPointer.h for CtoCpp1()
+ #include "security/LockingPointer.h"
+ 
+ #if USE_OPENSSL
+ #if HAVE_OPENSSL_SSL_H
+ #include <openssl/ssl.h>
+ #endif
+ #endif
+ 
+ #if USE_GNUTLS
+ #if HAVE_GNUTLS_GNUTLS_H
+ #include <gnutls/gnutls.h>
+ #endif
+ #endif
+ 
+-/*
+- * NOTE: we use TidyPointer for sessions. OpenSSL provides explicit reference
+- * locking mechanisms, but GnuTLS only provides init/deinit. To ensure matching
+- * behaviour we cannot use LockingPointer (yet) and must ensure that there is
+- * no possibility of double-free being used on the raw pointers. That is
+- * currently done by using a TidyPointer in the global fde table so its
+- * lifetime matched the connection.
+- */
+-
+ namespace Security {
+ 
+ #if USE_OPENSSL
+ typedef SSL* SessionPtr;
+ CtoCpp1(SSL_free, SSL *);
+-typedef TidyPointer<SSL, Security::SSL_free_cpp> SessionPointer;
++typedef LockingPointer<SSL, Security::SSL_free_cpp, CRYPTO_LOCK_SSL> SessionPointer;
+ 
+ #elif USE_GNUTLS
+ typedef gnutls_session_t SessionPtr;
+ CtoCpp1(gnutls_deinit, gnutls_session_t);
++// TODO: Convert to Locking pointer.
++// Locks can be implemented attaching locks counter to gnutls_session_t
++// objects using the gnutls_session_set_ptr()/gnutls_session_get_ptr () 
++// library functions
+ typedef TidyPointer<struct gnutls_session_int, Security::gnutls_deinit_cpp> SessionPointer;
+ 
+ #else
+ // use void* so we can check against NULL
+ typedef void* SessionPtr;
+ typedef TidyPointer<void, nullptr> SessionPointer;
+ 
+ #endif
+ 
+ } // namespace Security
+ 
+ #endif /* SQUID_SRC_SECURITY_SESSION_H */
+ 
+
+=== modified file 'src/ssl/PeekingPeerConnector.cc'
+--- src/ssl/PeekingPeerConnector.cc	2016-02-08 17:44:43 +0000
++++ src/ssl/PeekingPeerConnector.cc	2016-02-10 16:37:24 +0000
+@@ -188,70 +188,64 @@
+                     srvBio->mode(csd->sslBumpMode);
+                 }
+             }
+         } else {
+             // Set client SSL options
+             SSL_set_options(ssl, ::Security::ProxyOutgoingConfig.parsedOptions);
+ 
+             // Use SNI TLS extension only when we connect directly
+             // to the origin server and we know the server host name.
+             const char *sniServer = NULL;
+             const bool redirected = request->flags.redirected && ::Config.onoff.redir_rewrites_host;
+             if (!hostName || redirected)
+                 sniServer = !request->url.hostIsNumeric() ? request->url.host() : NULL;
+             else
+                 sniServer = hostName->c_str();
+ 
+             if (sniServer)
+                 Ssl::setClientSNI(ssl, sniServer);
+         }
+ 
+-        // store peeked cert to check SQUID_X509_V_ERR_CERT_CHANGE
+-        X509 *peeked_cert;
+-        if (csd->serverBump() &&
+-                (peeked_cert = csd->serverBump()->serverCert.get())) {
+-            CRYPTO_add(&(peeked_cert->references),1,CRYPTO_LOCK_X509);
+-            SSL_set_ex_data(ssl, ssl_ex_index_ssl_peeked_cert, peeked_cert);
++        if (Ssl::ServerBump *serverBump = csd->serverBump()) {
++            serverBump->attachServerSSL(ssl);
++            // store peeked cert to check SQUID_X509_V_ERR_CERT_CHANGE
++            if (X509 *peeked_cert = serverBump->serverCert.get()) {
++                CRYPTO_add(&(peeked_cert->references),1,CRYPTO_LOCK_X509);
++                SSL_set_ex_data(ssl, ssl_ex_index_ssl_peeked_cert, peeked_cert);
++            }
+         }
+     }
+ 
+     return ssl;
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::noteNegotiationDone(ErrorState *error)
+ {
+     Security::SessionPtr ssl = fd_table[serverConnection()->fd].ssl.get();
+ 
+     // Check the list error with
+     if (!request->clientConnectionManager.valid() || ! ssl)
+         return;
+ 
+     // remember the server certificate from the ErrorDetail object
+     if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
+-        // remember validation errors, if any
+-        if (certErrors) {
+-            if (serverBump->sslErrors)
+-                cbdataReferenceDone(serverBump->sslErrors);
+-            serverBump->sslErrors = cbdataReference(certErrors);
+-        }
+-
+         if (!serverBump->serverCert.get()) {
+             // remember the server certificate from the ErrorDetail object
+             if (error && error->detail && error->detail->peerCert())
+                 serverBump->serverCert.resetAndLock(error->detail->peerCert());
+             else {
+                 handleServerCertificate();
+             }
+         }
+ 
+         if (error) {
+             // For intercepted connections, set the host name to the server
+             // certificate CN. Otherwise, we just hope that CONNECT is using
+             // a user-entered address (a host name or a user-entered IP).
+             const bool isConnectRequest = !request->clientConnectionManager->port->flags.isIntercepted();
+             if (request->flags.sslPeek && !isConnectRequest) {
+                 if (X509 *srvX509 = serverBump->serverCert.get()) {
+                     if (const char *name = Ssl::CommonHostName(srvX509)) {
+                         request->url.host(name);
+                         debugs(83, 3, "reset request host: " << name);
+                     }
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2016-02-02 15:39:23 +0000
++++ src/ssl/PeerConnector.cc	2016-02-10 16:59:06 +0000
+@@ -8,54 +8,52 @@
+ 
+ /* DEBUG: section 83    TLS Server/Peer negotiation */
+ 
+ #include "squid.h"
+ #include "acl/FilledChecklist.h"
+ #include "comm/Loops.h"
+ #include "errorpage.h"
+ #include "fde.h"
+ #include "HttpRequest.h"
+ #include "SquidConfig.h"
+ #include "ssl/cert_validate_message.h"
+ #include "ssl/Config.h"
+ #include "ssl/helper.h"
+ #include "ssl/PeerConnector.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeerConnector);
+ 
+ Ssl::PeerConnector::PeerConnector(const Comm::ConnectionPointer &aServerConn, AsyncCall::Pointer &aCallback, const AccessLogEntryPointer &alp, const time_t timeout) :
+     AsyncJob("Ssl::PeerConnector"),
+     serverConn(aServerConn),
+-    certErrors(NULL),
+     al(alp),
+     callback(aCallback),
+     negotiationTimeout(timeout),
+     startTime(squid_curtime),
+     useCertValidator_(true)
+ {
+     // if this throws, the caller's cb dialer is not our CbDialer
+     Must(dynamic_cast<CbDialer*>(callback->getDialer()));
+ }
+ 
+ Ssl::PeerConnector::~PeerConnector()
+ {
+-    cbdataReferenceDone(certErrors);
+     debugs(83, 5, "Peer connector " << this << " gone");
+ }
+ 
+ bool Ssl::PeerConnector::doneAll() const
+ {
+     return (!callback || callback->canceled()) && AsyncJob::doneAll();
+ }
+ 
+ /// Preps connection and SSL state. Calls negotiate().
+ void
+ Ssl::PeerConnector::start()
+ {
+     AsyncJob::start();
+ 
+     if (prepareSocket() && initializeSsl())
+         negotiateSsl();
+ }
+ 
+ void
+ Ssl::PeerConnector::commCloseHandler(const CommCloseCbParams &params)
+@@ -186,66 +184,64 @@
+                    "validate that certificate.");
+             // fall through to do blocking in-process generation.
+             ErrorState *anErr = new ErrorState(ERR_GATEWAY_FAILURE, Http::scInternalServerError, request.getRaw());
+ 
+             noteNegotiationDone(anErr);
+             bail(anErr);
+             serverConn->close();
+             return true;
+         }
+     }
+ 
+     noteNegotiationDone(NULL);
+     return true;
+ }
+ 
+ void
+ Ssl::PeerConnector::sslCrtvdHandleReply(Ssl::CertValidationResponse::Pointer validationResponse)
+ {
+     Must(validationResponse != NULL);
+ 
+-    Ssl::CertErrors *errs = NULL;
+     Ssl::ErrorDetail *errDetails = NULL;
+     bool validatorFailed = false;
+     if (!Comm::IsConnOpen(serverConnection())) {
+         return;
+     }
+ 
+     debugs(83,5, request->url.host() << " cert validation result: " << validationResponse->resultCode);
+ 
+-    if (validationResponse->resultCode == ::Helper::Error)
+-        errs = sslCrtvdCheckForErrors(*validationResponse, errDetails);
+-    else if (validationResponse->resultCode != ::Helper::Okay)
++    if (validationResponse->resultCode == ::Helper::Error) {
++        if (Ssl::CertErrors *errs = sslCrtvdCheckForErrors(*validationResponse, errDetails)) {
++            Security::SessionPtr ssl = fd_table[serverConnection()->fd].ssl.get();
++            Ssl::CertErrors *oldErrs = static_cast<Ssl::CertErrors*>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors));
++            SSL_set_ex_data(ssl, ssl_ex_index_ssl_errors,  (void *)errs);
++            delete oldErrs;
++        }
++    } else if (validationResponse->resultCode != ::Helper::Okay)
+         validatorFailed = true;
+ 
+     if (!errDetails && !validatorFailed) {
+         noteNegotiationDone(NULL);
+         callBack();
+         return;
+     }
+ 
+-    if (errs) {
+-        if (certErrors)
+-            cbdataReferenceDone(certErrors);
+-        certErrors = cbdataReference(errs);
+-    }
+-
+     ErrorState *anErr = NULL;
+     if (validatorFailed) {
+         anErr = new ErrorState(ERR_GATEWAY_FAILURE, Http::scInternalServerError, request.getRaw());
+     }  else {
+         anErr =  new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scServiceUnavailable, request.getRaw());
+         anErr->detail = errDetails;
+         /*anErr->xerrno= Should preserved*/
+     }
+ 
+     noteNegotiationDone(anErr);
+     bail(anErr);
+     serverConn->close();
+     return;
+ }
+ 
+ /// Checks errors in the cert. validator response against sslproxy_cert_error.
+ /// The first honored error, if any, is returned via errDetails parameter.
+ /// The method returns all seen errors except SSL_ERROR_NONE as Ssl::CertErrors.
+ Ssl::CertErrors *
+ Ssl::PeerConnector::sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &resp, Ssl::ErrorDetail *& errDetails)
+@@ -380,45 +376,40 @@
+         anErr = new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scServiceUnavailable, NULL);
+     anErr->xerrno = sysErrNo;
+ 
+     Security::SessionPtr ssl = fd_table[fd].ssl.get();
+     Ssl::ErrorDetail *errFromFailure = (Ssl::ErrorDetail *)SSL_get_ex_data(ssl, ssl_ex_index_ssl_error_detail);
+     if (errFromFailure != NULL) {
+         // The errFromFailure is attached to the ssl object
+         // and will be released when ssl object destroyed.
+         // Copy errFromFailure to a new Ssl::ErrorDetail object
+         anErr->detail = new Ssl::ErrorDetail(*errFromFailure);
+     } else {
+         // server_cert can be NULL here
+         X509 *server_cert = SSL_get_peer_certificate(ssl);
+         anErr->detail = new Ssl::ErrorDetail(SQUID_ERR_SSL_HANDSHAKE, server_cert, NULL);
+         X509_free(server_cert);
+     }
+ 
+     if (ssl_lib_error != SSL_ERROR_NONE)
+         anErr->detail->setLibError(ssl_lib_error);
+ 
+-    assert(certErrors == NULL);
+-    // remember validation errors, if any
+-    if (Ssl::CertErrors *errs = static_cast<Ssl::CertErrors*>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors)))
+-        certErrors = cbdataReference(errs);
+-
+     noteNegotiationDone(anErr);
+     bail(anErr);
+ }
+ 
+ void
+ Ssl::PeerConnector::bail(ErrorState *error)
+ {
+     Must(error); // or the recepient will not know there was a problem
+     Must(callback != NULL);
+     CbDialer *dialer = dynamic_cast<CbDialer*>(callback->getDialer());
+     Must(dialer);
+     dialer->answer().error = error;
+ 
+     callBack();
+     // Our job is done. The callabck recepient will probably close the failed
+     // peer connection and try another peer or go direct (if possible). We
+     // can close the connection ourselves (our error notification would reach
+     // the recepient before the fd-closure notification), but we would rather
+     // minimize the number of fd-closure notifications and let the recepient
+     // manage the TCP state of the connection.
+
+=== modified file 'src/ssl/PeerConnector.h'
+--- src/ssl/PeerConnector.h	2016-02-08 17:44:43 +0000
++++ src/ssl/PeerConnector.h	2016-02-10 16:29:32 +0000
+@@ -140,43 +140,40 @@
+     virtual void noteNegotiationDone(ErrorState *error) {}
+ 
+     /// Must implemented by the kid classes to return the Security::ContextPtr object to use
+     /// for building the SSL objects.
+     virtual Security::ContextPtr getSslContext() = 0;
+ 
+     /// mimics FwdState to minimize changes to FwdState::initiate/negotiateSsl
+     Comm::ConnectionPointer const &serverConnection() const { return serverConn; }
+ 
+     void bail(ErrorState *error); ///< Return an error to the PeerConnector caller
+ 
+     /// Callback the caller class, and pass the ready to communicate secure
+     /// connection or an error if PeerConnector failed.
+     void callBack();
+ 
+     /// If called the certificates validator will not used
+     void bypassCertValidator() {useCertValidator_ = false;}
+ 
+     HttpRequestPointer request; ///< peer connection trigger or cause
+     Comm::ConnectionPointer serverConn; ///< TCP connection to the peer
+-    /// Certificate errors found from SSL validation procedure or from cert
+-    /// validator
+-    Ssl::CertErrors *certErrors;
+     AccessLogEntryPointer al; ///< info for the future access.log entry
+ private:
+     PeerConnector(const PeerConnector &); // not implemented
+     PeerConnector &operator =(const PeerConnector &); // not implemented
+ 
+     /// Process response from cert validator helper
+     void sslCrtvdHandleReply(Ssl::CertValidationResponsePointer);
+ 
+     /// Check SSL errors returned from cert validator against sslproxy_cert_error access list
+     Ssl::CertErrors *sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &, Ssl::ErrorDetail *&);
+ 
+     /// A wrapper function for negotiateSsl for use with Comm::SetSelect
+     static void NegotiateSsl(int fd, void *data);
+     AsyncCall::Pointer callback; ///< we call this with the results
+     AsyncCall::Pointer closeHandler; ///< we call this when the connection closed
+     time_t negotiationTimeout; ///< the SSL connection timeout to use
+     time_t startTime; ///< when the peer connector negotiation started
+     bool useCertValidator_; ///< whether the certificate validator should bypassed
+ };
+ 
+
+=== modified file 'src/ssl/ServerBump.cc'
+--- src/ssl/ServerBump.cc	2016-01-24 17:41:43 +0000
++++ src/ssl/ServerBump.cc	2016-02-10 16:00:53 +0000
+@@ -5,51 +5,67 @@
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 33    Client-side Routines */
+ 
+ #include "squid.h"
+ 
+ #include "client_side.h"
+ #include "FwdState.h"
+ #include "http/Stream.h"
+ #include "ssl/ServerBump.h"
+ #include "Store.h"
+ #include "StoreClient.h"
+ #include "URL.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, ServerBump);
+ 
+ Ssl::ServerBump::ServerBump(HttpRequest *fakeRequest, StoreEntry *e, Ssl::BumpMode md):
+     request(fakeRequest),
+-    sslErrors(NULL),
+     step(bumpStep1)
+ {
+     debugs(33, 4, "will peek at " << request->url.authority(true));
+     act.step1 = md;
+     act.step2 = act.step3 = Ssl::bumpNone;
+ 
+     if (e) {
+         entry = e;
+         entry->lock("Ssl::ServerBump");
+     } else {
+         // XXX: Performance regression. c_str() reallocates
+         SBuf uri(request->effectiveRequestUri());
+         entry = storeCreateEntry(uri.c_str(), uri.c_str(), request->flags, request->method);
+     }
+     // We do not need to be a client because the error contents will be used
+     // later, but an entry without any client will trim all its contents away.
+     sc = storeClientListAdd(entry, this);
+ }
+ 
+ Ssl::ServerBump::~ServerBump()
+ {
+     debugs(33, 4, HERE << "destroying");
+     if (entry) {
+         debugs(33, 4, HERE << *entry);
+         storeUnregister(sc, entry, this);
+         entry->unlock("Ssl::ServerBump");
+     }
+-    cbdataReferenceDone(sslErrors);
+ }
+ 
++void
++Ssl::ServerBump::attachServerSSL(SSL *ssl)
++{
++    if (serverSSL.get())
++        return;
++
++    serverSSL.resetAndLock(ssl);
++}
++
++const Ssl::CertErrors *
++Ssl::ServerBump::sslErrors() const
++{
++    if (!serverSSL.get())
++        return NULL;
++
++    const Ssl::CertErrors *errs = static_cast<const Ssl::CertErrors*>(SSL_get_ex_data(serverSSL.get(), ssl_ex_index_ssl_errors));
++    return errs;
++}
+
+=== modified file 'src/ssl/ServerBump.h'
+--- src/ssl/ServerBump.h	2016-01-01 00:12:18 +0000
++++ src/ssl/ServerBump.h	2016-02-10 16:47:46 +0000
+@@ -15,42 +15,46 @@
+ #include "HttpRequest.h"
+ #include "ip/Address.h"
+ #include "security/forward.h"
+ 
+ class ConnStateData;
+ class store_client;
+ 
+ namespace Ssl
+ {
+ 
+ /**
+  * Maintains bump-server-first related information.
+  */
+ class ServerBump
+ {
+     CBDATA_CLASS(ServerBump);
+ 
+ public:
+     explicit ServerBump(HttpRequest *fakeRequest, StoreEntry *e = NULL, Ssl::BumpMode mode = Ssl::bumpServerFirst);
+     ~ServerBump();
++    void attachServerSSL(SSL *); ///< Sets the server SSL object
++    const Ssl::CertErrors *sslErrors() const; ///< SSL [certificate validation] errors
+ 
+     /// faked, minimal request; required by Client API
+     HttpRequest::Pointer request;
+     StoreEntry *entry; ///< for receiving Squid-generated error messages
+-    Security::CertPointer serverCert; ///< HTTPS server certificate
+-    Ssl::CertErrors *sslErrors; ///< SSL [certificate validation] errors
++    /// HTTPS server certificate. Maybe it is different than the one
++    /// it is stored in serverSSL object (error SQUID_X509_V_ERR_CERT_CHANGE)
++    Security::CertPointer serverCert;
+     struct {
+         Ssl::BumpMode step1; ///< The SSL bump mode at step1
+         Ssl::BumpMode step2; ///< The SSL bump mode at step2
+         Ssl::BumpMode step3; ///< The SSL bump mode at step3
+     } act; ///< bumping actions at various bumping steps
+     Ssl::BumpStep step; ///< The SSL bumping step
+     SBuf clientSni; ///< the SSL client SNI name
++    Security::SessionPointer serverSSL; ///< The SSL object on server side.
+ 
+ private:
+     store_client *sc; ///< dummy client to prevent entry trimming
+ };
+ 
+ } // namespace Ssl
+ 
+ #endif
+ 
+

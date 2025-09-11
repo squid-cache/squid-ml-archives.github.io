@@ -1,0 +1,569 @@
+Avoid memory leaks when a certificate validator is used with SslBump
+
+When a certificate validator was used, sslCrtvdHandleReplyWrapper delivered
+validator response directly to the Ssl::PeerConnector job using job's
+Ssl::CertValidationHelper::CVHCB callback. If that synchronous call happened
+to be the last job call, then Ssl::PeerConnector::done() would become true
+for the job, as it should, but nobody would notice that the PeerConnector
+job object should be deleted, and the object would leak.
+
+This fix converts CVHCB into an async job call to avoid direct, unprotected
+job calls in this context.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2015-11-28 03:00:35 +0000
++++ src/ssl/PeerConnector.cc	2015-11-30 18:06:46 +0000
+@@ -169,41 +169,42 @@
+ Ssl::PeerConnector::sslFinalized()
+ {
+     if (Ssl::TheConfig.ssl_crt_validator && useCertValidator_) {
+         const int fd = serverConnection()->fd;
+         SSL *ssl = fd_table[fd].ssl;
+ 
+         Ssl::CertValidationRequest validationRequest;
+         // WARNING: Currently we do not use any locking for any of the
+         // members of the Ssl::CertValidationRequest class. In this code the
+         // Ssl::CertValidationRequest object used only to pass data to
+         // Ssl::CertValidationHelper::submit method.
+         validationRequest.ssl = ssl;
+         validationRequest.domainName = request->url.host();
+         if (Ssl::CertErrors *errs = static_cast<Ssl::CertErrors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors)))
+             // validationRequest disappears on return so no need to cbdataReference
+             validationRequest.errors = errs;
+         else
+             validationRequest.errors = NULL;
+         try {
+             debugs(83, 5, "Sending SSL certificate for validation to ssl_crtvd.");
+-            Ssl::CertValidationHelper::GetInstance()->sslSubmit(validationRequest, sslCrtvdHandleReplyWrapper, this);
++            AsyncCall::Pointer call = asyncCall(83,5, "Ssl::PeerConnector::sslCrtvdHandleReply", Ssl::CertValidationHelper::CbDialer(this, &Ssl::PeerConnector::sslCrtvdHandleReply, nullptr));
++            Ssl::CertValidationHelper::GetInstance()->sslSubmit(validationRequest, call);
+             return false;
+         } catch (const std::exception &e) {
+             debugs(83, DBG_IMPORTANT, "ERROR: Failed to compose ssl_crtvd " <<
+                    "request for " << validationRequest.domainName <<
+                    " certificate: " << e.what() << "; will now block to " <<
+                    "validate that certificate.");
+             // fall through to do blocking in-process generation.
+             ErrorState *anErr = new ErrorState(ERR_GATEWAY_FAILURE, Http::scInternalServerError, request.getRaw());
+ 
+             noteNegotiationDone(anErr);
+             bail(anErr);
+             serverConn->close();
+             return true;
+         }
+     }
+ 
+     noteNegotiationDone(NULL);
+     return true;
+ }
+ 
+@@ -292,61 +293,56 @@
+ }
+ 
+ Ssl::BumpMode
+ Ssl::PeekingPeerConnector::checkForPeekAndSpliceGuess() const
+ {
+     if (const ConnStateData *csd = request->clientConnectionManager.valid()) {
+         const Ssl::BumpMode currentMode = csd->sslBumpMode;
+         if (currentMode == Ssl::bumpStare) {
+             debugs(83,5, "default to bumping after staring");
+             return Ssl::bumpBump;
+         }
+         debugs(83,5, "default to splicing after " << currentMode);
+     } else {
+         debugs(83,3, "default to splicing due to missing info");
+     }
+ 
+     return Ssl::bumpSplice;
+ }
+ 
+ void
+-Ssl::PeerConnector::sslCrtvdHandleReplyWrapper(void *data, Ssl::CertValidationResponse const &validationResponse)
++Ssl::PeerConnector::sslCrtvdHandleReply(Ssl::CertValidationResponse::Pointer validationResponse)
+ {
+-    Ssl::PeerConnector *connector = (Ssl::PeerConnector *)(data);
+-    connector->sslCrtvdHandleReply(validationResponse);
+-}
++    Must(validationResponse != NULL);
+ 
+-void
+-Ssl::PeerConnector::sslCrtvdHandleReply(Ssl::CertValidationResponse const &validationResponse)
+-{
+     Ssl::CertErrors *errs = NULL;
+     Ssl::ErrorDetail *errDetails = NULL;
+     bool validatorFailed = false;
+     if (!Comm::IsConnOpen(serverConnection())) {
+         return;
+     }
+ 
+-    debugs(83,5, request->url.host() << " cert validation result: " << validationResponse.resultCode);
++    debugs(83,5, request->url.host() << " cert validation result: " << validationResponse->resultCode);
+ 
+-    if (validationResponse.resultCode == ::Helper::Error)
+-        errs = sslCrtvdCheckForErrors(validationResponse, errDetails);
+-    else if (validationResponse.resultCode != ::Helper::Okay)
++    if (validationResponse->resultCode == ::Helper::Error)
++        errs = sslCrtvdCheckForErrors(*validationResponse, errDetails);
++    else if (validationResponse->resultCode != ::Helper::Okay)
+         validatorFailed = true;
+ 
+     if (!errDetails && !validatorFailed) {
+         noteNegotiationDone(NULL);
+         callBack();
+         return;
+     }
+ 
+     if (errs) {
+         if (certErrors)
+             cbdataReferenceDone(certErrors);
+         certErrors = cbdataReference(errs);
+     }
+ 
+     ErrorState *anErr = NULL;
+     if (validatorFailed) {
+         anErr = new ErrorState(ERR_GATEWAY_FAILURE, Http::scInternalServerError, request.getRaw());
+     }  else {
+         anErr =  new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scServiceUnavailable, request.getRaw());
+         anErr->detail = errDetails;
+
+=== modified file 'src/ssl/PeerConnector.h'
+--- src/ssl/PeerConnector.h	2015-11-28 03:00:35 +0000
++++ src/ssl/PeerConnector.h	2015-11-30 17:02:11 +0000
+@@ -1,46 +1,48 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SSL_PEER_CONNECTOR_H
+ #define SQUID_SSL_PEER_CONNECTOR_H
+ 
+ #include "acl/Acl.h"
+ #include "base/AsyncCbdataCalls.h"
+ #include "base/AsyncJob.h"
++#include "CommCalls.h"
+ #include "security/EncryptorAnswer.h"
+ #include "ssl/support.h"
+ #include <iosfwd>
+ 
+ class HttpRequest;
+ class ErrorState;
+ 
+ namespace Ssl
+ {
+ 
+ class ErrorDetail;
+ class CertValidationResponse;
++typedef RefCount<CertValidationResponse> CertValidationResponsePointer;
+ 
+ /**
+  \par
+  * Connects Squid to SSL/TLS-capable peers or services.
+  * Contains common code and interfaces of various specialized PeerConnectors,
+  * including peer certificate validation code.
+  \par
+  * The caller receives a call back with Security::EncryptorAnswer. If answer.error
+  * is not nil, then there was an error and the SSL connection to the SSL peer
+  * was not fully established. The error object is suitable for error response
+  * generation.
+  \par
+  * The caller must monitor the connection for closure because this
+  * job will not inform the caller about such events.
+  \par
+  * PeerConnector class curently supports a form of SSL negotiation timeout,
+  * which accounted only when sets the read timeout from SSL peer.
+  * For a complete solution, the caller must monitor the overall connection
+  * establishment timeout and close the connection on timeouts. This is probably
+  * better than having dedicated (or none at all!) timeouts for peer selection,
+@@ -143,48 +145,45 @@
+ 
+     void bail(ErrorState *error); ///< Return an error to the PeerConnector caller
+ 
+     /// If called the certificates validator will not used
+     void bypassCertValidator() {useCertValidator_ = false;}
+ 
+     HttpRequestPointer request; ///< peer connection trigger or cause
+     Comm::ConnectionPointer serverConn; ///< TCP connection to the peer
+     /// Certificate errors found from SSL validation procedure or from cert
+     /// validator
+     Ssl::CertErrors *certErrors;
+ private:
+     PeerConnector(const PeerConnector &); // not implemented
+     PeerConnector &operator =(const PeerConnector &); // not implemented
+ 
+     /// Callback the caller class, and pass the ready to communicate secure
+     /// connection or an error if PeerConnector failed.
+     void callBack();
+ 
+     /// Process response from cert validator helper
+-    void sslCrtvdHandleReply(Ssl::CertValidationResponse const &);
++    void sslCrtvdHandleReply(Ssl::CertValidationResponsePointer);
+ 
+     /// Check SSL errors returned from cert validator against sslproxy_cert_error access list
+     Ssl::CertErrors *sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &, Ssl::ErrorDetail *&);
+ 
+-    /// Callback function called when squid receive message from cert validator helper
+-    static void sslCrtvdHandleReplyWrapper(void *data, Ssl::CertValidationResponse const &);
+-
+     /// A wrapper function for negotiateSsl for use with Comm::SetSelect
+     static void NegotiateSsl(int fd, void *data);
+     AsyncCall::Pointer callback; ///< we call this with the results
+     AsyncCall::Pointer closeHandler; ///< we call this when the connection closed
+     time_t negotiationTimeout; ///< the SSL connection timeout to use
+     time_t startTime; ///< when the peer connector negotiation started
+     bool useCertValidator_; ///< whether the certificate validator should bypassed
+ };
+ 
+ /// A simple PeerConnector for SSL/TLS cache_peers. No SslBump capabilities.
+ class BlindPeerConnector: public PeerConnector {
+     CBDATA_CLASS(BlindPeerConnector);
+ public:
+     BlindPeerConnector(HttpRequestPointer &aRequest,
+                        const Comm::ConnectionPointer &aServerConn,
+                        AsyncCall::Pointer &aCallback, const time_t timeout = 0) :
+         AsyncJob("Ssl::BlindPeerConnector"),
+         PeerConnector(aServerConn, aCallback, timeout)
+     {
+         request = aRequest;
+
+=== modified file 'src/ssl/cert_validate_message.h'
+--- src/ssl/cert_validate_message.h	2015-09-14 16:25:05 +0000
++++ src/ssl/cert_validate_message.h	2015-11-30 16:58:52 +0000
+@@ -1,60 +1,63 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SSL_CERT_VALIDATE_MESSAGE_H
+ #define SQUID_SSL_CERT_VALIDATE_MESSAGE_H
+ 
++#include "base/RefCount.h"
+ #include "helper/ResultCode.h"
+ #include "ssl/crtd_message.h"
+ #include "ssl/support.h"
+ 
+ #include <vector>
+ 
+ namespace Ssl
+ {
+ 
+ /**
+  * This class is used to hold the required informations to build
+  * a request message for the certificate validator helper
+  */
+ class CertValidationRequest
+ {
+ public:
+     SSL *ssl;
+     CertErrors *errors; ///< The list of errors detected
+     std::string domainName; ///< The server name
+     CertValidationRequest() : ssl(NULL), errors(NULL) {}
+ };
+ 
+ /**
+  * This class is used to store informations found in certificate validation
+  * response messages read from certificate validator helper
+  */
+-class CertValidationResponse
++class CertValidationResponse: public RefCountable
+ {
+ public:
++    typedef RefCount<CertValidationResponse> Pointer;
++
+     /**
+      * This class used to hold error informations returned from
+      * cert validator helper.
+      */
+     class  RecvdError
+     {
+     public:
+         RecvdError(): id(0), error_no(SSL_ERROR_NONE), cert(NULL) {}
+         RecvdError(const RecvdError &);
+         RecvdError & operator =(const RecvdError &);
+         void setCert(X509 *);  ///< Sets cert to the given certificate
+         int id; ///<  The id of the error
+         ssl_error_t error_no; ///< The OpenSSL error code
+         std::string error_reason; ///< A string describing the error
+         Security::CertPointer cert; ///< The broken certificate
+     };
+ 
+     typedef std::vector<RecvdError> RecvdErrors;
+ 
+     /// Search in errors list for the error item with id=errorId.
+
+=== modified file 'src/ssl/helper.cc'
+--- src/ssl/helper.cc	2015-11-19 05:51:49 +0000
++++ src/ssl/helper.cc	2015-11-30 18:07:12 +0000
+@@ -2,41 +2,41 @@
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "../helper.h"
+ #include "anyp/PortCfg.h"
+ #include "fs_io.h"
+ #include "helper/Reply.h"
+ #include "SquidConfig.h"
+ #include "SquidString.h"
+ #include "SquidTime.h"
+ #include "ssl/cert_validate_message.h"
+ #include "ssl/Config.h"
+ #include "ssl/helper.h"
+ #include "wordlist.h"
+ 
+-LruMap<Ssl::CertValidationResponse> *Ssl::CertValidationHelper::HelperCache = NULL;
++Ssl::CertValidationHelper::LruCache *Ssl::CertValidationHelper::HelperCache = nullptr;
+ 
+ #if USE_SSL_CRTD
+ Ssl::Helper * Ssl::Helper::GetInstance()
+ {
+     static Ssl::Helper sslHelper;
+     return &sslHelper;
+ }
+ 
+ Ssl::Helper::Helper() : ssl_crtd(NULL)
+ {
+ }
+ 
+ Ssl::Helper::~Helper()
+ {
+     Shutdown();
+ }
+ 
+ void Ssl::Helper::Init()
+ {
+     assert(ssl_crtd == NULL);
+@@ -156,123 +156,126 @@
+         bool parseParams = true;
+         while ((token = strwordtok(NULL, &tmp))) {
+             if (parseParams) {
+                 if (strncmp(token, "ttl=", 4) == 0) {
+                     ttl = atoi(token + 4);
+                     continue;
+                 } else if (strncmp(token, "cache=", 6) == 0) {
+                     cache = atoi(token + 6);
+                     continue;
+                 } else
+                     parseParams = false;
+             }
+             wordlistAdd(&ssl_crt_validator->cmdline, token);
+         }
+         xfree(tmp_begin);
+     }
+     helperOpenServers(ssl_crt_validator);
+ 
+     //WARNING: initializing static member in an object initialization method
+     assert(HelperCache == NULL);
+-    HelperCache = new LruMap<Ssl::CertValidationResponse>(ttl, cache);
++    HelperCache = new Ssl::CertValidationHelper::LruCache(ttl, cache);
+ }
+ 
+ void Ssl::CertValidationHelper::Shutdown()
+ {
+     if (!ssl_crt_validator)
+         return;
+     helperShutdown(ssl_crt_validator);
+     wordlistDestroy(&ssl_crt_validator->cmdline);
+     delete ssl_crt_validator;
+     ssl_crt_validator = NULL;
+ 
+     // CertValidationHelper::HelperCache is a static member, it is not good policy to
+     // reset it here. Will work because the current Ssl::CertValidationHelper is
+     // always the same static object.
+     delete HelperCache;
+     HelperCache = NULL;
+ }
+ 
+ class submitData
+ {
+     CBDATA_CLASS(submitData);
+ 
+ public:
+     std::string query;
+-    Ssl::CertValidationHelper::CVHCB *callback;
+-    void *data;
++    AsyncCall::Pointer callback;
+     SSL *ssl;
+ };
+ CBDATA_CLASS_INIT(submitData);
+ 
+ static void
+ sslCrtvdHandleReplyWrapper(void *data, const ::Helper::Reply &reply)
+ {
+     Ssl::CertValidationMsg replyMsg(Ssl::CrtdMessage::REPLY);
+-    Ssl::CertValidationResponse *validationResponse = new Ssl::CertValidationResponse;
++    Ssl::CertValidationResponse::Pointer validationResponse = new Ssl::CertValidationResponse;
+     std::string error;
+ 
+     submitData *crtdvdData = static_cast<submitData *>(data);
+     STACK_OF(X509) *peerCerts = SSL_get_peer_cert_chain(crtdvdData->ssl);
+     if (reply.result == ::Helper::BrokenHelper) {
+         debugs(83, DBG_IMPORTANT, "\"ssl_crtvd\" helper error response: " << reply.other().content());
+         validationResponse->resultCode = ::Helper::BrokenHelper;
+     } else if (replyMsg.parse(reply.other().content(), reply.other().contentSize()) != Ssl::CrtdMessage::OK ||
+                !replyMsg.parseResponse(*validationResponse, peerCerts, error) ) {
+         debugs(83, DBG_IMPORTANT, "WARNING: Reply from ssl_crtvd for " << " is incorrect");
+         debugs(83, DBG_IMPORTANT, "Certificate cannot be validated. ssl_crtvd response: " << replyMsg.getBody());
+         validationResponse->resultCode = ::Helper::BrokenHelper;
+     } else
+         validationResponse->resultCode = reply.result;
+ 
+-    crtdvdData->callback(crtdvdData->data, *validationResponse);
++    Ssl::CertValidationHelper::CbDialer *dialer = dynamic_cast<Ssl::CertValidationHelper::CbDialer*>(crtdvdData->callback->getDialer());
++    Must(dialer);
++    dialer->arg1 = validationResponse;
++    ScheduleCallHere(crtdvdData->callback);
+ 
+     if (Ssl::CertValidationHelper::HelperCache &&
+             (validationResponse->resultCode == ::Helper::Okay || validationResponse->resultCode == ::Helper::Error)) {
+-        Ssl::CertValidationHelper::HelperCache->add(crtdvdData->query.c_str(), validationResponse);
+-    } else
+-        delete validationResponse;
++        Ssl::CertValidationResponse::Pointer *item = new Ssl::CertValidationResponse::Pointer(validationResponse);
++        Ssl::CertValidationHelper::HelperCache->add(crtdvdData->query.c_str(), item);
++    }
+ 
+-    cbdataReferenceDone(crtdvdData->data);
+     SSL_free(crtdvdData->ssl);
+     delete crtdvdData;
+ }
+ 
+-void Ssl::CertValidationHelper::sslSubmit(Ssl::CertValidationRequest const &request, Ssl::CertValidationHelper::CVHCB * callback, void * data)
++void Ssl::CertValidationHelper::sslSubmit(Ssl::CertValidationRequest const &request, AsyncCall::Pointer &callback)
+ {
+     assert(ssl_crt_validator);
+ 
+     Ssl::CertValidationMsg message(Ssl::CrtdMessage::REQUEST);
+     message.setCode(Ssl::CertValidationMsg::code_cert_validate);
+     message.composeRequest(request);
+     debugs(83, 5, "SSL crtvd request: " << message.compose().c_str());
+ 
+     submitData *crtdvdData = new submitData;
+     crtdvdData->query = message.compose();
+     crtdvdData->query += '\n';
+     crtdvdData->callback = callback;
+-    crtdvdData->data = cbdataReference(data);
+     crtdvdData->ssl = request.ssl;
+     CRYPTO_add(&crtdvdData->ssl->references,1,CRYPTO_LOCK_SSL);
+-    Ssl::CertValidationResponse const*validationResponse;
++    Ssl::CertValidationResponse::Pointer const*validationResponse;
+ 
+     if (CertValidationHelper::HelperCache &&
+             (validationResponse = CertValidationHelper::HelperCache->get(crtdvdData->query.c_str()))) {
+-        callback(data, *validationResponse);
+-        cbdataReferenceDone(crtdvdData->data);
++
++        CertValidationHelper::CbDialer *dialer = dynamic_cast<CertValidationHelper::CbDialer*>(callback->getDialer());
++        dialer->arg1 = *validationResponse;
++        ScheduleCallHere(callback);
+         SSL_free(crtdvdData->ssl);
+         delete crtdvdData;
+         return;
+     }
+ 
+     if (!ssl_crt_validator->trySubmit(crtdvdData->query.c_str(), sslCrtvdHandleReplyWrapper, crtdvdData)) {
+-        Ssl::CertValidationResponse resp;
+-        resp.resultCode = ::Helper::BrokenHelper;
+-        callback(data, resp);
++        Ssl::CertValidationResponse::Pointer resp = new Ssl::CertValidationResponse;;
++        resp->resultCode = ::Helper::BrokenHelper;
++        Ssl::CertValidationHelper::CbDialer *dialer = dynamic_cast<Ssl::CertValidationHelper::CbDialer*>(callback->getDialer());
++        dialer->arg1 = resp;
++        ScheduleCallHere(callback);
+ 
+-        cbdataReferenceDone(crtdvdData->data);
+         SSL_free(crtdvdData->ssl);
+         delete crtdvdData;
+         return;
+     }
+ }
+ 
+
+=== modified file 'src/ssl/helper.h'
+--- src/ssl/helper.h	2015-01-13 07:25:36 +0000
++++ src/ssl/helper.h	2015-11-30 17:19:25 +0000
+@@ -1,63 +1,68 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SSL_HELPER_H
+ #define SQUID_SSL_HELPER_H
+ 
++#include "base/AsyncJobCalls.h"
+ #include "base/LruMap.h"
+ #include "helper/forward.h"
+ #include "ssl/cert_validate_message.h"
+ #include "ssl/crtd_message.h"
+ 
+ namespace Ssl
+ {
+ /**
+  * Set of thread for ssl_crtd. This class is singleton. Use this class only
+  * over GetIntance() static method. This class use helper structure
+  * for threads management.
+  */
+ #if USE_SSL_CRTD
+ class Helper
+ {
+ public:
+     static Helper * GetInstance(); ///< Instance class.
+     void Init(); ///< Init helper structure.
+     void Shutdown(); ///< Shutdown helper structure.
+     /// Submit crtd message to external crtd server.
+     void sslSubmit(CrtdMessage const & message, HLPCB * callback, void *data);
+ private:
+     Helper();
+     ~Helper();
+ 
+     helper * ssl_crtd; ///< helper for management of ssl_crtd.
+ };
+ #endif
+ 
++class PeerConnector;
+ class CertValidationRequest;
+ class CertValidationResponse;
+ class CertValidationHelper
+ {
+ public:
++    typedef UnaryMemFunT<Ssl::PeerConnector, CertValidationResponse::Pointer> CbDialer;
++
+     typedef void CVHCB(void *, Ssl::CertValidationResponse const &);
+     static CertValidationHelper * GetInstance(); ///< Instance class.
+     void Init(); ///< Init helper structure.
+     void Shutdown(); ///< Shutdown helper structure.
+     /// Submit crtd request message to external crtd server.
+-    void sslSubmit(Ssl::CertValidationRequest const & request, CVHCB * callback, void *data);
++    void sslSubmit(Ssl::CertValidationRequest const & request, AsyncCall::Pointer &);
+ private:
+     CertValidationHelper();
+     ~CertValidationHelper();
+ 
+     helper * ssl_crt_validator; ///< helper for management of ssl_crtd.
+ public:
+-    static LruMap<Ssl::CertValidationResponse> *HelperCache; ///< cache for cert validation helper
++    typedef LruMap<Ssl::CertValidationResponse::Pointer, sizeof(Ssl::CertValidationResponse::Pointer) + sizeof(Ssl::CertValidationResponse)> LruCache;
++    static LruCache *HelperCache; ///< cache for cert validation helper
+ };
+ 
+ } //namespace Ssl
+ #endif // SQUID_SSL_HELPER_H
+ 
+

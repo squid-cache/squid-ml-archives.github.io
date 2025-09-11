@@ -1,0 +1,241 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] convert DNS shutdown to runner
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20convert%20DNS%20shutdown%20to%20runner&In-Reply-To=%3C9939da28-9066-5007-65ff-28e60fe57029%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="006910.html">
+   <LINK REL="Next"  HREF="006916.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] convert DNS shutdown to runner</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20convert%20DNS%20shutdown%20to%20runner&In-Reply-To=%3C9939da28-9066-5007-65ff-28e60fe57029%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] convert DNS shutdown to runner">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Sun Oct  2 12:35:57 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006910.html">[squid-dev] [PATCH] cleanup removal of needless get()
+</A></li>
+        <LI>Next message: <A HREF="006916.html">[squid-dev] [PATCH] convert DNS shutdown to runner
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6913">[ date ]</a>
+              <a href="thread.html#6913">[ thread ]</a>
+              <a href="subject.html#6913">[ subject ]</a>
+              <a href="author.html#6913">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>This patch adds a Runner to manage the DNS component state on shutdown
+(and the matching reconfigure port closures). The actions taken on
+reconfigure and shutdown are not changed, just their timing.
+
+Visible differences are now that Squid logs when DNS ports are being
+closed (and the reason), also that the still-open FD table report no
+longer lists the DNS listening FD as being open on shutdown when
+comm_exit() is called and forces all fd_table entries to close.
+
+NP: I have not moved the Dns::Init() operations to the runner at this
+stage because it needs some deeper analysis and redesign as to which
+Squid processes DNS is enabled/initialized. Currently everything from
+coordinator to Diskers enable the internal-DNS state.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/base/RunnersRegistry.h'
+--- src/base/RunnersRegistry.h	2016-09-12 11:27:33 +0000
++++ src/base/RunnersRegistry.h	2016-10-02 09:38:01 +0000
+@@ -57,6 +57,11 @@
+ 
+     /* Reconfiguration events */
+ 
++    /// Called after receiving a reconfigure request and before parsing squid.conf.
++    /// Meant for halting any active modules that could be triggered by external
++    /// events (such as listening ports) while changing their configuration.
++    virtual void startReconfigure() {}
++
+     /// Called after parsing squid.conf during reconfiguration.
+     /// Meant for adjusting the module state based on configuration changes.
+     virtual void syncConfig() {}
+
+=== modified file 'src/dns/forward.h'
+--- src/dns/forward.h	2016-10-01 12:02:44 +0000
++++ src/dns/forward.h	2016-10-02 09:35:36 +0000
+@@ -22,7 +22,6 @@
+ class LookupDetails;
+ 
+ void Init(void);
+-void Shutdown(void);
+ 
+ } // namespace Dns
+ 
+
+=== modified file 'src/dns_internal.cc'
+--- src/dns_internal.cc	2016-04-22 11:39:23 +0000
++++ src/dns_internal.cc	2016-10-02 12:18:51 +0000
+@@ -10,6 +10,7 @@
+ 
+ #include &quot;squid.h&quot;
+ #include &quot;base/InstanceId.h&quot;
++#include &quot;base/RunnersRegistry.h&quot;
+ #include &quot;comm.h&quot;
+ #include &quot;comm/Connection.h&quot;
+ #include &quot;comm/ConnOpener.h&quot;
+@@ -209,6 +210,21 @@
+     nsvc *vc;
+ };
+ 
++namespace Dns
++{
++
++/// manage DNS internal component
++class ConfigRr : public RegisteredRunner
++{
++public:
++    virtual void startReconfigure() override;
++    virtual void endingShutdown() override;
++};
++
++RunnerRegistrationEntry(ConfigRr);
++
++} // namespace Dns
++
+ struct _sp {
+     char domain[NS_MAXDNAME];
+     int queries;
+@@ -903,7 +919,7 @@
+ {
+     delete queue;
+     delete msg;
+-    if (ns &lt; nns) // XXX: Dns::Shutdown may have freed nameservers[]
++    if (ns &lt; nns) // XXX: idnsShutdownAndFreeState may have freed nameservers[]
+         nameservers[ns].vc = NULL;
+ }
+ 
+@@ -1641,12 +1657,14 @@
+     Mgr::RegisterAction(&quot;idns&quot;, &quot;Internal DNS Statistics&quot;, idnsStats, 0, 1);
+ }
+ 
+-void
+-Dns::Shutdown(void)
++static void
++idnsShutdownAndFreeState(const char *reason)
+ {
+     if (DnsSocketA &lt; 0 &amp;&amp; DnsSocketB &lt; 0)
+         return;
+ 
++    debugs(78, DBG_IMPORTANT, reason &lt;&lt; &quot;: Closing DNS sockets&quot;);
++
+     if (DnsSocketA &gt;= 0 ) {
+         comm_close(DnsSocketA);
+         DnsSocketA = -1;
+@@ -1669,6 +1687,18 @@
+     idnsFreeSearchpath();
+ }
+ 
++void
++Dns::ConfigRr::endingShutdown()
++{
++    idnsShutdownAndFreeState(&quot;Shutdown&quot;);
++}
++
++void
++Dns::ConfigRr::startReconfigure()
++{
++    idnsShutdownAndFreeState(&quot;Reconfigure&quot;);
++}
++
+ static int
+ idnsCachedLookup(const char *key, IDNSCB * callback, void *data)
+ {
+
+=== modified file 'src/main.cc'
+--- src/main.cc	2016-06-25 14:35:41 +0000
++++ src/main.cc	2016-10-02 12:19:21 +0000
+@@ -851,13 +851,14 @@
+     debugs(1, DBG_IMPORTANT, &quot;Reconfiguring Squid Cache (version &quot; &lt;&lt; version_string &lt;&lt; &quot;)...&quot;);
+     reconfiguring = 1;
+ 
++    RunRegisteredHere(RegisteredRunner::startReconfigure);
++
+     // Initiate asynchronous closing sequence
+     serverConnectionsClose();
+     icpClosePorts();
+ #if USE_HTCP
+     htcpClosePorts();
+ #endif
+-    Dns::Shutdown();
+ #if USE_SSL_CRTD
+     Ssl::Helper::GetInstance()-&gt;Shutdown();
+ #endif
+@@ -2006,7 +2007,6 @@
+ #endif
+ 
+     debugs(1, DBG_IMPORTANT, &quot;Shutting down...&quot;);
+-    Dns::Shutdown();
+ #if USE_SSL_CRTD
+     Ssl::Helper::GetInstance()-&gt;Shutdown();
+ #endif
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006910.html">[squid-dev] [PATCH] cleanup removal of needless get()
+</A></li>
+	<LI>Next message: <A HREF="006916.html">[squid-dev] [PATCH] convert DNS shutdown to runner
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6913">[ date ]</a>
+              <a href="thread.html#6913">[ thread ]</a>
+              <a href="subject.html#6913">[ subject ]</a>
+              <a href="author.html#6913">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

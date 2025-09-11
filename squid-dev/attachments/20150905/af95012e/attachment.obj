@@ -1,0 +1,1056 @@
+=== modified file 'src/Makefile.am'
+--- src/Makefile.am	2015-08-31 09:58:00 +0000
++++ src/Makefile.am	2015-09-02 17:04:24 +0000
+@@ -421,6 +421,8 @@ squid_SOURCES = \
+ 	send-announce.h \
+ 	send-announce.cc \
+ 	$(SBUF_SOURCE) \
++	SBufAlgos.h \
++	SBufAlgos.cc \
+ 	SBufDetailedStats.h \
+ 	SBufDetailedStats.cc \
+ 	SBufStatsAction.h \
+
+=== modified file 'src/auth/Config.cc'
+--- src/auth/Config.cc	2015-01-13 07:25:36 +0000
++++ src/auth/Config.cc	2015-09-04 13:37:51 +0000
+@@ -157,22 +157,3 @@ Auth::Config::done()
+     keyExtrasLine.clean();
+ }
+ 
+-Auth::User::Pointer
+-Auth::Config::findUserInCache(const char *nameKey, Auth::Type authType)
+-{
+-    AuthUserHashPointer *usernamehash;
+-    debugs(29, 9, "Looking for user '" << nameKey << "'");
+-
+-    if (nameKey && (usernamehash = static_cast<AuthUserHashPointer *>(hash_lookup(proxy_auth_username_cache, nameKey)))) {
+-        while (usernamehash) {
+-            if ((usernamehash->user()->auth_type == authType) &&
+-                    !strcmp(nameKey, (char const *)usernamehash->key))
+-                return usernamehash->user();
+-
+-            usernamehash = static_cast<AuthUserHashPointer *>(usernamehash->next);
+-        }
+-    }
+-
+-    return NULL;
+-}
+-
+
+=== modified file 'src/auth/Config.h'
+--- src/auth/Config.h	2015-08-04 19:57:07 +0000
++++ src/auth/Config.h	2015-09-04 07:03:09 +0000
+@@ -108,9 +108,6 @@ public:
+     /** add headers as needed when challenging for auth */
+     virtual void fixHeader(UserRequest::Pointer, HttpReply *, Http::HdrType, HttpRequest *) = 0;
+ 
+-    /// Find any existing user credentials in the authentication cache by name and type.
+-    virtual Auth::User::Pointer findUserInCache(const char *nameKey, Auth::Type type);
+-
+     /** prepare to handle requests */
+     virtual void init(Config *) = 0;
+ 
+
+=== modified file 'src/auth/Gadgets.cc'
+--- src/auth/Gadgets.cc	2015-01-13 07:25:36 +0000
++++ src/auth/Gadgets.cc	2015-09-04 13:37:51 +0000
+@@ -16,10 +16,15 @@
+ #include "acl/Acl.h"
+ #include "acl/FilledChecklist.h"
+ #include "auth/AclProxyAuth.h"
++#include "auth/basic/User.h"
+ #include "auth/Config.h"
++#include "auth/digest/User.h"
+ #include "auth/Gadgets.h"
++#include "auth/negotiate/User.h"
++#include "auth/ntlm/User.h"
+ #include "auth/Scheme.h"
+ #include "auth/User.h"
++#include "auth/UserNameCache.h"
+ #include "auth/UserRequest.h"
+ #include "client_side.h"
+ #include "globals.h"
+@@ -64,10 +69,6 @@ authenticateRegisterWithCacheManager(Aut
+ void
+ authenticateInit(Auth::ConfigVector * config)
+ {
+-    /* Do this first to clear memory and remove dead state on a reconfigure */
+-    if (proxy_auth_username_cache)
+-        Auth::User::CachedACLsReset();
+-
+     /* If we do not have any auth config state to create stop now. */
+     if (!config)
+         return;
+@@ -79,9 +80,6 @@ authenticateInit(Auth::ConfigVector * co
+             schemeCfg->init(schemeCfg);
+     }
+ 
+-    if (!proxy_auth_username_cache)
+-        Auth::User::cacheInit();
+-
+     authenticateRegisterWithCacheManager(config);
+ }
+ 
+@@ -96,16 +94,9 @@ authenticateRotate(void)
+ void
+ authenticateReset(void)
+ {
+-    debugs(29, 2, HERE << "Reset authentication State.");
++    debugs(29, 2, "Reset authentication State.");
+ 
+-    /* free all username cache entries */
+-    hash_first(proxy_auth_username_cache);
+-    AuthUserHashPointer *usernamehash;
+-    while ((usernamehash = ((AuthUserHashPointer *) hash_next(proxy_auth_username_cache)))) {
+-        debugs(29, 5, HERE << "Clearing entry for user: " << usernamehash->user()->username());
+-        hash_remove_link(proxy_auth_username_cache, (hash_link *)usernamehash);
+-        delete usernamehash;
+-    }
++    // username cache is cleared via Runner registry
+ 
+     /* schedule shutdown of the helpers */
+     authenticateRotate();
+@@ -114,17 +105,30 @@ authenticateReset(void)
+     Auth::TheConfig.clear();
+ }
+ 
+-AuthUserHashPointer::AuthUserHashPointer(Auth::User::Pointer anAuth_user):
+-    auth_user(anAuth_user)
++std::vector<Auth::User::Pointer>
++authenticateCachedUsersList()
+ {
+-    key = (void *)anAuth_user->userKey();
+-    next = NULL;
+-    hash_join(proxy_auth_username_cache, (hash_link *) this);
+-}
+-
+-Auth::User::Pointer
+-AuthUserHashPointer::user() const
+-{
+-    return auth_user;
++    auto aucp_compare = [=](const Auth::User::Pointer lhs, const Auth::User::Pointer rhs) {
++        return lhs->userKey() < rhs->userKey();
++    };
++    std::vector<Auth::User::Pointer> v1, v2, rv, u1, u2;
++    if (Auth::Config::Find("basic") != nullptr)
++        u1 = Auth::Basic::User::Cache()->sortedUsersList();
++    if (Auth::Config::Find("digest") != nullptr)
++        u2 = Auth::Digest::User::Cache()->sortedUsersList();
++    v1.reserve(u1.size()+u2.size());
++    std::merge(u1.begin(), u1.end(),u2.begin(), u2.end(),
++               std::back_inserter(v1), aucp_compare);
++    if (Auth::Config::Find("negotiate") != nullptr)
++        u1 = Auth::Negotiate::User::Cache()->sortedUsersList();
++    if (Auth::Config::Find("ntlm") != nullptr)
++        u2 = Auth::Ntlm::User::Cache()->sortedUsersList();
++    v2.reserve(u1.size()+u2.size());
++    std::merge(u1.begin(), u1.end(),u2.begin(), u2.end(),
++               std::back_inserter(v2), aucp_compare);
++    rv.reserve(v1.size()+v2.size());
++    std::merge(v1.begin(), v1.end(),v2.begin(), v2.end(),
++               std::back_inserter(rv), aucp_compare);
++    return rv;
+ }
+ 
+
+=== modified file 'src/auth/Gadgets.h'
+--- src/auth/Gadgets.h	2015-01-13 07:25:36 +0000
++++ src/auth/Gadgets.h	2015-09-04 11:56:37 +0000
+@@ -15,32 +15,6 @@
+ #include "auth/User.h"
+ #include "hash.h"
+ 
+-/**
+- \ingroup AuthAPI
+- *
+- * This is used to link AuthUsers objects into the username cache.
+- * Because some schemes may link in aliases to a user,
+- * the link is not part of the AuthUser structure itself.
+- *
+- * Code must not hold onto copies of these objects.
+- * They may exist only so long as the AuthUser being referenced
+- * is recorded in the cache. Any caller using hash_remove_link
+- * must then delete the AuthUserHashPointer.
+- */
+-class AuthUserHashPointer : public hash_link
+-{
+-    MEMPROXY_CLASS(AuthUserHashPointer);
+-
+-public:
+-    AuthUserHashPointer(Auth::User::Pointer);
+-    ~AuthUserHashPointer() { auth_user = NULL; };
+-
+-    Auth::User::Pointer user() const;
+-
+-private:
+-    Auth::User::Pointer auth_user;
+-};
+-
+ namespace Auth
+ {
+ class Scheme;
+@@ -81,6 +55,8 @@ int authenticateSchemeCount(void);
+ /// \ingroup AuthAPI
+ void authenticateOnCloseConnection(ConnStateData * conn);
+ 
++std::vector<Auth::User::Pointer> authenticateCachedUsersList();
++
+ #endif /* USE_AUTH */
+ #endif /* SQUID_AUTH_GADGETS_H */
+ 
+
+=== modified file 'src/auth/Makefile.am'
+--- src/auth/Makefile.am	2015-01-13 07:25:36 +0000
++++ src/auth/Makefile.am	2015-09-01 11:09:13 +0000
+@@ -32,6 +32,8 @@ libauth_la_SOURCES = \
+ 	State.cc \
+ 	User.h \
+ 	User.cc \
++	UserNameCache.h \
++	UserNameCache.cc \
+ 	UserRequest.h \
+ 	UserRequest.cc
+ 
+
+=== modified file 'src/auth/User.cc'
+--- src/auth/User.cc	2015-08-24 14:20:07 +0000
++++ src/auth/User.cc	2015-09-04 07:03:09 +0000
+@@ -14,6 +14,7 @@
+ #include "auth/Config.h"
+ #include "auth/Gadgets.h"
+ #include "auth/User.h"
++#include "auth/UserNameCache.h"
+ #include "auth/UserRequest.h"
+ #include "event.h"
+ #include "globals.h"
+@@ -21,8 +22,6 @@
+ #include "SquidTime.h"
+ #include "Store.h"
+ 
+-time_t Auth::User::last_discard = 0;
+-
+ Auth::User::User(Auth::Config *aConfig, const char *aRequestRealm) :
+     auth_type(Auth::AUTH_UNKNOWN),
+     config(aConfig),
+@@ -139,82 +138,6 @@ Auth::User::~User()
+ }
+ 
+ void
+-Auth::User::cacheInit(void)
+-{
+-    if (!proxy_auth_username_cache) {
+-        /* First time around, 7921 should be big enough */
+-        proxy_auth_username_cache = hash_create((HASHCMP *) strcmp, 7921, hash_string);
+-        assert(proxy_auth_username_cache);
+-        eventAdd("User Cache Maintenance", cacheCleanup, NULL, ::Config.authenticateGCInterval, 1);
+-        last_discard = squid_curtime;
+-    }
+-}
+-
+-void
+-Auth::User::CachedACLsReset()
+-{
+-    /*
+-     * This must complete all at once, because we are ensuring correctness.
+-     */
+-    AuthUserHashPointer *usernamehash;
+-    Auth::User::Pointer auth_user;
+-    debugs(29, 3, HERE << "Flushing the ACL caches for all users.");
+-    hash_first(proxy_auth_username_cache);
+-
+-    while ((usernamehash = ((AuthUserHashPointer *) hash_next(proxy_auth_username_cache)))) {
+-        auth_user = usernamehash->user();
+-        /* free cached acl results */
+-        aclCacheMatchFlush(&auth_user->proxy_match_cache);
+-    }
+-
+-    debugs(29, 3, HERE << "Finished.");
+-}
+-
+-void
+-Auth::User::cacheCleanup(void *)
+-{
+-    /*
+-     * We walk the hash by username as that is the unique key we use.
+-     * For big hashs we could consider stepping through the cache, 100/200
+-     * entries at a time. Lets see how it flys first.
+-     */
+-    AuthUserHashPointer *usernamehash;
+-    Auth::User::Pointer auth_user;
+-    char const *username = NULL;
+-    debugs(29, 3, HERE << "Cleaning the user cache now");
+-    debugs(29, 3, HERE << "Current time: " << current_time.tv_sec);
+-    hash_first(proxy_auth_username_cache);
+-
+-    while ((usernamehash = ((AuthUserHashPointer *) hash_next(proxy_auth_username_cache)))) {
+-        auth_user = usernamehash->user();
+-        username = auth_user->username();
+-
+-        /* if we need to have indedendent expiry clauses, insert a module call
+-         * here */
+-        debugs(29, 4, HERE << "Cache entry:\n\tType: " <<
+-               auth_user->auth_type << "\n\tUsername: " << username <<
+-               "\n\texpires: " <<
+-               (long int) (auth_user->expiretime + ::Config.authenticateTTL) <<
+-               "\n\treferences: " << auth_user->LockCount());
+-
+-        if (auth_user->expiretime + ::Config.authenticateTTL <= current_time.tv_sec) {
+-            debugs(29, 5, HERE << "Removing user " << username << " from cache due to timeout.");
+-
+-            /* Old credentials are always removed. Existing users must hold their own
+-             * Auth::User::Pointer to the credentials. Cache exists only for finding
+-             * and re-using current valid credentials.
+-             */
+-            hash_remove_link(proxy_auth_username_cache, usernamehash);
+-            delete usernamehash;
+-        }
+-    }
+-
+-    debugs(29, 3, HERE << "Finished cleaning the user cache.");
+-    eventAdd("User Cache Maintenance", cacheCleanup, NULL, ::Config.authenticateGCInterval, 1);
+-    last_discard = squid_curtime;
+-}
+-
+-void
+ Auth::User::clearIp()
+ {
+     AuthUserIP *ipdata, *tempnode;
+@@ -316,29 +239,13 @@ Auth::User::BuildUserKey(const char *use
+ }
+ 
+ /**
+- * Add the Auth::User structure to the username cache.
+- */
+-void
+-Auth::User::addToNameCache()
+-{
+-    /* AuthUserHashPointer will self-register with the username cache */
+-    new AuthUserHashPointer(this);
+-}
+-
+-/**
+  * Dump the username cache statictics for viewing...
+  */
+ void
+ Auth::User::UsernameCacheStats(StoreEntry *output)
+ {
+-    AuthUserHashPointer *usernamehash;
+-
+-    /* overview of username cache */
+-    storeAppendPrintf(output, "Cached Usernames: %d of %d\n", proxy_auth_username_cache->count, proxy_auth_username_cache->size);
+-    storeAppendPrintf(output, "Next Garbage Collection in %d seconds.\n",
+-                      static_cast<int32_t>(last_discard + ::Config.authenticateGCInterval - squid_curtime));
+-
+-    /* cache dump column titles */
++    auto userlist = authenticateCachedUsersList();
++    storeAppendPrintf(output, "Cached Usernames: %d", static_cast<int32_t>(userlist.size()));
+     storeAppendPrintf(output, "\n%-15s %-9s %-9s %-9s %s\n",
+                       "Type",
+                       "State",
+@@ -346,11 +253,7 @@ Auth::User::UsernameCacheStats(StoreEntr
+                       "Cache TTL",
+                       "Username");
+     storeAppendPrintf(output, "--------------- --------- --------- --------- ------------------------------\n");
+-
+-    hash_first(proxy_auth_username_cache);
+-    while ((usernamehash = ((AuthUserHashPointer *) hash_next(proxy_auth_username_cache)))) {
+-        Auth::User::Pointer auth_user = usernamehash->user();
+-
++    for ( auto auth_user : userlist ) {
+         storeAppendPrintf(output, "%-15s %-9s %-9d %-9d %s\n",
+                           Auth::Type_str[auth_user->auth_type],
+                           CredentialState_str[auth_user->credentials()],
+
+=== modified file 'src/auth/User.h'
+--- src/auth/User.h	2015-02-08 11:40:30 +0000
++++ src/auth/User.h	2015-09-04 13:15:50 +0000
+@@ -13,19 +13,20 @@
+ 
+ #include "auth/CredentialState.h"
+ #include "auth/Type.h"
++#include "base/CbcPointer.h"
+ #include "base/RefCount.h"
+ #include "dlink.h"
+ #include "ip/Address.h"
+ #include "Notes.h"
+ #include "SBuf.h"
+ 
+-class AuthUserHashPointer;
+ class StoreEntry;
+ 
+ namespace Auth
+ {
+ 
+ class Config;
++class UserNameCache;
+ 
+ /**
+  *  \ingroup AuthAPI
+@@ -56,8 +57,6 @@ public:
+     NotePairs notes;
+ 
+ public:
+-    static void cacheInit();
+-    static void CachedACLsReset();
+     static SBuf BuildUserKey(const char *username, const char *realm);
+ 
+     void absorb(Auth::User::Pointer from);
+@@ -66,7 +65,7 @@ public:
+     void username(char const *); ///< set stored username and userKey
+ 
+     // NP: key is set at the same time as username_. Until then both are empty/NULL.
+-    const char *userKey() {return !userKey_.isEmpty() ? userKey_.c_str() : NULL;}
++    const SBuf userKey() const {return userKey_;}
+ 
+     /**
+      * How long these credentials are still valid for.
+@@ -79,9 +78,14 @@ public:
+     void removeIp(Ip::Address);
+     void addIp(Ip::Address);
+ 
+-    void addToNameCache();
++    /// add the Auth::User to the protocol-specific username cache.
++    virtual void addToNameCache() = 0;
+     static void UsernameCacheStats(StoreEntry * output);
+ 
++    // userKey ->Auth::User::Pointer cache
++    // must be reimplemented in subclasses
++    static CbcPointer<Auth::UserNameCache> Cache();
++
+     CredentialState credentials() const;
+     void credentials(CredentialState);
+ 
+@@ -101,12 +105,6 @@ protected:
+ 
+ private:
+     /**
+-     * Garbage Collection for the username cache.
+-     */
+-    static void cacheCleanup(void *unused);
+-    static time_t last_discard; /// Time of last username cache garbage collection.
+-
+-    /**
+      * DPW 2007-05-08
+      * The username_ memory will be allocated via
+      * xstrdup().  It is our responsibility.
+
+=== added file 'src/auth/UserNameCache.cc'
+--- src/auth/UserNameCache.cc	1970-01-01 00:00:00 +0000
++++ src/auth/UserNameCache.cc	2015-09-04 13:37:51 +0000
+@@ -0,0 +1,111 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++/* DEBUG: section 29    Authenticator */
++
++#include "squid.h"
++#include "acl/Gadgets.h"
++#include "auth/UserNameCache.h"
++#include "Debug.h"
++#include "event.h"
++#include "SquidConfig.h"
++#include "SquidTime.h"
++
++namespace Auth {
++
++CBDATA_CLASS_INIT(UserNameCache);
++
++UserNameCache::UserNameCache(const char *name) :
++    cachename(name), cacheCleanupEventName("User cache cleanup: ")
++{
++    debugs(29, 5, "initializing " << name << " username cache");
++    cacheCleanupEventName.append(name);
++    eventAdd(cacheCleanupEventName.c_str(), &UserNameCache::Cleanup,
++             this, ::Config.authenticateGCInterval, 1);
++    RegisterRunner(this);
++}
++
++Auth::User::Pointer
++UserNameCache::lookup(const SBuf &userKey) const
++{
++    debugs(29, 6, "lookup for " << userKey);
++    auto p = store_.find(userKey);
++    if (p == store_.end())
++        return User::Pointer(nullptr);
++    return p->second;
++}
++
++void
++UserNameCache::Cleanup(void *data)
++{
++    debugs(29, 5, "checkpoint");
++    if (!cbdataReferenceValid(data))
++        return;
++    // data is this in disguise
++    UserNameCache *self = static_cast<UserNameCache *>(data);
++    // cache entries with expiretime <= expirationTime are to be evicted
++    const time_t expirationTime =  current_time.tv_sec - ::Config.authenticateTTL;
++
++    const auto end = self->store_.end();
++    for (auto i = self->store_.begin(); i != end;) {
++        debugs(29, 6, "considering " << i->first << "(expires in " <<
++               (expirationTime - i->second->expiretime) << " sec)");
++        if (i->second->expiretime <= expirationTime) {
++            debugs(29, 6, "evicting " << i->first);
++            i = self->store_.erase(i); //erase advances i
++        } else {
++            ++i;
++        }
++    }
++    eventAdd(self->cacheCleanupEventName.c_str(), &UserNameCache::Cleanup,
++             self, ::Config.authenticateGCInterval, 1);
++}
++
++void
++UserNameCache::insert(Auth::User::Pointer anAuth_user)
++{
++    debugs(29, 6, "adding " << anAuth_user->userKey());
++    store_[anAuth_user->userKey()] = anAuth_user;
++}
++
++// generates the list of cached usernames in a format that is convenient
++// to merge with equivalent lists obtained from other UserNameCaches.
++std::vector<Auth::User::Pointer>
++UserNameCache::sortedUsersList() const
++{
++    std::vector<Auth::User::Pointer> rv(size(), nullptr);
++    std::transform(store_.begin(), store_.end(), rv.begin(),
++    [](StoreType::value_type v) { return v.second; }
++                  );
++    std::sort(rv.begin(), rv.end(),
++    [](const Auth::User::Pointer &lhs, const Auth::User::Pointer &rhs) {
++        return strcmp(lhs->username(), rhs->username()) < 0;
++    }
++             );
++    return rv;
++}
++
++void
++UserNameCache::endingShutdown()
++{
++    debugs(29, 5, "Shutting down username cache " << cachename);
++    eventDelete(&UserNameCache::Cleanup, this);
++    reset();
++}
++
++void
++UserNameCache::syncConfig()
++{
++    debugs(29, 5, "Reconfiguring username cache " << cachename);
++    for (auto i : store_) {
++        aclCacheMatchFlush(&i.second->proxy_match_cache);
++    }
++}
++
++} /* namespace Auth */
++
+
+=== added file 'src/auth/UserNameCache.h'
+--- src/auth/UserNameCache.h	1970-01-01 00:00:00 +0000
++++ src/auth/UserNameCache.h	2015-09-04 13:37:51 +0000
+@@ -0,0 +1,83 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SRC_AUTH_UERNAMECACHE_H
++#define SQUID_SRC_AUTH_UERNAMECACHE_H
++
++#include "auth/User.h"
++#include "base/RunnersRegistry.h"
++#include "cbdata.h"
++#include "SBufAlgos.h"
++
++#include <unordered_map>
++
++namespace Auth {
++
++/** Cache of Auth::User::Pointer, keyed by Auth::User::userKey
++ *
++ * \returns a pointer to cached credentials, or nullptr if none found
++ */
++class UserNameCache : public RegisteredRunner
++{
++private:
++    CBDATA_CLASS(UserNameCache);
++
++    /// key is User::userKey(), mapped value is User::Pointer
++    typedef std::unordered_map<SBuf, Auth::User::Pointer> StoreType;
++
++public:
++    UserNameCache() = delete;
++    explicit UserNameCache(const char *name);
++
++    ~UserNameCache() = default;
++    UserNameCache(const UserNameCache& ) = delete;
++    UserNameCache& operator=(const UserNameCache&) = delete;
++
++    /// obtain pointer to user if present, or Pointer(nullptr) if not
++    Auth::User::Pointer lookup(const SBuf &userKey) const;
++
++    /// add an user to the cache
++    void insert(Auth::User::Pointer anAuth_user);
++
++    /// clear cache
++    void reset() { store_.clear(); }
++
++    /// extract number of cached usernames
++    size_t size() const { return store_.size(); }
++
++    /** periodic cleanup function, removes timed-out entries
++     *
++     * Must be static to support EVH interface. Argument will be this
++     */
++    static void Cleanup(void *);
++
++    /** obtain sorted list of usernames
++     *
++     */
++    std::vector<Auth::User::Pointer> sortedUsersList() const;
++
++    /* RegisteredRunner API */
++    virtual void endingShutdown() override;
++    virtual void syncConfig() override;
++
++private:
++    StoreType store_;
++
++    // for logs, events etc.
++    const char *cachename;
++
++    // c_str() raw pointer is used in event. std::string must not reallocate
++    // after ctor and until shutdown
++    // must be unique
++    std::string cacheCleanupEventName;
++};
++
++} /* namespace Auth */
++
++#endif /* SQUID_SRC_AUTH_UERNAMECACHE_H */
++
+
+=== modified file 'src/auth/basic/Config.cc'
+--- src/auth/basic/Config.cc	2015-08-04 19:57:07 +0000
++++ src/auth/basic/Config.cc	2015-09-04 13:15:47 +0000
+@@ -19,6 +19,7 @@
+ #include "auth/basic/UserRequest.h"
+ #include "auth/Gadgets.h"
+ #include "auth/State.h"
++#include "auth/UserNameCache.h"
+ #include "cache_cf.h"
+ #include "charset.h"
+ #include "helper.h"
+@@ -246,7 +247,7 @@ Auth::Basic::Config::decode(char const *
+     /* now lookup and see if we have a matching auth_user structure in memory. */
+     Auth::User::Pointer auth_user;
+ 
+-    if ((auth_user = findUserInCache(lb->userKey(), Auth::AUTH_BASIC)) == NULL) {
++    if (!(auth_user = Auth::Basic::User::Cache()->lookup(lb->userKey()))) {
+         /* the user doesn't exist in the username cache yet */
+         /* save the credentials */
+         debugs(29, 9, HERE << "Creating new user '" << lb->username() << "'");
+
+=== modified file 'src/auth/basic/User.cc'
+--- src/auth/basic/User.cc	2015-01-13 07:25:36 +0000
++++ src/auth/basic/User.cc	2015-09-04 13:37:51 +0000
+@@ -9,6 +9,7 @@
+ #include "squid.h"
+ #include "auth/basic/Config.h"
+ #include "auth/basic/User.h"
++#include "auth/UserNameCache.h"
+ #include "Debug.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+@@ -79,3 +80,16 @@ Auth::Basic::User::updateCached(Auth::Ba
+     }
+ }
+ 
++CbcPointer<Auth::UserNameCache>
++Auth::Basic::User::Cache()
++{
++    static CbcPointer<Auth::UserNameCache> p(new Auth::UserNameCache("basic"));
++    return p;
++}
++
++void
++Auth::Basic::User::addToNameCache()
++{
++    Cache()->insert(this);
++}
++
+
+=== modified file 'src/auth/basic/User.h'
+--- src/auth/basic/User.h	2015-01-13 07:25:36 +0000
++++ src/auth/basic/User.h	2015-09-04 12:36:22 +0000
+@@ -36,6 +36,10 @@ public:
+     void updateCached(User *from);
+     virtual int32_t ttl() const;
+ 
++    /* Auth::User API */
++    static CbcPointer<Auth::UserNameCache> Cache();
++    virtual void addToNameCache() override;
++
+     char *passwd;
+ 
+     QueueNode *queue;
+
+=== modified file 'src/auth/digest/Config.cc'
+--- src/auth/digest/Config.cc	2015-08-25 14:36:54 +0000
++++ src/auth/digest/Config.cc	2015-09-04 07:03:09 +0000
+@@ -19,6 +19,7 @@
+ #include "auth/digest/UserRequest.h"
+ #include "auth/Gadgets.h"
+ #include "auth/State.h"
++#include "auth/UserNameCache.h"
+ #include "base/LookupTable.h"
+ #include "base64.h"
+ #include "cache_cf.h"
+@@ -1042,7 +1043,7 @@ Auth::Digest::Config::decode(char const
+     Auth::User::Pointer auth_user;
+ 
+     SBuf key = Auth::User::BuildUserKey(username, aRequestRealm);
+-    if (key.isEmpty() || (auth_user = findUserInCache(key.c_str(), Auth::AUTH_DIGEST)) == NULL) {
++    if (key.isEmpty() || !(auth_user = Auth::Digest::User::Cache()->lookup(key))) {
+         /* the user doesn't exist in the username cache yet */
+         debugs(29, 9, "Creating new digest user '" << username << "'");
+         digest_user = new Auth::Digest::User(this, aRequestRealm);
+
+=== modified file 'src/auth/digest/Scheme.cc'
+--- src/auth/digest/Scheme.cc	2015-01-13 07:25:36 +0000
++++ src/auth/digest/Scheme.cc	2015-09-04 13:37:51 +0000
+@@ -37,7 +37,6 @@ Auth::Digest::Scheme::shutdownCleanup()
+     if (_instance == NULL)
+         return;
+ 
+-    PurgeCredentialsCache();
+     authenticateDigestNonceShutdown();
+ 
+     _instance = NULL;
+@@ -51,21 +50,3 @@ Auth::Digest::Scheme::createConfig()
+     return dynamic_cast<Auth::Config*>(digestCfg);
+ }
+ 
+-void
+-Auth::Digest::Scheme::PurgeCredentialsCache(void)
+-{
+-    AuthUserHashPointer *usernamehash;
+-
+-    debugs(29, 2, HERE << "Erasing Digest authentication credentials from username cache.");
+-    hash_first(proxy_auth_username_cache);
+-
+-    while ((usernamehash = static_cast<AuthUserHashPointer *>(hash_next(proxy_auth_username_cache)) )) {
+-        Auth::User::Pointer auth_user = usernamehash->user();
+-
+-        if (strcmp(auth_user->config->type(), "digest") == 0) {
+-            hash_remove_link(proxy_auth_username_cache, static_cast<hash_link*>(usernamehash));
+-            delete usernamehash;
+-        }
+-    }
+-}
+-
+
+=== modified file 'src/auth/digest/Scheme.h'
+--- src/auth/digest/Scheme.h	2015-01-13 07:25:36 +0000
++++ src/auth/digest/Scheme.h	2015-08-31 15:48:26 +0000
+@@ -38,12 +38,6 @@ public:
+ private:
+     static Auth::Scheme::Pointer _instance;
+ 
+-    /**
+-     * Remove all cached user credentials from circulation.
+-     * Intended for use during shutdown procedure.
+-     * After calling this all newly received credentials must be re-authenticated.
+-     */
+-    static void PurgeCredentialsCache(void);
+ };
+ 
+ } // namespace Digest
+
+=== modified file 'src/auth/digest/User.cc'
+--- src/auth/digest/User.cc	2015-01-13 07:25:36 +0000
++++ src/auth/digest/User.cc	2015-09-04 13:37:51 +0000
+@@ -9,6 +9,7 @@
+ #include "squid.h"
+ #include "auth/digest/Config.h"
+ #include "auth/digest/User.h"
++#include "auth/UserNameCache.h"
+ #include "Debug.h"
+ #include "dlink.h"
+ #include "SquidConfig.h"
+@@ -72,3 +73,16 @@ Auth::Digest::User::currentNonce()
+     return nonce;
+ }
+ 
++CbcPointer<Auth::UserNameCache>
++Auth::Digest::User::Cache()
++{
++    static CbcPointer<Auth::UserNameCache> p(new Auth::UserNameCache("digest"));
++    return p;
++}
++
++void
++Auth::Digest::User::addToNameCache()
++{
++    Cache()->insert(this);
++}
++
+
+=== modified file 'src/auth/digest/User.h'
+--- src/auth/digest/User.h	2015-01-13 07:25:36 +0000
++++ src/auth/digest/User.h	2015-09-04 12:36:22 +0000
+@@ -9,7 +9,9 @@
+ #ifndef _SQUID_AUTH_DIGEST_USER_H
+ #define _SQUID_AUTH_DIGEST_USER_H
+ 
++#include "auth/digest/Config.h"
+ #include "auth/User.h"
++#include "rfc2617.h"
+ 
+ namespace Auth
+ {
+@@ -25,9 +27,12 @@ public:
+     User(Auth::Config *, const char *requestRealm);
+     ~User();
+     int authenticated() const;
+-
+     virtual int32_t ttl() const;
+ 
++    /* Auth::User API */
++    static CbcPointer<Auth::UserNameCache> Cache();
++    virtual void addToNameCache() override;
++
+     HASH HA1;
+     int HA1created;
+ 
+
+=== modified file 'src/auth/negotiate/User.cc'
+--- src/auth/negotiate/User.cc	2015-01-13 07:25:36 +0000
++++ src/auth/negotiate/User.cc	2015-09-04 13:37:51 +0000
+@@ -9,6 +9,7 @@
+ #include "squid.h"
+ #include "auth/Config.h"
+ #include "auth/negotiate/User.h"
++#include "auth/UserNameCache.h"
+ #include "Debug.h"
+ 
+ Auth::Negotiate::User::User(Auth::Config *aConfig, const char *aRequestRealm) :
+@@ -27,3 +28,16 @@ Auth::Negotiate::User::ttl() const
+     return -1; // Negotiate cannot be cached.
+ }
+ 
++CbcPointer<Auth::UserNameCache>
++Auth::Negotiate::User::Cache()
++{
++    static CbcPointer<Auth::UserNameCache> p(new Auth::UserNameCache("negotiate"));
++    return p;
++}
++
++void
++Auth::Negotiate::User::addToNameCache()
++{
++    Cache()->insert(this);
++}
++
+
+=== modified file 'src/auth/negotiate/User.h'
+--- src/auth/negotiate/User.h	2015-01-13 07:25:36 +0000
++++ src/auth/negotiate/User.h	2015-09-04 12:36:22 +0000
+@@ -29,6 +29,10 @@ public:
+     ~User();
+     virtual int32_t ttl() const;
+ 
++    /* Auth::User API */
++    static CbcPointer<Auth::UserNameCache> Cache();
++    virtual void addToNameCache() override;
++
+     dlink_list proxy_auth_list;
+ };
+ 
+
+=== modified file 'src/auth/negotiate/UserRequest.cc'
+--- src/auth/negotiate/UserRequest.cc	2015-08-24 14:20:07 +0000
++++ src/auth/negotiate/UserRequest.cc	2015-09-04 13:15:47 +0000
+@@ -9,9 +9,11 @@
+ #include "squid.h"
+ #include "AccessLogEntry.h"
+ #include "auth/negotiate/Config.h"
++#include "auth/negotiate/User.h"
+ #include "auth/negotiate/UserRequest.h"
+ #include "auth/State.h"
+ #include "auth/User.h"
++#include "auth/UserNameCache.h"
+ #include "client_side.h"
+ #include "fatal.h"
+ #include "format/Format.h"
+@@ -331,24 +333,19 @@ Auth::Negotiate::UserRequest::HandleRepl
+ 
+         /* connection is authenticated */
+         debugs(29, 4, HERE << "authenticated user " << auth_user_request->user()->username());
+-        /* see if this is an existing user */
+-        AuthUserHashPointer *usernamehash = static_cast<AuthUserHashPointer *>(hash_lookup(proxy_auth_username_cache, auth_user_request->user()->userKey()));
+-        Auth::User::Pointer local_auth_user = lm_request->user();
+-        while (usernamehash && (usernamehash->user()->auth_type != Auth::AUTH_NEGOTIATE ||
+-                                strcmp(usernamehash->user()->userKey(), auth_user_request->user()->userKey()) != 0))
+-            usernamehash = static_cast<AuthUserHashPointer *>(usernamehash->next);
+-        if (usernamehash) {
++        auto local_auth_user = lm_request->user();
++        auto cached_user = Auth::Negotiate::User::Cache()->lookup(auth_user_request->user()->userKey());
++        if (!cached_user) {
++            local_auth_user->addToNameCache();
++        } else {
+             /* we can't seamlessly recheck the username due to the
+              * challenge-response nature of the protocol.
+              * Just free the temporary auth_user after merging as
+              * much of it new state into the existing one as possible */
+-            usernamehash->user()->absorb(local_auth_user);
++            cached_user->absorb(local_auth_user);
+             /* from here on we are working with the original cached credentials. */
+-            local_auth_user = usernamehash->user();
++            local_auth_user = cached_user;
+             auth_user_request->user(local_auth_user);
+-        } else {
+-            /* store user in hash's */
+-            local_auth_user->addToNameCache();
+         }
+         /* set these to now because this is either a new login from an
+          * existing user or a new user */
+
+=== modified file 'src/auth/ntlm/User.cc'
+--- src/auth/ntlm/User.cc	2015-01-13 07:25:36 +0000
++++ src/auth/ntlm/User.cc	2015-09-04 13:37:51 +0000
+@@ -9,6 +9,7 @@
+ #include "squid.h"
+ #include "auth/Config.h"
+ #include "auth/ntlm/User.h"
++#include "auth/UserNameCache.h"
+ #include "Debug.h"
+ 
+ Auth::Ntlm::User::User(Auth::Config *aConfig, const char *aRequestRealm) :
+@@ -27,3 +28,16 @@ Auth::Ntlm::User::ttl() const
+     return -1; // NTLM credentials cannot be cached.
+ }
+ 
++CbcPointer<Auth::UserNameCache>
++Auth::Ntlm::User::Cache()
++{
++    static CbcPointer<Auth::UserNameCache> p(new Auth::UserNameCache("ntlm"));
++    return p;
++}
++
++void
++Auth::Ntlm::User::addToNameCache()
++{
++    Cache()->insert(this);
++}
++
+
+=== modified file 'src/auth/ntlm/User.h'
+--- src/auth/ntlm/User.h	2015-01-13 07:25:36 +0000
++++ src/auth/ntlm/User.h	2015-09-04 13:37:51 +0000
+@@ -27,9 +27,12 @@ class User : public Auth::User
+ public:
+     User(Auth::Config *, const char *requestRealm);
+     ~User();
+-
+     virtual int32_t ttl() const;
+ 
++    /* Auth::User API */
++    static CbcPointer<Auth::UserNameCache> Cache();
++    virtual void addToNameCache() override;
++
+     dlink_list proxy_auth_list;
+ };
+ 
+
+=== modified file 'src/auth/ntlm/UserRequest.cc'
+--- src/auth/ntlm/UserRequest.cc	2015-08-24 14:20:07 +0000
++++ src/auth/ntlm/UserRequest.cc	2015-09-04 13:37:51 +0000
+@@ -9,8 +9,10 @@
+ #include "squid.h"
+ #include "AccessLogEntry.h"
+ #include "auth/ntlm/Config.h"
++#include "auth/ntlm/User.h"
+ #include "auth/ntlm/UserRequest.h"
+ #include "auth/State.h"
++#include "auth/UserNameCache.h"
+ #include "cbdata.h"
+ #include "client_side.h"
+ #include "fatal.h"
+@@ -326,23 +328,19 @@ Auth::Ntlm::UserRequest::HandleReply(voi
+         /* connection is authenticated */
+         debugs(29, 4, HERE << "authenticated user " << auth_user_request->user()->username());
+         /* see if this is an existing user */
+-        AuthUserHashPointer *usernamehash = static_cast<AuthUserHashPointer *>(hash_lookup(proxy_auth_username_cache, auth_user_request->user()->userKey()));
+-        Auth::User::Pointer local_auth_user = lm_request->user();
+-        while (usernamehash && (usernamehash->user()->auth_type != Auth::AUTH_NTLM ||
+-                                strcmp(usernamehash->user()->userKey(), auth_user_request->user()->userKey()) != 0))
+-            usernamehash = static_cast<AuthUserHashPointer *>(usernamehash->next);
+-        if (usernamehash) {
++        auto local_auth_user = lm_request->user();
++        auto cached_user = Auth::Ntlm::User::Cache()->lookup(auth_user_request->user()->userKey());
++        if (!cached_user) {
++            local_auth_user->addToNameCache();
++        } else {
+             /* we can't seamlessly recheck the username due to the
+              * challenge-response nature of the protocol.
+              * Just free the temporary auth_user after merging as
+              * much of it new state into the existing one as possible */
+-            usernamehash->user()->absorb(local_auth_user);
++            cached_user->absorb(local_auth_user);
+             /* from here on we are working with the original cached credentials. */
+-            local_auth_user = usernamehash->user();
++            local_auth_user = cached_user;
+             auth_user_request->user(local_auth_user);
+-        } else {
+-            /* store user in hash's */
+-            local_auth_user->addToNameCache();
+         }
+         /* set these to now because this is either a new login from an
+          * existing user or a new user */
+
+=== modified file 'src/globals.h'
+--- src/globals.h	2015-01-13 07:25:36 +0000
++++ src/globals.h	2015-09-04 07:03:09 +0000
+@@ -88,7 +88,6 @@ extern int store_swap_low;  /* 0 */
+ extern int store_swap_high; /* 0 */
+ extern size_t store_pages_max;  /* 0 */
+ extern int64_t store_maxobjsize;    /* 0 */
+-extern hash_table *proxy_auth_username_cache;   /* NULL */
+ extern int incoming_sockets_accepted;
+ #if _SQUID_WINDOWS_
+ extern unsigned int WIN32_Socks_initialized;    /* 0 */
+
+=== modified file 'src/tests/stub_libauth.cc'
+--- src/tests/stub_libauth.cc	2015-08-04 19:57:07 +0000
++++ src/tests/stub_libauth.cc	2015-09-04 07:03:09 +0000
+@@ -25,9 +25,6 @@ void authenticateInit(Auth::ConfigVector
+ void authenticateRotate(void) STUB
+ void authenticateReset(void) STUB
+ 
+-AuthUserHashPointer::AuthUserHashPointer(Auth::User::Pointer anAuth_user) STUB
+-Auth::User::Pointer AuthUserHashPointer::user() const STUB_RETVAL(NULL)
+-
+ #include "auth/Scheme.h"
+ #include <vector>
+ std::vector<Auth::Scheme::Pointer> *Auth::Scheme::_Schemes = NULL;
+@@ -42,9 +39,6 @@ Auth::CredentialState Auth::User::creden
+ void Auth::User::credentials(CredentialState) STUB
+ void Auth::User::absorb(Auth::User::Pointer) STUB
+ Auth::User::~User() STUB_NOP
+-void Auth::User::cacheInit(void) STUB
+-void Auth::User::CachedACLsReset() STUB
+-void Auth::User::cacheCleanup(void *) STUB
+ void Auth::User::clearIp() STUB
+ void Auth::User::removeIp(Ip::Address) STUB
+ void Auth::User::addIp(Ip::Address) STUB
+

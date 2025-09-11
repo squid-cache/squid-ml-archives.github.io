@@ -1,0 +1,325 @@
+Fixed Write.cc:41 "!ccb->active()" assertion.
+
+The following sequence of events triggers this assertion:
+  - The server sends an 1xx control message.
+  - http.cc schedules ConnStateData::sendControlMsg call.
+  - Before sendControlMsg is fired, http.cc detects an error (e.g., I/O
+    error or timeout) and starts writing the reply to the user.
+  - The ConnStateData::sendControlMsg is fired, starts writing 1xx, and
+    hits the "no concurrent writes" assertion.
+
+We could only reproduce this sequence in the lab after changing Squid
+code to trigger a timeout at the right moment, but the sequence looks
+plausible. Other event sequences might result in the same outcome.
+
+To avoid concurrent writes, Squid now drops the control message if
+Http::One::Server detects that a reply is already being written. Also,
+ConnStateData delays reply writing until a pending control message write
+has been completed.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/HttpControlMsg.cc'
+--- src/HttpControlMsg.cc	2016-01-01 00:12:18 +0000
++++ src/HttpControlMsg.cc	2016-11-14 17:49:10 +0000
+@@ -1,38 +1,46 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "comm/Flag.h"
+ #include "CommCalls.h"
+ #include "HttpControlMsg.h"
+ 
++void
++HttpControlMsgSink::wroteControlMsgOK()
++{
++    if (cbControlMsgSent) {
++        ScheduleCallHere(cbControlMsgSent);
++        cbControlMsgSent = nullptr;
++    }
++}
++
+ /// called when we wrote the 1xx response
+ void
+ HttpControlMsgSink::wroteControlMsg(const CommIoCbParams &params)
+ {
+     if (params.flag == Comm::ERR_CLOSING)
+         return;
+ 
+     if (params.flag == Comm::OK) {
+-        if (cbControlMsgSent)
+-            ScheduleCallHere(cbControlMsgSent);
++        wroteControlMsgOK();
+         return;
+     }
+ 
+     debugs(33, 3, "1xx writing failed: " << xstrerr(params.xerrno));
+     // no error notification: see HttpControlMsg.h for rationale and
+     // note that some errors are detected elsewhere (e.g., close handler)
+ 
+     // close on 1xx errors to be conservative and to simplify the code
+     // (if we do not close, we must notify the source of a failure!)
+     params.conn->close();
+ 
+     // XXX: writeControlMsgAndCall() should handle writer-specific writing
+     // results, including errors and then call us with success/failure outcome.
+ }
+ 
+
+=== modified file 'src/HttpControlMsg.h'
+--- src/HttpControlMsg.h	2016-01-01 00:12:18 +0000
++++ src/HttpControlMsg.h	2016-11-14 17:48:28 +0000
+@@ -16,40 +16,42 @@
+ class HttpControlMsg;
+ 
+ /*
+  * This API exists to throttle forwarding of 1xx messages from the server
+  * side (Source == HttpStateData) to the client side (Sink == ConnStateData).
+  *
+  * Without throttling, Squid would have to drop some 1xx responses to
+  * avoid DoS attacks that send many 1xx responses without reading them.
+  * Dropping 1xx responses without violating HTTP is as complex as throttling.
+  */
+ 
+ /// sends a single control message, notifying the Sink
+ class HttpControlMsgSink: public virtual AsyncJob
+ {
+ public:
+     HttpControlMsgSink(): AsyncJob("unused") {}
+ 
+     /// called to send the 1xx message and notify the Source
+     virtual void sendControlMsg(HttpControlMsg msg) = 0;
+ 
++    virtual void wroteControlMsgOK();
++
+     /// callback to handle Comm::Write completion
+     void wroteControlMsg(const CommIoCbParams &);
+ 
+     /// Call to schedule when the control msg has been sent
+     AsyncCall::Pointer cbControlMsgSent;
+ };
+ 
+ /// bundles HTTP 1xx reply and the "successfully forwarded" callback
+ class HttpControlMsg
+ {
+ public:
+     typedef AsyncCall::Pointer Callback;
+ 
+     HttpControlMsg(const HttpReply::Pointer &aReply, const Callback &aCallback):
+         reply(aReply), cbSuccess(aCallback) {}
+ 
+ public:
+     HttpReply::Pointer reply; ///< the 1xx message being forwarded
+     Callback cbSuccess; ///< called after successfully writing the 1xx message
+ 
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2016-11-04 16:47:34 +0000
++++ src/client_side.cc	2016-11-14 17:52:01 +0000
+@@ -797,40 +797,42 @@
+         return;
+ 
+     /* Test preconditions */
+     assert(node != NULL);
+     PROF_start(clientSocketRecipient);
+     /* TODO: handle this rather than asserting
+      * - it should only ever happen if we cause an abort and
+      * the callback chain loops back to here, so we can simply return.
+      * However, that itself shouldn't happen, so it stays as an assert for now.
+      */
+     assert(cbdataReferenceValid(node));
+     assert(node->node.next == NULL);
+     Http::StreamPointer context = dynamic_cast<Http::Stream *>(node->data.getRaw());
+     assert(context != NULL);
+ 
+     /* TODO: check offset is what we asked for */
+ 
+     // TODO: enforces HTTP/1 MUST on pipeline order, but is irrelevant to HTTP/2
+     if (context != http->getConn()->pipeline.front())
+         context->deferRecipientForLater(node, rep, receivedData);
++    else if (http->getConn()->cbControlMsgSent) // 1xx to the user is pending
++        context->deferRecipientForLater(node, rep, receivedData);
+     else
+         http->getConn()->handleReply(rep, receivedData);
+ 
+     PROF_stop(clientSocketRecipient);
+ }
+ 
+ /**
+  * Called when a downstream node is no longer interested in
+  * our data. As we are a terminal node, this means on aborts
+  * only
+  */
+ void
+ clientSocketDetach(clientStreamNode * node, ClientHttpRequest * http)
+ {
+     /* Test preconditions */
+     assert(node != NULL);
+     /* TODO: handle this rather than asserting
+      * - it should only ever happen if we cause an abort and
+      * the callback chain loops back to here, so we can simply return.
+      * However, that itself shouldn't happen, so it stays as an assert for now.
+@@ -3814,40 +3816,51 @@
+     }
+ 
+     // HTTP/1 1xx status messages are only valid when there is a transaction to trigger them
+     if (!pipeline.empty()) {
+         HttpReply::Pointer rep(msg.reply);
+         Must(rep);
+         // remember the callback
+         cbControlMsgSent = msg.cbSuccess;
+ 
+         typedef CommCbMemFunT<HttpControlMsgSink, CommIoCbParams> Dialer;
+         AsyncCall::Pointer call = JobCallback(33, 5, Dialer, this, HttpControlMsgSink::wroteControlMsg);
+ 
+         writeControlMsgAndCall(rep.getRaw(), call);
+         return;
+     }
+ 
+     debugs(33, 3, HERE << " closing due to missing context for 1xx");
+     clientConnection->close();
+ }
+ 
++void
++ConnStateData::wroteControlMsgOK()
++{
++    HttpControlMsgSink::wroteControlMsgOK();
++
++    if (Http::StreamPointer deferredRequest = pipeline.front()) {
++        debugs(33, 3, clientConnection << ": calling PushDeferredIfNeeded after control msg wrote");
++        ClientSocketContextPushDeferredIfNeeded(deferredRequest, this);
++    }
++}
++
+ /// Our close handler called by Comm when the pinned connection is closed
+ void
+ ConnStateData::clientPinnedConnectionClosed(const CommCloseCbParams &io)
+ {
+     // FwdState might repin a failed connection sooner than this close
+     // callback is called for the failed connection.
+     assert(pinning.serverConnection == io.conn);
+     pinning.closeHandler = NULL; // Comm unregisters handlers before calling
+     const bool sawZeroReply = pinning.zeroReply; // reset when unpinning
+     pinning.serverConnection->noteClosure();
+     unpinConnection(false);
+ 
+     if (sawZeroReply && clientConnection != NULL) {
+         debugs(33, 3, "Closing client connection on pinned zero reply.");
+         clientConnection->close();
+     }
+ 
+ }
+ 
+ void
+
+=== modified file 'src/client_side.h'
+--- src/client_side.h	2016-11-04 16:47:34 +0000
++++ src/client_side.h	2016-11-14 17:51:36 +0000
+@@ -60,40 +60,41 @@
+  *
+  * To terminate a ConnStateData close() the client Comm::Connection it is
+  * managing, or for graceful half-close use the stopReceiving() or
+  * stopSending() methods.
+  */
+ class ConnStateData : public Server, public HttpControlMsgSink, private IndependentRunner
+ {
+ 
+ public:
+     explicit ConnStateData(const MasterXaction::Pointer &xact);
+     virtual ~ConnStateData();
+ 
+     /* ::Server API */
+     virtual void receivedFirstByte();
+     virtual bool handleReadData();
+     virtual void afterClientRead();
+     virtual void afterClientWrite(size_t);
+ 
+     /* HttpControlMsgSink API */
+     virtual void sendControlMsg(HttpControlMsg);
++    virtual void wroteControlMsgOK();
+ 
+     /// Traffic parsing
+     bool clientParseRequests();
+     void readNextRequest();
+ 
+     /// try to make progress on a transaction or read more I/O
+     void kick();
+ 
+     bool isOpen() const;
+ 
+     Http1::TeChunkedParser *bodyParser; ///< parses HTTP/1.1 chunked request body
+ 
+     /** number of body bytes we need to comm_read for the "current" request
+      *
+      * \retval 0         We do not need to read any [more] body bytes
+      * \retval negative  May need more but do not know how many; could be zero!
+      * \retval positive  Need to read exactly that many more body bytes
+      */
+     int64_t mayNeedToReadMoreBody() const;
+ 
+
+=== modified file 'src/servers/Http1Server.cc'
+--- src/servers/Http1Server.cc	2016-11-04 16:47:34 +0000
++++ src/servers/Http1Server.cc	2016-11-14 17:32:29 +0000
+@@ -292,41 +292,53 @@
+                                           !receivedData.length;
+     if (responseFinishedOrFailed && !mustSendLastChunk) {
+         context->writeComplete(0);
+         return;
+     }
+ 
+     if (!context->startOfOutput()) {
+         context->sendBody(receivedData);
+         return;
+     }
+ 
+     assert(rep);
+     http->al->reply = rep;
+     HTTPMSGLOCK(http->al->reply);
+     context->sendStartOfMessage(rep, receivedData);
+ }
+ 
+ void
+ Http::One::Server::writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call)
+ {
+-    const ClientHttpRequest *http = pipeline.front()->http;
++    Http::StreamPointer context = pipeline.front();
++    Must(context != nullptr);
++
++    // Ignore this late control message if we have started sending a 
++    // reply to the user already (e.g., after an error).
++    if (context->reply) {
++        debugs(11, 2, "drop 1xx made late by " << context->reply);
++        // but still inform the caller (so it may resume its operation)
++        ScheduleCallHere(call);
++        return;
++    }
++
++    const ClientHttpRequest *http = context->http;
+ 
+     // apply selected clientReplyContext::buildReplyHeader() mods
+     // it is not clear what headers are required for control messages
+     rep->header.removeHopByHopEntries();
+     rep->header.putStr(Http::HdrType::CONNECTION, "keep-alive");
+     httpHdrMangleList(&rep->header, http->request, http->al, ROR_REPLY);
+ 
+     MemBuf *mb = rep->pack();
+ 
+     debugs(11, 2, "HTTP Client " << clientConnection);
+     debugs(11, 2, "HTTP Client CONTROL MSG:\n---------\n" << mb->buf << "\n----------");
+ 
+     Comm::Write(clientConnection, mb, call);
+ 
+     delete mb;
+ }
+ 
+ ConnStateData *
+ Http::NewServer(MasterXactionPointer &xact)
+ {
+

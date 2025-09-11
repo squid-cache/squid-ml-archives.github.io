@@ -1,0 +1,164 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] SSLv2 records force SslBump bumping despite a matching step2 peek rule.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20SSLv2%20records%20force%20SslBump%20bumping%20despite%0A%20a%20matching%20step2%20peek%20rule.&In-Reply-To=%3Ce6909ab2-aa5f-628b-83b6-0843d2b68eb4%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="007780.html">
+   <LINK REL="Next"  HREF="007782.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] SSLv2 records force SslBump bumping despite a matching step2 peek rule.</H1>
+    <B>Alex Rousskov</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20SSLv2%20records%20force%20SslBump%20bumping%20despite%0A%20a%20matching%20step2%20peek%20rule.&In-Reply-To=%3Ce6909ab2-aa5f-628b-83b6-0843d2b68eb4%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] SSLv2 records force SslBump bumping despite a matching step2 peek rule.">rousskov at measurement-factory.com
+       </A><BR>
+    <I>Thu Jan 12 16:48:10 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007780.html">[squid-dev] [PATCH] SSLv2 records force SslBump bumping despite a matching step2 peek rule.
+</A></li>
+        <LI>Next message: <A HREF="007782.html">[squid-dev] [PATCH] SSLv2 records force SslBump bumping despite a matching step2 peek rule.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7781">[ date ]</a>
+              <a href="thread.html#7781">[ thread ]</a>
+              <a href="subject.html#7781">[ subject ]</a>
+              <a href="author.html#7781">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 01/12/2017 08:35 AM, Christos Tsantilas wrote:
+
+&gt;<i> The patch fixes Squid to peeks (or stares) at the origin server as
+</I>&gt;<i> configured, even if it does not recognize the client TLS
+</I>&gt;<i> record/message.
+</I>
+s/to peeks (or stares)/to peek (or stare)/
+
+I agree that this is the right thing to do, but I have some concerns
+regarding _how_ we are doing that peeking or staring during step3 when
+we essentially failed to get ClientHello during step2. Specifics are below.
+
+
+&gt;<i>      if (!helloBuild &amp;&amp; (bumpMode_ == Ssl::bumpPeek || bumpMode_ == Ssl::bumpStare)) {
+</I>&gt;<i> +        // it is an SSL Version3 message and it is a Handshake/Hello message
+</I>&gt;<i> +        Must (buf[1] &gt;= 3 &amp;&amp; buf[0] == 0x16);
+</I>
+If this is a Must() now, then we should not combine the two conditions
+so that we know which of them has failed if one of them does. Also, we
+should check the size of the buffer before accessing its contents!
+Finally, it would be good to explain the odd (but correct) order of
+checks. Here is a sketch:
+
+  /* check that we have a v3+ record containing ClientHello */
+  Must(size &gt;= 2); // enough for version and content_type checks below
+  Must(buf[1] &gt;= 3); // record's version.major
+  // only now we know that we are dealing with supported record format
+  Must(buf[0] == 22); // TLSPlaintext.content_type == handshake in v3+
+
+It is not 100% clear to me why we expect these checks to pass now. It
+probably has something to do with the fact that we are inside BIO (and
+so we expect to deal with SSL traffic) but what if this is an
+unsupported SSL version, session resumption, or some other situation
+where there is no ClientHello? Why do we demand a ClientHello presence
+here? But only in peek or stare modes? I think we need to add a comment
+to clarify all that.
+
+On a related note, did not we just try to parse the same information
+already when looking at ClientHello? Why not use that parsed info
+instead of re-parsing the same bytes? And if we did not try to parse
+these bytes earlier (for one reason or another; e.g., server-first
+bumping?), perhaps we should not try parsing it here either??
+
+
+&gt;<i> +        auto ssl = fd_table[fd_].ssl.get();
+</I>&gt;<i> +        if (ssl) {
+</I>
+If possible, merge into one statement to avoid leaking the ssl pointer
+name outside the if-statement that ensures it is not nil.
+
+
+&gt;<i>  static bool
+</I>&gt;<i>  adjustSSL(SSL *ssl, Security::TlsDetails::Pointer const &amp;details, SBuf &amp;helloMessage)
+</I>&gt;<i>  {
+</I>&gt;<i> +    if (!details)
+</I>&gt;<i> +        return false;
+</I>...
+&gt;<i>  }
+</I>
+... but then ...
+
+&gt;<i> +                helloMsg.append(clientHelloMessage);
+</I>
+If details (i.e., clientTlsDetails) are missing, then
+setClientFeatures() was not called. If setClientFeatures() was not
+called, then clientHelloMessage would be missing as well, but we are
+using it unconditionally above, even when adjustSSL() returns false.
+This does not add up IMO. Perhaps we have to require that
+clientTlsDetails are set before we use it?
+
+
+&gt;<i>          // If we do not build any hello message, copy the current
+</I>&gt;<i>          if (helloMsg.isEmpty())
+</I>&gt;<i>              helloMsg.append(buf, size);
+</I>
+And if we did build a helloMsg ourselves, then what happens to the buf
+contents (that may not match our clientHelloMessage boundary)? For
+example, how do we know that buf does not contain just 50% of the client
+handshake and that the other 50% would not be later sent after our
+handshake, corrupting the stream? I think we know this because our
+handshake parser waits until the end of the client handshake, but is it
+possible that we are building helloMsg even though our parser has failed
+(or was not engaged at all)?
+
+Perhaps (bumpMode_ == Ssl::bumpPeek || bumpMode_ == Ssl::bumpStare)
+implies that our parser has succeeded?? If yes, then we need a comment
+here to clarify these hidden/assumed dependencies (at least).
+
+
+Thank you,
+
+Alex.
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007780.html">[squid-dev] [PATCH] SSLv2 records force SslBump bumping despite a matching step2 peek rule.
+</A></li>
+	<LI>Next message: <A HREF="007782.html">[squid-dev] [PATCH] SSLv2 records force SslBump bumping despite a matching step2 peek rule.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7781">[ date ]</a>
+              <a href="thread.html#7781">[ thread ]</a>
+              <a href="subject.html#7781">[ subject ]</a>
+              <a href="author.html#7781">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

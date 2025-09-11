@@ -1,0 +1,177 @@
+diff --git a/src/clients/FtpClient.cc b/src/clients/FtpClient.cc
+index 49fdd10..7316367 100644
+--- a/src/clients/FtpClient.cc
++++ b/src/clients/FtpClient.cc
+@@ -169,6 +169,7 @@ Ftp::Client::Client(FwdState *fwdState):
+      state(BEGIN),
+      old_request(NULL),
+      old_reply(NULL),
++     ftperr(NULL),
+      shortenReadTimeout(false)
+ {
+     ++statCounter.server.all.requests;
+@@ -192,6 +193,8 @@ Ftp::Client::~Client()
+ 
+     safe_free(old_request);
+     safe_free(old_reply);
++    if(ftperr)
++	    delete ftperr;
+     fwd = NULL; // refcounted
+ }
+ 
+@@ -243,13 +246,23 @@ Ftp::Client::doneWithServer() const
+ }
+ 
+ void
+-Ftp::Client::failed(err_type error, int xerrno)
++Ftp::Client::failed(err_type error, int xerrno,  Http::StatusCode httpSC )
+ {
+     debugs(9, 3, "entry-null=" << (entry?entry->isEmpty():0) << ", entry=" << entry);
+ 
++    debugs(9, 6, "error=" << error << ", code=" << xerrno << ", status=" << httpSC);
++
+     const char *command, *reply;
+-    const Http::StatusCode httpStatus = failedHttpStatus(error);
+-    ErrorState *const ftperr = new ErrorState(error, httpStatus, fwd->request);
++    bool have_ftperr = ftperr != NULL;
++
++    if(have_ftperr) {
++	error = ftperr->type;
++    } else {
++	Http::StatusCode httpStatus = httpSC == Http::scNone ?
++		failedHttpStatus(error) : httpSC;
++	ftperr = new ErrorState(error, httpStatus, fwd->request);
++    }
++
+     ftperr->xerrno = xerrno;
+ 
+     ftperr->ftp.server_msg = ctrl.message;
+@@ -274,10 +287,11 @@ Ftp::Client::failed(err_type error, int xerrno)
+     if (reply)
+         ftperr->ftp.reply = xstrdup(reply);
+ 
+-    fwd->request->detailError(error, xerrno);
+-    fwd->fail(ftperr);
+-
+-    closeServer(); // we failed, so no serverComplete()
++    if(!have_ftperr && httpSC == Http::scNone) {
++	fwd->request->detailError(error, xerrno);
++	fwd->fail(ftperr);
++	closeServer(); // we failed, so no serverComplete()
++    }
+ }
+ 
+ Http::StatusCode
+diff --git a/src/clients/FtpClient.h b/src/clients/FtpClient.h
+index ef2aa98..12a7769 100644
+--- a/src/clients/FtpClient.h
++++ b/src/clients/FtpClient.h
+@@ -96,7 +96,8 @@ public:
+     virtual ~Client();
+ 
+     /// handle a fatal transaction error, closing the control connection
+-    virtual void failed(err_type error = ERR_NONE, int xerrno = 0);
++    virtual void failed(err_type error = ERR_NONE, int xerrno = 0,
++		    Http::StatusCode httpSC = Http::scNone);
+ 
+     /// read timeout handler
+     virtual void timeout(const CommTimeoutCbParams &io);
+@@ -155,6 +156,7 @@ public:
+     int state;
+     char *old_request;
+     char *old_reply;
++    ErrorState *ftperr;
+ 
+ protected:
+     /* AsyncJob API */
+diff --git a/src/clients/FtpGateway.cc b/src/clients/FtpGateway.cc
+index 524eebb..16fe5fe 100644
+--- a/src/clients/FtpGateway.cc
++++ b/src/clients/FtpGateway.cc
+@@ -1246,7 +1246,6 @@ void
+ Ftp::Gateway::loginFailed()
+ {
+     ErrorState *err = NULL;
+-    const char *command, *reply;
+ 
+     if ((state == SENT_USER || state == SENT_PASS) && ctrl.replycode >= 400) {
+         if (ctrl.replycode == 421 || ctrl.replycode == 426) {
+@@ -1262,39 +1261,15 @@ Ftp::Gateway::loginFailed()
+             else
+                 err = new ErrorState(ERR_FTP_FORBIDDEN, Http::scUnauthorized, fwd->request);
+         }
++	if(err)
++	    ftperr = err;
+     }
+-
++    
++    failed(ERR_NONE, ctrl.replycode);
+     // any other problems are general falures.
+-    if (!err) {
+-        ftpFail(this);
+-        return;
+-    }
+-
+-    err->ftp.server_msg = ctrl.message;
+-
+-    ctrl.message = NULL;
+-
+-    if (old_request)
+-        command = old_request;
+-    else
+-        command = ctrl.last_command;
+-
+-    if (command && strncmp(command, "PASS", 4) == 0)
+-        command = "PASS <yourpassword>";
+-
+-    if (old_reply)
+-        reply = old_reply;
+-    else
+-        reply = ctrl.last_reply;
+-
+-    if (command)
+-        err->ftp.request = xstrdup(command);
+-
+-    if (reply)
+-        err->ftp.reply = xstrdup(reply);
++    if (!err) return;
+ 
+     HttpReply *newrep = err->BuildHttpReply();
+-    delete err;
+ 
+ #if HAVE_AUTH_MODULE_BASIC
+     /* add Authenticate header */
+@@ -2438,7 +2413,12 @@ Ftp::Gateway::hackShortcut(FTPSM * nextState)
+ static void
+ ftpFail(Ftp::Gateway *ftpState)
+ {
+-    debugs(9, 6, HERE << "flags(" <<
++    int code = ftpState->ctrl.replycode;
++    err_type  error_code = ERR_NONE;
++    Http::StatusCode sc = Http::scNone;
++
++    debugs(9, 6, HERE << "state " << ftpState->state <<
++	   " reply code " << code << "flags(" <<
+            (ftpState->flags.isdir?"IS_DIR,":"") <<
+            (ftpState->flags.try_slash_hack?"TRY_SLASH_HACK":"") << "), " <<
+            "mdtm=" << ftpState->mdtm << ", size=" << ftpState->theSize <<
+@@ -2464,8 +2444,17 @@ ftpFail(Ftp::Gateway *ftpState)
+         }
+     }
+ 
+-    ftpState->failed(ERR_NONE, 0);
+-    /* failed() closes ctrl.conn and frees this */
++    if(!ftpState->ftperr)
++	    sc = ftpState->failedHttpStatus(error_code);
++
++    ftpState->failed(error_code, code, sc);
++
++    if(ftpState->ftperr) {
++	ftpState->ftperr->detailError(code);
++	HttpReply *newrep = ftpState->ftperr->BuildHttpReply();
++	ftpState->entry->replaceHttpReply(newrep);
++        ftpSendQuit(ftpState);
++    }
+ }
+ 
+ Http::StatusCode

@@ -1,0 +1,235 @@
+Errors served using invalid certificates when dealing with SSL server errors.
+
+When bumping Squid needs to send an Squid-generated error "page" over a
+secure connection, Squid needs to generate a certificate for that connection.
+Prior to these changes, several scenarios could lead to Squid generating
+a certificate that clients could not validate. In those cases, the user would
+get a cryptic and misleading browser error instead of a Squid-generated
+error page with useful details about the problem.
+
+For example, is a server certificate that is rejected by the certificate
+validation helper. Squid no longer uses CN from that certificate to generate
+a fake certificate.
+
+Another example is a user accessing an origin server using one of its
+"alternative names" and getting a Squid-generated certificate containing just
+the server common name (CN).
+
+These changes make sure that certificate for error pages is generated using
+SNI (when peeking or staring, if available) or CONNECT host name (including
+server-first bumping mode). We now update the ConnStateData::sslCommonName 
+field (used as CN field for generated certificates) only _after_ the server
+certificate is successfully validated.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2015-04-26 16:44:23 +0000
++++ src/ssl/PeerConnector.cc	2015-06-08 09:14:37 +0000
+@@ -257,51 +257,67 @@
+         return;
+ 
+     callBack();
+ }
+ 
+ void
+ Ssl::PeerConnector::handleServerCertificate()
+ {
+     if (serverCertificateHandled)
+         return;
+ 
+     if (ConnStateData *csd = request->clientConnectionManager.valid()) {
+         const int fd = serverConnection()->fd;
+         SSL *ssl = fd_table[fd].ssl;
+         Ssl::X509_Pointer serverCert(SSL_get_peer_certificate(ssl));
+         if (!serverCert.get())
+             return;
+ 
+         serverCertificateHandled = true;
+ 
+-        csd->resetSslCommonName(Ssl::CommonHostName(serverCert.get()));
+-        debugs(83, 5, "HTTPS server CN: " << csd->sslCommonName() <<
+-               " bumped: " << *serverConnection());
+-
+         // remember the server certificate for later use
+         if (Ssl::ServerBump *serverBump = csd->serverBump()) {
+             serverBump->serverCert.reset(serverCert.release());
+         }
+     }
+ }
+ 
++void
++Ssl::PeerConnector::serverCertificateVerified()
++{
++    if (ConnStateData *csd = request->clientConnectionManager.valid()) {
++        Ssl::X509_Pointer serverCert;
++        if(Ssl::ServerBump *serverBump = csd->serverBump())
++            serverCert.resetAndLock(serverBump->serverCert.get());
++        else {
++            const int fd = serverConnection()->fd;
++            SSL *ssl = fd_table[fd].ssl;
++            serverCert.reset(SSL_get_peer_certificate(ssl));
++        }
++        if (serverCert.get()) {
++            csd->resetSslCommonName(Ssl::CommonHostName(serverCert.get()));
++            debugs(83, 5, "HTTPS server CN: " << csd->sslCommonName() <<
++                   " bumped: " << *serverConnection());
++        }
++    }
++}
++
+ bool
+ Ssl::PeerConnector::sslFinalized()
+ {
+     const int fd = serverConnection()->fd;
+     SSL *ssl = fd_table[fd].ssl;
+ 
+     // In the case the session is resuming, the certificates does not exist and
+     // we did not do any cert validation
+     if (resumingSession)
+         return true;
+ 
+     handleServerCertificate();
+ 
+     if (ConnStateData *csd = request->clientConnectionManager.valid()) {
+         if (Ssl::ServerBump *serverBump = csd->serverBump()) {
+             // remember validation errors, if any
+             if (Ssl::CertErrors *errs = static_cast<Ssl::CertErrors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors)))
+                 serverBump->sslErrors = cbdataReference(errs);
+         }
+     }
+@@ -321,40 +337,42 @@
+             validationRequest.errors = NULL;
+         try {
+             debugs(83, 5, "Sending SSL certificate for validation to ssl_crtvd.");
+             Ssl::CertValidationHelper::GetInstance()->sslSubmit(validationRequest, sslCrtvdHandleReplyWrapper, this);
+             return false;
+         } catch (const std::exception &e) {
+             debugs(83, DBG_IMPORTANT, "ERROR: Failed to compose ssl_crtvd " <<
+                    "request for " << validationRequest.domainName <<
+                    " certificate: " << e.what() << "; will now block to " <<
+                    "validate that certificate.");
+             // fall through to do blocking in-process generation.
+             ErrorState *anErr = new ErrorState(ERR_GATEWAY_FAILURE, Http::scInternalServerError, request.getRaw());
+             bail(anErr);
+             if (serverConnection()->getPeer()) {
+                 peerConnectFailed(serverConnection()->getPeer());
+             }
+             serverConn->close();
+             return true;
+         }
+     }
++
++    serverCertificateVerified();
+     return true;
+ }
+ 
+ void switchToTunnel(HttpRequest *request, Comm::ConnectionPointer & clientConn, Comm::ConnectionPointer &srvConn);
+ 
+ void
+ Ssl::PeerConnector::cbCheckForPeekAndSpliceDone(allow_t answer, void *data)
+ {
+     Ssl::PeerConnector *peerConnect = (Ssl::PeerConnector *) data;
+     peerConnect->checkForPeekAndSpliceDone((Ssl::BumpMode)answer.kind);
+ }
+ 
+ void
+ Ssl::PeerConnector::checkForPeekAndSplice()
+ {
+     // Mark Step3 of bumping
+     if (request->clientConnectionManager.valid()) {
+         if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
+             serverBump->step = Ssl::bumpStep3;
+         }
+@@ -418,40 +436,41 @@
+ }
+ 
+ void
+ Ssl::PeerConnector::sslCrtvdHandleReply(Ssl::CertValidationResponse const &validationResponse)
+ {
+     Ssl::CertErrors *errs = NULL;
+     Ssl::ErrorDetail *errDetails = NULL;
+     bool validatorFailed = false;
+     if (!Comm::IsConnOpen(serverConnection())) {
+         return;
+     }
+ 
+     debugs(83,5, request->GetHost() << " cert validation result: " << validationResponse.resultCode);
+ 
+     if (validationResponse.resultCode == ::Helper::Error)
+         errs = sslCrtvdCheckForErrors(validationResponse, errDetails);
+     else if (validationResponse.resultCode != ::Helper::Okay)
+         validatorFailed = true;
+ 
+     if (!errDetails && !validatorFailed) {
++        serverCertificateVerified();
+         if (splice)
+             switchToTunnel(request.getRaw(), clientConn, serverConn);
+         else
+             callBack();
+         return;
+     }
+ 
+     ErrorState *anErr = NULL;
+     if (validatorFailed) {
+         anErr = new ErrorState(ERR_GATEWAY_FAILURE, Http::scInternalServerError, request.getRaw());
+     }  else {
+ 
+         // Check the list error with
+         if (errDetails && request->clientConnectionManager.valid()) {
+             // remember the server certificate from the ErrorDetail object
+             if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
+                 // remember validation errors, if any
+                 if (errs) {
+                     if (serverBump->sslErrors)
+                         cbdataReferenceDone(serverBump->sslErrors);
+
+=== modified file 'src/ssl/PeerConnector.h'
+--- src/ssl/PeerConnector.h	2015-04-15 11:35:52 +0000
++++ src/ssl/PeerConnector.h	2015-06-08 09:01:47 +0000
+@@ -141,40 +141,44 @@
+ 
+     /// mimics FwdState to minimize changes to FwdState::initiate/negotiateSsl
+     Comm::ConnectionPointer const &serverConnection() const { return serverConn; }
+ 
+     void bail(ErrorState *error); ///< Return an error to the PeerConnector caller
+ 
+     /// Callback the caller class, and pass the ready to communicate secure
+     /// connection or an error if PeerConnector failed.
+     void callBack();
+ 
+     /// Process response from cert validator helper
+     void sslCrtvdHandleReply(Ssl::CertValidationResponse const &);
+ 
+     /// Check SSL errors returned from cert validator against sslproxy_cert_error access list
+     Ssl::CertErrors *sslCrtvdCheckForErrors(Ssl::CertValidationResponse const &, Ssl::ErrorDetail *&);
+ 
+     /// Updates associated client connection manager members
+     /// if the server certificate was received from the server.
+     void handleServerCertificate();
+ 
++    /// Runs after the server certificate verified to update client
++    /// connection manager members
++    void serverCertificateVerified();
++
+     /// Callback function called when squid receive message from cert validator helper
+     static void sslCrtvdHandleReplyWrapper(void *data, Ssl::CertValidationResponse const &);
+ 
+     /// A wrapper function for negotiateSsl for use with Comm::SetSelect
+     static void NegotiateSsl(int fd, void *data);
+ 
+     /// A wrapper function for checkForPeekAndSpliceDone for use with acl
+     static void cbCheckForPeekAndSpliceDone(allow_t answer, void *data);
+ 
+     HttpRequestPointer request; ///< peer connection trigger or cause
+     Comm::ConnectionPointer serverConn; ///< TCP connection to the peer
+     Comm::ConnectionPointer clientConn; ///< TCP connection to the client
+     AsyncCall::Pointer callback; ///< we call this with the results
+     AsyncCall::Pointer closeHandler; ///< we call this when the connection closed
+     time_t negotiationTimeout; ///< the ssl connection timeout to use
+     time_t startTime; ///< when the peer connector negotiation started
+     bool splice; ///< Whether we are going to splice or not
+     bool resumingSession; ///< whether it is an SSL resuming session connection
+     bool serverCertificateHandled; ///< whether handleServerCertificate() succeeded
+ 
+

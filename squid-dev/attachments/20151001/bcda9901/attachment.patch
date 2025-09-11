@@ -1,0 +1,298 @@
+=== modified file 'src/DiskIO/DiskThreads/DiskThreads.h'
+--- src/DiskIO/DiskThreads/DiskThreads.h	2015-08-28 14:43:37 +0000
++++ src/DiskIO/DiskThreads/DiskThreads.h	2015-10-01 14:17:04 +0000
+@@ -15,6 +15,7 @@
+ #ifndef __DISKTHREADS_H__
+ #define __DISKTHREADS_H__
+ 
++#include "cbdata.h"
+ #include "dlink.h"
+ #include "mem/forward.h"
+ 
+@@ -42,7 +43,7 @@
+ #define ASYNC_WRITE 0
+ #define ASYNC_READ 1
+ 
+-enum _squidaio_request_type {
++enum squidaio_request_type {
+     _AIO_OP_NONE = 0,
+     _AIO_OP_OPEN,
+     _AIO_OP_READ,
+@@ -52,19 +53,29 @@ enum _squidaio_request_type {
+     _AIO_OP_OPENDIR,
+     _AIO_OP_STAT
+ };
+-typedef enum _squidaio_request_type squidaio_request_type;
+ 
+ typedef void AIOCB(int fd, void *cbdata, const char *buf, int aio_return, int aio_errno);
+ 
+-struct squidaio_result_t {
++class squidaio_result_t {
++public:
++    squidaio_result_t() : aio_return(0), aio_errno(0), result_type(_AIO_OP_NONE), _data(nullptr), data(nullptr) {}
+     int aio_return;
+     int aio_errno;
+-    enum _squidaio_request_type result_type;
++    squidaio_request_type result_type;
+     void *_data;        /* Internal housekeeping */
+     void *data;         /* Available to the caller */
+ };
+ 
+-struct squidaio_ctrl_t {
++class squidaio_ctrl_t {
++    MEMPROXY_CLASS(squidaio_ctrl_t);
++public:
++    squidaio_ctrl_t()  = delete;
++    squidaio_ctrl_t(const squidaio_ctrl_t&)  = delete;
++    squidaio_ctrl_t& operator=(const squidaio_ctrl_t&) = delete;
++
++    squidaio_ctrl_t(int theFd, int theOperation, AIOCB * theCallback,
++                    void *theCallbackData, char *aBuffer = nullptr,
++                    int aBufferLength = 0, FREE *bufFreeFunc = nullptr);
+ 
+     struct squidaio_ctrl_t *next;
+     int fd;
+@@ -72,9 +83,9 @@ struct squidaio_ctrl_t {
+     AIOCB *done_handler;
+     void *done_handler_data;
+     squidaio_result_t result;
+-    int len;
++    int len;                 // length of bufp
+     char *bufp;
+-    FREE *free_func;
++    FREE *free_func;         // if present, apply it to free bufp, len
+     dlink_node node;
+ };
+ 
+
+=== modified file 'src/DiskIO/DiskThreads/DiskThreadsIOStrategy.cc'
+--- src/DiskIO/DiskThreads/DiskThreadsIOStrategy.cc	2015-01-13 07:25:36 +0000
++++ src/DiskIO/DiskThreads/DiskThreadsIOStrategy.cc	2015-09-30 16:50:09 +0000
+@@ -28,8 +28,6 @@ DiskThreadsIOStrategy::init(void)
+     if (initialised)
+         return;
+ 
+-    squidaio_ctrl_pool = memPoolCreate("aio_ctrl", sizeof(squidaio_ctrl_t));
+-
+     initialised = true;
+ 
+     /*
+@@ -56,10 +54,6 @@ DiskThreadsIOStrategy::done(void)
+ 
+     squidaio_shutdown();
+ 
+-    delete squidaio_ctrl_pool;
+-
+-    squidaio_ctrl_pool = NULL;
+-
+     initialised = false;
+ }
+ 
+@@ -144,7 +138,7 @@ DiskThreadsIOStrategy::callback()
+         if (ctrlp->operation == _AIO_READ)
+             squidaio_xfree(ctrlp->bufp, ctrlp->len);
+ 
+-        squidaio_ctrl_pool->freeOne(ctrlp);
++        delete ctrlp;
+     }
+ 
+     return retval;
+@@ -168,8 +162,7 @@ DiskThreadsIOStrategy::sync()
+ }
+ 
+ DiskThreadsIOStrategy::DiskThreadsIOStrategy() :
+-    initialised(false),
+-    squidaio_ctrl_pool(NULL)
++    initialised(false)
+ {}
+ 
+ void
+
+=== modified file 'src/DiskIO/DiskThreads/DiskThreadsIOStrategy.h'
+--- src/DiskIO/DiskThreads/DiskThreadsIOStrategy.h	2015-01-13 07:25:36 +0000
++++ src/DiskIO/DiskThreads/DiskThreadsIOStrategy.h	2015-09-30 16:50:09 +0000
+@@ -37,7 +37,6 @@ public:
+     /* Todo: add access limitations */
+     bool initialised;
+     static DiskThreadsIOStrategy Instance;
+-    MemAllocator *squidaio_ctrl_pool;
+ 
+ private:
+     static void aioStats(StoreEntry * sentry);
+
+=== modified file 'src/DiskIO/DiskThreads/aiops.cc'
+--- src/DiskIO/DiskThreads/aiops.cc	2015-07-15 14:23:29 +0000
++++ src/DiskIO/DiskThreads/aiops.cc	2015-10-01 13:57:27 +0000
+@@ -115,8 +115,8 @@ static int squidaio_initialised = 0;
+ static MemAllocator *squidaio_large_bufs = NULL;    /* 16K */
+ static MemAllocator *squidaio_medium_bufs = NULL;   /* 8K */
+ static MemAllocator *squidaio_small_bufs = NULL;    /* 4K */
+-static MemAllocator *squidaio_tiny_bufs = NULL; /* 2K */
+-static MemAllocator *squidaio_micro_bufs = NULL;    /* 128K */
++static MemAllocator *squidaio_tiny_bufs = NULL;     /* 2K */
++static MemAllocator *squidaio_micro_bufs = NULL;    /* 128 bytes */
+ 
+ static int request_queue_len = 0;
+ static MemAllocator *squidaio_request_pool = NULL;
+@@ -1020,3 +1020,13 @@ squidaio_stats(StoreEntry * sentry)
+     }
+ }
+ 
++squidaio_ctrl_t::squidaio_ctrl_t(int theFd, int theOperation,
++    AIOCB * theCallback, void *theCallbackData,
++    char *aBuffer, int aBufferLength,
++    FREE *bufFreeFunc) :
++    next(nullptr), fd(theFd), operation(theOperation),
++    done_handler(theCallback), done_handler_data(cbdataReference(theCallbackData)),
++    len(aBufferLength), bufp(aBuffer), free_func(bufFreeFunc)
++{
++    result.data = this;
++}
+
+=== modified file 'src/DiskIO/DiskThreads/async_io.cc'
+--- src/DiskIO/DiskThreads/async_io.cc	2015-01-13 07:25:36 +0000
++++ src/DiskIO/DiskThreads/async_io.cc	2015-10-01 13:25:21 +0000
+@@ -15,10 +15,6 @@
+ #include "Generic.h"
+ #include "Store.h"
+ 
+-/*
+- * squidaio_ctrl_t uses explicit alloc()/freeOne() allocators
+- * XXX: convert to MEMPROXY_CLASS() API
+- */
+ #include "mem/Pool.h"
+ 
+ AIOCounts squidaio_counts;
+@@ -38,12 +34,7 @@ aioOpen(const char *path, int oflag, mod
+ 
+     assert(DiskThreadsIOStrategy::Instance.initialised);
+     ++squidaio_counts.open_start;
+-    ctrlp = (squidaio_ctrl_t *)DiskThreadsIOStrategy::Instance.squidaio_ctrl_pool->alloc();
+-    ctrlp->fd = -2;
+-    ctrlp->done_handler = callback;
+-    ctrlp->done_handler_data = cbdataReference(callback_data);
+-    ctrlp->operation = _AIO_OPEN;
+-    ctrlp->result.data = ctrlp;
++    ctrlp = new squidaio_ctrl_t(-2, _AIO_OPEN, callback, callback_data);
+     squidaio_open(path, oflag, mode, &ctrlp->result);
+     dlinkAdd(ctrlp, &ctrlp->node, &used_list);
+     return;
+@@ -57,12 +48,7 @@ aioClose(int fd)
+     assert(DiskThreadsIOStrategy::Instance.initialised);
+     ++squidaio_counts.close_start;
+     aioCancel(fd);
+-    ctrlp = (squidaio_ctrl_t *)DiskThreadsIOStrategy::Instance.squidaio_ctrl_pool->alloc();
+-    ctrlp->fd = fd;
+-    ctrlp->done_handler = NULL;
+-    ctrlp->done_handler_data = NULL;
+-    ctrlp->operation = _AIO_CLOSE;
+-    ctrlp->result.data = ctrlp;
++    ctrlp = new squidaio_ctrl_t(fd, _AIO_CLOSE, nullptr, nullptr);
+     squidaio_close(fd, &ctrlp->result);
+     dlinkAdd(ctrlp, &ctrlp->node, &used_list);
+     return;
+@@ -105,7 +91,7 @@ aioCancel(int fd)
+         }
+ 
+         dlinkDelete(m, &used_list);
+-        DiskThreadsIOStrategy::Instance.squidaio_ctrl_pool->freeOne(ctrlp);
++        delete ctrlp;
+     }
+ }
+ 
+@@ -117,13 +103,7 @@ aioWrite(int fd, off_t offset, char *buf
+ 
+     assert(DiskThreadsIOStrategy::Instance.initialised);
+     ++squidaio_counts.write_start;
+-    ctrlp = (squidaio_ctrl_t *)DiskThreadsIOStrategy::Instance.squidaio_ctrl_pool->alloc();
+-    ctrlp->fd = fd;
+-    ctrlp->done_handler = callback;
+-    ctrlp->done_handler_data = cbdataReference(callback_data);
+-    ctrlp->operation = _AIO_WRITE;
+-    ctrlp->bufp = bufp;
+-    ctrlp->free_func = free_func;
++    ctrlp = new squidaio_ctrl_t(fd, _AIO_WRITE, callback, callback_data, bufp, len, free_func);
+ 
+     if (offset >= 0)
+         seekmode = SEEK_SET;
+@@ -132,7 +112,6 @@ aioWrite(int fd, off_t offset, char *buf
+         offset = 0;
+     }
+ 
+-    ctrlp->result.data = ctrlp;
+     squidaio_write(fd, bufp, len, offset, seekmode, &ctrlp->result);
+     dlinkAdd(ctrlp, &ctrlp->node, &used_list);
+ }               /* aioWrite */
+@@ -145,13 +124,8 @@ aioRead(int fd, off_t offset, size_t len
+ 
+     assert(DiskThreadsIOStrategy::Instance.initialised);
+     ++squidaio_counts.read_start;
+-    ctrlp = (squidaio_ctrl_t *)DiskThreadsIOStrategy::Instance.squidaio_ctrl_pool->alloc();
+-    ctrlp->fd = fd;
+-    ctrlp->done_handler = callback;
+-    ctrlp->done_handler_data = cbdataReference(callback_data);
+-    ctrlp->operation = _AIO_READ;
+-    ctrlp->len = len;
+-    ctrlp->bufp = (char *)squidaio_xmalloc(len);
++    ctrlp = new squidaio_ctrl_t(fd, _AIO_READ, callback, callback_data,
++        (char *)squidaio_xmalloc(len), len);
+ 
+     if (offset >= 0)
+         seekmode = SEEK_SET;
+@@ -160,7 +134,6 @@ aioRead(int fd, off_t offset, size_t len
+         offset = 0;
+     }
+ 
+-    ctrlp->result.data = ctrlp;
+     squidaio_read(fd, ctrlp->bufp, len, offset, seekmode, &ctrlp->result);
+     dlinkAdd(ctrlp, &ctrlp->node, &used_list);
+     return;
+@@ -174,12 +147,7 @@ aioStat(char *path, struct stat *sb, AIO
+ 
+     assert(DiskThreadsIOStrategy::Instance.initialised);
+     ++squidaio_counts.stat_start;
+-    ctrlp = (squidaio_ctrl_t *)DiskThreadsIOStrategy::Instance.squidaio_ctrl_pool->alloc();
+-    ctrlp->fd = -2;
+-    ctrlp->done_handler = callback;
+-    ctrlp->done_handler_data = cbdataReference(callback_data);
+-    ctrlp->operation = _AIO_STAT;
+-    ctrlp->result.data = ctrlp;
++    ctrlp = new squidaio_ctrl_t(-2, _AIO_STAT, callback, callback_data);
+     squidaio_stat(path, sb, &ctrlp->result);
+     dlinkAdd(ctrlp, &ctrlp->node, &used_list);
+     return;
+@@ -191,12 +159,7 @@ aioUnlink(const char *path, AIOCB * call
+     squidaio_ctrl_t *ctrlp;
+     assert(DiskThreadsIOStrategy::Instance.initialised);
+     ++squidaio_counts.unlink_start;
+-    ctrlp = (squidaio_ctrl_t *)DiskThreadsIOStrategy::Instance.squidaio_ctrl_pool->alloc();
+-    ctrlp->fd = -2;
+-    ctrlp->done_handler = callback;
+-    ctrlp->done_handler_data = cbdataReference(callback_data);
+-    ctrlp->operation = _AIO_UNLINK;
+-    ctrlp->result.data = ctrlp;
++    ctrlp = new squidaio_ctrl_t(-2, _AIO_UNLINK, callback, callback_data);
+     squidaio_unlink(path, &ctrlp->result);
+     dlinkAdd(ctrlp, &ctrlp->node, &used_list);
+ }               /* aioUnlink */
+@@ -204,6 +167,6 @@ aioUnlink(const char *path, AIOCB * call
+ int
+ aioQueueSize(void)
+ {
+-    return DiskThreadsIOStrategy::Instance.squidaio_ctrl_pool->inUseCount();
++    return squidaio_ctrl_t::UseCount();
+ }
+ 
+
+=== modified file 'src/mem/AllocatorProxy.h'
+--- src/mem/AllocatorProxy.h	2015-09-30 14:12:55 +0000
++++ src/mem/AllocatorProxy.h	2015-09-30 16:50:09 +0000
+@@ -39,6 +39,7 @@ class MemPoolMeter;
+         if (address) \
+             Pool().freeOne(address); \
+     } \
++    static int UseCount() { return Pool().inUseCount(); } \
+     private:
+ 
+ namespace Mem
+

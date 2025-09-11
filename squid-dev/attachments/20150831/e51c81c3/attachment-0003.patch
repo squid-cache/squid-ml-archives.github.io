@@ -1,0 +1,251 @@
+Parse SSLv2 Hellos. They may start an SSLv3 or even TLSv1 sessions.
+
+Clients using OpenSSL v0.9.8 with default options send SSLv2 Hello messages
+while offering to support TLSv1.
+
+Squid should allow SSLv2 Hellos, even when SSLv2 session support is prohibited.
+These changes allow Squid to parse such Hello messages instead of just
+terminating the SSL client connection when an SSLv2 Hello message is detected.
+After the Hello message is parsed, the regular SslBump rules apply, and Squid
+may still reject SSL session with insufficiently high protocol versions.
+
+=== modified file 'src/ssl/bio.cc'
+--- src/ssl/bio.cc	2015-05-22 05:05:33 +0000
++++ src/ssl/bio.cc	2015-09-01 05:22:30 +0000
+@@ -8,42 +8,40 @@
+ 
+ /* DEBUG: section 83    SSL accelerator support */
+ 
+ #include "squid.h"
+ #include "ssl/support.h"
+ 
+ /* support.cc says this is needed */
+ #if USE_OPENSSL
+ 
+ #include "comm.h"
+ #include "fde.h"
+ #include "globals.h"
+ #include "ip/Address.h"
+ #include "Mem.h"
+ #include "ssl/bio.h"
+ 
+ #if HAVE_OPENSSL_SSL_H
+ #include <openssl/ssl.h>
+ #endif
+ 
+-#undef DO_SSLV23
+-
+ #if _SQUID_WINDOWS_
+ extern int socket_read_method(int, char *, int);
+ extern int socket_write_method(int, const char *, int);
+ #endif
+ 
+ /* BIO callbacks */
+ static int squid_bio_write(BIO *h, const char *buf, int num);
+ static int squid_bio_read(BIO *h, char *buf, int size);
+ static int squid_bio_puts(BIO *h, const char *str);
+ //static int squid_bio_gets(BIO *h, char *str, int size);
+ static long squid_bio_ctrl(BIO *h, int cmd, long arg1, void *arg2);
+ static int squid_bio_create(BIO *h);
+ static int squid_bio_destroy(BIO *data);
+ /* SSL callbacks */
+ static void squid_ssl_info(const SSL *ssl, int where, int ret);
+ 
+ /// Initialization structure for the BIO table with
+ /// Squid-specific methods and BIO method wrappers.
+ static BIO_METHOD SquidMethods = {
+     BIO_TYPE_SOCKET,
+@@ -764,49 +762,47 @@ Ssl::Bio::sslFeatures::parseMsgHead(cons
+     const char *s = objToString(head, buf.contentSize());
+     debugs(83, 7, "SSL Header: " << s);
+     if (buf.contentSize() < 5)
+         return 0;
+ 
+     if (helloMsgSize > 0)
+         return helloMsgSize;
+ 
+     // Check for SSLPlaintext/TLSPlaintext record
+     // RFC6101 section 5.2.1
+     // RFC5246 section 6.2.1
+     if (head[0] == 0x16) {
+         debugs(83, 7, "SSL version 3 handshake message");
+         // The SSL version exist in the 2nd and 3rd bytes
+         sslVersion = (head[1] << 8) | head[2];
+         debugs(83, 7, "SSL Version :" << std::hex << std::setw(8) << std::setfill('0') << sslVersion);
+         // The hello message size exist in 4th and 5th bytes
+         helloMsgSize = (head[3] << 8) + head[4];
+         debugs(83, 7, "SSL Header Size: " << helloMsgSize);
+         helloMsgSize +=5;
+-#if defined(DO_SSLV23)
+     } else if ((head[0] & 0x80) && head[2] == 0x01 && head[3] == 0x03) {
+         debugs(83, 7, "SSL version 2 handshake message with v3 support");
+-        sslVersion = (hello[3] << 8) | hello[4];
++        sslVersion = (head[3] << 8) | head[4];
+         debugs(83, 7, "SSL Version :" << std::hex << std::setw(8) << std::setfill('0') << sslVersion);
+         // The hello message size exist in 2nd byte
+         helloMsgSize = head[1];
+         helloMsgSize +=2;
+-#endif
+     } else {
+         debugs(83, 7, "Not an SSL acceptable handshake message (SSLv2 message?)");
+         return (helloMsgSize = -1);
+     }
+ 
+     // Set object as initialized. Even if we did not full parsing yet
+     // The basic features, like the SSL version is set
+     initialized_ = true;
+     return helloMsgSize;
+ }
+ 
+ bool
+ Ssl::Bio::sslFeatures::checkForCcsOrNst(const unsigned char *msg, size_t size)
+ {
+     while (size > 5) {
+         const int msgType = msg[0];
+         const int msgSslVersion = (msg[1] << 8) | msg[2];
+         debugs(83, 7, "SSL Message Version :" << std::hex << std::setw(8) << std::setfill('0') << msgSslVersion);
+         // Check for Change Cipher Spec message
+         // RFC5246 section 6.2.1
+@@ -837,46 +833,43 @@ Ssl::Bio::sslFeatures::checkForCcsOrNst(
+ bool
+ Ssl::Bio::sslFeatures::get(const MemBuf &buf, bool record)
+ {
+     int msgSize;
+     if ((msgSize = parseMsgHead(buf)) <= 0) {
+         debugs(83, 7, "Not a known SSL handshake message");
+         return false;
+     }
+ 
+     if (msgSize > buf.contentSize()) {
+         debugs(83, 2, "Partial SSL handshake message, can not parse!");
+         return false;
+     }
+ 
+     if (record) {
+         helloMessage.clear();
+         helloMessage.append(buf.content(), buf.contentSize());
+     }
+ 
+     const unsigned char *msg = (const unsigned char *)buf.content();
+-#if defined(DO_SSLV23)
+     if (msg[0] & 0x80)
+         return parseV23Hello(msg, (size_t)msgSize);
+-    else
+-#endif
+-    {
++    else {
+         // Hello messages require 5 bytes header + 1 byte Msg type + 3 bytes for Msg size
+         if (buf.contentSize() < 9)
+             return false;
+ 
+         // Check for the Handshake/Message type
+         // The type 2 is a ServerHello, the type 1 is a ClientHello
+         // RFC5246 section 7.4
+         if (msg[5] == 0x2) { // ServerHello message
+             if (parseV3ServerHello(msg, (size_t)msgSize)) {
+                 hasCcsOrNst = checkForCcsOrNst(msg + msgSize,  buf.contentSize() - msgSize);
+                 return true;
+             }
+         } else if (msg[5] == 0x1) // ClientHello message,
+             return parseV3Hello(msg, (size_t)msgSize);
+     }
+ 
+     return false;
+ }
+ 
+ bool
+@@ -1077,81 +1070,83 @@ Ssl::Bio::sslFeatures::parseV3Hello(cons
+                 } else if (extType == 0x3374) {
+                     // detected TLS next protocol negotiate extension
+                 } else if (extType == 0x10) {
+                     // Application-Layer Protocol Negotiation Extension, RFC7301
+                     const int listLen = (ext[0] << 8) | ext[1];
+                     if (listLen < extLen)
+                         tlsAppLayerProtoNeg.assign((const char *)(ext+5), listLen);
+                 } else
+                     extensions.push_back(extType);
+ 
+                 ext += extLen;
+             }
+         }
+     }
+     return true;
+ }
+ 
+ bool
+ Ssl::Bio::sslFeatures::parseV23Hello(const unsigned char *hello, size_t size)
+ {
+-#if defined(DO_SSLV23)
+     debugs(83, 7, "Get fake features from v23 ClientHello message.");
+     if (size < 7)
+         return false;
+     //Ciphers list. It is stored after the Session ID.
+-    const int ciphersLen = (hello[5] << 8) | hello[6];
++    const unsigned int ciphersLen = (hello[5] << 8) | hello[6];
+     const unsigned char *ciphers = hello + 11;
+ 
+-    if (size < ciphersLen + 11 + SSL3_RANDOM_SIZE)
++    if (size < ciphersLen + 11)
+         return false;
+ 
+     if (ciphersLen) {
+         const SSL_METHOD *method = SSLv23_method();
+         int cs = method->put_cipher_by_char(NULL, NULL);
+         assert(cs > 0);
+-        for (int i = 0; i < ciphersLen; i += cs) {
++        for (unsigned int i = 0; i < ciphersLen; i += cs) {
+             // The v2 hello messages cipher has 3 bytes.
+             // The v2 cipher has the first byte not null
+             // Because we are going to sent only v3 message we
+             // are ignoring these ciphers
+             if (ciphers[i] != 0)
+                 continue;
+             const SSL_CIPHER *c = method->get_cipher_by_char((ciphers + i + 1));
+             if (c != NULL) {
+                 if (!clientRequestedCiphers.empty())
+                     clientRequestedCiphers.append(":");
+                 clientRequestedCiphers.append(c->name);
+             }
+         }
+     }
+     debugs(83, 7, "Ciphers requested by client: " << clientRequestedCiphers);
+ 
+-    //Get Client Random number. It starts on the position 11 of hello message
+-    memcpy(client_random, ciphers + ciphersLen, SSL3_RANDOM_SIZE);
+-    debugs(83, 7, "Client random: " <<  objToString(client_random, SSL3_RANDOM_SIZE));
++    const unsigned int sessionIdLength = (hello[7] << 8) | hello[8];
++    debugs(83, 7, "SessionID length: " << sessionIdLength);
++    // SessionID starts at: hello+11+ciphersLen
++    if (sessionIdLength)
++        sessionId.assign((const char *)(hello + 11 + ciphersLen), sessionIdLength);
++
++    const unsigned int challengeLength = (hello[5] << 9) | hello[10];
++    debugs(83, 7, "Challenge Length: " << challengeLength);
++    //challenge starts at: hello+11+ciphersLen+sessionIdLength
+ 
+     compressMethod = 0;
+     return true;
+-#else
+-    return false;
+-#endif
+ }
+ 
+ void
+ Ssl::Bio::sslFeatures::applyToSSL(SSL *ssl, Ssl::BumpMode bumpMode) const
+ {
+     // To increase the possibility for bumping after peek mode selection or
+     // splicing after stare mode selection it is good to set the
+     // SSL protocol version.
+     // The SSL_set_ssl_method is not the correct method because it will strict
+     // SSL version which can be used to the SSL version used for client hello message.
+     // For example will prevent comunnicating with a tls1.0 server if the
+     // client sent and tlsv1.2 Hello message.
+     //SSL_set_ssl_method(ssl, Ssl::method(features.toSquidSSLVersion()));
+ #if defined(TLSEXT_NAMETYPE_host_name)
+     if (!serverName.isEmpty()) {
+         SSL_set_tlsext_host_name(ssl, serverName.c_str());
+     }
+ #endif
+     if (!clientRequestedCiphers.empty())
+         SSL_set_cipher_list(ssl, clientRequestedCiphers.c_str());
+

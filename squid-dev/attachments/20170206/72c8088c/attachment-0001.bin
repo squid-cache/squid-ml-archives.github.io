@@ -1,0 +1,121 @@
+Bump SSL client on [more] errors encountered before ssl_bump evaluation
+
+... such as ERR_ACCESS_DENIED with HTTP/403 Forbidden triggered by an
+http_access deny rule match.
+
+The old code allowed ssl_bump step1 rules to be evaluated in the
+presence of an error. An ssl_bump splicing decision would then trigger
+the useless "send the error to the client now" processing logic instead
+of going down the "to serve an error, bump the client first" path.
+
+Furthermore, the ssl_bump evaluation result itself could be surprising
+to the admin because ssl_bump (and most other) rules are not meant to be
+evaluated for a transaction in an error state. This complicated triage.
+
+Also polished an important comment to clarify that we want to bump on
+error if (and only if) the SslBump feature is applicable to the failed
+transaction (i.e., if the ssl_bump rules would have been evaluated if
+there were no prior errors). The old comment could have been
+misinterpreted that ssl_bump rules must be evaluated to allow an
+"ssl_bump splice" match to hide the error.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/client_side_request.cc'
+--- src/client_side_request.cc	2017-01-23 02:05:46 +0000
++++ src/client_side_request.cc	2017-02-06 16:56:16 +0000
+@@ -1425,40 +1425,47 @@
+                "), " << "ignoring ssl_bump for " << http->getConn());
+         if (!http->getConn()->serverBump())
+             http->sslBumpNeed(bumpMode); // for processRequest() to bump if needed and not already bumped
+         http->al->ssl.bumpMode = bumpMode; // inherited from bumped connection
+         return false;
+     }
+ 
+     // If we have not decided yet, decide whether to bump now.
+ 
+     // Bumping here can only start with a CONNECT request on a bumping port
+     // (bumping of intercepted SSL conns is decided before we get 1st request).
+     // We also do not bump redirected CONNECT requests.
+     if (http->request->method != Http::METHOD_CONNECT || http->redirect.status ||
+             !Config.accessList.ssl_bump ||
+             !http->getConn()->port->flags.tunnelSslBumping) {
+         http->al->ssl.bumpMode = Ssl::bumpEnd; // SslBump does not apply; log -
+         debugs(85, 5, HERE << "cannot SslBump this request");
+         return false;
+     }
+ 
++    if (error) {
++        debugs(85, 5, "SslBump applies. Force bump action on error " << err_type_str[(error->type >= ERR_NONE && error->type < ERR_MAX) ? error->type : ERR_NONE]);
++        http->sslBumpNeed(Ssl::bumpBump);
++        http->al->ssl.bumpMode = Ssl::bumpBump;
++        return false;
++    }
++
+     // Do not bump during authentication: clients would not proxy-authenticate
+     // if we delay a 407 response and respond with 200 OK to CONNECT.
+     if (error && error->httpStatus == Http::scProxyAuthenticationRequired) {
+         http->al->ssl.bumpMode = Ssl::bumpEnd; // SslBump does not apply; log -
+         debugs(85, 5, HERE << "no SslBump during proxy authentication");
+         return false;
+     }
+ 
+     debugs(85, 5, HERE << "SslBump possible, checking ACL");
+ 
+     ACLFilledChecklist *aclChecklist = clientAclChecklistCreate(Config.accessList.ssl_bump, http);
+     aclChecklist->nonBlockingCheck(sslBumpAccessCheckDoneWrapper, this);
+     return true;
+ }
+ 
+ /**
+  * A wrapper function to use the ClientRequestContext::sslBumpAccessCheckDone method
+  * as ACLFilledChecklist callback
+  */
+ static void
+@@ -1764,42 +1771,43 @@
+             ch.my_addr = request->my_addr;
+             tos_t tos = aclMapTOS(Ip::Qos::TheConfig.tosToClient, &ch);
+             if (tos)
+                 Ip::Qos::setSockTos(getConn()->clientConnection, tos);
+         }
+     }
+ 
+     if (!calloutContext->nfmarkToClientDone) {
+         calloutContext->nfmarkToClientDone = true;
+         if (getConn() != NULL && Comm::IsConnOpen(getConn()->clientConnection)) {
+             ACLFilledChecklist ch(NULL, request, NULL);
+             ch.src_addr = request->client_addr;
+             ch.my_addr = request->my_addr;
+             nfmark_t mark = aclMapNfmark(Ip::Qos::TheConfig.nfmarkToClient, &ch);
+             if (mark)
+                 Ip::Qos::setSockNfmark(getConn()->clientConnection, mark);
+         }
+     }
+ 
+ #if USE_OPENSSL
+-    // We need to check for SslBump even if the calloutContext->error is set
+-    // because bumping may require delaying the error until after CONNECT.
++    // Even with calloutContext->error, we call sslBumpAccessCheck() to decide
++    // whether SslBump applies to this transaction. If it applies, we will
++    // attempt to bump the client to serve the error.
+     if (!calloutContext->sslBumpCheckDone) {
+         calloutContext->sslBumpCheckDone = true;
+         if (calloutContext->sslBumpAccessCheck())
+             return;
+         /* else no ssl bump required*/
+     }
+ #endif
+ 
+     if (calloutContext->error) {
+         const char *storeUri = request->storeId();
+         StoreEntry *e= storeCreateEntry(storeUri, storeUri, request->flags, request->method);
+ #if USE_OPENSSL
+         if (sslBumpNeeded()) {
+             // We have to serve an error, so bump the client first.
+             sslBumpNeed(Ssl::bumpClientFirst);
+             // set final error but delay sending until we bump
+             Ssl::ServerBump *srvBump = new Ssl::ServerBump(request, e);
+             errorAppendEntry(e, calloutContext->error);
+             calloutContext->error = NULL;
+             getConn()->setServerBump(srvBump);
+

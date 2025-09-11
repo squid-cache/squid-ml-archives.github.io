@@ -1,0 +1,629 @@
+Fix shared memory initialization and cleanup. Ensure its usability.
+
+Max OS X O_TRUNC portability fix broke zeroing of freshly allocated
+shared memory segments in cases where an old/stale segment was left from
+a previous [failed] Squid run. We now always truncate to zero first.
+
+Squid was not removing the squid-squid-page-pool.shm when not running in
+SMP mode. That segment is used in non-SMP mode if memory_cache_shared
+was explicitly set to "on" (a config primarily used for testing).
+
+Call mlock(2) if available to guarantee that mmapped memory is usable.
+On Linux (at least), mmap(2) often does not allocate much memory.
+Instead, the kernel tries to allocate memory when it is actually
+accessed for the first time by the program. What happens when the shared
+memory is not available at that time? Kernel kills Squid with SIGBUS,
+and developers spend many days trying to find a Squid bug.
+
+Technically, it is the responsibility of the admin to make sure the
+Squid box has enough shared memory for the configured caches.  However,
+it is difficult to figure out how much is "enough" _and_ correctly
+configure the OS to have that much shared memory. Mistakes are very
+common, especially for larger memory caches. Such mistakes go completely
+unnoticed for many hours or days (as the memory cache gets filled) so
+they often slip through pre-deployment tests, and the resulting SIGBUS
+crashes are often too obscure to point to OS misconfiguration as the
+true cause.
+
+The problem is so bad that we must make mlock() failures fatal, even if
+this will break some "working" setups that just did not happen to hit
+their shared memory limits yet (e.g., because they configured Squid to
+have a memory cache size larger than Squid can ever fill in their
+environment).
+
+On the bright side, mlock(2) is also a performance optimization as it
+prevents future paging I/O. The memory is allocated and paged in at
+startup.
+
+
+Also, two mmpapped memory checks were temporary added:
+
+1. Check that a freshly-allocated shared memory segment is filled with
+   zeros, can be re-filled with 1s, and can be re-filled with 0s.  This
+   check is performed upon creation of each shared memory segment (done
+   in the master process).
+
+2. Check that we can read shared memory upon opening an existing
+   shared memory segment.
+
+In environments where mlock(2) is not available (or the call is manually
+removed from Squid sources), these checks usually result in SIGBUS
+deaths if Squid grossly over-allocates shared memory, but they may not
+show any problem in borderline configurations where mlock(2) calls do
+fail.
+
+Also modified Squid to run /tmp/squid-on-fatal.sh on fatal errors and
+when mlock() and/or mmapped memory test #1 above fails. Needs more work.
+
+=== modified file 'src/fatal.cc'
+--- src/fatal.cc	2015-01-13 07:25:36 +0000
++++ src/fatal.cc	2015-12-01 01:21:16 +0000
+@@ -1,55 +1,87 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "Debug.h"
+ #include "fatal.h"
+ #include "globals.h"
+ #include "SwapDir.h"
+ #include "tools.h"
+ 
++#if HAVE_SYS_STAT_H
++#include <sys/stat.h>
++#endif
++#if HAVE_UNISTD_H
++#include <unistd.h>
++#endif
++
++/// Final reporting/non-state-changing parts of fatal().
++/// Not static to simplify temporary hacks that report Squid state
++/// [while bypassing nearly-fatal events].
++void
++OnFatal()
++{
++    PrintRusage();
++    dumpMallocStats();
++
++    // Run an on-fatal script if any; TODO: Remove or make configurable.
++    const char *script = "/tmp/squid-on-fatal.sh";
++    struct stat st;
++    if (stat(script, &st) == 0) {
++        debugs(54, 2, "running " << script);
++        if (system(script) != 0) {
++            const int savedError = errno;
++            debugs(54, DBG_IMPORTANT, script << " failure: " << xstrerr(savedError));
++        }
++        debugs(54, 5, "done running " << script);
++    } else {
++        const int savedError = errno;
++        debugs(54, 2, "assuming no " << script << ": " << xstrerr(savedError));
++    }
++
++    fflush(debug_log);
++}
++
+ static void
+ fatal_common(const char *message)
+ {
+ #if HAVE_SYSLOG
+     syslog(LOG_ALERT, "%s", message);
+ #endif
+ 
+     fprintf(debug_log, "FATAL: %s\n", message);
+ 
+     if (Debug::log_stderr > 0 && debug_log != stderr)
+         fprintf(stderr, "FATAL: %s\n", message);
+ 
+     fprintf(debug_log, "Squid Cache (Version %s): Terminated abnormally.\n",
+             version_string);
+ 
+     fflush(debug_log);
+ 
+-    PrintRusage();
+-
+-    dumpMallocStats();
++    OnFatal();    
+ }
+ 
+ void
+ fatal(const char *message)
+ {
+     /* suppress secondary errors from the dying */
+     shutting_down = 1;
+ 
+     releaseServerSockets();
+     /* check for store_dirs_rebuilding because fatal() is often
+      * used in early initialization phases, long before we ever
+      * get to the store log. */
+ 
+     /* XXX: this should be turned into a callback-on-fatal, or
+      * a mandatory-shutdown-event or something like that.
+      * - RBC 20060819
+      */
+ 
+     /*
+      * DPW 2007-07-06
+
+=== modified file 'src/ipc/mem/Pages.cc'
+--- src/ipc/mem/Pages.cc	2015-01-13 07:25:36 +0000
++++ src/ipc/mem/Pages.cc	2015-12-04 17:39:10 +0000
+@@ -115,28 +115,25 @@ SharedMemPagesRr::useConfig()
+     Ipc::Mem::RegisteredRunner::useConfig();
+ }
+ 
+ void
+ SharedMemPagesRr::create()
+ {
+     Must(!owner);
+     owner = Ipc::Mem::PagePool::Init(PagePoolId, Ipc::Mem::PageLimit(),
+                                      Ipc::Mem::PageSize());
+ }
+ 
+ void
+ SharedMemPagesRr::open()
+ {
+     Must(!ThePagePool);
+     ThePagePool = new Ipc::Mem::PagePool(PagePoolId);
+ }
+ 
+ SharedMemPagesRr::~SharedMemPagesRr()
+ {
+-    if (!UsingSmp())
+-        return;
+-
+     delete ThePagePool;
+     ThePagePool = NULL;
+     delete owner;
+ }
+ 
+
+=== modified file 'src/ipc/mem/Segment.cc'
+--- src/ipc/mem/Segment.cc	2015-02-24 10:32:15 +0000
++++ src/ipc/mem/Segment.cc	2015-12-04 17:37:36 +0000
+@@ -1,38 +1,40 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 54    Interprocess Communication */
+ 
+ #include "squid.h"
+ #include "base/TextException.h"
+ #include "compat/shm.h"
+ #include "Debug.h"
+ #include "fatal.h"
+ #include "ipc/mem/Segment.h"
++#include "ipc/mem/Pages.h"
+ #include "SBuf.h"
+ #include "tools.h"
++#include "SquidTime.h"
+ 
+ #if HAVE_FCNTL_H
+ #include <fcntl.h>
+ #endif
+ #if HAVE_SYS_MMAN_H
+ #include <sys/mman.h>
+ #endif
+ #if HAVE_SYS_STAT_H
+ #include <sys/stat.h>
+ #endif
+ #if HAVE_UNISTD_H
+ #include <unistd.h>
+ #endif
+ 
+ // test cases change this
+ const char *Ipc::Mem::Segment::BasePath = DEFAULT_STATEDIR;
+ 
+ void *
+ Ipc::Mem::Segment::reserve(size_t chunkSize)
+ {
+@@ -71,126 +73,165 @@ Ipc::Mem::Segment::~Segment()
+         if (close(theFD) != 0)
+             debugs(54, 5, HERE << "close " << theName << ": " << xstrerror());
+     }
+     if (doUnlink)
+         unlink();
+ }
+ 
+ // fake Ipc::Mem::Segment::Enabled (!HAVE_SHM) is more selective
+ bool
+ Ipc::Mem::Segment::Enabled()
+ {
+     return true;
+ }
+ 
+ void
+ Ipc::Mem::Segment::create(const off_t aSize)
+ {
+     assert(aSize > 0);
+     assert(theFD < 0);
+ 
+-    // OS X does not allow using O_TRUNC here.
++    // OS X does not allow using O_TRUNC here so we may open stale segment data.
+     theFD = shm_open(theName.termedBuf(), O_CREAT | O_RDWR,
+                      S_IRUSR | S_IWUSR);
+     if (theFD < 0) {
+         debugs(54, 5, HERE << "shm_open " << theName << ": " << xstrerror());
+         fatalf("Ipc::Mem::Segment::create failed to shm_open(%s): %s\n",
+                theName.termedBuf(), xstrerror());
+     }
+ 
+-    if (ftruncate(theFD, aSize)) {
+-        const int savedError = errno;
+-        unlink();
+-        debugs(54, 5, HERE << "ftruncate " << theName << ": " << xstrerr(savedError));
+-        fatalf("Ipc::Mem::Segment::create failed to ftruncate(%s): %s\n",
+-               theName.termedBuf(), xstrerr(savedError));
+-    }
+-    // We assume that the shm_open(O_CREAT)+ftruncate() combo zeros the segment.
++    truncate(0); // remove any [stale] data
++    truncate(aSize); // set desired size and zero [0, aSize) range
+ 
+     theSize = statSize("Ipc::Mem::Segment::create");
+ 
+     // OS X will round up to a full page, so not checking for exact size match.
+     assert(theSize >= aSize);
+ 
+     theReserved = 0;
+     doUnlink = true;
+ 
+     debugs(54, 3, HERE << "created " << theName << " segment: " << theSize);
+ 
+     attach();
++
++    fillTest();
+ }
+ 
+ void
+ Ipc::Mem::Segment::open()
+ {
+     assert(theFD < 0);
+ 
+     theFD = shm_open(theName.termedBuf(), O_RDWR, 0);
+     if (theFD < 0) {
+         debugs(54, 5, HERE << "shm_open " << theName << ": " << xstrerror());
+         fatalf("Ipc::Mem::Segment::open failed to shm_open(%s): %s\n",
+                theName.termedBuf(), xstrerror());
+     }
+ 
+     theSize = statSize("Ipc::Mem::Segment::open");
+ 
+     debugs(54, 3, HERE << "opened " << theName << " segment: " << theSize);
+ 
+     attach();
++
++    scanTest();
+ }
+ 
++extern void OnFatal();
++
+ /// Map the shared memory segment to the process memory space.
+ void
+ Ipc::Mem::Segment::attach()
+ {
+     assert(theFD >= 0);
+     assert(!theMem);
+ 
+     // mmap() accepts size_t for the size; we give it off_t which might
+     // be bigger; assert overflows until we support multiple mmap()s?
+     assert(theSize == static_cast<off_t>(static_cast<size_t>(theSize)));
+ 
+     void *const p =
+         mmap(NULL, theSize, PROT_READ | PROT_WRITE, MAP_SHARED, theFD, 0);
+     if (p == MAP_FAILED) {
+         debugs(54, 5, HERE << "mmap " << theName << ": " << xstrerror());
+         fatalf("Ipc::Mem::Segment::attach failed to mmap(%s): %s\n",
+                theName.termedBuf(), xstrerror());
+     }
++
++    // mmap() may succeed and then the kernel kills a kid with SIGBUS when Squid
++    // attempts to actually access the mapped memory regions beyond what the
++    // kernel is willing to give that kid process. Some of the memory limits
++    // enforced by the kernel are currently poorly understood: We do not know
++    // how to detect and check some of them. This call ensures that the mapped
++    // memory will be available. It is also a performance optimization as it
++    // prevents future paging I/O. However, it requires a large enough
++    // RLIMIT_MEMLOCK limit and/or CAP_IPC_LOCK capability.
++#ifdef _POSIX_MEMLOCK_RANGE
++    if (mlock(p, theSize) != 0) {
++        const int savedError = errno;
++        debugs(54, DBG_IMPORTANT, "mlock(" << theName << ") failure: " << xstrerr(savedError));
++        fatalf("Ipc::Mem::Segment::attach failed to mlock(%s, %" PRId64 "): %s\n",
++               theName.termedBuf(), theSize, xstrerr(savedError));
++    }
++#else
++    {
++        static bool warnedOnce = false;
++        if (!warnedOnce) {
++            debugs(54, DBG_IMPORTANT, "Missing mlock(2) prevents mmapped memory usability checks");
++            warnedOnce = true;
++        }
++    }
++#endif
+     theMem = p;
+ }
+ 
+ /// Unmap the shared memory segment from the process memory space.
+ void
+ Ipc::Mem::Segment::detach()
+ {
+     if (!theMem)
+         return;
+ 
+     if (munmap(theMem, theSize)) {
+         debugs(54, 5, HERE << "munmap " << theName << ": " << xstrerror());
+         fatalf("Ipc::Mem::Segment::detach failed to munmap(%s): %s\n",
+                theName.termedBuf(), xstrerror());
+     }
+     theMem = 0;
+ }
+ 
++/// truncates segment to the desired (including zero) size; failures are fatal
++void
++Ipc::Mem::Segment::truncate(const off_t desiredSize)
++{
++    if (ftruncate(theFD, desiredSize) != 0) {
++        const int savedError = errno;
++        unlink();
++        debugs(54, 5, HERE << "ftruncate(" << theName << ", " << desiredSize << "): " <<
++               xstrerr(savedError));
++        fatalf("Ipc::Mem::Segment::create failed to ftruncate(%s, %" PRId64 "): %s\n",
++               theName.termedBuf(), desiredSize, xstrerr(savedError));
++    }
++}
++
+ void
+ Ipc::Mem::Segment::unlink()
+ {
+     if (shm_unlink(theName.termedBuf()) != 0)
+         debugs(54, 5, HERE << "shm_unlink(" << theName << "): " << xstrerror());
+     else
+         debugs(54, 3, HERE << "unlinked " << theName << " segment");
+ }
+ 
+ /// determines the size of the underlying "file"
+ off_t
+ Ipc::Mem::Segment::statSize(const char *context) const
+ {
+     Must(theFD >= 0);
+ 
+     struct stat s;
+     memset(&s, 0, sizeof(s));
+ 
+     if (fstat(theFD, &s) != 0) {
+         debugs(54, 5, HERE << context << " fstat " << theName << ": " << xstrerror());
+@@ -213,40 +254,163 @@ Ipc::Mem::Segment::GenerateName(const ch
+         name.append(BasePath);
+         if (name[name.size()-1] != '/')
+             name.append('/');
+     } else
+         name.append("/squid-");
+ 
+     // append id, replacing slashes with dots
+     for (const char *slash = strchr(id, '/'); slash; slash = strchr(id, '/')) {
+         if (id != slash) {
+             name.append(id, slash - id);
+             name.append('.');
+         }
+         id = slash + 1;
+     }
+     name.append(id);
+ 
+     name.append(".shm"); // to distinguish from non-segments when nameIsPath
+     return name;
+ }
+ 
++bool
++Ipc::Mem::Segment::shouldTest() const
++{
++    const char *guard = getenv("SQUID_TEST_SHM");
++    if (guard && strcmp(guard, "1") == 0) {
++        debugs(54, DBG_IMPORTANT, "Shared memory check started for " <<
++           theSize << "-byte " << theName);
++        return true;
++    }
++
++    debugs(54, 5, "Skipping shared memory checks: " << guard);
++    return false;
++}
++
++static const void *PageWithZeros = 0;
++static const void *PageWithOnes = 0;
++
++void
++Ipc::Mem::Segment::fillTest()
++{
++    if (!shouldTest())
++        return;
++
++    const int pageSize = PageSize();
++    const int pages = theSize / pageSize;
++    const int rest = theSize % pageSize;
++    uint64_t memProcessing = ChunkSize;
++    unsigned char *p = static_cast<unsigned char*>(theMem);
++    const unsigned char *beg = p;
++    int msecElapsed = 0;
++
++    if (!PageWithZeros) {
++        PageWithZeros = new char[pageSize];
++        memset(const_cast<void*>(PageWithZeros), 0, pageSize);
++        PageWithOnes = new char[pageSize];
++        memset(const_cast<void*>(PageWithOnes), 0xFF, pageSize);
++    }
++
++    // a quick test of the highest offsets
++    const int tailSize = theSize > pageSize ? pageSize : theSize;
++    readWriteTest(p + theSize - tailSize, tailSize);
++
++    getCurrentTime();
++    struct timeval start = current_time;
++    for (int i = 0; i < pages; ++i) {
++        readWriteTest(p, pageSize);
++        p += pageSize;
++        if (p > beg + memProcessing) {
++            getCurrentTime();
++            msecElapsed += tvSubMsec(start, current_time);
++            start = current_time;
++            debugs(54, DBG_IMPORTANT, "Shared memory checking for " << theName <<
++                    ", mem processed: " << memProcessing / GB << "GB"
++                    ", duration: " << msecElapsed << "ms");
++            memProcessing += ChunkSize;
++        }
++    }
++    if (rest)
++        readWriteTest(p, rest);
++    getCurrentTime();
++    msecElapsed += tvSubMsec(start, current_time);
++    debugs(54, DBG_IMPORTANT, "Shared memory check completed for " << theName <<
++            ", total bytes processed: " << theSize <<
++            ", total duration: " << msecElapsed << "ms");
++}
++
++void
++Ipc::Mem::Segment::sameAs(unsigned char *p, const int n, const void *page) {
++    // XXX: assumes n never exceeds the page size
++    if (memcmp(p, page, n) != 0)
++        fatal_dump("mmapped memory is unusuable");
++}
++
++void
++Ipc::Mem::Segment::readWriteTest(unsigned char *p, const int n) {
++    sameAs(p, n, PageWithZeros);
++    memset(p, 0xFF, n);
++    sameAs(p, n, PageWithOnes);
++    memset(p, 0, n);
++    sameAs(p, n, PageWithZeros);
++}
++
++void
++Ipc::Mem::Segment::scanTest()
++{
++    if (!shouldTest())
++        return;
++
++    const int pageSize = PageSize();
++    const int pages = theSize / pageSize;
++    const int rest = theSize % pageSize;
++    char *buf = new char[pageSize];
++    const unsigned char *p = static_cast<unsigned char*>(theMem);
++    const unsigned char *beg = p;
++    uint64_t memProcessing = ChunkSize;
++    int msecElapsed = 0;
++
++    debugs(54, DBG_IMPORTANT, "Shared memory scan started for " << theName);
++    getCurrentTime();
++    struct timeval start = current_time;
++    for (int i = 0; i < pages; ++i) {
++        memcpy(buf, p, pageSize);
++        p += pageSize;
++        if (p > beg + memProcessing) {
++            getCurrentTime();
++            msecElapsed += tvSubMsec(start, current_time);
++            start = current_time;
++            debugs(54, DBG_IMPORTANT, "Shared memory scanning for " << theName <<
++                    ", mem processed: " << memProcessing / GB << "GB" <<
++                    ", duration: " << msecElapsed << "ms");
++            memProcessing += ChunkSize;
++        }
++    }
++    if (rest)
++        memcpy(buf, p, rest);
++    getCurrentTime();
++    msecElapsed += tvSubMsec(start, current_time);
++    debugs(54, DBG_IMPORTANT, "Shared memory scan completed for " << theName <<
++            ", total bytes processed: " << theSize <<
++            ", total duration: " << msecElapsed << "ms");
++    delete [] buf;
++}
++
+ #else // HAVE_SHM
+ 
+ #include <map>
+ 
+ typedef std::map<String, Ipc::Mem::Segment *> SegmentMap;
+ static SegmentMap Segments;
+ 
+ Ipc::Mem::Segment::Segment(const char *const id):
+     theName(id), theMem(NULL), theSize(0), theReserved(0), doUnlink(false)
+ {
+ }
+ 
+ Ipc::Mem::Segment::~Segment()
+ {
+     if (doUnlink) {
+         delete [] static_cast<char *>(theMem);
+         theMem = NULL;
+         Segments.erase(theName);
+         debugs(54, 3, HERE << "unlinked " << theName << " fake segment");
+     }
+
+=== modified file 'src/ipc/mem/Segment.h'
+--- src/ipc/mem/Segment.h	2015-01-13 07:25:36 +0000
++++ src/ipc/mem/Segment.h	2015-11-29 23:50:41 +0000
+@@ -39,45 +39,55 @@ public:
+     off_t size() { return theSize; } ///< shared memory segment size
+     void *mem() { return reserve(0); } ///< pointer to the next chunk
+     void *reserve(size_t chunkSize); ///< reserve and return the next chunk
+ 
+     /// common path of all segment names in path-based environments
+     static const char *BasePath;
+ 
+     /// concatenates parts of a name to form a complete name (or its prefix)
+     static SBuf Name(const SBuf &prefix, const char *suffix);
+ 
+ private:
+ 
+     // not implemented
+     Segment(const Segment &);
+     Segment &operator =(const Segment &);
+ 
+ #if HAVE_SHM
+ 
+     void attach();
+     void detach();
++    void truncate(const off_t desiredSize);
+     void unlink(); ///< unlink the segment
+     off_t statSize(const char *context) const;
+ 
+     static String GenerateName(const char *id);
+ 
++    void fillTest();
++    void scanTest();
++    bool shouldTest() const;
++    void readWriteTest(unsigned char *p, const int n);
++    void sameAs(unsigned char *p, const int n, const void *page);
++
++    static const uint64_t GB = 1024LLU * 1024 * 1024;
++    static const uint64_t ChunkSize = 10 * GB;
++
+     int theFD; ///< shared memory segment file descriptor
+ 
+ #else // HAVE_SHM
+ 
+     void checkSupport(const char *const context);
+ 
+ #endif // HAVE_SHM
+ 
+     const String theName; ///< shared memory segment file name
+     void *theMem; ///< pointer to mmapped shared memory segment
+     off_t theSize; ///< shared memory segment size
+     off_t theReserved; ///< the total number of reserve()d bytes
+     bool doUnlink; ///< whether the segment should be unlinked on destruction
+ };
+ 
+ /// Base class for runners that create and open shared memory segments.
+ /// First may run create() method and then open().
+ class RegisteredRunner: public ::RegisteredRunner
+ {
+ public:
+

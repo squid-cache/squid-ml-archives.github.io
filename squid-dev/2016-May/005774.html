@@ -1,0 +1,592 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] cryptong: cleanup the context init sequence
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20cryptong%3A%20cleanup%20the%20context%20init%20sequence&In-Reply-To=%3C6721ef0e-dc4d-1116-b06b-9cb4d374a4b2%40treenet.co.nz%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="005764.html">
+   <LINK REL="Next"  HREF="005775.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] cryptong: cleanup the context init sequence</H1>
+    <B>Amos Jeffries</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20cryptong%3A%20cleanup%20the%20context%20init%20sequence&In-Reply-To=%3C6721ef0e-dc4d-1116-b06b-9cb4d374a4b2%40treenet.co.nz%3E"
+       TITLE="[squid-dev] [PATCH] cryptong: cleanup the context init sequence">squid3 at treenet.co.nz
+       </A><BR>
+    <I>Wed May 25 11:03:46 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005764.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » clang,d-fedora-22 #653
+</A></li>
+        <LI>Next message: <A HREF="005775.html">[squid-dev] [PATCH] Deprecating SMB LanMan helpers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5774">[ date ]</a>
+              <a href="thread.html#5774">[ thread ]</a>
+              <a href="subject.html#5774">[ subject ]</a>
+              <a href="author.html#5774">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>The libsecurity ServerOptions and PeerOptions class methods are now
+supposed to be the API for creating SSL contexts for https_port,
+cache_peer and outgoing connections.
+
+Continue the API transition by making the callers of sslCreate*Context()
+functions use the libsecurity API instead and repurpose the now obsolete
+functions into the Ssl:: namespace to simply initialize the keying
+material and other not yet converted state details of an existing context.
+
+A side effect of this is that GnuTLS contexts are now actually created
+and initialized as far as they can be.
+
+SSL-Bump context initialization is not altered by this.
+
+Amos
+-------------- next part --------------
+=== modified file 'src/anyp/PortCfg.cc'
+--- src/anyp/PortCfg.cc	2016-01-01 00:12:18 +0000
++++ src/anyp/PortCfg.cc	2016-05-25 05:37:16 +0000
+@@ -126,30 +126,28 @@
+     }
+ 
+     if (!signPkey)
+         debugs(3, DBG_IMPORTANT, &quot;No SSL private key configured for  &quot; &lt;&lt; AnyP::ProtocolType_str[transport.protocol] &lt;&lt; &quot;_port &quot; &lt;&lt; s);
+ 
+     Ssl::generateUntrustedCert(untrustedSigningCert, untrustedSignPkey,
+                                signingCert, signPkey);
+ 
+     if (!untrustedSigningCert) {
+         char buf[128];
+         fatalf(&quot;Unable to generate signing SSL certificate for untrusted sites for %s_port %s&quot;, AnyP::ProtocolType_str[transport.protocol], s.toUrl(buf, sizeof(buf)));
+     }
+ 
+     if (clientca) {
+         clientCA.reset(SSL_load_client_CA_file(clientca));
+         if (clientCA.get() == NULL) {
+             fatalf(&quot;Unable to read client CAs! from %s&quot;, clientca);
+         }
+     }
+ 
+-    secure.updateTlsVersionLimits();
+-    secure.staticContext.reset(sslCreateServerContext(*this));
+-
++    secure.staticContext.reset(secure.createStaticServerContext(*this));
+     if (!secure.staticContext) {
+         char buf[128];
+         fatalf(&quot;%s_port %s initialization error&quot;, AnyP::ProtocolType_str[transport.protocol], s.toUrl(buf, sizeof(buf)));
+     }
+ }
+ #endif
+ 
+
+=== modified file 'src/security/PeerOptions.cc'
+--- src/security/PeerOptions.cc	2016-05-21 23:19:36 +0000
++++ src/security/PeerOptions.cc	2016-05-25 05:28:36 +0000
+@@ -223,64 +223,58 @@
+ #if USE_OPENSSL
+     Ssl::Initialize();
+ 
+ #if (OPENSSL_VERSION_NUMBER &gt;= 0x10100000L)
+     t = SSL_CTX_new(TLS_client_method());
+ #else
+     t = SSL_CTX_new(SSLv23_client_method());
+ #endif
+     if (!t) {
+         const auto x = ERR_error_string(ERR_get_error(), nullptr);
+         fatalf(&quot;Failed to allocate TLS client context: %s\n&quot;, x);
+     }
+ 
+ #elif USE_GNUTLS
+     // Initialize for X.509 certificate exchange
+     if (const int x = gnutls_certificate_allocate_credentials(&amp;t)) {
+         fatalf(&quot;Failed to allocate TLS client context: error=%d\n&quot;, x);
+     }
+ 
+ #else
+-    fatal(&quot;Failed to allocate TLS client context: No TLS library\n&quot;);
++    debugs(83, 1, &quot;WARNING: Failed to allocate TLS client context: No TLS library&quot;);
+ 
+ #endif
+ 
+     return t;
+ }
+ 
+ Security::ContextPtr
+ Security::PeerOptions::createClientContext(bool setOptions)
+ {
+-    Security::ContextPtr t = nullptr;
+-
+     updateTlsVersionLimits();
+ 
++    Security::ContextPtr t = createBlankContext();
++    if (t) {
+ #if USE_OPENSSL
+-    // XXX: temporary performance regression. c_str() data copies and prevents this being a const method
+-    t = sslCreateClientContext(*this, (setOptions ? parsedOptions : 0), parsedFlags);
+-
+-#elif USE_GNUTLS &amp;&amp; WHEN_READY_FOR_GNUTLS
+-    t = createBlankContext();
+-
++        // XXX: temporary performance regression. c_str() data copies and prevents this being a const method
++        Ssl::InitClientContext(t, *this, (setOptions ? parsedOptions : 0), parsedFlags);
+ #endif
+-
+-    if (t) {
+         updateContextNpn(t);
+         updateContextCa(t);
+         updateContextCrl(t);
+     }
+ 
+     return t;
+ }
+ 
+ /// set of options we can parse and what they map to
+ static struct ssl_option {
+     const char *name;
+     long value;
+ 
+ } ssl_options[] = {
+ 
+ #if SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG
+     {
+         &quot;NETSCAPE_REUSE_CIPHER_CHANGE_BUG&quot;, SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG
+     },
+ #endif
+
+=== modified file 'src/security/ServerOptions.cc'
+--- src/security/ServerOptions.cc	2016-04-11 16:34:29 +0000
++++ src/security/ServerOptions.cc	2016-05-25 05:28:08 +0000
+@@ -100,40 +100,55 @@
+ #endif
+     if (!t) {
+         const auto x = ERR_error_string(ERR_get_error(), nullptr);
+         debugs(83, DBG_CRITICAL, &quot;ERROR: Failed to allocate TLS server context: &quot; &lt;&lt; x);
+     }
+ 
+ #elif USE_GNUTLS
+     // Initialize for X.509 certificate exchange
+     if (const int x = gnutls_certificate_allocate_credentials(&amp;t)) {
+         debugs(83, DBG_CRITICAL, &quot;ERROR: Failed to allocate TLS server context: error=&quot; &lt;&lt; x);
+     }
+ 
+ #else
+     debugs(83, DBG_CRITICAL, &quot;ERROR: Failed to allocate TLS server context: No TLS library&quot;);
+ 
+ #endif
+ 
+     return t;
+ }
+ 
++Security::ContextPtr
++Security::ServerOptions::createStaticServerContext(AnyP::PortCfg &amp;port)
++{
++    updateTlsVersionLimits();
++
++    Security::ContextPtr t = createBlankContext();
++    if (t) {
++#if USE_OPENSSL
++        Ssl::InitServerContext(t, port);
++#endif
++    }
++
++    return t;
++}
++
+ void
+ Security::ServerOptions::loadDhParams()
+ {
+     if (dhParamsFile.isEmpty())
+         return;
+ 
+ #if USE_OPENSSL
+     DH *dhp = nullptr;
+     if (FILE *in = fopen(dhParamsFile.c_str(), &quot;r&quot;)) {
+         dhp = PEM_read_DHparams(in, NULL, NULL, NULL);
+         fclose(in);
+     }
+ 
+     if (!dhp) {
+         debugs(83, DBG_IMPORTANT, &quot;WARNING: Failed to read DH parameters '&quot; &lt;&lt; dhParamsFile &lt;&lt; &quot;'&quot;);
+         return;
+     }
+ 
+     int codes;
+     if (DH_check(dhp, &amp;codes) == 0) {
+
+=== modified file 'src/security/ServerOptions.h'
+--- src/security/ServerOptions.h	2016-04-11 16:34:29 +0000
++++ src/security/ServerOptions.h	2016-05-25 10:38:53 +0000
+@@ -1,53 +1,57 @@
+ /*
+  * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SRC_SECURITY_SERVEROPTIONS_H
+ #define SQUID_SRC_SECURITY_SERVEROPTIONS_H
+ 
++#include &quot;anyp/forward.h&quot;
+ #include &quot;security/PeerOptions.h&quot;
+ 
+ namespace Security
+ {
+ 
+ /// TLS squid.conf settings for a listening port
+ class ServerOptions : public PeerOptions
+ {
+ public:
+     ServerOptions() : PeerOptions() {
+         // Bug 4005: dynamic contexts use a lot of memory and it
+         // is more secure to have only a small set of trusted CA.
+         flags.tlsDefaultCa.defaultTo(false);
+     }
+     virtual ~ServerOptions() = default;
+ 
+     /* Security::PeerOptions API */
+     virtual void parse(const char *);
+     virtual void clear() {*this = ServerOptions();}
+     virtual Security::ContextPtr createBlankContext() const;
+     virtual void dumpCfg(Packable *, const char *pfx) const;
+ 
++    /// generate a security server-context from these configured options
++    Security::ContextPtr createStaticServerContext(AnyP::PortCfg &amp;);
++
+     /// update the context with DH, EDH, EECDH settings
+     void updateContextEecdh(Security::ContextPtr &amp;);
+ 
+ public:
+     /// TLS context to use for HTTPS accelerator or static SSL-Bump
+     Security::ContextPointer staticContext;
+ 
+ private:
+     void loadDhParams();
+ 
+ private:
+     SBuf dh;            ///&lt; Diffi-Helman cipher config
+     SBuf dhParamsFile;  ///&lt; Diffi-Helman ciphers parameter file
+     SBuf eecdhCurve;    ///&lt; Elliptic curve for ephemeral EC-based DH key exchanges
+ 
+     Security::DhePointer parsedDhParams; ///&lt; DH parameters for temporary/ephemeral DH key exchanges
+ };
+ 
+ } // namespace Security
+ 
+
+=== modified file 'src/ssl/support.cc'
+--- src/ssl/support.cc	2016-05-20 13:20:27 +0000
++++ src/ssl/support.cc	2016-05-25 05:26:44 +0000
+@@ -539,111 +539,109 @@
+         } else {
+             debugs(83, 9, &quot;Requiring client certificates.&quot;);
+             SSL_CTX_set_verify(sslContext, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ssl_verify_cb);
+         }
+ 
+         port.secure.updateContextCrl(sslContext);
+ 
+     } else {
+         debugs(83, 9, &quot;Not requiring any client certificates&quot;);
+         SSL_CTX_set_verify(sslContext, SSL_VERIFY_NONE, NULL);
+     }
+ 
+     if (port.secure.parsedFlags &amp; SSL_FLAG_DONT_VERIFY_DOMAIN)
+         SSL_CTX_set_ex_data(sslContext, ssl_ctx_ex_index_dont_verify_domain, (void *) -1);
+ 
+     Ssl::SetSessionCallbacks(sslContext);
+ 
+     return true;
+ }
+ 
+-Security::ContextPtr
+-sslCreateServerContext(AnyP::PortCfg &amp;port)
++bool
++Ssl::InitServerContext(Security::ContextPtr &amp;sslContext, AnyP::PortCfg &amp;port)
+ {
+-    Security::ContextPtr sslContext(port.secure.createBlankContext());
+     if (!sslContext)
+-        return nullptr;
++        return false;
+ 
+     if (!SSL_CTX_use_certificate(sslContext, port.signingCert.get())) {
+         const int ssl_error = ERR_get_error();
+         const auto &amp;keys = port.secure.certs.front();
+         debugs(83, DBG_CRITICAL, &quot;ERROR: Failed to acquire TLS certificate '&quot; &lt;&lt; keys.certFile &lt;&lt; &quot;': &quot; &lt;&lt; ERR_error_string(ssl_error, NULL));
+         SSL_CTX_free(sslContext);
+-        return NULL;
++        return false;
+     }
+ 
+     if (!SSL_CTX_use_PrivateKey(sslContext, port.signPkey.get())) {
+         const int ssl_error = ERR_get_error();
+         const auto &amp;keys = port.secure.certs.front();
+         debugs(83, DBG_CRITICAL, &quot;ERROR: Failed to acquire TLS private key '&quot; &lt;&lt; keys.privateKeyFile &lt;&lt; &quot;': &quot; &lt;&lt; ERR_error_string(ssl_error, NULL));
+         SSL_CTX_free(sslContext);
+-        return NULL;
++        return false;
+     }
+ 
+     Ssl::addChainToSslContext(sslContext, port.certsToChain.get());
+ 
+     /* Alternate code;
+         debugs(83, DBG_IMPORTANT, &quot;Using certificate in &quot; &lt;&lt; certfile);
+ 
+         if (!SSL_CTX_use_certificate_chain_file(sslContext, certfile)) {
+             ssl_error = ERR_get_error();
+             debugs(83, DBG_CRITICAL, &quot;ERROR: Failed to acquire SSL certificate '&quot; &lt;&lt; certfile &lt;&lt; &quot;': &quot; &lt;&lt; ERR_error_string(ssl_error, NULL));
+             SSL_CTX_free(sslContext);
+-            return NULL;
++            return false;
+         }
+ 
+         debugs(83, DBG_IMPORTANT, &quot;Using private key in &quot; &lt;&lt; keyfile);
+         ssl_ask_password(sslContext, keyfile);
+ 
+         if (!SSL_CTX_use_PrivateKey_file(sslContext, keyfile, SSL_FILETYPE_PEM)) {
+             ssl_error = ERR_get_error();
+             debugs(83, DBG_CRITICAL, &quot;ERROR: Failed to acquire SSL private key '&quot; &lt;&lt; keyfile &lt;&lt; &quot;': &quot; &lt;&lt; ERR_error_string(ssl_error, NULL));
+             SSL_CTX_free(sslContext);
+-            return NULL;
++            return false;
+         }
+ 
+         debugs(83, 5, &quot;Comparing private and public SSL keys.&quot;);
+ 
+         if (!SSL_CTX_check_private_key(sslContext)) {
+             ssl_error = ERR_get_error();
+             debugs(83, DBG_CRITICAL, &quot;ERROR: SSL private key '&quot; &lt;&lt; certfile &lt;&lt; &quot;' does not match public key '&quot; &lt;&lt;
+                    keyfile &lt;&lt; &quot;': &quot; &lt;&lt; ERR_error_string(ssl_error, NULL));
+             SSL_CTX_free(sslContext);
+-            return NULL;
++            return false;
+         }
+     */
+ 
+     if (!configureSslContext(sslContext, port)) {
+         debugs(83, DBG_CRITICAL, &quot;ERROR: Configuring static SSL context&quot;);
+         SSL_CTX_free(sslContext);
+-        return NULL;
++        return false;
+     }
+ 
+-    return sslContext;
++    return true;
+ }
+ 
+-Security::ContextPtr
+-sslCreateClientContext(Security::PeerOptions &amp;peer, long options, long fl)
++bool
++Ssl::InitClientContext(Security::ContextPtr &amp;sslContext, Security::PeerOptions &amp;peer, long options, long fl)
+ {
+-    Security::ContextPtr sslContext(peer.createBlankContext());
+     if (!sslContext)
+-        return nullptr;
++        return false;
+ 
+     SSL_CTX_set_options(sslContext, options);
+ 
+ #if defined(SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS)
+     SSL_CTX_set_info_callback(sslContext, ssl_info_cb);
+ #endif
+ 
+     if (!peer.sslCipher.isEmpty()) {
+         debugs(83, 5, &quot;Using chiper suite &quot; &lt;&lt; peer.sslCipher &lt;&lt; &quot;.&quot;);
+ 
+         const char *cipher = peer.sslCipher.c_str();
+         if (!SSL_CTX_set_cipher_list(sslContext, cipher)) {
+             const int ssl_error = ERR_get_error();
+             fatalf(&quot;Failed to set SSL cipher suite '%s': %s\n&quot;,
+                    cipher, ERR_error_string(ssl_error, NULL));
+         }
+     }
+ 
+     if (!peer.certs.empty()) {
+         // TODO: support loading multiple cert/key pairs
+@@ -672,41 +670,41 @@
+ 
+             if (!SSL_CTX_check_private_key(sslContext)) {
+                 const int ssl_error = ERR_get_error();
+                 fatalf(&quot;SSL private key '%s' does not match public key '%s': %s\n&quot;,
+                        certfile, keyfile, ERR_error_string(ssl_error, NULL));
+             }
+         }
+     }
+ 
+     debugs(83, 9, &quot;Setting RSA key generation callback.&quot;);
+     SSL_CTX_set_tmp_rsa_callback(sslContext, ssl_temp_rsa_cb);
+ 
+     if (fl &amp; SSL_FLAG_DONT_VERIFY_PEER) {
+         debugs(83, 2, &quot;NOTICE: Peer certificates are not verified for validity!&quot;);
+         SSL_CTX_set_verify(sslContext, SSL_VERIFY_NONE, NULL);
+     } else {
+         debugs(83, 9, &quot;Setting certificate verification callback.&quot;);
+         SSL_CTX_set_verify(sslContext, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ssl_verify_cb);
+     }
+ 
+-    return sslContext;
++    return true;
+ }
+ 
+ /// \ingroup ServerProtocolSSLInternal
+ int
+ ssl_read_method(int fd, char *buf, int len)
+ {
+     auto ssl = fd_table[fd].ssl.get();
+ 
+ #if DONT_DO_THIS
+ 
+     if (!SSL_is_init_finished(ssl)) {
+         errno = ENOTCONN;
+         return -1;
+     }
+ 
+ #endif
+ 
+     int i = SSL_read(ssl, buf, len);
+ 
+     if (i &gt; 0 &amp;&amp; SSL_pending(ssl) &gt; 0) {
+
+=== modified file 'src/ssl/support.h'
+--- src/ssl/support.h	2016-04-05 09:43:47 +0000
++++ src/ssl/support.h	2016-05-25 05:26:01 +0000
+@@ -94,47 +94,47 @@
+     /**
+      * Absolute cert position in the final certificate chain that may include
+      * intermediate certificates. Chain positions start with zero and increase
+      * towards the root certificate. Negative if unknown.
+      */
+     int depth;
+     CertError(ssl_error_t anErr, X509 *aCert, int depth = -1);
+     CertError(CertError const &amp;err);
+     CertError &amp; operator = (const CertError &amp;old);
+     bool operator == (const CertError &amp;ce) const;
+     bool operator != (const CertError &amp;ce) const;
+ };
+ 
+ /// Holds a list of certificate SSL errors
+ typedef CbDataList&lt;Ssl::CertError&gt; CertErrors;
+ 
+ void SetSessionCallbacks(Security::ContextPtr);
+ extern Ipc::MemMap *SessionCache;
+ extern const char *SessionCacheName;
+ 
+-} //namespace Ssl
++/// initialize a TLS server context with OpenSSL specific settings
++bool InitServerContext(Security::ContextPtr &amp;, AnyP::PortCfg &amp;);
+ 
+-/// \ingroup ServerProtocolSSLAPI
+-Security::ContextPtr sslCreateServerContext(AnyP::PortCfg &amp;port);
++/// initialize a TLS client context with OpenSSL specific settings
++bool InitClientContext(Security::ContextPtr &amp;, Security::PeerOptions &amp;, long options, long flags);
+ 
+-/// \ingroup ServerProtocolSSLAPI
+-Security::ContextPtr sslCreateClientContext(Security::PeerOptions &amp;, long options, long flags);
++} //namespace Ssl
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ int ssl_read_method(int, char *, int);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ int ssl_write_method(int, const char *, int);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ void ssl_shutdown_method(SSL *ssl);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ const char *sslGetUserEmail(SSL *ssl);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ const char *sslGetUserAttribute(SSL *ssl, const char *attribute_name);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+ const char *sslGetCAAttribute(SSL *ssl, const char *attribute_name);
+ 
+ /// \ingroup ServerProtocolSSLAPI
+
+=== modified file 'src/tests/stub_libsslsquid.cc'
+--- src/tests/stub_libsslsquid.cc	2016-02-17 21:03:29 +0000
++++ src/tests/stub_libsslsquid.cc	2016-05-25 05:27:22 +0000
+@@ -38,43 +38,43 @@
+ Ssl::LocalContextStorage *Ssl::GlobalContextStorage::getLocalStorage(Ip::Address const &amp; address)
+ { fatal(STUB_API &quot; required&quot;); static Ssl::LocalContextStorage v(0,0); return &v; }
+ void Ssl::GlobalContextStorage::reconfigureStart() STUB
+ //Ssl::GlobalContextStorage Ssl::TheGlobalContextStorage;
+ 
+ #include &quot;ssl/ErrorDetail.h&quot;
+ Ssl::ssl_error_t parseErrorString(const char *name) STUB_RETVAL(0)
+ //const char *Ssl::getErrorName(ssl_error_t value) STUB_RETVAL(NULL)
+ Ssl::ErrorDetail::ErrorDetail(ssl_error_t err_no, X509 *, X509 *, const char *) STUB
+ Ssl::ErrorDetail::ErrorDetail(ErrorDetail const &amp;) STUB
+ const String &amp; Ssl::ErrorDetail::toString() const STUB_RETSTATREF(String)
+ 
+ #include &quot;ssl/support.h&quot;
+ namespace Ssl
+ {
+ //CertError::CertError(ssl_error_t anErr, X509 *aCert) STUB
+ //CertError::CertError(CertError const &amp;err) STUB
+ CertError &amp; CertError::operator = (const CertError &amp;old) STUB_RETVAL(*this)
+ bool CertError::operator == (const CertError &amp;ce) const STUB_RETVAL(false)
+ bool CertError::operator != (const CertError &amp;ce) const STUB_RETVAL(false)
++bool InitServerContext(Security::ContextPtr &amp;, AnyP::PortCfg &amp;) STUB_RETVAL(false)
++bool InitClientContext(Security::ContextPtr &amp;, Security::PeerOptions &amp;, long, const char *) STUB_RETVAL(false)
+ } // namespace Ssl
+-Security::ContextPtr sslCreateServerContext(AnyP::PortCfg &amp;port) STUB_RETVAL(NULL)
+-Security::ContextPtr sslCreateClientContext(Security::PeerOptions &amp;, long, const char *) STUB_RETVAL(nullptr)
+ int ssl_read_method(int, char *, int) STUB_RETVAL(0)
+ int ssl_write_method(int, const char *, int) STUB_RETVAL(0)
+ void ssl_shutdown_method(SSL *ssl) STUB
+ const char *sslGetUserEmail(SSL *ssl) STUB_RETVAL(NULL)
+ const char *sslGetUserAttribute(SSL *ssl, const char *attribute_name) STUB_RETVAL(NULL)
+ const char *sslGetCAAttribute(SSL *ssl, const char *attribute_name) STUB_RETVAL(NULL)
+ const char *sslGetUserCertificatePEM(SSL *ssl) STUB_RETVAL(NULL)
+ const char *sslGetUserCertificateChainPEM(SSL *ssl) STUB_RETVAL(NULL)
+ namespace Ssl
+ {
+ //GETX509ATTRIBUTE GetX509UserAttribute;
+ //GETX509ATTRIBUTE GetX509CAAttribute;
+ //GETX509ATTRIBUTE GetX509Fingerprint;
+ const char *BumpModeStr[] = {&quot;&quot;};
+ bool generateUntrustedCert(Security::CertPointer &amp; untrustedCert, EVP_PKEY_Pointer &amp; untrustedPkey, Security::CertPointer const &amp; cert, EVP_PKEY_Pointer const &amp; pkey) STUB_RETVAL(false)
+ Security::ContextPtr generateSslContext(CertificateProperties const &amp;properties, AnyP::PortCfg &amp;port) STUB_RETVAL(NULL)
+ bool verifySslCertificate(Security::ContextPtr sslContext,  CertificateProperties const &amp;properties) STUB_RETVAL(false)
+ Security::ContextPtr generateSslContextUsingPkeyAndCertFromMemory(const char * data, AnyP::PortCfg &amp;port) STUB_RETVAL(NULL)
+ void addChainToSslContext(Security::ContextPtr sslContext, STACK_OF(X509) *certList) STUB
+ void readCertChainAndPrivateKeyFromFiles(Security::CertPointer &amp; cert, EVP_PKEY_Pointer &amp; pkey, X509_STACK_Pointer &amp; chain, char const * certFilename, char const * keyFilename) STUB
+
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005764.html">[squid-dev] Jenkins build is back to normal : trunk-matrix » clang,d-fedora-22 #653
+</A></li>
+	<LI>Next message: <A HREF="005775.html">[squid-dev] [PATCH] Deprecating SMB LanMan helpers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5774">[ date ]</a>
+              <a href="thread.html#5774">[ thread ]</a>
+              <a href="subject.html#5774">[ subject ]</a>
+              <a href="author.html#5774">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

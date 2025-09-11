@@ -1,0 +1,1640 @@
+Log TLS Cryptography Parameters
+
+This patch adds the following formatting codes:
+  %ssl::>negotiated_version  The TLS version of the client-to-Squid connection.
+  %ssl::<negotiated_version  The TLS version of the Squid-to-server connection.
+  %ssl::>received_hello_version The TLS version of the Hello message received
+                                from TLS client
+  %ssl::<received_hello_version The TLS version of the Hello message received
+                                from TLS server.
+  %ssl::>received_supported_version The maximum TLS version supported by the
+                                    the TLS client.
+  %ssl::<received_supported_version The maximum TLS version supported by the
+                                    the TLS server.
+  %ssl::>cipher   The negotiated cipher of the client-to-Squid connection.
+  %ssl::<cipher   The negotiated cipher of the Squid-to-server connection.
+
+These are useful for statistics collection, security reviews, and reviews
+prior to adjusting the list of the allowed TLS protocols and ciphers.
+
+This is a Measurement Factory project
+
+=== modified file 'src/SquidConfig.h'
+--- src/SquidConfig.h	2015-12-02 19:45:15 +0000
++++ src/SquidConfig.h	2015-12-13 18:53:12 +0000
+@@ -318,40 +318,43 @@
+         int emailErrData;
+         int httpd_suppress_version_string;
+         int global_internal_static;
+         int collapsed_forwarding;
+ 
+ #if FOLLOW_X_FORWARDED_FOR
+         int acl_uses_indirect_client;
+         int delay_pool_uses_indirect_client;
+         int log_uses_indirect_client;
+ #if LINUX_NETFILTER
+         int tproxy_uses_indirect_client;
+ #endif
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+ 
+         int WIN32_IpAddrChangeMonitor;
+         int memory_cache_first;
+         int memory_cache_disk;
+         int hostStrictVerify;
+         int client_dst_passthru;
+         int dns_mdns;
++#if USE_OPENSSL
++        bool logTlsServerHelloDetails;
++#endif
+     } onoff;
+ 
+     int pipeline_max_prefetch;
+ 
+     int forward_max_tries;
+     int connect_retries;
+ 
+     class ACL *aclList;
+ 
+     struct {
+         acl_access *http;
+         acl_access *adapted_http;
+         acl_access *icp;
+         acl_access *miss;
+         acl_access *NeverDirect;
+         acl_access *AlwaysDirect;
+         acl_access *ASlists;
+         acl_access *noCache;
+         acl_access *sendHit;
+         acl_access *storeMiss;
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2015-12-02 19:45:15 +0000
++++ src/cf.data.pre	2015-12-13 18:58:49 +0000
+@@ -4182,40 +4182,64 @@
+ 				SSL certificate or a dash ('-') if Squid has
+ 				received an invalid/malformed certificate or
+ 				no certificate at all. Consider encoding the
+ 				logged value because Subject often has spaces.
+ 
+ 		ssl::>cert_issuer
+ 				The Issuer field of the received client
+ 				SSL certificate or a dash ('-') if Squid has
+ 				received an invalid/malformed certificate or
+ 				no certificate at all. Consider encoding the
+ 				logged value because Issuer often has spaces.
+ 
+ 		ssl::<cert_errors
+ 				The list of certificate validation errors
+ 				detected by Squid (including OpenSSL and
+ 				certificate validation helper components). The
+ 				errors are listed in the discovery order. By
+ 				default, the error codes are separated by ':'.
+ 				Accepts an optional separator argument.
+ 
++		%ssl::>negotiated_version The negotiated TLS version of the
++				client connection.
++
++		%ssl::<negotiated_version The negotiated TLS version of the
++				last server or peer connection.
++
++		%ssl::>received_hello_version The TLS version of the Hello
++				message received from TLS client.
++
++		%ssl::<received_hello_version The TLS version of the Hello
++				message received from TLS server.
++
++		%ssl::>received_supported_version The maximum TLS version
++				supported by the TLS client.
++
++		%ssl::<received_supported_version The maximum TLS version
++				supported by the TLS server.
++
++		%ssl::>negotiated_cipher The negotiated cipher of the
++				client connection.
++
++		%ssl::<negotiated_cipher The negotiated cipher of the
++				last server or peer connection.
++
+ 	If ICAP is enabled, the following code becomes available (as
+ 	well as ICAP log codes documented with the icap_log option):
+ 
+ 		icap::tt        Total ICAP processing time for the HTTP
+ 				transaction. The timer ticks when ICAP
+ 				ACLs are checked and when ICAP
+ 				transaction is in progress.
+ 
+ 	If adaptation is enabled the following codes become available:
+ 
+ 		adapt::<last_h	The header of the last ICAP response or
+ 				meta-information from the last eCAP
+ 				transaction related to the HTTP transaction.
+ 				Like <h, accepts an optional header name
+ 				argument.
+ 
+ 		adapt::sum_trs Summed adaptation transaction response
+ 				times recorded as a comma-separated list in
+ 				the order of transaction start time. Each time
+ 				value is recorded as an integer number,
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2015-12-04 13:35:13 +0000
++++ src/client_side.cc	2015-12-13 19:31:05 +0000
+@@ -86,40 +86,41 @@
+ #include "helper/Reply.h"
+ #include "http.h"
+ #include "http/one/RequestParser.h"
+ #include "http/one/TeChunkedParser.h"
+ #include "HttpHdrContRange.h"
+ #include "HttpHeaderTools.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+ #include "ident/Config.h"
+ #include "ident/Ident.h"
+ #include "internal.h"
+ #include "ipc/FdNotes.h"
+ #include "ipc/StartListening.h"
+ #include "log/access_log.h"
+ #include "MemBuf.h"
+ #include "MemObject.h"
+ #include "mime_header.h"
+ #include "parser/Tokenizer.h"
+ #include "profiler/Profiler.h"
+ #include "rfc1738.h"
++#include "security/NegotiationHistory.h"
+ #include "servers/forward.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "StatCounters.h"
+ #include "StatHist.h"
+ #include "Store.h"
+ #include "TimeOrTag.h"
+ #include "tools.h"
+ #include "URL.h"
+ 
+ #if USE_AUTH
+ #include "auth/UserRequest.h"
+ #endif
+ #if USE_DELAY_POOLS
+ #include "ClientInfo.h"
+ #endif
+ #if USE_OPENSSL
+ #include "ssl/bio.h"
+ #include "ssl/context_storage.h"
+ #include "ssl/gadgets.h"
+@@ -3391,42 +3392,42 @@
+             * Because there are two possible usable cast, if you get an error here, try the other
+             * commented line. */
+ 
+             PEM_ASN1_write((int(*)())i2d_SSL_SESSION, PEM_STRING_SSL_SESSION, debug_log, (char *)SSL_get_session(ssl), NULL,NULL,0,NULL,NULL);
+             /* PEM_ASN1_write((int(*)(...))i2d_SSL_SESSION, PEM_STRING_SSL_SESSION, debug_log, (char *)SSL_get_session(ssl), NULL,NULL,0,NULL,NULL); */
+ 
+ #else
+ 
+             debugs(83, 4, "With " OPENSSL_VERSION_TEXT ", session details are available only defining ALLOW_ALWAYS_SSL_SESSION_DETAIL=1 in the source." );
+ 
+ #endif
+             /* Note: This does not automatically fflush the log file.. */
+         }
+ 
+         debugs(83, 2, "clientNegotiateSSL: New session " <<
+                SSL_get_session(ssl) << " on FD " << fd << " (" <<
+                fd_table[fd].ipaddr << ":" << (int)fd_table[fd].remote_port <<
+                ")");
+     }
+ 
+-    debugs(83, 3, "clientNegotiateSSL: FD " << fd << " negotiated cipher " <<
+-           SSL_get_cipher(ssl));
++    // Connection established. Retrieve TLS connection parameters for logging.
++    conn->clientConnection->tlsNegotiations()->fillWith(ssl);
+ 
+     client_cert = SSL_get_peer_certificate(ssl);
+ 
+     if (client_cert != NULL) {
+         debugs(83, 3, "clientNegotiateSSL: FD " << fd <<
+                " client certificate: subject: " <<
+                X509_NAME_oneline(X509_get_subject_name(client_cert), 0, 0));
+ 
+         debugs(83, 3, "clientNegotiateSSL: FD " << fd <<
+                " client certificate: issuer: " <<
+                X509_NAME_oneline(X509_get_issuer_name(client_cert), 0, 0));
+ 
+         X509_free(client_cert);
+     } else {
+         debugs(83, 5, "clientNegotiateSSL: FD " << fd <<
+                " has no certificate.");
+     }
+ 
+ #if defined(TLSEXT_NAMETYPE_host_name)
+     if (!conn->serverBump()) {
+@@ -3874,41 +3875,41 @@
+ 
+     int ret = 0;
+     if ((ret = Squid_SSL_accept(conn, clientPeekAndSpliceSSL)) < 0)
+         debugs(83, 2, "SSL_accept failed.");
+ 
+     BIO *b = SSL_get_rbio(ssl);
+     assert(b);
+     Ssl::ClientBio *bio = static_cast<Ssl::ClientBio *>(b->ptr);
+     if (ret < 0) {
+         const err_type err = bio->noSslClient() ? ERR_PROTOCOL_UNKNOWN : ERR_SECURE_ACCEPT_FAIL;
+         if (!conn->spliceOnError(err))
+             conn->clientConnection->close();
+         return;
+     }
+ 
+     if (bio->rBufData().contentSize() > 0)
+         conn->receivedFirstByte();
+ 
+     if (bio->gotHello()) {
+         if (conn->serverBump()) {
+-            Ssl::Bio::sslFeatures const &features = bio->getFeatures();
++            Ssl::Bio::sslFeatures const &features = bio->receivedHelloFeatures();
+             if (!features.serverName.isEmpty()) {
+                 conn->serverBump()->clientSni = features.serverName;
+                 conn->resetSslCommonName(features.serverName.c_str());
+             }
+         }
+ 
+         debugs(83, 5, "I got hello. Start forwarding the request!!! ");
+         Comm::SetSelect(fd, COMM_SELECT_READ, NULL, NULL, 0);
+         Comm::SetSelect(fd, COMM_SELECT_WRITE, NULL, NULL, 0);
+         conn->startPeekAndSpliceDone();
+         return;
+     }
+ }
+ 
+ void ConnStateData::startPeekAndSplice()
+ {
+     // will call httpsPeeked() with certificate and connection, eventually
+     auto unConfiguredCTX = Ssl::createSSLContext(port->signingCert, port->signPkey, *port);
+     fd_table[clientConnection->fd].dynamicSslContext = unConfiguredCTX;
+ 
+@@ -3951,40 +3952,44 @@
+         bumpAction = (Ssl::BumpMode)answer.kind;
+     } else
+         bumpAction = Ssl::bumpSplice;
+ 
+     connState->serverBump()->act.step2 = bumpAction;
+     connState->sslBumpMode = bumpAction;
+ 
+     if (bumpAction == Ssl::bumpTerminate) {
+         connState->clientConnection->close();
+     } else if (bumpAction != Ssl::bumpSplice) {
+         connState->startPeekAndSpliceDone();
+     } else
+         connState->splice();
+ }
+ 
+ void
+ ConnStateData::splice()
+ {
+     //Normally we can splice here, because we just got client hello message
+     auto ssl = fd_table[clientConnection->fd].ssl;
++
++    //retrieve received TLS client information
++    clientConnection->tlsNegotiations()->fillWith(ssl);
++
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ClientBio *bio = static_cast<Ssl::ClientBio *>(b->ptr);
+     MemBuf const &rbuf = bio->rBufData();
+     debugs(83,5, "Bio for  " << clientConnection << " read " << rbuf.contentSize() << " helo bytes");
+     // Do splice:
+     fd_table[clientConnection->fd].read_method = &default_read_method;
+     fd_table[clientConnection->fd].write_method = &default_write_method;
+ 
+     if (transparent()) {
+         // set the current protocol to something sensible (was "HTTPS" for the bumping process)
+         // we are sending a faked-up HTTP/1.1 message wrapper, so go with that.
+         transferProtocol = Http::ProtocolVersion();
+         // XXX: copy from MemBuf reallocates, not a regression since old code did too
+         SBuf temp;
+         temp.append(rbuf.content(), rbuf.contentSize());
+         fakeAConnectRequest("intercepted TLS spliced", temp);
+     } else {
+         // XXX: assuming that there was an HTTP/1.1 CONNECT to begin with...
+ 
+         // reset the current protocol to HTTP/1.1 (was "HTTPS" for the bumping process)
+
+=== modified file 'src/comm/Connection.cc'
+--- src/comm/Connection.cc	2015-08-24 14:20:07 +0000
++++ src/comm/Connection.cc	2015-12-13 19:31:33 +0000
+@@ -1,67 +1,71 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "CachePeer.h"
+ #include "cbdata.h"
+ #include "comm.h"
+ #include "comm/Connection.h"
+ #include "fde.h"
+ #include "neighbors.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
++#include "security/NegotiationHistory.h"
+ 
+ class CachePeer;
+ bool
+ Comm::IsConnOpen(const Comm::ConnectionPointer &conn)
+ {
+     return conn != NULL && conn->isOpen();
+ }
+ 
+ Comm::Connection::Connection() :
+     peerType(HIER_NONE),
+     fd(-1),
+     tos(0),
+     nfmark(0),
+     flags(COMM_NONBLOCKING),
+     peer_(nullptr),
+-    startTime_(squid_curtime)
++    startTime_(squid_curtime),
++    tlsHistory(nullptr)
+ {
+     *rfc931 = 0; // quick init the head. the rest does not matter.
+ }
+ 
+ static int64_t lost_conn = 0;
+ Comm::Connection::~Connection()
+ {
+     if (fd >= 0) {
+         debugs(5, 4, "BUG #3329: Orphan Comm::Connection: " << *this);
+         debugs(5, 4, "NOTE: " << ++lost_conn << " Orphans since last started.");
+         close();
+     }
+ 
+     cbdataReferenceDone(peer_);
++
++    delete tlsHistory;
+ }
+ 
+ Comm::ConnectionPointer
+ Comm::Connection::copyDetails() const
+ {
+     ConnectionPointer c = new Comm::Connection;
+ 
+     c->setAddrs(local, remote);
+     c->peerType = peerType;
+     c->tos = tos;
+     c->nfmark = nfmark;
+     c->flags = flags;
+     c->startTime_ = startTime_;
+ 
+     // ensure FD is not open in the new copy.
+     c->fd = -1;
+ 
+     // ensure we have a cbdata reference to peer_ not a straight ptr copy.
+     c->peer_ = cbdataReference(getPeer());
+ 
+@@ -102,20 +106,28 @@
+     /* set to self. nothing to do. */
+     if (getPeer() == p)
+         return;
+ 
+     cbdataReferenceDone(peer_);
+     if (p) {
+         peer_ = cbdataReference(p);
+     }
+ }
+ 
+ time_t
+ Comm::Connection::timeLeft(const time_t idleTimeout) const
+ {
+     if (!Config.Timeout.pconnLifetime)
+         return idleTimeout;
+ 
+     const time_t lifeTimeLeft = lifeTime() < Config.Timeout.pconnLifetime ? Config.Timeout.pconnLifetime - lifeTime() : 1;
+     return min(lifeTimeLeft, idleTimeout);
+ }
+ 
++Security::NegotiationHistory *
++Comm::Connection::tlsNegotiations()
++{
++    if (!tlsHistory)
++        tlsHistory = new Security::NegotiationHistory;
++    return tlsHistory;
++}
++
+
+=== modified file 'src/comm/Connection.h'
+--- src/comm/Connection.h	2015-08-31 06:17:22 +0000
++++ src/comm/Connection.h	2015-12-13 19:32:13 +0000
+@@ -11,40 +11,45 @@
+ #ifndef _SQUIDCONNECTIONDETAIL_H_
+ #define _SQUIDCONNECTIONDETAIL_H_
+ 
+ #include "comm/forward.h"
+ #include "defines.h"
+ #if USE_SQUID_EUI
+ #include "eui/Eui48.h"
+ #include "eui/Eui64.h"
+ #endif
+ #include "hier_code.h"
+ #include "ip/Address.h"
+ #include "ip/forward.h"
+ #include "mem/forward.h"
+ #include "SquidTime.h"
+ 
+ #include <iosfwd>
+ #include <ostream>
+ 
+ class CachePeer;
+ 
++namespace Security
++{
++class NegotiationHistory;
++};
++
+ namespace Comm
+ {
+ 
+ /* TODO: make these a struct of boolean flags members in the connection instead of a bitmap.
+  * we can't do that until all non-comm code uses Commm::Connection objects to create FD
+  * currently there is code still using comm_open() and comm_openex() synchronously!!
+  */
+ #define COMM_UNSET              0x00
+ #define COMM_NONBLOCKING        0x01  // default flag.
+ #define COMM_NOCLOEXEC          0x02
+ #define COMM_REUSEADDR          0x04  // shared FD may be both accept()ing and read()ing
+ #define COMM_DOBIND             0x08  // requires a bind()
+ #define COMM_TRANSPARENT        0x10  // arrived via TPROXY
+ #define COMM_INTERCEPTION       0x20  // arrived via NAT
+ 
+ /**
+  * Store data about the physical and logical attributes of a connection.
+  *
+  * Some link state can be infered from the data, however this is not an
+  * object for state data. But a semantic equivalent for FD with easily
+@@ -90,40 +95,44 @@
+      * The caller is responsible for all CBDATA operations regarding the
+      * used of the pointer returned.
+      */
+     CachePeer * getPeer() const;
+ 
+     /** alter the stored CachePeer pointer.
+      * Perform appropriate CBDATA operations for locking the CachePeer pointer
+      */
+     void setPeer(CachePeer * p);
+ 
+     /** The time the connection started */
+     time_t startTime() const {return startTime_;}
+ 
+     /** The connection lifetime */
+     time_t lifeTime() const {return squid_curtime - startTime_;}
+ 
+     /** The time left for this connection*/
+     time_t timeLeft(const time_t idleTimeout) const;
+ 
+     void noteStart() {startTime_ = squid_curtime;}
++
++    Security::NegotiationHistory *tlsNegotiations();
++    const Security::NegotiationHistory *hasTlsNegotiations() const {return tlsHistory;}
++
+ private:
+     /** These objects may not be exactly duplicated. Use copyDetails() instead. */
+     Connection(const Connection &c);
+ 
+     /** These objects may not be exactly duplicated. Use copyDetails() instead. */
+     Connection & operator =(const Connection &c);
+ 
+ public:
+     /** Address/Port for the Squid end of a TCP link. */
+     Ip::Address local;
+ 
+     /** Address for the Remote end of a TCP link. */
+     Ip::Address remote;
+ 
+     /** Hierarchy code for this connection link */
+     hier_code peerType;
+ 
+     /** Socket used by this connection. Negative if not open. */
+     int fd;
+ 
+@@ -132,40 +141,43 @@
+ 
+     /** Netfilter MARK values currently sent on this connection */
+     nfmark_t nfmark;
+ 
+     /** COMM flags set on this connection */
+     int flags;
+ 
+     char rfc931[USER_IDENT_SZ];
+ 
+ #if USE_SQUID_EUI
+     Eui::Eui48 remoteEui48;
+     Eui::Eui64 remoteEui64;
+ #endif
+ 
+ private:
+     /** cache_peer data object (if any) */
+     CachePeer *peer_;
+ 
+     /** The time the connection object was created */
+     time_t startTime_;
++
++    /** TLS connection details*/
++    Security::NegotiationHistory *tlsHistory;
+ };
+ 
+ }; // namespace Comm
+ 
+ // NP: Order and namespace here is very important.
+ //     * The second define inlines the first.
+ //     * Stream inheritance overloading is searched in the global scope first.
+ 
+ inline std::ostream &
+ operator << (std::ostream &os, const Comm::Connection &conn)
+ {
+     os << "local=" << conn.local << " remote=" << conn.remote;
+     if (conn.fd >= 0)
+         os << " FD " << conn.fd;
+     if (conn.flags != COMM_UNSET)
+         os << " flags=" << conn.flags;
+ #if USE_IDENT
+     if (*conn.rfc931)
+         os << " IDENT::" << conn.rfc931;
+ #endif
+
+=== modified file 'src/format/ByteCode.h'
+--- src/format/ByteCode.h	2015-10-09 09:23:22 +0000
++++ src/format/ByteCode.h	2015-12-13 19:04:11 +0000
+@@ -201,40 +201,48 @@
+ 
+     LFT_ICAP_REP_HEADER,
+     LFT_ICAP_REP_HEADER_ELEM,
+     LFT_ICAP_REP_ALL_HEADERS,
+ 
+     LFT_ICAP_TR_RESPONSE_TIME,
+     LFT_ICAP_IO_TIME,
+     LFT_ICAP_OUTCOME,
+     LFT_ICAP_STATUS_CODE,
+ #endif
+     LFT_CREDENTIALS,
+ 
+ #if USE_OPENSSL
+     LFT_SSL_BUMP_MODE,
+     LFT_SSL_USER_CERT_SUBJECT,
+     LFT_SSL_USER_CERT_ISSUER,
+     LFT_SSL_CLIENT_SNI,
+     LFT_SSL_SERVER_CERT_SUBJECT,
+     LFT_SSL_SERVER_CERT_ISSUER,
+     LFT_SSL_SERVER_CERT_ERRORS,
++    LFT_TLS_CLIENT_NEGOTIATED_VERSION,
++    LFT_TLS_SERVER_NEGOTIATED_VERSION,
++    LFT_TLS_CLIENT_NEGOTIATED_CIPHER,
++    LFT_TLS_SERVER_NEGOTIATED_CIPHER,
++    LFT_TLS_CLIENT_RECEIVED_HELLO_VERSION,
++    LFT_TLS_SERVER_RECEIVED_HELLO_VERSION,
++    LFT_TLS_CLIENT_SUPPORTED_VERSION,
++    LFT_TLS_SERVER_SUPPORTED_VERSION,
+ #endif
+ 
+     LFT_NOTE,
+     LFT_PERCENT,            /* special string cases for escaped chars */
+ 
+     // TODO assign better bytecode names and Token strings for these
+ #if USE_OPENSSL
+     LFT_EXT_ACL_USER_CERT_RAW,
+     LFT_EXT_ACL_USER_CERTCHAIN_RAW,
+     LFT_EXT_ACL_USER_CERT,
+     LFT_EXT_ACL_USER_CA_CERT,
+ #endif
+     LFT_EXT_ACL_CLIENT_EUI48,
+     LFT_EXT_ACL_CLIENT_EUI64,
+     LFT_EXT_ACL_NAME,
+     LFT_EXT_ACL_DATA
+ 
+ } ByteCode_t;
+ 
+ /// Quoting style for a format output.
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2015-10-11 18:12:00 +0000
++++ src/format/Format.cc	2015-12-13 19:05:27 +0000
+@@ -7,40 +7,41 @@
+  */
+ 
+ #include "squid.h"
+ #include "AccessLogEntry.h"
+ #include "client_side.h"
+ #include "comm/Connection.h"
+ #include "err_detail_type.h"
+ #include "errorpage.h"
+ #include "fde.h"
+ #include "format/Format.h"
+ #include "format/Quoting.h"
+ #include "format/Token.h"
+ #include "fqdncache.h"
+ #include "HttpRequest.h"
+ #include "MemBuf.h"
+ #include "rfc1738.h"
+ #include "SquidTime.h"
+ #include "Store.h"
+ #include "tools.h"
+ #include "URL.h"
++#include "security/NegotiationHistory.h"
+ #if USE_OPENSSL
+ #include "ssl/ErrorDetail.h"
+ #include "ssl/ServerBump.h"
+ #endif
+ 
+ /// Convert a string to NULL pointer if it is ""
+ #define strOrNull(s) ((s)==NULL||(s)[0]=='\0'?NULL:(s))
+ 
+ Format::Format::Format(const char *n) :
+     format(NULL),
+     next(NULL)
+ {
+     name = xstrdup(n);
+ }
+ 
+ Format::Format::~Format()
+ {
+     // erase the list without consuming stack space
+     while (next) {
+         // unlink the next entry for deletion
+@@ -1242,40 +1243,80 @@
+                 if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
+                     const char *separator = fmt->data.string ? fmt->data.string : ":";
+                     for (Ssl::CertErrors *sslError = srvBump->sslErrors; sslError != NULL;  sslError = sslError->next) {
+                         if (sb.size())
+                             sb.append(separator);
+                         if (const char *errorName = Ssl::GetErrorName(sslError->element.code))
+                             sb.append(errorName);
+                         else
+                             sb.append(sslErrorName(sslError->element.code, tmp, sizeof(tmp)));
+                     }
+                     if (sb.size())
+                         out = sb.termedBuf();
+                 }
+             }
+             break;
+ 
+         case LFT_SSL_SERVER_CERT_ISSUER:
+         case LFT_SSL_SERVER_CERT_SUBJECT:
+             // Not implemented
+             break;
++
++        case LFT_TLS_CLIENT_NEGOTIATED_VERSION:
++            if (al->tcpClient != nullptr && al->tcpClient->hasTlsNegotiations())
++                out = al->tcpClient->hasTlsNegotiations()->negotiatedVersion();
++            break;
++
++        case LFT_TLS_SERVER_NEGOTIATED_VERSION:
++            if (al->hier.tcpServer != nullptr && al->hier.tcpServer->hasTlsNegotiations())
++                out = al->hier.tcpServer->hasTlsNegotiations()->negotiatedVersion();
++            break;
++
++        case LFT_TLS_CLIENT_RECEIVED_HELLO_VERSION:
++            if (al->tcpClient != nullptr && al->tcpClient->hasTlsNegotiations())
++                out = al->tcpClient->hasTlsNegotiations()->helloVersion();
++            break;
++
++        case LFT_TLS_SERVER_RECEIVED_HELLO_VERSION:
++            if (al->hier.tcpServer != nullptr && al->hier.tcpServer->hasTlsNegotiations())
++                out = al->hier.tcpServer->hasTlsNegotiations()->helloVersion();
++            break;
++
++        case LFT_TLS_CLIENT_SUPPORTED_VERSION:
++            if (al->tcpClient != nullptr && al->tcpClient->hasTlsNegotiations())
++                out = al->tcpClient->hasTlsNegotiations()->supportedVersion();
++            break;
++
++        case LFT_TLS_SERVER_SUPPORTED_VERSION:
++            if (al->hier.tcpServer != nullptr && al->hier.tcpServer->hasTlsNegotiations())
++                out = al->hier.tcpServer->hasTlsNegotiations()->supportedVersion();
++            break;
++
++        case LFT_TLS_CLIENT_NEGOTIATED_CIPHER:
++            if (al->tcpClient != nullptr && al->tcpClient->hasTlsNegotiations())
++                out = al->tcpClient->hasTlsNegotiations()->cipherName();
++            break;
++
++        case LFT_TLS_SERVER_NEGOTIATED_CIPHER:
++            if (al->hier.tcpServer != nullptr && al->hier.tcpServer->hasTlsNegotiations())
++                out = al->hier.tcpServer->hasTlsNegotiations()->cipherName();
++            break;
+ #endif
+ 
+         case LFT_REQUEST_URLGROUP_OLD_2X:
+             assert(LFT_REQUEST_URLGROUP_OLD_2X == 0); // should never happen.
+ 
+         case LFT_NOTE:
+             tmp[0] = fmt->data.header.separator;
+             tmp[1] = '\0';
+             if (fmt->data.header.header && *fmt->data.header.header) {
+                 const char *separator = tmp;
+ #if USE_ADAPTATION
+                 Adaptation::History::Pointer ah = al->request ? al->request->adaptHistory() : Adaptation::History::Pointer();
+                 if (ah != NULL && ah->metaHeaders != NULL) {
+                     if (const char *meta = ah->metaHeaders->find(fmt->data.header.header, separator))
+                         sb.append(meta);
+                 }
+ #endif
+                 if (al->notes != NULL) {
+                     if (const char *note = al->notes->find(fmt->data.header.header, separator)) {
+                         if (sb.size())
+
+=== modified file 'src/format/Token.cc'
+--- src/format/Token.cc	2015-10-09 09:23:22 +0000
++++ src/format/Token.cc	2015-12-13 19:21:32 +0000
+@@ -202,40 +202,48 @@
+ 
+     TokenTableEntry("tr",  LFT_ICAP_TR_RESPONSE_TIME),
+     TokenTableEntry("tio", LFT_ICAP_IO_TIME),
+     TokenTableEntry("to",  LFT_ICAP_OUTCOME),
+     TokenTableEntry("Hs",  LFT_ICAP_STATUS_CODE),
+ 
+     TokenTableEntry(NULL, LFT_NONE)           /* this must be last */
+ };
+ #endif
+ 
+ #if USE_OPENSSL
+ // SSL (ssl::) tokens
+ static TokenTableEntry TokenTableSsl[] = {
+     TokenTableEntry("bump_mode", LFT_SSL_BUMP_MODE),
+     TokenTableEntry(">cert_subject", LFT_SSL_USER_CERT_SUBJECT),
+     TokenTableEntry(">cert_issuer", LFT_SSL_USER_CERT_ISSUER),
+     TokenTableEntry(">sni", LFT_SSL_CLIENT_SNI),
+     /*TokenTableEntry("<cert_subject", LFT_SSL_SERVER_CERT_SUBJECT), */
+     /*TokenTableEntry("<cert_issuer", LFT_SSL_SERVER_CERT_ISSUER), */
+     TokenTableEntry("<cert_errors", LFT_SSL_SERVER_CERT_ERRORS),
++    TokenTableEntry(">negotiated_version", LFT_TLS_CLIENT_NEGOTIATED_VERSION),
++    TokenTableEntry("<negotiated_version", LFT_TLS_SERVER_NEGOTIATED_VERSION),
++    TokenTableEntry(">negotiated_cipher", LFT_TLS_CLIENT_NEGOTIATED_CIPHER),
++    TokenTableEntry("<negotiated_cipher", LFT_TLS_SERVER_NEGOTIATED_CIPHER),
++    TokenTableEntry(">received_hello_version", LFT_TLS_CLIENT_RECEIVED_HELLO_VERSION),
++    TokenTableEntry("<received_hello_version", LFT_TLS_SERVER_RECEIVED_HELLO_VERSION),
++    TokenTableEntry(">received_supported_version", LFT_TLS_CLIENT_SUPPORTED_VERSION),
++    TokenTableEntry("<received_supported_version", LFT_TLS_SERVER_SUPPORTED_VERSION),
+     TokenTableEntry(NULL, LFT_NONE)
+ };
+ #endif
+ } // namespace Format
+ 
+ /// Register all components custom format tokens
+ void
+ Format::Token::Init()
+ {
+     // TODO standard log tokens
+ 
+ #if USE_ADAPTATION
+     TheConfig.registerTokens(String("adapt"),::Format::TokenTableAdapt);
+ #endif
+ #if ICAP_CLIENT
+     TheConfig.registerTokens(String("icap"),::Format::TokenTableIcap);
+ #endif
+ #if USE_OPENSSL
+     TheConfig.registerTokens(String("ssl"),::Format::TokenTableSsl);
+ #endif
+@@ -582,40 +590,48 @@
+         debugs(46, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: The \"oa\" formatting code is deprecated. Use the \"<la\" instead.");
+         type = LFT_SERVER_LOCAL_IP;
+         break;
+ 
+     case LFT_REQUEST_URLPATH_OLD_31:
+         debugs(46, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: The \"rp\" formatting code is deprecated. Use the \">rp\" instead.");
+         type = LFT_CLIENT_REQ_URLPATH;
+         break;
+ 
+     case LFT_REQUEST_VERSION_OLD_2X:
+         debugs(46, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: The \">v\" formatting code is deprecated. Use the \">rv\" instead.");
+         type = LFT_REQUEST_VERSION;
+         break;
+ 
+ #if !USE_SQUID_EUI
+     case LFT_CLIENT_EUI:
+         debugs(46, DBG_CRITICAL, "WARNING: The \">eui\" formatting code requires EUI features which are disabled in this Squid.");
+         break;
+ #endif
+ 
++#if USE_OPENSSL
++    case LFT_TLS_SERVER_NEGOTIATED_VERSION:
++    case LFT_TLS_SERVER_RECEIVED_HELLO_VERSION:
++    case LFT_TLS_SERVER_SUPPORTED_VERSION:
++        Config.onoff.logTlsServerHelloDetails = true;
++        break;
++#endif
++
+     case LFT_REQUEST_URLGROUP_OLD_2X:
+         debugs(46, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: The \"rG\" formatting code is deprecated. Use \"note{urlgroup}\" instead.");
+         type = LFT_NOTE;
+         data.header.header = xstrdup("urlgroup");
+         break;
+ 
+     default:
+         break;
+     }
+ 
+     return (cur - def);
+ }
+ 
+ Format::Token::Token() : type(LFT_NONE),
+     label(NULL),
+     widthMin(-1),
+     widthMax(-1),
+     quote(LOG_QUOTE_NONE),
+     left(false),
+     space(false),
+
+=== modified file 'src/security/Makefile.am'
+--- src/security/Makefile.am	2015-12-08 01:48:40 +0000
++++ src/security/Makefile.am	2015-12-13 18:17:10 +0000
+@@ -1,24 +1,26 @@
+ ## Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+ ##
+ ## Squid software is distributed under GPLv2+ license and includes
+ ## contributions from numerous individuals and organizations.
+ ## Please see the COPYING and CONTRIBUTORS files for details.
+ ##
+ 
+ include $(top_srcdir)/src/Common.am
+ include $(top_srcdir)/src/TestHeaders.am
+ 
+ noinst_LTLIBRARIES = libsecurity.la
+ 
+ libsecurity_la_SOURCES= \
+ 	Context.h \
+ 	EncryptorAnswer.cc \
+ 	EncryptorAnswer.h \
+ 	forward.h \
+ 	KeyData.h \
+ 	LockingPointer.h \
++	NegotiationHistory.cc \
++	NegotiationHistory.h \
+ 	PeerOptions.cc \
+ 	PeerOptions.h \
+ 	ServerOptions.cc \
+ 	ServerOptions.h \
+ 	Session.h
+
+=== added file 'src/security/NegotiationHistory.cc'
+--- src/security/NegotiationHistory.cc	1970-01-01 00:00:00 +0000
++++ src/security/NegotiationHistory.cc	2015-12-13 18:45:39 +0000
+@@ -0,0 +1,73 @@
++#include "squid.h"
++#include "MemBuf.h"
++#include "security/NegotiationHistory.h"
++#include "SquidConfig.h"
++#include "ssl/bio.h"
++#include "ssl/support.h"
++
++const char *
++Security::NegotiationHistory::printTlsVersion(int v) const
++{
++#if USE_OPENSSL
++    switch(v) {
++#if OPENSSL_VERSION_NUMBER >= 0x10001000L
++    case TLS1_2_VERSION:
++        return "TLS/1.2";
++    case TLS1_1_VERSION:
++        return "TLS/1.1";
++#endif
++    case TLS1_VERSION:
++        return "TLS/1.0";
++    case SSL3_VERSION:
++        return "SSL/3.0";
++    case SSL2_VERSION:
++        return "SSL/2.0";
++    default:
++        return nullptr;
++    }
++#else
++    return nullptr;
++#endif
++}
++
++#if USE_OPENSSL
++void
++Security::NegotiationHistory::fillWith(SSL *ssl)
++{
++    if ((cipher = SSL_get_current_cipher(ssl)) != NULL) {
++        // Set the negotiated version only if the cipher negotiated
++        // else probably the negotiation is not completed and version
++        // is not the final negotiated version
++        version_ = ssl->version;
++    }
++
++    BIO *b = SSL_get_rbio(ssl);
++    Ssl::Bio *bio = static_cast<Ssl::Bio *>(b->ptr);
++
++    if (::Config.onoff.logTlsServerHelloDetails) {
++        if (Ssl::ServerBio *srvBio = dynamic_cast<Ssl::ServerBio *>(bio))
++            srvBio->extractHelloFeatures();
++    }
++
++    const Ssl::Bio::sslFeatures &features = bio->receivedHelloFeatures();
++    helloVersion_ = features.sslHelloVersion;
++    supportedVersion_ = features.sslVersion;
++
++    debugs(83, 5, "SSL connection info on FD " << bio->fd() <<
++           " SSL version " << version_ <<
++           " negotiated cipher " << cipherName());
++}
++#endif
++
++const char *
++Security::NegotiationHistory::cipherName() const
++{
++#if USE_OPENSSL
++    if (!cipher)
++        return nullptr;
++
++    return SSL_CIPHER_get_name(cipher);
++#else
++    return nullptr;
++#endif
++}
+
+=== added file 'src/security/NegotiationHistory.h'
+--- src/security/NegotiationHistory.h	1970-01-01 00:00:00 +0000
++++ src/security/NegotiationHistory.h	2015-12-13 18:38:21 +0000
+@@ -0,0 +1,40 @@
++#ifndef SQUID_SRC_SECURITY_NEGOTIATION_HISTORY_H
++#define SQUID_SRC_SECURITY_NEGOTIATION_HISTORY_H
++
++#if USE_OPENSSL
++#if HAVE_OPENSSL_SSL_H
++#include <openssl/ssl.h>
++#endif
++#endif
++
++namespace Security {
++class NegotiationHistory
++{
++public:
++    NegotiationHistory(): helloVersion_(-1), supportedVersion_(-1), version_(-1), cipher(NULL) {}
++#if USE_OPENSSL
++    void fillWith(SSL *); ///< Extract negotiation information from TLS object
++#endif
++    const char *cipherName() const; ///< The name of negotiated cipher
++    /// String representation of TLS negotiated version
++    const char *negotiatedVersion() const {return printTlsVersion(version_);}
++    /// String representation of the received TLS hello message version.
++    const char *helloVersion() const {return printTlsVersion(helloVersion_);}
++    /// String representation of the maximum supported TLS version
++    /// by remote peer
++    const char *supportedVersion() const {return printTlsVersion(supportedVersion_);}
++private:
++    /// String representation of the TLS version 'v'
++    const char *printTlsVersion(int v) const;
++    int helloVersion_; ///< The TLL version of the hello message
++    int supportedVersion_; ///< The maximum supported TLS version
++    int version_; ///< The negotiated TLL version
++#if USE_OPENSSL
++    const SSL_CIPHER *cipher; ///< The negotiated cipher
++#endif
++};
++
++} // namespace Security
++
++#endif /* SQUID_SRC_SECURITY_NEGOTIATION_HISTORY_H */
++
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2015-12-07 09:53:57 +0000
++++ src/ssl/PeerConnector.cc	2015-12-13 19:34:44 +0000
+@@ -3,40 +3,41 @@
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 17    Request Forwarding */
+ 
+ #include "squid.h"
+ #include "acl/FilledChecklist.h"
+ #include "base/AsyncCbdataCalls.h"
+ #include "CachePeer.h"
+ #include "client_side.h"
+ #include "comm/Loops.h"
+ #include "errorpage.h"
+ #include "fde.h"
+ #include "globals.h"
+ #include "helper/ResultCode.h"
+ #include "HttpRequest.h"
+ #include "neighbors.h"
++#include "security/NegotiationHistory.h"
+ #include "SquidConfig.h"
+ #include "ssl/bio.h"
+ #include "ssl/cert_validate_message.h"
+ #include "ssl/Config.h"
+ #include "ssl/ErrorDetail.h"
+ #include "ssl/helper.h"
+ #include "ssl/PeerConnector.h"
+ #include "ssl/ServerBump.h"
+ #include "ssl/support.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeerConnector);
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, BlindPeerConnector);
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeekingPeerConnector);
+ 
+ Ssl::PeerConnector::PeerConnector(const Comm::ConnectionPointer &aServerConn, AsyncCall::Pointer &aCallback, const time_t timeout) :
+     AsyncJob("Ssl::PeerConnector"),
+     serverConn(aServerConn),
+     certErrors(NULL),
+     callback(aCallback),
+     negotiationTimeout(timeout),
+@@ -663,61 +664,61 @@
+ {
+     SSL *ssl = Ssl::PeerConnector::initializeSsl();
+     if (!ssl)
+         return NULL;
+ 
+     if (ConnStateData *csd = request->clientConnectionManager.valid()) {
+ 
+         // client connection is required in the case we need to splice
+         // or terminate client and server connections
+         assert(clientConn != NULL);
+         SBuf *hostName = NULL;
+         Ssl::ClientBio *cltBio = NULL;
+ 
+         //Enable Status_request tls extension, required to bump some clients
+         SSL_set_tlsext_status_type(ssl, TLSEXT_STATUSTYPE_ocsp);
+ 
+         // In server-first bumping mode, clientSsl is NULL.
+         if (SSL *clientSsl = fd_table[clientConn->fd].ssl) {
+             BIO *b = SSL_get_rbio(clientSsl);
+             cltBio = static_cast<Ssl::ClientBio *>(b->ptr);
+-            const Ssl::Bio::sslFeatures &features = cltBio->getFeatures();
++            const Ssl::Bio::sslFeatures &features = cltBio->receivedHelloFeatures();
+             if (!features.serverName.isEmpty())
+                 hostName = new SBuf(features.serverName);
+         }
+ 
+         if (!hostName) {
+             // While we are peeking at the certificate, we may not know the server
+             // name that the client will request (after interception or CONNECT)
+             // unless it was the CONNECT request with a user-typed address.
+             const bool isConnectRequest = !csd->port->flags.isIntercepted();
+             if (!request->flags.sslPeek || isConnectRequest)
+                 hostName = new SBuf(request->url.host());
+         }
+ 
+         if (hostName)
+             SSL_set_ex_data(ssl, ssl_ex_index_server, (void*)hostName);
+ 
+         Must(!csd->serverBump() || csd->serverBump()->step <= Ssl::bumpStep2);
+         if (csd->sslBumpMode == Ssl::bumpPeek || csd->sslBumpMode == Ssl::bumpStare) {
+             assert(cltBio);
+-            const Ssl::Bio::sslFeatures &features = cltBio->getFeatures();
++            const Ssl::Bio::sslFeatures &features = cltBio->receivedHelloFeatures();
+             if (features.sslVersion != -1) {
+                 features.applyToSSL(ssl, csd->sslBumpMode);
+                 // Should we allow it for all protocols?
+                 if (features.sslVersion >= 3) {
+                     BIO *b = SSL_get_rbio(ssl);
+                     Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
+                     // Inherite client features, like SSL version, SNI and other
+                     srvBio->setClientFeatures(features);
+                     srvBio->recordInput(true);
+                     srvBio->mode(csd->sslBumpMode);
+                 }
+             }
+         } else {
+             // Set client SSL options
+             SSL_set_options(ssl, ::Security::ProxyOutgoingConfig.parsedOptions);
+ 
+             // Use SNI TLS extension only when we connect directly
+             // to the origin server and we know the server host name.
+             const char *sniServer = NULL;
+             const bool redirected = request->flags.redirected && ::Config.onoff.redir_rewrites_host;
+@@ -768,44 +769,50 @@
+                 handleServerCertificate();
+             }
+         }
+ 
+         if (error) {
+             // For intercepted connections, set the host name to the server
+             // certificate CN. Otherwise, we just hope that CONNECT is using
+             // a user-entered address (a host name or a user-entered IP).
+             const bool isConnectRequest = !request->clientConnectionManager->port->flags.isIntercepted();
+             if (request->flags.sslPeek && !isConnectRequest) {
+                 if (X509 *srvX509 = serverBump->serverCert.get()) {
+                     if (const char *name = Ssl::CommonHostName(srvX509)) {
+                         request->url.host(name);
+                         debugs(83, 3, "reset request host: " << name);
+                     }
+                 }
+             }
+         }
+     }
+ 
++    // retrieve TLS server information if any
++    serverConnection()->tlsNegotiations()->fillWith(ssl);
+     if (!error) {
+         serverCertificateVerified();
+-        if (splice)
++        if (splice) {
++            //retrieved received TLS client informations
++            SSL *clientSsl = fd_table[clientConn->fd].ssl;
++            clientConn->tlsNegotiations()->fillWith(clientSsl);
+             switchToTunnel(request.getRaw(), clientConn, serverConn);
++        }
+     }
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::noteWantWrite()
+ {
+     const int fd = serverConnection()->fd;
+     SSL *ssl = fd_table[fd].ssl;
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
+ 
+     if ((srvBio->bumpMode() == Ssl::bumpPeek || srvBio->bumpMode() == Ssl::bumpStare) && srvBio->holdWrite()) {
+         debugs(81, DBG_IMPORTANT, "hold write on SSL connection on FD " << fd);
+         checkForPeekAndSplice();
+         return;
+     }
+ 
+     Ssl::PeerConnector::noteWantWrite();
+ }
+ 
+
+=== modified file 'src/ssl/bio.cc'
+--- src/ssl/bio.cc	2015-10-11 05:30:33 +0000
++++ src/ssl/bio.cc	2015-12-13 20:33:15 +0000
+@@ -208,63 +208,63 @@
+     static std::string buf;
+     buf.clear();
+     for (int i = 0; i < len; i++ ) {
+         char tmp[3];
+         snprintf(tmp, sizeof(tmp), "%.2x", bytes[i]);
+         buf.append(tmp);
+     }
+     return buf.c_str();
+ }
+ 
+ int
+ Ssl::ClientBio::read(char *buf, int size, BIO *table)
+ {
+     if (helloState < atHelloReceived) {
+         int bytes = readAndBuffer(buf, size, table, "TLS client Hello");
+         if (bytes <= 0)
+             return bytes;
+     }
+ 
+     if (helloState == atHelloNone) {
+-        helloSize = features.parseMsgHead(rbuf);
++        helloSize = receivedHelloFeatures_.parseMsgHead(rbuf);
+         if (helloSize == 0) {
+             // Not enough bytes to get hello message size
+             BIO_set_retry_read(table);
+             return -1;
+         } else if (helloSize < 0) {
+             wrongProtocol = true;
+             return -1;
+         }
+ 
+         helloState = atHelloStarted; //Next state
+     }
+ 
+     if (helloState == atHelloStarted) {
+         const unsigned char *head = (const unsigned char *)rbuf.content();
+         const char *s = objToString(head, rbuf.contentSize());
+         debugs(83, 7, "SSL Header: " << s);
+ 
+         if (helloSize > rbuf.contentSize()) {
+             BIO_set_retry_read(table);
+             return -1;
+         }
+-        features.get(rbuf);
++        receivedHelloFeatures_.get(rbuf);
+         helloState = atHelloReceived;
+     }
+ 
+     if (holdRead_) {
+         debugs(83, 7, "Hold flag is set, retry latter. (Hold " << size << "bytes)");
+         BIO_set_retry_read(table);
+         return -1;
+     }
+ 
+     if (helloState == atHelloReceived) {
+         if (rbuf.hasContent()) {
+             int bytes = (size <= rbuf.contentSize() ? size : rbuf.contentSize());
+             memcpy(buf, rbuf.content(), bytes);
+             rbuf.consume(bytes);
+             return bytes;
+         } else
+             return Ssl::Bio::read(buf, size, table);
+     }
+ 
+     return -1;
+@@ -485,53 +485,59 @@
+         }
+ 
+         // Sending hello message complete. Do not send more data for now...
+         holdWrite_ = true;
+ 
+         // spoof openSSL that we write what it ask us to write
+         return size;
+     } else
+         return Ssl::Bio::write(buf, size, table);
+ }
+ 
+ void
+ Ssl::ServerBio::flush(BIO *table)
+ {
+     if (!helloMsg.isEmpty()) {
+         int ret = Ssl::Bio::write(helloMsg.rawContent(), helloMsg.length(), table);
+         helloMsg.consume(ret);
+     }
+ }
+ 
++void 
++Ssl::ServerBio::extractHelloFeatures()
++{
++    if (!receivedHelloFeatures_.initialized_)
++        receivedHelloFeatures_.get(rbuf, false);
++}
++
+ bool
+ Ssl::ServerBio::resumingSession()
+ {
+-    if (!serverFeatures.initialized_)
+-        serverFeatures.get(rbuf, false);
++    extractHelloFeatures();
+ 
+-    if (!clientFeatures.sessionId.isEmpty() && !serverFeatures.sessionId.isEmpty())
+-        return clientFeatures.sessionId == serverFeatures.sessionId;
++    if (!clientFeatures.sessionId.isEmpty() && !receivedHelloFeatures_.sessionId.isEmpty())
++        return clientFeatures.sessionId == receivedHelloFeatures_.sessionId;
+ 
+     // is this a session resuming attempt using TLS tickets?
+     if (clientFeatures.hasTlsTicket &&
+-            serverFeatures.tlsTicketsExtension &&
+-            serverFeatures.hasCcsOrNst)
++            receivedHelloFeatures_.tlsTicketsExtension &&
++            receivedHelloFeatures_.hasCcsOrNst)
+         return true;
+ 
+     return false;
+ }
+ 
+ /// initializes BIO table after allocation
+ static int
+ squid_bio_create(BIO *bi)
+ {
+     bi->init = 0; // set when we store Bio object and socket fd (BIO_C_SET_FD)
+     bi->num = 0;
+     bi->ptr = NULL;
+     bi->flags = 0;
+     return 1;
+ }
+ 
+ /// cleans BIO table before deallocation
+ static int
+ squid_bio_destroy(BIO *table)
+ {
+@@ -622,41 +628,52 @@
+         case BIO_CTRL_WPENDING:
+     */
+     default:
+         return 0;
+ 
+     }
+ 
+     return 0; /* NOTREACHED */
+ }
+ 
+ /// wrapper for Bio::stateChanged()
+ static void
+ squid_ssl_info(const SSL *ssl, int where, int ret)
+ {
+     if (BIO *table = SSL_get_rbio(ssl)) {
+         if (Ssl::Bio *bio = static_cast<Ssl::Bio*>(table->ptr))
+             bio->stateChanged(ssl, where, ret);
+     }
+ }
+ 
+-Ssl::Bio::sslFeatures::sslFeatures(): sslVersion(-1), compressMethod(-1), helloMsgSize(0), unknownCiphers(false), doHeartBeats(true), tlsTicketsExtension(false), hasTlsTicket(false), tlsStatusRequest(false), hasCcsOrNst(false), initialized_(false)
++Ssl::Bio::sslFeatures::sslFeatures():
++    sslHelloVersion(-1),
++    sslVersion(-1),
++    compressMethod(-1),
++    helloMsgSize(0),
++    unknownCiphers(false),
++    doHeartBeats(true),
++    tlsTicketsExtension(false),
++    hasTlsTicket(false),
++    tlsStatusRequest(false),
++    hasCcsOrNst(false),
++    initialized_(false)
+ {
+     memset(client_random, 0, SSL3_RANDOM_SIZE);
+ }
+ 
+ int Ssl::Bio::sslFeatures::toSquidSSLVersion() const
+ {
+     if (sslVersion == SSL2_VERSION)
+         return 2;
+     else if (sslVersion == SSL3_VERSION)
+         return 3;
+     else if (sslVersion == TLS1_VERSION)
+         return 4;
+ #if OPENSSL_VERSION_NUMBER >= 0x10001000L
+     else if (sslVersion == TLS1_1_VERSION)
+         return 5;
+     else if (sslVersion == TLS1_2_VERSION)
+         return 6;
+ #endif
+     else
+         return 1;
+@@ -753,49 +770,49 @@
+ }
+ 
+ int
+ Ssl::Bio::sslFeatures::parseMsgHead(const MemBuf &buf)
+ {
+     const unsigned char *head = (const unsigned char *)buf.content();
+     const char *s = objToString(head, buf.contentSize());
+     debugs(83, 7, "SSL Header: " << s);
+     if (buf.contentSize() < 5)
+         return 0;
+ 
+     if (helloMsgSize > 0)
+         return helloMsgSize;
+ 
+     // Check for SSLPlaintext/TLSPlaintext record
+     // RFC6101 section 5.2.1
+     // RFC5246 section 6.2.1
+     if (head[0] == 0x16) {
+         debugs(83, 7, "SSL version 3 handshake message");
+         // The SSL version exist in the 2nd and 3rd bytes
+-        sslVersion = (head[1] << 8) | head[2];
++        sslHelloVersion = (head[1] << 8) | head[2];
+         debugs(83, 7, "SSL Version :" << std::hex << std::setw(8) << std::setfill('0') << sslVersion);
+         // The hello message size exist in 4th and 5th bytes
+         helloMsgSize = (head[3] << 8) + head[4];
+         debugs(83, 7, "SSL Header Size: " << helloMsgSize);
+         helloMsgSize +=5;
+     } else if ((head[0] & 0x80) && head[2] == 0x01 && head[3] == 0x03) {
+         debugs(83, 7, "SSL version 2 handshake message with v3 support");
+-        sslVersion = (head[3] << 8) | head[4];
++        sslHelloVersion = 0x0002;
+         debugs(83, 7, "SSL Version :" << std::hex << std::setw(8) << std::setfill('0') << sslVersion);
+         // The hello message size exist in 2nd byte
+         helloMsgSize = head[1];
+         helloMsgSize +=2;
+     } else {
+         debugs(83, 7, "Not an SSL acceptable handshake message (SSLv2 message?)");
+         return (helloMsgSize = -1);
+     }
+ 
+     // Set object as initialized. Even if we did not full parsing yet
+     // The basic features, like the SSL version is set
+     initialized_ = true;
+     return helloMsgSize;
+ }
+ 
+ bool
+ Ssl::Bio::sslFeatures::checkForCcsOrNst(const unsigned char *msg, size_t size)
+ {
+     while (size > 5) {
+         const int msgType = msg[0];
+@@ -1082,40 +1099,44 @@
+             } else if (extType == 0x10) {
+                 // Application-Layer Protocol Negotiation Extension, RFC7301
+                 const size_t listLen = (ext[0] << 8) | ext[1];
+                 if (listLen < extLen)
+                     tlsAppLayerProtoNeg.assign(reinterpret_cast<const char *>(ext+5), listLen);
+             } else
+                 extensions.push_back(extType);
+ 
+             ext += extLen;
+         }
+     }
+     return true;
+ }
+ 
+ bool
+ Ssl::Bio::sslFeatures::parseV23Hello(const unsigned char *hello, size_t size)
+ {
+     debugs(83, 7, "Get fake features from v23 ClientHello message.");
+     if (size < 7)
+         return false;
++
++    // Get the SSL/TLS version supported by client
++    sslVersion = (hello[3] << 8) | hello[4];
++
+     //Ciphers list. It is stored after the Session ID.
+     const unsigned int ciphersLen = (hello[5] << 8) | hello[6];
+     const unsigned char *ciphers = hello + 11;
+ 
+     if (size < ciphersLen + 11)
+         return false;
+ 
+     if (ciphersLen) {
+ #if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+         const SSL_METHOD *method = TLS_method();
+ #else
+         const SSL_METHOD *method = SSLv23_method();
+ #endif
+         for (unsigned int i = 0; i < ciphersLen; i += 3) {
+             // The v2 hello messages cipher has 3 bytes.
+             // The v2 cipher has the first byte not null
+             // Because we are going to sent only v3 message we
+             // are ignoring these ciphers
+             if (ciphers[i] != 0)
+                 continue;
+
+=== modified file 'src/ssl/bio.h'
+--- src/ssl/bio.h	2015-05-20 11:00:11 +0000
++++ src/ssl/bio.h	2015-12-13 19:18:45 +0000
+@@ -44,40 +44,41 @@
+         bool parseV3Hello(const unsigned char *hello, size_t helloSize);
+         /// Parses a v23 ClientHello message
+         bool parseV23Hello(const unsigned char *hello, size_t helloSize);
+         /// Parses a v3 ServerHello message.
+         bool parseV3ServerHello(const unsigned char *hello, size_t helloSize);
+         /// Prints to os stream a human readable form of sslFeatures object
+         std::ostream & print(std::ostream &os) const;
+         /// Converts to the internal squid SSL version form the sslVersion
+         int toSquidSSLVersion() const;
+         /// Configure the SSL object with the SSL features of the sslFeatures object
+         void applyToSSL(SSL *ssl, Ssl::BumpMode bumpMode) const;
+         /// Parses an SSL Message header. It returns the ssl Message size.
+         /// \retval >0 if the hello size is retrieved
+         /// \retval 0 if the contents of the buffer are not enough
+         /// \retval <0 if the contents of buf are not SSLv3 or TLS hello message
+         int parseMsgHead(const MemBuf &);
+         /// Parses msg buffer and return true if one of the Change Cipher Spec
+         /// or New Session Ticket messages found
+         bool checkForCcsOrNst(const unsigned char *msg, size_t size);
+     public:
++        int sslHelloVersion; ///< The SSL hello message version
+         int sslVersion; ///< The requested/used SSL version
+         int compressMethod; ///< The requested/used compressed  method
+         int helloMsgSize; ///< the hello message size
+         mutable SBuf serverName; ///< The SNI hostname, if any
+         std::string clientRequestedCiphers; ///< The client requested ciphers
+         bool unknownCiphers; ///< True if one or more ciphers are unknown
+         std::string ecPointFormatList;///< tlsExtension ecPointFormatList
+         std::string ellipticCurves; ///< tlsExtension ellipticCurveList
+         std::string opaquePrf; ///< tlsExtension opaquePrf
+         bool doHeartBeats;
+         bool tlsTicketsExtension; ///< whether TLS tickets extension is enabled
+         bool hasTlsTicket; ///< whether a TLS ticket is included
+         bool tlsStatusRequest; ///< whether the TLS status request extension is set
+         SBuf tlsAppLayerProtoNeg; ///< The value of the TLS application layer protocol extension if it is enabled
+         /// whether Change Cipher Spec message included in ServerHello
+         /// handshake message
+         bool hasCcsOrNst;
+         /// The client random number
+         unsigned char client_random[SSL3_RANDOM_SIZE];
+         SBuf sessionId;
+@@ -99,79 +100,80 @@
+     virtual void flush(BIO *table) {}
+ 
+     int fd() const { return fd_; } ///< The SSL socket descriptor
+ 
+     /// Called by linked SSL connection whenever state changes, an alert
+     /// appears, or an error occurs. See SSL_set_info_callback().
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+ 
+     /// Creates a low-level BIO table, creates a high-level Ssl::Bio object
+     /// for a given socket, and then links the two together via BIO_C_SET_FD.
+     static BIO *Create(const int fd, Type type);
+     /// Tells ssl connection to use BIO and monitor state via stateChanged()
+     static void Link(SSL *ssl, BIO *bio);
+ 
+     /// Prepare the rbuf buffer to accept hello data
+     void prepReadBuf();
+ 
+     /// Reads data from socket and record them to a buffer
+     int readAndBuffer(char *buf, int size, BIO *table, const char *description);
+ 
++    /// Return the TLS features requested by TLS client
++    const Bio::sslFeatures &receivedHelloFeatures() const {return receivedHelloFeatures_;}
++
+     const MemBuf &rBufData() {return rbuf;}
+ protected:
+     const int fd_; ///< the SSL socket we are reading and writing
+     MemBuf rbuf;  ///< Used to buffer input data.
++    /// The features retrieved from client or Server TLS hello message
++    Bio::sslFeatures receivedHelloFeatures_;
+ };
+ 
+ /// BIO node to handle socket IO for squid client side
+ /// If bumping is enabled  this Bio detects and analyses client hello message
+ /// to retrieve the SSL features supported by the client
+ class ClientBio: public Bio
+ {
+ public:
+     /// The ssl hello message read states
+     typedef enum {atHelloNone = 0, atHelloStarted, atHelloReceived} HelloReadState;
+     explicit ClientBio(const int anFd): Bio(anFd), holdRead_(false), holdWrite_(false), helloState(atHelloNone), helloSize(0), wrongProtocol(false) {}
+ 
+     /// The ClientBio version of the Ssl::Bio::stateChanged method
+     /// When the client hello message retrieved, fill the
+     /// "features" member with the client provided informations.
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+     /// The ClientBio version of the Ssl::Bio::write method
+     virtual int write(const char *buf, int size, BIO *table);
+     /// The ClientBio version of the Ssl::Bio::read method
+     /// If the holdRead flag is true then it does not write any data
+     /// to socket and sets the "read retry" flag of the BIO to true
+     virtual int read(char *buf, int size, BIO *table);
+     /// Return true if the client hello message received and analized
+     bool gotHello() { return (helloState == atHelloReceived); }
+-    /// Return the SSL features requested by SSL client
+-    const Bio::sslFeatures &getFeatures() const {return features;}
+     /// Prevents or allow writting on socket.
+     void hold(bool h) {holdRead_ = holdWrite_ = h;}
+     /// True if client does not looks like an SSL client
+     bool noSslClient() {return wrongProtocol;}
+ private:
+     /// True if the SSL state corresponds to a hello message
+     bool isClientHello(int state);
+-    /// The futures retrieved from client SSL hello message
+-    Bio::sslFeatures features;
+     bool holdRead_; ///< The read hold state of the bio.
+     bool holdWrite_;  ///< The write hold state of the bio.
+     HelloReadState helloState; ///< The SSL hello read state
+     int helloSize; ///< The SSL hello message sent by client size
+     bool wrongProtocol; ///< true if client SSL hello parsing failed
+ };
+ 
+ /// BIO node to handle socket IO for squid server side
+ /// If bumping is enabled, analyses the SSL hello message sent by squid OpenSSL
+ /// subsystem (step3 bumping step) against bumping mode:
+ ///   * Peek mode:  Send client hello message instead of the openSSL generated
+ ///                 hello message and normaly denies bumping and allow only
+ ///                 splice or terminate the SSL connection
+ ///   * Stare mode: Sends the openSSL generated hello message and normaly
+ ///                 denies splicing and allow bump or terminate the SSL
+ ///                 connection
+ ///  If SQUID_USE_OPENSSL_HELLO_OVERWRITE_HACK is enabled also checks if the
+ ///  openSSL library features are compatible with the features reported in
+ ///  web client SSL hello message and if it is, overwrites the openSSL SSL
+ ///  object members to replace hello message with web client hello message.
+@@ -180,57 +182,60 @@
+ class ServerBio: public Bio
+ {
+ public:
+     explicit ServerBio(const int anFd): Bio(anFd), helloMsgSize(0), helloBuild(false), allowSplice(false), allowBump(false), holdWrite_(false), record_(false), bumpMode_(bumpNone) {}
+     /// The ServerBio version of the Ssl::Bio::stateChanged method
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+     /// The ServerBio version of the Ssl::Bio::write method
+     /// If a clientRandom number is set then rewrites the raw hello message
+     /// "client random" field with the provided random number.
+     /// It may buffer the output packets.
+     virtual int write(const char *buf, int size, BIO *table);
+     /// The ServerBio version of the Ssl::Bio::read method
+     /// If the record flag is set then append the data to the rbuf member
+     virtual int read(char *buf, int size, BIO *table);
+     /// The ServerBio version of the Ssl::Bio::flush method.
+     /// Flushes any buffered data
+     virtual void flush(BIO *table);
+     /// Sets the random number to use in client SSL HELLO message
+     void setClientFeatures(const sslFeatures &features);
+ 
++    /// Parses server Hello message if it is recorded and extracts
++    /// server-supported features.
++    void extractHelloFeatures();
++
+     bool resumingSession();
+     /// The write hold state
+     bool holdWrite() const {return holdWrite_;}
+     /// Enables or disables the write hold state
+     void holdWrite(bool h) {holdWrite_ = h;}
+     /// Enables or disables the input data recording, for internal analysis.
+     void recordInput(bool r) {record_ = r;}
+     /// Whether we can splice or not the SSL stream
+     bool canSplice() {return allowSplice;}
+     /// Whether we can bump or not the SSL stream
+     bool canBump() {return allowBump;}
+     /// The bumping mode
+     void mode(Ssl::BumpMode m) {bumpMode_ = m;}
+     Ssl::BumpMode bumpMode() {return bumpMode_;} ///< return the bumping mode
+ private:
+     sslFeatures clientFeatures; ///< SSL client features extracted from ClientHello message or SSL object
+-    sslFeatures serverFeatures; ///< SSL server features extracted from ServerHello message
+     SBuf helloMsg; ///< Used to buffer output data.
+     mb_size_t  helloMsgSize;
+     bool helloBuild; ///< True if the client hello message sent to the server
+     bool allowSplice; ///< True if the SSL stream can be spliced
+     bool allowBump;  ///< True if the SSL stream can be bumped
+     bool holdWrite_;  ///< The write hold state of the bio.
+     bool record_; ///< If true the input data recorded to rbuf for internal use
+     Ssl::BumpMode bumpMode_;
+ };
+ 
+ inline
+ std::ostream &operator <<(std::ostream &os, Ssl::Bio::sslFeatures const &f)
+ {
+     return f.print(os);
+ }
+ 
+ } // namespace Ssl
+ 
+ #endif /* SQUID_SSL_BIO_H */
+ 
+

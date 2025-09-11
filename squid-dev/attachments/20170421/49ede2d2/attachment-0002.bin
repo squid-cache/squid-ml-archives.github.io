@@ -1,0 +1,260 @@
+=== modified file 'src/security/Session.cc'
+--- src/security/Session.cc	2017-02-05 06:12:19 +0000
++++ src/security/Session.cc	2017-04-19 06:38:34 +0000
+@@ -105,40 +105,43 @@
+ {
+     if (!Comm::IsConnOpen(conn)) {
+         debugs(83, DBG_IMPORTANT, "Gone connection");
+         return false;
+     }
+ 
+ #if USE_OPENSSL || USE_GNUTLS
+ 
+     const char *errAction = "with no TLS/SSL library";
+     int errCode = 0;
+ #if USE_OPENSSL
+     Security::SessionPointer session(Security::NewSessionObject(ctx));
+     if (!session) {
+         errCode = ERR_get_error();
+         errAction = "failed to allocate handle";
+     }
+ #elif USE_GNUTLS
+     gnutls_session_t tmp;
+     errCode = gnutls_init(&tmp, static_cast<unsigned int>(type) | GNUTLS_NONBLOCK);
+     Security::SessionPointer session(tmp, [](gnutls_session_t p) {
++        // free any ExtraData object associated with this session
++        auto *data = static_cast<Security::ExtraData *>(gnutls_session_get_ptr(p));
++        delete data;
+         debugs(83, 5, "gnutls_deinit session=" << (void*)p);
+         gnutls_deinit(p);
+     });
+     debugs(83, 5, "gnutls_init " << (type == Security::Io::BIO_TO_SERVER ? "client" : "server" )<< " session=" << (void*)session.get());
+     if (errCode != GNUTLS_E_SUCCESS) {
+         session.reset();
+         errAction = "failed to initialize session";
+     }
+ #endif
+ 
+     if (session) {
+         const int fd = conn->fd;
+ 
+ #if USE_OPENSSL
+         // without BIO, we would call SSL_set_fd(ssl.get(), fd) instead
+         if (BIO *bio = Ssl::Bio::Create(fd, type)) {
+             Ssl::Bio::Link(session.get(), bio); // cannot fail
+ #elif USE_GNUTLS
+         errCode = gnutls_credentials_set(session.get(), GNUTLS_CRD_CERTIFICATE, ctx.get());
+         if (errCode == GNUTLS_E_SUCCESS) {
+@@ -184,40 +187,83 @@
+ 
+ bool
+ Security::CreateServerSession(const Security::ContextPointer &ctx, const Comm::ConnectionPointer &c, const char *squidCtx)
+ {
+     return CreateSession(ctx, c, Security::Io::BIO_TO_CLIENT, squidCtx);
+ }
+ 
+ void
+ Security::SessionSendGoodbye(const Security::SessionPointer &s)
+ {
+     debugs(83, 5, "session=" << (void*)s.get());
+     if (s) {
+ #if USE_OPENSSL
+         SSL_shutdown(s.get());
+ #elif USE_GNUTLS
+         gnutls_bye(s.get(), GNUTLS_SHUT_RDWR);
+ #endif
+     }
+ }
+ 
++#if USE_OPENSSL
++/// "free" function for Security::ExtraData
++static void
++free_ExtraData(void *, void *ptr, CRYPTO_EX_DATA *, int, long, void *)
++{
++    delete static_cast<Security::ExtraData *>(ptr);
++}
++#endif
++
++Security::ExtraData *
++Security::ExtraData::GetFrom(const SessionPointer &session)
++{
++    if (!session)
++        return nullptr;
++
++    Security::ExtraData *data = nullptr;
++
++    // get any data we attached to the session earlier
++#if USE_OPENSSL
++    // initialize extended-data registration with OpenSSL if needed
++    static int data_index = -1;
++    if (data_index == -1) {
++        data_index = SSL_get_ex_new_index(0, const_cast<char *>("Security::ExtraData"), nullptr, nullptr, free_ExtraData);
++    }
++
++    data = static_cast<Security::ExtraData *>(SSL_get_ex_data(session.get(), data_index));
++#elif USE_GNUTLS
++    data = static_cast<Security::ExtraData *>(gnutls_session_get_ptr(session.get()));
++#endif
++
++    // allocate and attach a new data object if missing
++    if (!data) {
++        data = new Security::ExtraData;
++#if USE_OPENSSL
++        SSL_set_ex_data(session.get(), data_index, data);
++#elif USE_GNUTLS
++        gnutls_session_set_ptr(session.get(), data);
++#endif
++    }
++
++    return data;
++}
++
+ bool
+ Security::SessionIsResumed(const Security::SessionPointer &s)
+ {
+     bool result = false;
+ #if USE_OPENSSL
+     result = SSL_session_reused(s.get()) == 1;
+ #elif USE_GNUTLS
+     result = gnutls_session_is_resumed(s.get()) != 0;
+ #endif
+     debugs(83, 7, "session=" << (void*)s.get() << ", query? answer: " << (result ? 'T' : 'F') );
+     return result;
+ }
+ 
+ void
+ Security::MaybeGetSessionResumeData(const Security::SessionPointer &s, Security::SessionStatePointer &data)
+ {
+     if (!SessionIsResumed(s)) {
+ #if USE_OPENSSL
+         // nil is valid for SSL_get1_session(), it cannot fail.
+         data.reset(SSL_get1_session(s.get()));
+
+=== modified file 'src/security/Session.h'
+--- src/security/Session.h	2017-02-10 13:35:05 +0000
++++ src/security/Session.h	2017-04-19 06:38:34 +0000
+@@ -1,33 +1,34 @@
+ /*
+  * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_SRC_SECURITY_SESSION_H
+ #define SQUID_SRC_SECURITY_SESSION_H
+ 
+ #include "base/HardFun.h"
+ #include "comm/forward.h"
++#include "sbuf/SBuf.h"
+ #include "security/LockingPointer.h"
+ 
+ #include <memory>
+ 
+ #if USE_OPENSSL
+ #if HAVE_OPENSSL_SSL_H
+ #include <openssl/ssl.h>
+ #endif
+ #endif
+ 
+ #if USE_GNUTLS
+ #if HAVE_GNUTLS_GNUTLS_H
+ #include <gnutls/gnutls.h>
+ #endif
+ #endif
+ 
+ namespace Security {
+ 
+ /// Creates TLS Client connection structure (aka 'session' state) and initializes TLS/SSL I/O (Comm and BIO).
+ /// On errors, emits DBG_IMPORTANT with details and returns false.
+@@ -39,40 +40,54 @@
+ 
+ #if USE_OPENSSL
+ typedef std::shared_ptr<SSL> SessionPointer;
+ 
+ typedef std::unique_ptr<SSL_SESSION, HardFun<void, SSL_SESSION*, &SSL_SESSION_free>> SessionStatePointer;
+ 
+ #elif USE_GNUTLS
+ typedef std::shared_ptr<struct gnutls_session_int> SessionPointer;
+ 
+ // wrapper function to get around gnutls_free being a typedef
+ inline void squid_gnutls_free(void *d) {gnutls_free(d);}
+ typedef std::unique_ptr<gnutls_datum_t, HardFun<void, void*, &Security::squid_gnutls_free>> SessionStatePointer;
+ 
+ #else
+ typedef std::shared_ptr<void> SessionPointer;
+ 
+ typedef std::unique_ptr<int> SessionStatePointer;
+ 
+ #endif
+ 
++/// extra data which we attach to a TLS session
++class ExtraData
++{
++public:
++    SBuf sni;
++
++public:
++    /// The extra data (if any) associated with a session.
++    /// \note Guaranteed to return an object if the session pointer is set,
++    ///       will create if necessary.
++    /// \retval nullptr only if session is nullptr
++    static Security::ExtraData *GetFrom(const SessionPointer &);
++};
++
+ /// send the shutdown/bye notice for an active TLS session.
+ void SessionSendGoodbye(const Security::SessionPointer &);
+ 
+ /// whether the session is a resumed one
+ bool SessionIsResumed(const Security::SessionPointer &);
+ 
+ /**
+  * When the session is not a resumed session, retrieve the details needed to
+  * resume a later connection and store them in 'data'. This may result in 'data'
+  * becoming a nil Pointer if no details exist or an error occurs.
+  *
+  * When the session is already a resumed session, do nothing and leave 'data'
+  * unhanged.
+  * XXX: is this latter behaviour always correct?
+  */
+ void MaybeGetSessionResumeData(const Security::SessionPointer &, Security::SessionStatePointer &data);
+ 
+ /// Set the data for resuming a previous session.
+ /// Needs to be done before using the SessionPointer for a handshake.
+ void SetSessionResumeData(const Security::SessionPointer &, const Security::SessionStatePointer &);
+
+=== modified file 'src/tests/stub_libsecurity.cc'
+--- src/tests/stub_libsecurity.cc	2017-02-05 06:12:19 +0000
++++ src/tests/stub_libsecurity.cc	2017-04-19 06:38:34 +0000
+@@ -81,28 +81,29 @@
+ void Security::PeerOptions::updateContextCa(Security::ContextPointer &) STUB
+ void Security::PeerOptions::updateContextCrl(Security::ContextPointer &) STUB
+ void Security::PeerOptions::updateSessionOptions(Security::SessionPointer &) STUB
+ void Security::PeerOptions::dumpCfg(Packable*, char const*) const STUB
+ void Security::PeerOptions::parseOptions() STUB
+ void parse_securePeerOptions(Security::PeerOptions *) STUB
+ 
+ #include "security/ServerOptions.h"
+ //Security::ServerOptions::ServerOptions(const Security::ServerOptions &) STUB
+ void Security::ServerOptions::parse(const char *) STUB
+ void Security::ServerOptions::dumpCfg(Packable *, const char *) const STUB
+ Security::ContextPointer Security::ServerOptions::createBlankContext() const STUB_RETVAL(Security::ContextPointer())
+ bool Security::ServerOptions::createStaticServerContext(AnyP::PortCfg &) STUB_RETVAL(false)
+ void Security::ServerOptions::updateContextEecdh(Security::ContextPointer &) STUB
+ 
+ #include "security/Session.h"
+ namespace Security {
+ bool CreateClientSession(const Security::ContextPointer &, const Comm::ConnectionPointer &, const char *) STUB_RETVAL(false)
+ bool CreateServerSession(const Security::ContextPointer &, const Comm::ConnectionPointer &, const char *) STUB_RETVAL(false)
+ void SessionSendGoodbye(const Security::SessionPointer &) STUB
++Security::ExtraData *Security::ExtraData::GetFrom(const Security::SessionPointer &) STUB_RETVAL(nullptr)
+ bool SessionIsResumed(const Security::SessionPointer &) STUB_RETVAL(false)
+ void MaybeGetSessionResumeData(const Security::SessionPointer &, Security::SessionStatePointer &) STUB
+ void SetSessionResumeData(const Security::SessionPointer &, const Security::SessionStatePointer &) STUB
+ #if USE_OPENSSL
+ Security::SessionPointer NewSessionObject(const Security::ContextPointer &) STUB_RETVAL(nullptr)
+ #endif
+ } // namespace Security
+ 
+

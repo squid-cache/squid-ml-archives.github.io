@@ -1,0 +1,226 @@
+# Bazaar merge directive format 2 (Bazaar 0.90)
+# revision_id: kinkie@squid-cache.org-20150721145709-q49cty3dm84vk67q
+# target_branch: file:///home/kinkie/squid/workspace/trunk/
+# testament_sha1: 6f1e9150ed1c19b231a4b3370e38505aa7a207a4
+# timestamp: 2015-07-21 16:57:33 +0200
+# base_revision_id: squid3@treenet.co.nz-20150721135024-\
+#   lupfi0fh1z5t9gwg
+# 
+# Begin patch
+=== modified file 'helpers/log_daemon/file/log_file_daemon.cc'
+--- helpers/log_daemon/file/log_file_daemon.cc	2015-01-13 07:25:36 +0000
++++ helpers/log_daemon/file/log_file_daemon.cc	2015-07-21 12:42:27 +0000
+@@ -105,6 +105,9 @@
+         exit(1);
+     }
+     setbuf(stdout, NULL);
++    /* XXX stderr should not be closed, but in order to support squid must be
++     * able to collect and manage modules's stderr first.
++     */
+     close(2);
+     t = open(_PATH_DEVNULL, O_RDWR);
+     assert(t > -1);
+@@ -119,7 +122,7 @@
+                 /* try to detect the 32-bit file too big write error and rotate */
+                 int err = ferror(fp);
+                 clearerr(fp);
+-                if (err < 0) {
++                if (err != 0) {
+                     /* file too big - recover by rotating the logs and starting a new one.
+                      * out of device space - recover by rotating and hoping that rotation count drops a big one.
+                      */
+
+=== modified file 'helpers/ntlm_auth/smb_lm/ntlm_smb_lm_auth.cc'
+--- helpers/ntlm_auth/smb_lm/ntlm_smb_lm_auth.cc	2015-06-14 22:11:46 +0000
++++ helpers/ntlm_auth/smb_lm/ntlm_smb_lm_auth.cc	2015-07-21 12:53:18 +0000
+@@ -477,7 +477,6 @@
+     ntlmhdr *fast_header;
+     char buf[NTLM_BLOB_BUFFER_SIZE];
+     char decoded[NTLM_BLOB_BUFFER_SIZE];
+-    const char *ch;
+     char *ch2, *cred = NULL;
+ 
+     if (fgets(buf, NTLM_BLOB_BUFFER_SIZE, stdin) == NULL) {
+@@ -489,7 +488,6 @@
+     ch2 = (char*)memchr(buf, '\n', NTLM_BLOB_BUFFER_SIZE);  /* safer against overrun than strchr */
+     if (ch2) {
+         *ch2 = '\0';        /* terminate the string at newline. */
+-        ch = ch2;
+     }
+     debug("ntlm authenticator. Got '%s' from Squid\n", buf);
+ 
+@@ -628,7 +626,7 @@
+     }
+     if (memcmp(buf, "YR", 2) == 0) {    /* refresh-request */
+         dc_disconnect();
+-        ch = obtain_challenge();
++        const char *ch = obtain_challenge();
+         /* Robert says we can afford to wait forever. I'll trust him on this
+          * one */
+         while (ch == NULL) {
+
+=== modified file 'src/clients/FtpClient.cc'
+--- src/clients/FtpClient.cc	2015-05-26 18:12:08 +0000
++++ src/clients/FtpClient.cc	2015-07-20 20:39:02 +0000
+@@ -509,6 +509,8 @@
+             debugs(9, DBG_IMPORTANT, "WARNING: Server at " << ctrl.conn->remote << " sent unknown protocol negotiation hint: " << buf);
+             return sendPassive();
+         }
++        /* coverity[unreachable] */
++        /* safeguard against possible future bugs in above conditions */
+         failed(ERR_FTP_FAILURE, 0);
+         return false;
+     }
+
+=== modified file 'src/clients/FtpGateway.cc'
+--- src/clients/FtpGateway.cc	2015-07-19 13:23:01 +0000
++++ src/clients/FtpGateway.cc	2015-07-21 14:57:09 +0000
+@@ -1802,7 +1802,12 @@
+      */
+     if (fallback) {
+         int on = 1;
+-        setsockopt(ftpState->ctrl.conn->fd, SOL_SOCKET, SO_REUSEADDR, (char *) &on, sizeof(on));
++        errno = 0;
++        if (setsockopt(ftpState->ctrl.conn->fd, SOL_SOCKET, SO_REUSEADDR,
++                        (char *) &on, sizeof(on)) == -1) {
++            // SO_REUSEADDR is only an optimization, no need to be verbose about error
++            debugs(9, 4, "setsockopt failed: " << xstrerror());
++        }
+         ftpState->ctrl.conn->flags |= COMM_REUSEADDR;
+         temp->flags |= COMM_REUSEADDR;
+     } else {
+
+=== modified file 'src/debug.cc'
+--- src/debug.cc	2015-07-12 17:42:49 +0000
++++ src/debug.cc	2015-07-20 09:44:12 +0000
+@@ -487,10 +487,18 @@
+     if (Debug::rotateNumber > 0) {
+         snprintf(to, MAXPATHLEN, "%s.%d", debug_log_file, 0);
+ #if _SQUID_WINDOWS_
+-        remove
+-        (to);
++        errno = 0;
++        if (remove(to) == -1) {
++            const auto saved_errno = errno;
++            debugs(0, DBG_IMPORTANT, "removal of log file " << to << " failed: " << xstrerr(saved_errno));
++        }
+ #endif
+-        rename(debug_log_file, to);
++        errno = 0;
++        if (rename(debug_log_file, to) == -1) {
++            const auto saved_errno = errno;
++            debugs(0, DBG_IMPORTANT, "renaming file " << debug_log_file << " to "
++                            << to << "failed: " << xstrerr(saved_errno));
++        }
+     }
+ 
+     /* Close and reopen the log.  It may have been renamed "manually"
+
+=== modified file 'src/fs/rock/RockSwapDir.cc'
+--- src/fs/rock/RockSwapDir.cc	2015-01-13 07:25:36 +0000
++++ src/fs/rock/RockSwapDir.cc	2015-07-20 13:48:30 +0000
+@@ -405,11 +405,18 @@
+ ConfigOption *
+ Rock::SwapDir::getOptionTree() const
+ {
+-    ConfigOptionVector *vector = dynamic_cast<ConfigOptionVector*>(::SwapDir::getOptionTree());
+-    assert(vector);
+-    vector->options.push_back(new ConfigOptionAdapter<SwapDir>(*const_cast<SwapDir *>(this), &SwapDir::parseSizeOption, &SwapDir::dumpSizeOption));
+-    vector->options.push_back(new ConfigOptionAdapter<SwapDir>(*const_cast<SwapDir *>(this), &SwapDir::parseTimeOption, &SwapDir::dumpTimeOption));
+-    vector->options.push_back(new ConfigOptionAdapter<SwapDir>(*const_cast<SwapDir *>(this), &SwapDir::parseRateOption, &SwapDir::dumpRateOption));
++    ConfigOption *copt = ::SwapDir::getOptionTree();
++    ConfigOptionVector *vector = dynamic_cast<ConfigOptionVector*>(copt);
++    if (vector) {
++        // if copt is actually a ConfigOptionVector
++        vector->options.push_back(new ConfigOptionAdapter<SwapDir>(*const_cast<SwapDir *>(this), &SwapDir::parseSizeOption, &SwapDir::dumpSizeOption));
++        vector->options.push_back(new ConfigOptionAdapter<SwapDir>(*const_cast<SwapDir *>(this), &SwapDir::parseTimeOption, &SwapDir::dumpTimeOption));
++        vector->options.push_back(new ConfigOptionAdapter<SwapDir>(*const_cast<SwapDir *>(this), &SwapDir::parseRateOption, &SwapDir::dumpRateOption));
++    } else {
++        // we don't know how to handle copt, as it's not a ConfigOptionVector.
++        // free it (and return nullptr)
++        delete copt;
++    }
+     return vector;
+ }
+ 
+
+# Begin bundle
+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

@@ -1,0 +1,74 @@
+Restrict SslBump inspections of cache_peer connections.
+
+This change is specific to FwdState code path. It does not affect tunneled
+traffic. Thus, it does not affect CONNECT tunnels unless they are being
+inspected with SslBump code.
+
+The old code always used PeekingPeerConnector when connecting to a TLS-related
+cache_peer. That approach worked because PeekingPeerConnector does not always 
+inspect the SSL/TLS connection it establishes. We were kind of lucky that 
+PeekingPeerConnector exceptions matched FwdState needs.
+
+The primary PeekingPeerConnector goal is to inspect. As its code evolves, it may
+enable inspection when FwdState does not want it. Non-peeking cases inside
+PeekingPeerConnector should all deal with exceptional situations that
+are difficult to predict a priori, before the connector object is created.
+
+This change restricts inspection to cases where an \_inspected\_ SSL client
+connection is being forwarded, reducing the probability that a peer
+connection is wrongly inspected. This change does not fix any known bugs.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/FwdState.cc'
+--- src/FwdState.cc	2015-10-27 03:45:40 +0000
++++ src/FwdState.cc	2015-11-16 16:29:45 +0000
+@@ -688,42 +688,45 @@
+ 
+     if (serverConnection()->getPeer())
+         peerConnectSucceded(serverConnection()->getPeer());
+ 
+ #if USE_OPENSSL
+     if (!request->flags.pinned) {
+         const CachePeer *p = serverConnection()->getPeer();
+         const bool peerWantsTls = p && p->secure.encryptTransport;
+         // userWillSslToPeerForUs assumes CONNECT == HTTPS
+         const bool userWillTlsToPeerForUs = p && p->options.originserver &&
+                                             request->method == Http::METHOD_CONNECT;
+         const bool needTlsToPeer = peerWantsTls && !userWillTlsToPeerForUs;
+         const bool needTlsToOrigin = !p && request->url.getScheme() == AnyP::PROTO_HTTPS;
+         if (needTlsToPeer || needTlsToOrigin || request->flags.sslPeek) {
+             HttpRequest::Pointer requestPointer = request;
+             AsyncCall::Pointer callback = asyncCall(17,4,
+                                                     "FwdState::ConnectedToPeer",
+                                                     FwdStatePeerAnswerDialer(&FwdState::connectedToPeer, this));
+             // Use positive timeout when less than one second is left.
+             const time_t sslNegotiationTimeout = max(static_cast<time_t>(1), timeLeft());
+-            Ssl::PeekingPeerConnector *connector =
+-                new Ssl::PeekingPeerConnector(requestPointer, serverConnection(), clientConn, callback, sslNegotiationTimeout);
++            Ssl::PeerConnector *connector = NULL;
++            if (request->flags.sslPeek)
++                connector = new Ssl::PeekingPeerConnector(requestPointer, serverConnection(), clientConn, callback, sslNegotiationTimeout);
++            else
++                connector = new Ssl::BlindPeerConnector(requestPointer, serverConnection(), callback, sslNegotiationTimeout);
+             AsyncJob::Start(connector); // will call our callback
+             return;
+         }
+     }
+ #endif
+ 
+     // if not encrypting just run the post-connect actions
+     Security::EncryptorAnswer nil;
+     connectedToPeer(nil);
+ }
+ 
+ void
+ FwdState::connectedToPeer(Security::EncryptorAnswer &answer)
+ {
+     if (ErrorState *error = answer.error.get()) {
+         fail(error);
+         answer.error.clear(); // preserve error for errorSendComplete()
+         self = NULL;
+         return;
+     }
+

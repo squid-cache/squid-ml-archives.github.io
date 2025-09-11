@@ -1,0 +1,725 @@
+Ignore impossible SSL bumping actions, as intended and documented.
+
+According to Squid wiki: "Some actions are not possible during 
+certain processing steps. During a given processing step, Squid
+ignores ssl_bump lines with impossible actions". The distributed
+squid.conf.documented has similar text.
+
+Current Squid violates the above rule. Squid considers all actions,
+and if an impossible action matches first, Squid guesses what the
+true configuration intent was. Squid may guess wrong. For example,
+depending on the transaction, Squid may guess that a matching 
+stare or peek action during bumping step3 means "bump", breaking
+peeked connections that cannot be bumped.
+
+This unintended but gross configuration semantics violation remained
+invisible until bug 4237, probably because most configurations in
+most environments either worked around the problem (where admins
+experimented to "make it work") or did not result in visible
+errors (where Squid guesses did not lead to terminated connections).
+
+While configuration workarounds are possible, the current 
+implementation is very wrong and leads to overly complex and, hence,
+often wrong configurations. It is also nearly impossible to document
+accurately because the guessing logic depends on too many factors.
+
+To fix this, we add an action filtering/banning mechanism to Squid
+ACL code. This mechanism is then used to:
+  - ban client-first and server-first on bumping steps 2 and 3.
+  - ban peek and stare actions on bumping step 3.
+  - ban splice on step3 if stare is selected on step2 and
+    Squid cannot splice the SSL connection any more.
+  - ban bump on step3 if peek is selected on step2 and
+    Squid cannot bump the connection any more.
+
+The same action filtering mechanism may be useful for other
+ACL-driven directives with state-dependent custom actions.
+
+This change adds a runtime performance overhead of a single virtual
+method call to all ORed ACLs that do not use banned actions.
+That method itself just returns false unless the ACL represents
+a whole directive rule. In the latter case, an std::vector size()
+is also checked. It is possible to avoid this overhead by adding
+a boolean "I may ban actions" flag to Acl::OrNode, but we decided
+the small performance harm is not worth the extra code to set
+that flag.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/acl/Acl.h'
+--- src/acl/Acl.h	2015-01-13 07:25:36 +0000
++++ src/acl/Acl.h	2015-08-10 15:51:03 +0000
+@@ -149,52 +149,56 @@
+     virtual bool requiresReply() const;
+ };
+ 
+ /// \ingroup ACLAPI
+ typedef enum {
+     // Authorization ACL result states
+     ACCESS_DENIED,
+     ACCESS_ALLOWED,
+     ACCESS_DUNNO,
+ 
+     // Authentication ACL result states
+     ACCESS_AUTH_REQUIRED,    // Missing Credentials
+ } aclMatchCode;
+ 
+ /// \ingroup ACLAPI
+ /// ACL check answer; TODO: Rename to Acl::Answer
+ class allow_t
+ {
+ public:
+     // not explicit: allow "aclMatchCode to allow_t" conversions (for now)
+-    allow_t(const aclMatchCode aCode): code(aCode), kind(0) {}
++    allow_t(const aclMatchCode aCode, int aKind = 0): code(aCode), kind(aKind) {}
+ 
+     allow_t(): code(ACCESS_DUNNO), kind(0) {}
+ 
+     bool operator ==(const aclMatchCode aCode) const {
+         return code == aCode;
+     }
+ 
+     bool operator !=(const aclMatchCode aCode) const {
+         return !(*this == aCode);
+     }
+ 
++    bool operator ==(const allow_t allow) const {
++        return code == allow.code && kind == allow.kind;
++    }
++
+     operator aclMatchCode() const {
+         return code;
+     }
+ 
+     aclMatchCode code; ///< ACCESS_* code
+     int kind; ///< which custom access list verb matched
+ };
+ 
+ inline std::ostream &
+ operator <<(std::ostream &o, const allow_t a)
+ {
+     switch (a) {
+     case ACCESS_DENIED:
+         o << "DENIED";
+         break;
+     case ACCESS_ALLOWED:
+         o << "ALLOWED";
+         break;
+     case ACCESS_DUNNO:
+         o << "DUNNO";
+
+=== modified file 'src/acl/BoolOps.cc'
+--- src/acl/BoolOps.cc	2015-01-13 07:25:36 +0000
++++ src/acl/BoolOps.cc	2015-08-04 10:58:04 +0000
+@@ -98,47 +98,55 @@
+ Acl::AndNode::parse()
+ {
+     // Not implemented: AndNode cannot be configured directly. See Acl::AllOf.
+     assert(false);
+ }
+ 
+ /* Acl::OrNode */
+ 
+ char const *
+ Acl::OrNode::typeString() const
+ {
+     return "any-of";
+ }
+ 
+ ACL *
+ Acl::OrNode::clone() const
+ {
+     return new OrNode;
+ }
+ 
++bool
++Acl::OrNode::bannedAction(ACLChecklist *, Nodes::const_iterator) const
++{
++    return false;
++}
++
+ int
+ Acl::OrNode::doMatch(ACLChecklist *checklist, Nodes::const_iterator start) const
+ {
+     lastMatch_ = nodes.end();
+ 
+     // find the first node that matches, but stop if things go wrong
+     for (Nodes::const_iterator i = start; i != nodes.end(); ++i) {
++        if (bannedAction(checklist, i))
++            continue;
+         if (checklist->matchChild(this, i, *i)) {
+             lastMatch_ = i;
+             return 1;
+         }
+ 
+         if (!checklist->keepMatching())
+             return -1; // suspend on async calls and stop on failures
+     }
+ 
+     // zero and not one on empty because in math empty sum equals zero
+     return 0; // all nodes mismatched
+ }
+ 
+ void
+ Acl::OrNode::parse()
+ {
+     // Not implemented: OrNode cannot be configured directly. See Acl::AnyOf.
+     assert(false);
+ }
+ 
+
+=== modified file 'src/acl/BoolOps.h'
+--- src/acl/BoolOps.h	2015-01-13 07:25:36 +0000
++++ src/acl/BoolOps.h	2015-08-10 15:09:14 +0000
+@@ -45,36 +45,40 @@
+     MEMPROXY_CLASS(AndNode);
+ 
+ public:
+     /* ACL API */
+     virtual char const *typeString() const;
+     virtual ACL *clone() const;
+     virtual void parse();
+ 
+ private:
+     virtual int doMatch(ACLChecklist *checklist, Nodes::const_iterator start) const;
+ };
+ 
+ /// An inner ACL expression tree node representing a boolean disjuction (OR)
+ /// operator applied to a list of child tree nodes.
+ /// For example, conditions expressed by multiple http_access lines are ORed.
+ class OrNode: public InnerNode
+ {
+     MEMPROXY_CLASS(OrNode);
+ 
+ public:
++    /// whether the given rule should be excluded from matching tests based
++    /// on its action
++    virtual bool bannedAction(ACLChecklist *, Nodes::const_iterator) const;
++
+     /* ACL API */
+     virtual char const *typeString() const;
+     virtual ACL *clone() const;
+     virtual void parse();
+ 
+ protected:
+     mutable Nodes::const_iterator lastMatch_;
+ 
+ private:
+     virtual int doMatch(ACLChecklist *checklist, Nodes::const_iterator start) const;
+ };
+ 
+ } // namespace Acl
+ 
+ #endif /* SQUID_ACL_LOGIC_H */
+ 
+
+=== modified file 'src/acl/Checklist.cc'
+--- src/acl/Checklist.cc	2015-01-13 07:25:36 +0000
++++ src/acl/Checklist.cc	2015-08-10 14:36:45 +0000
+@@ -1,36 +1,38 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ /* DEBUG: section 28    Access Control */
+ 
+ #include "squid.h"
+ #include "acl/Checklist.h"
+ #include "acl/Tree.h"
+ #include "Debug.h"
+ #include "profiler/Profiler.h"
+ 
++#include <algorithm>
++
+ /// common parts of nonBlockingCheck() and resumeNonBlockingCheck()
+ bool
+ ACLChecklist::prepNonBlocking()
+ {
+     assert(accessList);
+ 
+     if (callerGone()) {
+         checkCallback(ACCESS_DUNNO); // the answer does not really matter
+         return false;
+     }
+ 
+     /** \par
+      * If the accessList is no longer valid (i.e. its been
+      * freed because of a reconfigure), then bail with ACCESS_DUNNO.
+      */
+ 
+     if (!cbdataReferenceValid(accessList)) {
+         cbdataReferenceDone(accessList);
+         debugs(28, 4, "ACLChecklist::check: " << this << " accessList is invalid");
+         checkCallback(ACCESS_DUNNO);
+@@ -374,20 +376,34 @@
+     const allow_t lastAction = (accessList && cbdataReferenceValid(accessList)) ?
+                                accessList->lastAction() : allow_t(ACCESS_DUNNO);
+     allow_t implicitRuleAnswer = ACCESS_DUNNO;
+     if (lastAction == ACCESS_DENIED) // reverse last seen "deny"
+         implicitRuleAnswer = ACCESS_ALLOWED;
+     else if (lastAction == ACCESS_ALLOWED) // reverse last seen "allow"
+         implicitRuleAnswer = ACCESS_DENIED;
+     // else we saw no rules and will respond with ACCESS_DUNNO
+ 
+     debugs(28, 3, HERE << this << " NO match found, last action " <<
+            lastAction << " so returning " << implicitRuleAnswer);
+     markFinished(implicitRuleAnswer, "implicit rule won");
+ }
+ 
+ bool
+ ACLChecklist::callerGone()
+ {
+     return !cbdataReferenceValid(callback_data);
+ }
+ 
++bool
++ACLChecklist::bannedAction(const allow_t &action) const
++{
++    const bool found = std::find(bannedActions_.begin(), bannedActions_.end(), action) != bannedActions_.end();
++    debugs(28, 5, "ACLChecklist: action '" << action << "/" << action.kind << (found ? " is " : "is not") << " banned");
++    return found;
++}
++
++void
++ACLChecklist::banAction(const allow_t &action)
++{
++    bannedActions_.push_back(action);
++}
++
+
+=== modified file 'src/acl/Checklist.h'
+--- src/acl/Checklist.h	2015-01-13 07:25:36 +0000
++++ src/acl/Checklist.h	2015-08-10 15:37:11 +0000
+@@ -1,33 +1,34 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #ifndef SQUID_ACLCHECKLIST_H
+ #define SQUID_ACLCHECKLIST_H
+ 
+ #include "acl/InnerNode.h"
+ #include <stack>
++#include <vector>
+ 
+ /// ACL checklist callback
+ typedef void ACLCB(allow_t, void *);
+ 
+ /** \ingroup ACLAPI
+     Base class for maintaining Squid and transaction state for access checks.
+     Provides basic ACL checking methods. Its only child, ACLFilledChecklist,
+     keeps the actual state data. The split is necessary to avoid exposing
+     all ACL-related code to virtually Squid data types. */
+ class ACLChecklist
+ {
+ 
+ public:
+ 
+     /**
+      * State class.
+      * This abstract class defines the behaviour of
+      * async lookups - which can vary for different ACL types.
+      * Today, every state object must be a singleton.
+      * See NULLState for an example.
+@@ -135,40 +136,45 @@
+     /// Otherwise, returns false; the caller is expected to handle the failure.
+     bool goAsync(AsyncState *);
+ 
+     /// Matches (or resumes matching of) a child node while maintaning
+     /// resumption breadcrumbs if a [grand]child node goes async.
+     bool matchChild(const Acl::InnerNode *parent, Acl::Nodes::const_iterator pos, const ACL *child);
+ 
+     /// Whether we should continue to match tree nodes or stop/pause.
+     bool keepMatching() const { return !finished() && !asyncInProgress(); }
+ 
+     /// whether markFinished() was called
+     bool finished() const { return finished_; }
+     /// async call has been started and has not finished (or failed) yet
+     bool asyncInProgress() const { return asyncStage_ != asyncNone; }
+     /// called when no more ACLs should be checked; sets the final answer and
+     /// prints a debugging message explaining the reason for that answer
+     void markFinished(const allow_t &newAnswer, const char *reason);
+ 
+     const allow_t &currentAnswer() const { return allow_; }
+ 
++    /// whether the action is banned or not
++    bool bannedAction(const allow_t &action) const;
++    /// add action to the list of banned actions
++    void banAction(const allow_t &action);
++
+     // XXX: ACLs that need request or reply have to use ACLFilledChecklist and
+     // should do their own checks so that we do not have to povide these two
+     // for ACL::checklistMatches to use
+     virtual bool hasRequest() const = 0;
+     virtual bool hasReply() const = 0;
+ 
+ private:
+     /// Calls non-blocking check callback with the answer and destroys self.
+     void checkCallback(allow_t answer);
+ 
+     void matchAndFinish();
+ 
+     void changeState(AsyncState *);
+     AsyncState *asyncState() const;
+ 
+ public:
+     const Acl::Tree *accessList;
+ 
+     ACLCB *callback;
+     void *callback_data;
+@@ -200,24 +206,26 @@
+     bool prepNonBlocking();
+     void completeNonBlocking();
+     void calcImplicitAnswer();
+ 
+     bool asyncCaller_; ///< whether the caller supports async/slow ACLs
+     bool occupied_; ///< whether a check (fast or non-blocking) is in progress
+     bool finished_;
+     allow_t allow_;
+ 
+     enum AsyncStage { asyncNone, asyncStarting, asyncRunning, asyncFailed };
+     AsyncStage asyncStage_;
+     AsyncState *state_;
+     Breadcrumb matchLoc_; ///< location of the node running matches() now
+     Breadcrumb asyncLoc_; ///< currentNode_ that called goAsync()
+     unsigned asyncLoopDepth_; ///< how many times the current async state has resumed
+ 
+     bool callerGone();
+ 
+     /// suspended (due to an async lookup) matches() in the ACL tree
+     std::stack<Breadcrumb> matchPath;
++    /// the list of actions which must ignored during acl checks
++    std::vector<allow_t> bannedActions_;
+ };
+ 
+ #endif /* SQUID_ACLCHECKLIST_H */
+ 
+
+=== modified file 'src/acl/Tree.cc'
+--- src/acl/Tree.cc	2015-01-25 07:25:48 +0000
++++ src/acl/Tree.cc	2015-08-10 15:04:01 +0000
+@@ -1,30 +1,31 @@
+ /*
+  * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
+  *
+  * Squid software is distributed under GPLv2+ license and includes
+  * contributions from numerous individuals and organizations.
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+ #include "squid.h"
+ #include "acl/Tree.h"
++#include "Checklist.h"
+ #include "wordlist.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Acl, Tree);
+ 
+ allow_t
+ Acl::Tree::winningAction() const
+ {
+     return actionAt(lastMatch_ - nodes.begin());
+ }
+ 
+ allow_t
+ Acl::Tree::lastAction() const
+ {
+     if (actions.empty())
+         return ACCESS_DUNNO;
+     return actions.back();
+ }
+ 
+ /// computes action that corresponds to the position of the matched rule
+ allow_t
+@@ -68,20 +69,30 @@
+ 
+         if (action != actions.end()) {
+             const char *act = convert ? convert[action->kind] :
+                               (*action == ACCESS_ALLOWED ? "allow" : "deny");
+             text.push_back(act?SBuf(act):SBuf("???"));
+             ++action;
+         }
+ 
+ #if __cplusplus >= 201103L
+         text.splice(text.end(), (*node)->dump());
+ #else
+         // temp is needed until c++11 move constructor
+         SBufList temp = (*node)->dump();
+         text.splice(text.end(), temp);
+ #endif
+         text.push_back(SBuf("\n"));
+     }
+     return text;
+ }
+ 
++bool
++Acl::Tree::bannedAction(ACLChecklist *checklist, Nodes::const_iterator node) const
++{
++    if (actions.size()) {
++        assert(actions.size() == nodes.size());
++        const Nodes::size_type pos = node - nodes.begin();
++        return checklist->bannedAction(actions.at(pos));
++    }
++    return false;
++}
+
+=== modified file 'src/acl/Tree.h'
+--- src/acl/Tree.h	2015-01-13 07:25:36 +0000
++++ src/acl/Tree.h	2015-08-10 15:09:49 +0000
+@@ -23,31 +23,33 @@
+     // refcounted as well. Otherwise, async lookups will reach deleted ACLs.
+     CBDATA_CLASS(Tree);
+ 
+ public:
+     /// dumps <name, action, rule, new line> tuples
+     /// action.kind is mapped to a string using the supplied conversion table
+     typedef const char **ActionToString;
+     SBufList treeDump(const char *name, const ActionToString &convert) const;
+ 
+     /// Returns the corresponding action after a successful tree match.
+     allow_t winningAction() const;
+ 
+     /// what action to use if no nodes matched
+     allow_t lastAction() const;
+ 
+     /// appends and takes control over the rule with a given action
+     void add(ACL *rule, const allow_t &action);
+     void add(ACL *rule); ///< same as InnerNode::add()
+ 
+ protected:
++    /// Acl::OrNode API
++    virtual bool bannedAction(ACLChecklist *, Nodes::const_iterator) const override;
+     allow_t actionAt(const Nodes::size_type pos) const;
+ 
+     /// if not empty, contains actions corresponding to InnerNode::nodes
+     typedef std::vector<allow_t> Actions;
+     Actions actions;
+ };
+ 
+ } // namespace Acl
+ 
+ #endif /* SQUID_ACL_TREE_H */
+ 
+
+=== modified file 'src/cache_cf.cc'
+--- src/cache_cf.cc	2015-07-29 07:11:17 +0000
++++ src/cache_cf.cc	2015-08-05 12:44:24 +0000
+@@ -848,40 +848,41 @@
+ #endif
+         }
+     } else {
+         Config2.effectiveUserID = geteuid();
+         Config2.effectiveGroupID = getegid();
+     }
+ 
+     if (NULL != Config.effectiveGroup) {
+ 
+         struct group *grp = getgrnam(Config.effectiveGroup);
+ 
+         if (NULL == grp) {
+             fatalf("getgrnam failed to find groupid for effective group '%s'",
+                    Config.effectiveGroup);
+             return;
+         }
+ 
+         Config2.effectiveGroupID = grp->gr_gid;
+     }
+ 
++    Security::ProxyOutgoingConfig.encryptTransport = true;
+     if (Security::ProxyOutgoingConfig.encryptTransport) {
+         debugs(3, DBG_IMPORTANT, "Initializing https:// proxy context");
+         Config.ssl_client.sslContext = Security::ProxyOutgoingConfig.createClientContext(false);
+         if (!Config.ssl_client.sslContext) {
+             debugs(3, DBG_CRITICAL, "ERROR: Could not initialize https:// proxy context");
+             self_destruct();
+         }
+     }
+ 
+     for (CachePeer *p = Config.peers; p != NULL; p = p->next) {
+ 
+         // default value for ssldomain= is the peer host/IP
+         if (p->secure.sslDomain.isEmpty())
+             p->secure.sslDomain = p->host;
+ 
+         if (p->secure.encryptTransport) {
+             debugs(3, DBG_IMPORTANT, "Initializing cache_peer " << p->name << " TLS context");
+             p->sslContext = p->secure.createClientContext(true);
+             if (!p->sslContext) {
+                 debugs(3, DBG_CRITICAL, "ERROR: Could not initialize cache_peer " << p->name << " TLS context");
+
+=== modified file 'src/client_side.cc'
+--- src/client_side.cc	2015-08-03 09:36:20 +0000
++++ src/client_side.cc	2015-08-05 13:54:45 +0000
+@@ -4177,42 +4177,40 @@
+     auto ssl = fd_table[clientConnection->fd].ssl;
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ClientBio *bio = static_cast<Ssl::ClientBio *>(b->ptr);
+     bio->hold(true);
+ }
+ 
+ void httpsSslBumpStep2AccessCheckDone(allow_t answer, void *data)
+ {
+     ConnStateData *connState = (ConnStateData *) data;
+ 
+     // if the connection is closed or closing, just return.
+     if (!connState->isOpen())
+         return;
+ 
+     debugs(33, 5, "Answer: " << answer << " kind:" << answer.kind);
+     assert(connState->serverBump());
+     Ssl::BumpMode bumpAction;
+     if (answer == ACCESS_ALLOWED) {
+         if (answer.kind == Ssl::bumpNone)
+             bumpAction = Ssl::bumpSplice;
+-        else if (answer.kind == Ssl::bumpClientFirst || answer.kind == Ssl::bumpServerFirst)
+-            bumpAction = Ssl::bumpBump;
+         else
+             bumpAction = (Ssl::BumpMode)answer.kind;
+     } else
+         bumpAction = Ssl::bumpSplice;
+ 
+     connState->serverBump()->act.step2 = bumpAction;
+     connState->sslBumpMode = bumpAction;
+ 
+     if (bumpAction == Ssl::bumpTerminate) {
+         connState->clientConnection->close();
+     } else if (bumpAction != Ssl::bumpSplice) {
+         connState->startPeekAndSpliceDone();
+     } else
+         connState->splice();
+ }
+ 
+ void
+ ConnStateData::splice()
+ {
+     //Normally we can splice here, because we just got client hello message
+@@ -4241,40 +4239,42 @@
+         // in.buf still has the "CONNECT ..." request data, reset it to SSL hello message
+         in.buf.append(rbuf.content(), rbuf.contentSize());
+         ClientSocketContext::Pointer context = getCurrentContext();
+         ClientHttpRequest *http = context->http;
+         tunnelStart(http, &http->out.size, &http->al->http.code, http->al);
+     }
+ }
+ 
+ void
+ ConnStateData::startPeekAndSpliceDone()
+ {
+     // This is the Step2 of the SSL bumping
+     assert(sslServerBump);
+     if (sslServerBump->step == Ssl::bumpStep1) {
+         sslServerBump->step = Ssl::bumpStep2;
+         // Run a accessList check to check if want to splice or continue bumping
+ 
+         ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(Config.accessList.ssl_bump, sslServerBump->request.getRaw(), NULL);
+         //acl_checklist->src_addr = params.conn->remote;
+         //acl_checklist->my_addr = s->s;
++        acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpClientFirst));
++        acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpServerFirst));
+         acl_checklist->nonBlockingCheck(httpsSslBumpStep2AccessCheckDone, this);
+         return;
+     }
+ 
+     FwdState::fwdStart(clientConnection, sslServerBump->entry, sslServerBump->request.getRaw());
+ }
+ 
+ void
+ ConnStateData::doPeekAndSpliceStep()
+ {
+     auto ssl = fd_table[clientConnection->fd].ssl;
+     BIO *b = SSL_get_rbio(ssl);
+     assert(b);
+     Ssl::ClientBio *bio = static_cast<Ssl::ClientBio *>(b->ptr);
+ 
+     debugs(33, 5, "PeekAndSplice mode, proceed with client negotiation. Currrent state:" << SSL_state_string_long(ssl));
+     bio->hold(false);
+ 
+     Comm::SetSelect(clientConnection->fd, COMM_SELECT_WRITE, clientNegotiateSSL, this, 0);
+     switchedToHttps_ = true;
+
+=== modified file 'src/ssl/PeerConnector.cc'
+--- src/ssl/PeerConnector.cc	2015-08-01 03:50:37 +0000
++++ src/ssl/PeerConnector.cc	2015-08-10 14:42:50 +0000
+@@ -214,61 +214,68 @@
+ {
+     Ssl::PeekingPeerConnector *peerConnect = (Ssl::PeekingPeerConnector *) data;
+     peerConnect->checkForPeekAndSpliceDone((Ssl::BumpMode)answer.kind);
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::checkForPeekAndSplice()
+ {
+     // Mark Step3 of bumping
+     if (request->clientConnectionManager.valid()) {
+         if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
+             serverBump->step = Ssl::bumpStep3;
+         }
+     }
+ 
+     handleServerCertificate();
+ 
+     ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(
+         ::Config.accessList.ssl_bump,
+         request.getRaw(), NULL);
++    acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpPeek));
++    acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpStare));
++    acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpClientFirst));
++    acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpServerFirst));
++    SSL *ssl = fd_table[serverConn->fd].ssl;
++    BIO *b = SSL_get_rbio(ssl);
++    Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
++    if (!srvBio->canSplice())
++        acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpSplice));
++    if (!srvBio->canBump())
++        acl_checklist->banAction(allow_t(ACCESS_ALLOWED, Ssl::bumpBump));
+     acl_checklist->nonBlockingCheck(Ssl::PeekingPeerConnector::cbCheckForPeekAndSpliceDone, this);
+ }
+ 
+ void
+ Ssl::PeekingPeerConnector::checkForPeekAndSpliceDone(Ssl::BumpMode const action)
+ {
+     SSL *ssl = fd_table[serverConn->fd].ssl;
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
+     debugs(83,5, "Will check for peek and splice on FD " << serverConn->fd);
+ 
+     Ssl::BumpMode finalAction = action;
+     // adjust the final bumping mode if needed
+-    if (finalAction < Ssl::bumpSplice)
+-        finalAction = Ssl::bumpBump;
+-
+-    if (finalAction == Ssl::bumpSplice && !srvBio->canSplice())
+-        finalAction = Ssl::bumpBump;
+-    else if (finalAction == Ssl::bumpBump && !srvBio->canBump())
++    if (finalAction == Ssl::bumpNone)
+         finalAction = Ssl::bumpSplice;
+ 
++    Must(finalAction == Ssl::bumpSplice || finalAction == Ssl::bumpBump || finalAction == Ssl::bumpTerminate);
+     // Record final decision
+     if (request->clientConnectionManager.valid()) {
+         request->clientConnectionManager->sslBumpMode = finalAction;
+         request->clientConnectionManager->serverBump()->act.step3 = finalAction;
+     }
+ 
+     if (finalAction == Ssl::bumpTerminate) {
+         serverConn->close();
+         clientConn->close();
+     } else if (finalAction != Ssl::bumpSplice) {
+         //Allow write, proceed with the connection
+         srvBio->holdWrite(false);
+         srvBio->recordInput(false);
+         debugs(83,5, "Retry the fwdNegotiateSSL on FD " << serverConn->fd);
+         Ssl::PeerConnector::noteWantWrite();
+     } else {
+         splice = true;
+         // Ssl Negotiation stops here. Last SSL checks for valid certificates
+         // and if done, switch to tunnel mode
+         if (sslFinalized()) {
+

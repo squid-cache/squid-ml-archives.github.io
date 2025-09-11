@@ -1,0 +1,455 @@
+Handshake Error: ccs received early part2
+
+Squid currently does not handle SSL server responses that start with
+an SSL Alert Record. Squid fails to parse the Server Hello message and
+also fails to detect and handle resuming sessions.
+
+This is a Measurement Factory project.
+
+=== modified file 'src/ssl/bio.cc'
+--- src/ssl/bio.cc	2016-04-18 15:28:15 +0000
++++ src/ssl/bio.cc	2016-04-29 09:17:38 +0000
+@@ -212,58 +212,58 @@
+     static std::string buf;
+     buf.clear();
+     for (int i = 0; i < len; i++ ) {
+         char tmp[3];
+         snprintf(tmp, sizeof(tmp), "%.2x", bytes[i]);
+         buf.append(tmp);
+     }
+     return buf.c_str();
+ }
+ 
+ int
+ Ssl::ClientBio::read(char *buf, int size, BIO *table)
+ {
+     if (helloState < atHelloReceived) {
+         int bytes = readAndBuffer(buf, size, table, "TLS client Hello");
+         if (bytes <= 0)
+             return bytes;
+     }
+ 
+     if (helloState == atHelloNone) {
+-        helloSize = features.parseMsgHead(rbuf);
++        const int helloSize = features.parseMsgHead(rbuf);
+         if (helloSize == 0) {
+             // Not enough bytes to get hello message size
+             BIO_set_retry_read(table);
+             return -1;
+         } else if (helloSize < 0) {
+             return -1;
+         }
+ 
+         helloState = atHelloStarted; //Next state
+     }
+ 
+     if (helloState == atHelloStarted) {
+         const unsigned char *head = (const unsigned char *)rbuf.content();
+         const char *s = objToString(head, rbuf.contentSize());
+         debugs(83, 7, "SSL Header: " << s);
+ 
+-        if (helloSize > rbuf.contentSize()) {
++        if (!features.helloRecord(rbuf)) {
+             BIO_set_retry_read(table);
+             return -1;
+         }
+         features.get(rbuf);
+         helloState = atHelloReceived;
+     }
+ 
+     if (holdRead_) {
+         debugs(83, 7, "Hold flag is set, retry latter. (Hold " << size << "bytes)");
+         BIO_set_retry_read(table);
+         return -1;
+     }
+ 
+     if (helloState == atHelloReceived) {
+         if (rbuf.hasContent()) {
+             int bytes = (size <= rbuf.contentSize() ? size : rbuf.contentSize());
+             memcpy(buf, rbuf.content(), bytes);
+             rbuf.consume(bytes);
+             return bytes;
+         } else
+@@ -623,41 +623,41 @@
+         case BIO_CTRL_WPENDING:
+     */
+     default:
+         return 0;
+ 
+     }
+ 
+     return 0; /* NOTREACHED */
+ }
+ 
+ /// wrapper for Bio::stateChanged()
+ static void
+ squid_ssl_info(const SSL *ssl, int where, int ret)
+ {
+     if (BIO *table = SSL_get_rbio(ssl)) {
+         if (Ssl::Bio *bio = static_cast<Ssl::Bio*>(table->ptr))
+             bio->stateChanged(ssl, where, ret);
+     }
+ }
+ 
+-Ssl::Bio::sslFeatures::sslFeatures(): sslVersion(-1), compressMethod(-1), helloMsgSize(0), unknownCiphers(false), doHeartBeats(true), tlsTicketsExtension(false), hasTlsTicket(false), tlsStatusRequest(false), hasCcsOrNst(false), initialized_(false)
++Ssl::Bio::sslFeatures::sslFeatures(): sslVersion(-1), compressMethod(-1), helloRecordStart(0), helloMsgSize(0), unknownCiphers(false), doHeartBeats(true), tlsTicketsExtension(false), hasTlsTicket(false), tlsStatusRequest(false), hasCcsOrNst(false), initialized_(false)
+ {
+     memset(client_random, 0, SSL3_RANDOM_SIZE);
+ }
+ 
+ int Ssl::Bio::sslFeatures::toSquidSSLVersion() const
+ {
+     if (sslVersion == SSL2_VERSION)
+         return 2;
+     else if (sslVersion == SSL3_VERSION)
+         return 3;
+     else if (sslVersion == TLS1_VERSION)
+         return 4;
+ #if OPENSSL_VERSION_NUMBER >= 0x10001000L
+     else if (sslVersion == TLS1_1_VERSION)
+         return 5;
+     else if (sslVersion == TLS1_2_VERSION)
+         return 6;
+ #endif
+     else
+         return 1;
+@@ -748,136 +748,177 @@
+         debugs(83, 7, "tlsExtension client-opaque-prf-input of length " << len);
+         opaquePrf = objToString(p, len);
+     }
+ #endif
+     initialized_ = true;
+     return true;
+ }
+ 
+ int
+ Ssl::Bio::sslFeatures::parseMsgHead(const MemBuf &buf)
+ {
+     const unsigned char *head = (const unsigned char *)buf.content();
+     const char *s = objToString(head, buf.contentSize());
+     debugs(83, 7, "SSL Header: " << s);
+     if (buf.contentSize() < 5)
+         return 0;
+ 
+     if (helloMsgSize > 0)
+         return helloMsgSize;
+ 
+-    // Check for SSLPlaintext/TLSPlaintext record
+-    // RFC6101 section 5.2.1
+-    // RFC5246 section 6.2.1
+-    if (head[0] == 0x16) {
+-        debugs(83, 7, "SSL version 3 handshake message");
+-        // The SSL version exist in the 2nd and 3rd bytes
+-        sslVersion = (head[1] << 8) | head[2];
+-        debugs(83, 7, "SSL Version :" << std::hex << std::setw(8) << std::setfill('0') << sslVersion);
+-        // The hello message size exist in 4th and 5th bytes
+-        helloMsgSize = (head[3] << 8) + head[4];
+-        debugs(83, 7, "SSL Header Size: " << helloMsgSize);
+-        helloMsgSize +=5;
+-    } else if ((head[0] & 0x80) && head[2] == 0x01 && head[3] == 0x03) {
++    if ((head[0] & 0x80) && head[2] == 0x01 && head[3] == 0x03) {
+         debugs(83, 7, "SSL version 2 handshake message with v3 support");
+         sslVersion = (head[3] << 8) | head[4];
++        helloRecordStart = 0;
+         debugs(83, 7, "SSL Version :" << std::hex << std::setw(8) << std::setfill('0') << sslVersion);
+         // The hello message size exist in 2nd byte
+         helloMsgSize = head[1];
+         helloMsgSize +=2;
+-    } else {
+-        debugs(83, 7, "Not an SSL acceptable handshake message (SSLv2 message?)");
+-        return (helloMsgSize = -1);
++        initialized_ = true;
++        return helloMsgSize;
+     }
+ 
+-    // Set object as initialized. Even if we did not full parsing yet
+-    // The basic features, like the SSL version is set
+-    initialized_ = true;
+-    return helloMsgSize;
++    const int headSize = buf.contentSize();
++    int currentPos = 0;
++    do {
++        const unsigned char *currentRecord = head + currentPos;
++        // Check for Alert Protocol records before hello mesage. RFC5246 section-7.2
++        if (currentRecord[0] == 0x15) {
++            int recordSize = (currentRecord[3] << 8) + currentRecord[4];
++            // We need at least 5 bytes for each record.
++            if ((currentPos + recordSize + 5) > headSize)
++                return 0; // Not enough bytes;
++            // Check for fatal Alert and abort if found
++            if (currentRecord[5] > 1)
++                return -1;
++            currentPos += recordSize + 5;
++        } else if (currentRecord[0] == 0x16) {
++            // SSLPlaintext/TLSPlaintext record
++            // RFC6101 section 5.2.1, RFC5246 section 6.2.1
++            debugs(83, 7, "SSL version 3 handshake message");
++            // The SSL version exist in the 2nd and 3rd bytes
++            sslVersion = (currentRecord[1] << 8) | currentRecord[2];
++            debugs(83, 7, "SSL Version :" << std::hex << std::setw(8) << std::setfill('0') << sslVersion);
++            // The hello message size exist in 4th and 5th bytes
++            helloMsgSize = (currentRecord[3] << 8) + currentRecord[4];
++            debugs(83, 7, "SSL Header Size: " << helloMsgSize);
++            helloMsgSize +=5;
++            helloRecordStart = currentPos;
++
++            // Set object as initialized. Even if we did not full parsing yet
++            // The basic features, like the SSL version is set
++            initialized_ = true;
++            return helloMsgSize;
++        } else {
++            debugs(83, 7, "Not an SSL acceptable handshake message (SSLv2 message?)");
++            return (helloMsgSize = -1);
++        }
++    } while (currentPos + 5 <= headSize);
++
++    return 0;
+ }
+ 
+ bool
+-Ssl::Bio::sslFeatures::checkForCcsOrNst(const unsigned char *msg, size_t size)
++Ssl::Bio::sslFeatures::checkForCcsOrNst(const MemBuf &buf)
+ {
++    if (helloMsgSize <= 0) //unparsed content?
++        return false;
++
++    // Check the records after the Hello record.
++    const int afterHello = helloRecordStart + helloMsgSize;
++    const unsigned char *msg = reinterpret_cast<const unsigned char *>(buf.content()) + afterHello;
++    size_t size = (buf.contentSize() > afterHello) ? (size_t)(buf.contentSize() - afterHello) : 0;
+     while (size > 5) {
+         const int msgType = msg[0];
+         const int msgSslVersion = (msg[1] << 8) | msg[2];
+         debugs(83, 7, "SSL Message Version :" << std::hex << std::setw(8) << std::setfill('0') << msgSslVersion);
+         // Check for Change Cipher Spec message
+         // RFC5246 section 6.2.1
+         if (msgType == 0x14) {// Change Cipher Spec message found
+             debugs(83, 7, "SSL  Change Cipher Spec message found");
+             return true;
+         }
+         // Check for New Session Ticket message
+         // RFC5077 section 3.3
+         if (msgType == 0x04) {// New Session Ticket message found
+             debugs(83, 7, "TLS  New Session Ticket message found");
+             return true;
+         }
+         // The hello message size exist in 4th and 5th bytes
+         size_t msgLength = (msg[3] << 8) + msg[4];
+         debugs(83, 7, "SSL Message Size: " << msgLength);
+         msgLength += 5;
+ 
+         if (msgLength <= size) {
+             msg += msgLength;
+             size -= msgLength;
+         } else
+             size = 0;
+     }
+     return false;
+ }
+ 
++const unsigned char *
++Ssl::Bio::sslFeatures::helloRecord(const MemBuf &buf)
++{
++    if (helloMsgSize <= 0)
++        return NULL;
++
++    if (helloRecordStart + helloMsgSize <= buf.contentSize())
++        return reinterpret_cast<const unsigned char *>(buf.content()) + helloRecordStart;
++
++    return NULL;
++}
++
+ bool
+ Ssl::Bio::sslFeatures::get(const MemBuf &buf, bool record)
+ {
+     int msgSize;
+     if ((msgSize = parseMsgHead(buf)) <= 0) {
+         debugs(83, 7, "Not a known SSL handshake message");
+         return false;
+     }
+ 
+-    if (msgSize > buf.contentSize()) {
+-        debugs(83, 2, "Partial SSL handshake message, can not parse!");
+-        return false;
+-    }
+-
+     if (record) {
+         helloMessage.clear();
+         helloMessage.append(buf.content(), buf.contentSize());
+     }
+ 
+-    const unsigned char *msg = (const unsigned char *)buf.content();
++    const unsigned char *msg = helloRecord(buf);
++    if (!msg) {
++        debugs(83, 2, "Partial SSL handshake message, can not parse!");
++        return false;
++    }
++
+     if (msg[0] & 0x80)
+         return parseV23Hello(msg, (size_t)msgSize);
+     else {
+         // Hello messages require 5 bytes header + 1 byte Msg type + 3 bytes for Msg size
+         if (buf.contentSize() < 9)
+             return false;
+ 
+         // Check for the Handshake/Message type
+         // The type 2 is a ServerHello, the type 1 is a ClientHello
+         // RFC5246 section 7.4
+         if (msg[5] == 0x2) { // ServerHello message
+             if (parseV3ServerHello(msg, (size_t)msgSize)) {
+-                hasCcsOrNst = checkForCcsOrNst(msg + msgSize,  buf.contentSize() - msgSize);
++                hasCcsOrNst = checkForCcsOrNst(buf);
+                 return true;
+             }
+         } else if (msg[5] == 0x1) // ClientHello message,
+             return parseV3Hello(msg, (size_t)msgSize);
+     }
+ 
+     return false;
+ }
+ 
+ bool
+ Ssl::Bio::sslFeatures::parseV3ServerHello(const unsigned char *messageContainer, size_t messageContainerSize)
+ {
+     // Parse a ServerHello Handshake message
+     // RFC5246 section 7.4, 7.4.1.3
+     // The ServerHello starts at messageContainer + 5
+     const unsigned char *serverHello = messageContainer + 5;
+ 
+     // The Length field (bytes 1-3) plus 4 bytes of the serverHello message header (1 handshake type + 3 hello length)
+     const size_t helloSize = ((serverHello[1] << 16) | (serverHello[2] << 8) | serverHello[3]) + 4;
+     debugs(83, 7, "ServerHello message size: " << helloSize);
+
+=== modified file 'src/ssl/bio.h'
+--- src/ssl/bio.h	2016-01-01 00:14:27 +0000
++++ src/ssl/bio.h	2016-04-29 09:04:51 +0000
+@@ -35,51 +35,55 @@
+     class sslFeatures
+     {
+     public:
+         sslFeatures();
+         bool get(const SSL *ssl); ///< Retrieves the features from SSL object
+         /// Retrieves features from raw SSL Hello message.
+         /// \param record  whether to store Message to the helloMessage member
+         bool get(const MemBuf &, bool record = true);
+         /// Parses a v3 ClientHello message
+         bool parseV3Hello(const unsigned char *hello, size_t helloSize);
+         /// Parses a v23 ClientHello message
+         bool parseV23Hello(const unsigned char *hello, size_t helloSize);
+         /// Parses a v3 ServerHello message.
+         bool parseV3ServerHello(const unsigned char *hello, size_t helloSize);
+         /// Prints to os stream a human readable form of sslFeatures object
+         std::ostream & print(std::ostream &os) const;
+         /// Converts to the internal squid SSL version form the sslVersion
+         int toSquidSSLVersion() const;
+         /// Configure the SSL object with the SSL features of the sslFeatures object
+         void applyToSSL(SSL *ssl, Ssl::BumpMode bumpMode) const;
+-        /// Parses an SSL Message header. It returns the ssl Message size.
++        /// Parses an SSL Message header. It returns the Hello ssl Message size.
+         /// \retval >0 if the hello size is retrieved
+         /// \retval 0 if the contents of the buffer are not enough
+         /// \retval <0 if the contents of buf are not SSLv3 or TLS hello message
+         int parseMsgHead(const MemBuf &);
+-        /// Parses msg buffer and return true if one of the Change Cipher Spec
++        /// Return a pointer to the SSL Record include the hello message
++        /// or NULL if this is not available
++        const unsigned char *helloRecord(const MemBuf &);
++        /// Parses buf buffer and return true if one of the Change Cipher Spec
+         /// or New Session Ticket messages found
+-        bool checkForCcsOrNst(const unsigned char *msg, size_t size);
++        bool checkForCcsOrNst(const MemBuf &buf);
+     public:
+         int sslVersion; ///< The requested/used SSL version
+         int compressMethod; ///< The requested/used compressed  method
++        int helloRecordStart; ///< The SSL hello position in SSL
+         int helloMsgSize; ///< the hello message size
+         mutable SBuf serverName; ///< The SNI hostname, if any
+         std::string clientRequestedCiphers; ///< The client requested ciphers
+         bool unknownCiphers; ///< True if one or more ciphers are unknown
+         std::string ecPointFormatList;///< tlsExtension ecPointFormatList
+         std::string ellipticCurves; ///< tlsExtension ellipticCurveList
+         std::string opaquePrf; ///< tlsExtension opaquePrf
+         bool doHeartBeats;
+         bool tlsTicketsExtension; ///< whether TLS tickets extension is enabled
+         bool hasTlsTicket; ///< whether a TLS ticket is included
+         bool tlsStatusRequest; ///< whether the TLS status request extension is set
+         SBuf tlsAppLayerProtoNeg; ///< The value of the TLS application layer protocol extension if it is enabled
+         /// whether Change Cipher Spec message included in ServerHello
+         /// handshake message
+         bool hasCcsOrNst;
+         /// The client random number
+         unsigned char client_random[SSL3_RANDOM_SIZE];
+         SBuf sessionId;
+         std::list<int> extensions;
+         SBuf helloMessage;
+@@ -113,68 +117,67 @@
+     /// Prepare the rbuf buffer to accept hello data
+     void prepReadBuf();
+ 
+     /// Reads data from socket and record them to a buffer
+     int readAndBuffer(char *buf, int size, BIO *table, const char *description);
+ 
+     const MemBuf &rBufData() {return rbuf;}
+ protected:
+     const int fd_; ///< the SSL socket we are reading and writing
+     MemBuf rbuf;  ///< Used to buffer input data.
+ };
+ 
+ /// BIO node to handle socket IO for squid client side
+ /// If bumping is enabled  this Bio detects and analyses client hello message
+ /// to retrieve the SSL features supported by the client
+ class ClientBio: public Bio
+ {
+ public:
+     /// The ssl hello message read states
+     typedef enum {atHelloNone = 0, atHelloStarted, atHelloReceived} HelloReadState;
+-    explicit ClientBio(const int anFd): Bio(anFd), holdRead_(false), holdWrite_(false), helloState(atHelloNone), helloSize(0) {}
++    explicit ClientBio(const int anFd): Bio(anFd), holdRead_(false), holdWrite_(false), helloState(atHelloNone) {}
+ 
+     /// The ClientBio version of the Ssl::Bio::stateChanged method
+     /// When the client hello message retrieved, fill the
+     /// "features" member with the client provided informations.
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+     /// The ClientBio version of the Ssl::Bio::write method
+     virtual int write(const char *buf, int size, BIO *table);
+     /// The ClientBio version of the Ssl::Bio::read method
+     /// If the holdRead flag is true then it does not write any data
+     /// to socket and sets the "read retry" flag of the BIO to true
+     virtual int read(char *buf, int size, BIO *table);
+     /// Return true if the client hello message received and analized
+     bool gotHello() { return (helloState == atHelloReceived); }
+     /// Return the SSL features requested by SSL client
+     const Bio::sslFeatures &getFeatures() const {return features;}
+     /// Prevents or allow writting on socket.
+     void hold(bool h) {holdRead_ = holdWrite_ = h;}
+ 
+ private:
+     /// True if the SSL state corresponds to a hello message
+     bool isClientHello(int state);
+     /// The futures retrieved from client SSL hello message
+     Bio::sslFeatures features;
+     bool holdRead_; ///< The read hold state of the bio.
+     bool holdWrite_;  ///< The write hold state of the bio.
+     HelloReadState helloState; ///< The SSL hello read state
+-    int helloSize; ///< The SSL hello message sent by client size
+ };
+ 
+ /// BIO node to handle socket IO for squid server side
+ /// If bumping is enabled, analyses the SSL hello message sent by squid OpenSSL
+ /// subsystem (step3 bumping step) against bumping mode:
+ ///   * Peek mode:  Send client hello message instead of the openSSL generated
+ ///                 hello message and normaly denies bumping and allow only
+ ///                 splice or terminate the SSL connection
+ ///   * Stare mode: Sends the openSSL generated hello message and normaly
+ ///                 denies splicing and allow bump or terminate the SSL
+ ///                 connection
+ ///  If SQUID_USE_OPENSSL_HELLO_OVERWRITE_HACK is enabled also checks if the
+ ///  openSSL library features are compatible with the features reported in
+ ///  web client SSL hello message and if it is, overwrites the openSSL SSL
+ ///  object members to replace hello message with web client hello message.
+ ///  This is may allow bumping in peek mode and splicing in stare mode after
+ ///  the server hello message received.
+ class ServerBio: public Bio
+ {
+ public:
+

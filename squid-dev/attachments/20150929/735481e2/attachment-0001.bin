@@ -1,0 +1,316 @@
+%ssl::<cert_errors logformat code
+
+The new %ssl::<cert_errors logformat code lists server certificate
+validation errors detected by Squid (including OpenSSL and the
+certificate validation helper components). The errors are listed in
+the discovery order. By default, the error codes are separated by ':'.
+Custom separators are also supported. For example:
+
+  %{;}ssl::<cert_errors
+
+This is a Measurement Factory project.
+
+=== modified file 'src/cf.data.pre'
+--- src/cf.data.pre	2015-08-30 01:07:47 +0000
++++ src/cf.data.pre	2015-09-29 14:54:23 +0000
+@@ -4322,40 +4322,47 @@
+ 				times are recorded individually.
+ 
+ 	You can prefix adapt::*_trs format codes with adaptation
+ 	service name in curly braces to record response time(s) specific
+ 	to that service. For example: %{my_service}adapt::sum_trs
+ 
+ 	If SSL is enabled, the following formating codes become available:
+ 
+ 		%ssl::>cert_subject The Subject field of the received client
+ 				SSL certificate or a dash ('-') if Squid has
+ 				received an invalid/malformed certificate or
+ 				no certificate at all. Consider encoding the
+ 				logged value because Subject often has spaces.
+ 
+ 		%ssl::>cert_issuer The Issuer field of the received client
+ 				SSL certificate or a dash ('-') if Squid has
+ 				received an invalid/malformed certificate or
+ 				no certificate at all. Consider encoding the
+ 				logged value because Issuer often has spaces.
+ 
++		%ssl::<cert_errors The list of certificate validation errors
++				detected by Squid (including OpenSSL and
++				certificate validation helper components). The
++				errors are listed in the discovery order. By
++				default, the error codes are separated by ':'.
++				Accepts an optional separator argument.
++
+ 	The default formats available (which do not need re-defining) are:
+ 
+ logformat squid      %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %[un %Sh/%<a %mt
+ logformat common     %>a %[ui %[un [%tl] "%rm %ru HTTP/%rv" %>Hs %<st %Ss:%Sh
+ logformat combined   %>a %[ui %[un [%tl] "%rm %ru HTTP/%rv" %>Hs %<st "%{Referer}>h" "%{User-Agent}>h" %Ss:%Sh
+ logformat referrer   %ts.%03tu %>a %{Referer}>h %ru
+ logformat useragent  %>a [%tl] "%{User-Agent}>h"
+ 
+ 	NOTE: When the log_mime_hdrs directive is set to ON.
+ 		The squid, common and combined formats have a safely encoded copy
+ 		of the mime headers appended to each line within a pair of brackets.
+ 
+ 	NOTE: The common and combined formats are not quite true to the Apache definition.
+ 		The logs from Squid contain an extra status and hierarchy code appended.
+ 
+ DOC_END
+ 
+ NAME: access_log cache_access_log
+ TYPE: access_log
+ LOC: Config.Log.accesslogs
+
+=== modified file 'src/format/ByteCode.h'
+--- src/format/ByteCode.h	2015-01-13 07:25:36 +0000
++++ src/format/ByteCode.h	2015-09-16 09:16:57 +0000
+@@ -200,40 +200,41 @@
+     LFT_ICAP_REQ_ALL_HEADERS,
+ 
+     LFT_ICAP_REP_HEADER,
+     LFT_ICAP_REP_HEADER_ELEM,
+     LFT_ICAP_REP_ALL_HEADERS,
+ 
+     LFT_ICAP_TR_RESPONSE_TIME,
+     LFT_ICAP_IO_TIME,
+     LFT_ICAP_OUTCOME,
+     LFT_ICAP_STATUS_CODE,
+ #endif
+     LFT_CREDENTIALS,
+ 
+ #if USE_OPENSSL
+     LFT_SSL_BUMP_MODE,
+     LFT_SSL_USER_CERT_SUBJECT,
+     LFT_SSL_USER_CERT_ISSUER,
+     LFT_SSL_CLIENT_SNI,
+     LFT_SSL_SERVER_CERT_SUBJECT,
+     LFT_SSL_SERVER_CERT_ISSUER,
++    LFT_SSL_SERVER_CERT_ERRORS,
+ #endif
+ 
+     LFT_NOTE,
+     LFT_PERCENT,            /* special string cases for escaped chars */
+ 
+     // TODO assign better bytecode names and Token strings for these
+     LFT_EXT_ACL_USER_CERT_RAW,
+     LFT_EXT_ACL_USER_CERTCHAIN_RAW,
+     LFT_EXT_ACL_USER_CERT,
+     LFT_EXT_ACL_USER_CA_CERT,
+     LFT_EXT_ACL_CLIENT_EUI48,
+     LFT_EXT_ACL_CLIENT_EUI64,
+     LFT_EXT_ACL_NAME,
+     LFT_EXT_ACL_DATA
+ 
+ } ByteCode_t;
+ 
+ /// Quoting style for a format output.
+ enum Quoting {
+     LOG_QUOTE_NONE = 0,
+
+=== modified file 'src/format/Format.cc'
+--- src/format/Format.cc	2015-07-19 13:23:01 +0000
++++ src/format/Format.cc	2015-09-29 15:00:43 +0000
+@@ -292,40 +292,49 @@
+             *p = '\\';
+             ++p;
+             *p = 't';
+             ++p;
+             ++str;
+             break;
+ 
+         default:
+             *p = '\\';
+             ++p;
+             *p = *str;
+             ++p;
+             ++str;
+             break;
+         }
+     }
+ 
+     *p = '\0';
+ }
+ 
++#if USE_OPENSSL
++static char *
++sslErrorName(Ssl::ssl_error_t err, char *buf, size_t size)
++{
++    snprintf(buf, size, "SSL_ERR=%d", err);
++    return buf;
++}
++#endif
++
+ void
+ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logSequenceNumber) const
+ {
+     char tmp[1024];
+     String sb;
+ 
+     for (Token *fmt = format; fmt != NULL; fmt = fmt->next) {   /* for each token */
+         const char *out = NULL;
+         int quote = 0;
+         long int outint = 0;
+         int doint = 0;
+         int dofree = 0;
+         int64_t outoff = 0;
+         int dooff = 0;
+         struct timeval outtv = {0, 0};
+         int doMsec = 0;
+         int doSec = 0;
+ 
+         switch (fmt->type) {
+ 
+@@ -871,44 +880,42 @@
+                 outoff = al->hier.bodyBytesRead;
+                 dooff = 1;
+             }
+             // else if hier.bodyBytesRead < 0 we did not have any data exchange with
+             // a peer server so just print a "-" (eg requests served from cache,
+             // or internal error messages).
+             break;
+ 
+         case LFT_SQUID_STATUS:
+             out = al->cache.code.c_str();
+             break;
+ 
+         case LFT_SQUID_ERROR:
+             if (al->request && al->request->errType != ERR_NONE)
+                 out = errorPageName(al->request->errType);
+             break;
+ 
+         case LFT_SQUID_ERROR_DETAIL:
+ #if USE_OPENSSL
+             if (al->request && al->request->errType == ERR_SECURE_CONNECT_FAIL) {
+-                if (! (out = Ssl::GetErrorName(al->request->errDetail))) {
+-                    snprintf(tmp, sizeof(tmp), "SSL_ERR=%d", al->request->errDetail);
+-                    out = tmp;
+-                }
++                if (! (out = Ssl::GetErrorName(al->request->errDetail)))
++                    out = sslErrorName(al->request->errDetail, tmp, sizeof(tmp));
+             } else
+ #endif
+                 if (al->request && al->request->errDetail != ERR_DETAIL_NONE) {
+                     if (al->request->errDetail > ERR_DETAIL_START  &&
+                             al->request->errDetail < ERR_DETAIL_MAX)
+                         out = errorDetailName(al->request->errDetail);
+                     else {
+                         if (al->request->errDetail >= ERR_DETAIL_EXCEPTION_START)
+                             snprintf(tmp, sizeof(tmp), "%s=0x%X",
+                                      errorDetailName(al->request->errDetail), (uint32_t) al->request->errDetail);
+                         else
+                             snprintf(tmp, sizeof(tmp), "%s=%d",
+                                      errorDetailName(al->request->errDetail), al->request->errDetail);
+                         out = tmp;
+                     }
+                 }
+             break;
+ 
+         case LFT_SQUID_HIERARCHY:
+             if (al->hier.ping.timedout)
+@@ -1141,40 +1148,58 @@
+             }
+             break;
+ 
+         case LFT_SSL_USER_CERT_ISSUER:
+             if (X509 *cert = al->cache.sslClientCert.get()) {
+                 if (X509_NAME *issuer = X509_get_issuer_name(cert)) {
+                     X509_NAME_oneline(issuer, tmp, sizeof(tmp));
+                     out = tmp;
+                 }
+             }
+             break;
+         case LFT_SSL_CLIENT_SNI:
+             if (al->request && al->request->clientConnectionManager.valid()) {
+                 if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
+                     if (!srvBump->clientSni.isEmpty())
+                         out = srvBump->clientSni.c_str();
+                 }
+             }
+             break;
+ 
++        case LFT_SSL_SERVER_CERT_ERRORS:
++            if (al->request && al->request->clientConnectionManager.valid()) {
++                if (Ssl::ServerBump * srvBump = al->request->clientConnectionManager->serverBump()) {
++                    const char *separator = fmt->data.string ? fmt->data.string : ":";
++                    for (Ssl::CertErrors *sslError = srvBump->sslErrors; sslError != NULL;  sslError = sslError->next) {
++                        if (sb.size())
++                            sb.append(separator);
++                        if (const char *errorName = Ssl::GetErrorName(sslError->element.code))
++                            sb.append(errorName);
++                        else
++                            sb.append(sslErrorName(sslError->element.code, tmp, sizeof(tmp)));
++                    }
++                    if (sb.size())
++                        out = sb.termedBuf();
++                }
++            }
++            break;
++
+         case LFT_SSL_SERVER_CERT_ISSUER:
+         case LFT_SSL_SERVER_CERT_SUBJECT:
+             // Not implemented
+             break;
+ #endif
+ 
+         case LFT_REQUEST_URLGROUP_OLD_2X:
+             assert(LFT_REQUEST_URLGROUP_OLD_2X == 0); // should never happen.
+ 
+         case LFT_NOTE:
+             tmp[0] = fmt->data.header.separator;
+             tmp[1] = '\0';
+             if (fmt->data.header.header && *fmt->data.header.header) {
+                 const char *separator = tmp;
+ #if USE_ADAPTATION
+                 Adaptation::History::Pointer ah = al->request ? al->request->adaptHistory() : Adaptation::History::Pointer();
+                 if (ah != NULL && ah->metaHeaders != NULL) {
+                     if (const char *meta = ah->metaHeaders->find(fmt->data.header.header, separator))
+                         sb.append(meta);
+                 }
+
+=== modified file 'src/format/Token.cc'
+--- src/format/Token.cc	2015-01-13 07:25:36 +0000
++++ src/format/Token.cc	2015-09-16 09:16:45 +0000
+@@ -175,40 +175,41 @@
+     TokenTableEntry("<h",  LFT_ICAP_REP_HEADER),
+ 
+     TokenTableEntry("tr",  LFT_ICAP_TR_RESPONSE_TIME),
+     TokenTableEntry("tio", LFT_ICAP_IO_TIME),
+     TokenTableEntry("to",  LFT_ICAP_OUTCOME),
+     TokenTableEntry("Hs",  LFT_ICAP_STATUS_CODE),
+ 
+     TokenTableEntry(NULL, LFT_NONE)           /* this must be last */
+ };
+ #endif
+ 
+ #if USE_OPENSSL
+ // SSL (ssl::) tokens
+ static TokenTableEntry TokenTableSsl[] = {
+     TokenTableEntry("bump_mode", LFT_SSL_BUMP_MODE),
+     TokenTableEntry(">cert_subject", LFT_SSL_USER_CERT_SUBJECT),
+     TokenTableEntry(">cert_issuer", LFT_SSL_USER_CERT_ISSUER),
+     TokenTableEntry(">sni", LFT_SSL_CLIENT_SNI),
+     /*TokenTableEntry("<cert_subject", LFT_SSL_SERVER_CERT_SUBJECT), */
+     /*TokenTableEntry("<cert_issuer", LFT_SSL_SERVER_CERT_ISSUER), */
++    TokenTableEntry("<cert_errors", LFT_SSL_SERVER_CERT_ERRORS),
+     TokenTableEntry(NULL, LFT_NONE)
+ };
+ #endif
+ } // namespace Format
+ 
+ /// Register all components custom format tokens
+ void
+ Format::Token::Init()
+ {
+     // TODO standard log tokens
+     // TODO external ACL fmt tokens
+ 
+ #if USE_ADAPTATION
+     TheConfig.registerTokens(String("adapt"),::Format::TokenTableAdapt);
+ #endif
+ #if ICAP_CLIENT
+     TheConfig.registerTokens(String("icap"),::Format::TokenTableIcap);
+ #endif
+ #if USE_OPENSSL
+     TheConfig.registerTokens(String("ssl"),::Format::TokenTableSsl);
+

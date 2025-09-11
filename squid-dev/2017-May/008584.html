@@ -1,0 +1,180 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [squid-dev] [PATCH] Make PID file check/creation atomic
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Make%20PID%20file%20check/creation%20atomic&In-Reply-To=%3C4f979ba8-1da9-d706-0646-fcd6a391dd4c%40measurement-factory.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="008582.html">
+   <LINK REL="Next"  HREF="008604.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[squid-dev] [PATCH] Make PID file check/creation atomic</H1>
+    <B>Eduard Bagdasaryan</B> 
+    <A HREF="mailto:squid-dev%40lists.squid-cache.org?Subject=Re%3A%20%5Bsquid-dev%5D%20%5BPATCH%5D%20Make%20PID%20file%20check/creation%20atomic&In-Reply-To=%3C4f979ba8-1da9-d706-0646-fcd6a391dd4c%40measurement-factory.com%3E"
+       TITLE="[squid-dev] [PATCH] Make PID file check/creation atomic">eduard.bagdasaryan at measurement-factory.com
+       </A><BR>
+    <I>Sat May  6 21:59:00 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008582.html">[squid-dev] Jenkins build is back to normal : template-full-matrix » clang,d-centos-7 #338
+</A></li>
+        <LI>Next message: <A HREF="008604.html">[squid-dev] [PATCH] Make PID file check/creation atomic
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8584">[ date ]</a>
+              <a href="thread.html#8584">[ thread ]</a>
+              <a href="subject.html#8584">[ subject ]</a>
+              <a href="author.html#8584">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>This patch makes PID file check/creation atomic to avoid associated
+race conditions.
+
+Authors: Alex Rousskov, Eduard Bagdasaryan
+
+After this change, if N Squid instances are concurrently started shortly
+after time TS, then exactly one Squid instance (X) will run (and have
+the corresponding PID file). If another Squid instance has already been
+running (with the corresponding PID file) at TS, then X will be that
+&quot;old&quot; Squid instance. If no Squid instances were running at TS, then X
+will be one of those new N Squids started after TS.
+
+Lack of atomic PID file operations caused unexpected Squid behavior:
+* Mismatch between started Squid instance and stored PID file.
+* Unexpected crashes due to failed allocation of shared resources,
+   such as listening TCP ports or shared memory segments.
+
+A new File class guarantees atomic PID file operations using locks. We
+tried to generalize/reuse Ssl::Lock from the certificate generation
+helper, but that was a bad idea: Helpers cannot use a lot of Squid code
+(e.g., debugs(), TextException, SBuf, and enter_suid()), and the old
+Ssl::Lock class cannot support shared locking without a major rewrite.
+
+File locks on Solaris cannot work well (see bug #4212 comment #14), but
+those problems do not affect PID file management code. Solaris- and
+Windows-specific File code has not been tested and may not build.
+
+Failure to write a PID file is now fatal. It used to be fatal only when
+Squid was started with the -C command line option. In the increasingly
+SMP world, running without a PID file leads to difficult-to-triage
+errors. An admin who does not care about PID files should disable them.
+
+Squid now exits with a non-zero error code if another Squid is running.
+
+
+Also removed PID file rewriting during reconfiguration in non-daemon
+mode. Squid daemons do not support PID file reconfiguration since trunk
+r13867, but that revision (accidentally?) left behind half-broken
+reconfiguration code for non-daemon mode. Fixing that code is difficult,
+and supporting PID reconfigure in non-daemons is probably unnecessary.
+
+Also fixed &quot;is Squid running?&quot; check when kill(0) does not have
+permissions to signal the other instance. This does happen when Squid is
+started (e.g., on the command line) by a different user than the user
+Squid normally runs as or, perhaps, when the other Squid instance enters
+a privileged section at the time of the check (untested). The bug could
+result in undelivered signals or multiple running Squid instances.
+
+These changes do not alter partially broken enter/leave_suid() behavior
+of main.cc. That old code will need to be fixed separately!
+
+PID file-related cache.log messages have changed slightly to improve
+consistency with other DBG_IMPORTANT messages and to simplify code.
+Squid no longer lies about creating a non-configured PID file.
+
+
+* Terminal errors should throw instead of calling exit()
+
+Squid used to call exit() in many PID-related error cases. Using exit()
+as an error handling mechanism creates several problems:
+
+1. exit() does not unwind the stack, possibly executing atexit()
+    handlers in the wrong (e.g., privileged) context, possibly leaving
+    some RAII-controller resources in bad state, and complicating triage;
+2. Using exit() complicates code by adding a yet another error handling
+    mechanism to the (appropriate) exceptions and assertions.
+3. Spreading exit() calls around the code obscures unreachable code
+    areas, complicates unifying exit codes, and confuses code checkers.
+
+Long-term, it is best to use exceptions for nearly all error handling.
+Reaching that goal will take time, but we can and should move in that
+direction: The adjusted SquidMainSafe() treats exceptions as fatal
+errors, without dumping core or assuming that no exception can reach
+SquidMainSafe() on purpose. This trivial-looking change significantly
+simplified (and otherwise improved) PID-file handling code!
+
+
+Thanks,
+Eduard.
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: SQUID-285-atomic-pid-file-check-creation-t10.patch
+Type: text/x-patch
+Size: 78815 bytes
+Desc: not available
+URL: &lt;<A HREF="http://lists.squid-cache.org/pipermail/squid-dev/attachments/20170507/e14eed39/attachment-0001.bin">http://lists.squid-cache.org/pipermail/squid-dev/attachments/20170507/e14eed39/attachment-0001.bin</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008582.html">[squid-dev] Jenkins build is back to normal : template-full-matrix » clang,d-centos-7 #338
+</A></li>
+	<LI>Next message: <A HREF="008604.html">[squid-dev] [PATCH] Make PID file check/creation atomic
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8584">[ date ]</a>
+              <a href="thread.html#8584">[ thread ]</a>
+              <a href="subject.html#8584">[ subject ]</a>
+              <a href="author.html#8584">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.squid-cache.org/listinfo/squid-dev">More information about the squid-dev
+mailing list</a><br>
+</body></html>

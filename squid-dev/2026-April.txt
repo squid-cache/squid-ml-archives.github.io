@@ -1656,3 +1656,477 @@ HTH
 Amos
 
 
+From squid3 at treenet.co.nz  Tue Apr 21 08:01:54 2026
+From: squid3 at treenet.co.nz (Amos Jeffries)
+Date: Tue, 21 Apr 2026 20:01:54 +1200
+Subject: [squid-dev] Issue with acl note (without -m) splitting helper
+ tokens containing commas
+In-Reply-To: <10e9ebca-6fa4-48a9-9082-1c03eb97a792@measurement-factory.com>
+References: <CADJd0Y1M=Z9VY6spPMcR1SoFgrfDKuWdbWM=6=A=CEoS+oi+Og@mail.gmail.com>
+ <10e9ebca-6fa4-48a9-9082-1c03eb97a792@measurement-factory.com>
+Message-ID: <3d5b3018-9757-4e7d-bb24-172c674c2359@treenet.co.nz>
+
+On 21/04/2026 06:59, Alex Rousskov wrote:
+> On 2026-04-17 09:08, Andrey K wrote:
+> 
+>> While working with annotations, I?ve noticed an inconsistency in how 
+>> acl note (without the -m option) handles tokens received from helpers 
+>> when they contain a comma.
+> 
+> I think it is important to note that there are several distinct players 
+> here, including:
+> 
+> 1. What annotations the helper sends to Squid.
+> 
+
+Which is:
+
+     group="Staff:accountants,lawyers,security"
+
+
+> 2. How helper response parser converts received helper response into
+>  ?? transaction annotations.
+> 
+
+Which is:
+
+   1) remove double-quotes
+   2) translate \-escapes within quoted-string values
+   3) translate %-coded within token values
+
+Nothing more. ',' is not special for that parser.
+
+
+> 3. How the "note" ACL code interprets transaction annotations.
+>  ?? These annotations may come from sources other than a helper.
+> 
+
+This is where ',' becomes special as a list delimiter.
+
+The annotation system interprets "a,b,c" as a set of three values, 
+stored as a list.
+
+  (I do not understand why we need to store annotations in their 
+serialized format in the first place. It is generally a bad design.)
+
+
+> 
+>> According to the documentation, an ACL like this:
+>> ?? ? acl staff note group Staff:accountants,lawyers,security
+>> should match a helper response such as:
+>> ?? ? group="Staff:accountants,lawyers,security"
+> 
+> The above implies that helper response parser should not split group=X 
+> response fields (using comma as a delimiter). Do we document that 
+> anywhere?
+
+The only thing the helper response parser does is remove the DQUOTE 
+characters around the value string.
+
+As you noted below, the problem is ACL logic interaction with the 
+annotation storage.
+
+
+> Did our helper response parser ever split such fields in the 
+> past?
+> 
+
+If it did that was a bug. Prior to the annotations feature we did not 
+support key=value-list, only key=value (singular value).
+
+
+
+> BTW, 2015 commit 76ee67ac used a very similar example. AFAICT by looking 
+> at that code, we did not apply value delimiters by default back then 
+> (i.e. when ACL_F_SUBSTRING a.k.a. "-m" flag was not set). The bug was 
+> introduced in 2017 commit 4eac3407 that replaced a possibly-nil 
+> `flags.delimiters()` with a never-nil `&delimiters.value`.
+> 
+> The following comment suggests that we missed the fact that using the 
+> [default-initialized] value "without checking whether the option is 
+> enabled()" is a bug -- the corresponding "trick" never fully worked:
+> 
+> ```C++
+> // TODO: Some callers use .value without checking whether the option is
+> // enabled(), accessing the (default-initialized or customized) default
+> // value that way. This trick will stop working if we add valued options
+> // that can be disabled (e.g., --with-foo=x --without-foo).
+> ```
+> 
+> 
+>> However, this is not the case. The helper's response is split into 
+>> tokens using a comma as the default delimiter. As a result, only ACLs 
+>> like the following will match:
+>> ?? ? acl staff note group lawyers
+>>
+>> This behavior occurs because in Acl::NoteCheck::matchNotes(), a comma 
+>> is passed as the default delimiter to the expandListEntries() function
+> 
+> Agreed.
+> 
+
+Nod.
+
+> 
+>> I would like to propose two changes:
+>> 1. Removing the default comma delimiter.
+> 
+> ... and check enabled() before using the stored value, fixing the bug 
+> introduced in 2017 commit 4eac3407.
+> 
+
+IMO that is the initial bug causing issues.
+
+
+
+> 
+>> I am prepared to submit a simple PR to exclude this comma to fix the 
+>> incorrect matching of strings containing commas.
+>> However, I realize this might be a breaking change for users who 
+>> currently rely on this implicit splitting behavior.
+> 
+> Yes. We should disclose the bug fix in Squid release notes.
+> 
+> We can also add code to warn admins (via a cache.log WARNING message) 
+> when a "note" ACL configured without "-m" looks at an annotation value 
+> containing a comma, but that requires more work.
+> 
+> 
+>> 2. Supporting custom delimiters in helper responses.
+>> I also propose a PR to support a format where tag values can be passed 
+>> as a list with a custom delimiter:
+>> ?? ? <key>=<delimiter>"<value1><delimiter><value2>..."
+>> For example:
+>> ?? ? group=,"group1,group2,group3"
+>> ?? ? clt_con_tag=;"tag1;tag2;tag3"
+>> In this PR, the helper response would be tokenized based on the 
+>> specified custom delimiter, while still supporting delimiter escaping 
+>> with a backslash (\).
+> 
+> I do not think this hack will work well as is, without syntax 
+> modifications because Squid already uses double quotes specially in this 
+> context. Overloading quotation meaning would be confusing/wrong.
+> 
+> Overall, I am not excited about this hack, but let's start with these 
+> questions about its scope:
+> 
+> * Can the same effect be achieved today by sending a helper response 
+> containing multiple same-name annotations? For example:
+> 
+>  ??? group=group1 group=group2 group=group3
+> 
+
+No. That will be added as three different kv-pair by the helper logic.
+
+The annotations storing kv-pair in MiME syntax with mixed arbitrary 
+key=value and key=list,of,values is a problem.
+
+
+> * If the "note" ACL bug is fixed, do we still need to allow helper to 
+> use custom value delimiters?
+> 
+> * What would Squid do today if it receives a `group=,"a,b"` annotation 
+> from a helper? AFAICT from looking at 
+> Helper::Reply::parseResponseKeys(), Squid would silently treat the 
+> leading comma delimiter as the first character of the received 
+> annotation value and keep double quotes, right?
+
+No. All double-quotes are removed.
+
+That input would reach the annotations storage as:
+   { key: 'group', value: ',a,b' }
+
+Then the annotation storage saves that as key=value,list syntax and 
+expands it later. Same problems all over again.
+
+
+> 
+> * Squid does not treat backslashes in annotation values specially today, 
+> does it? If present, they become part of the annotation key or value, 
+> right?
+
+No. They are translated by the helper response parser into octets.
+
+
+Input ' group="a\,b" ' would reach the annotations storage as:
+   { key: 'group', value: 'a,b' }
+
+
+The bug is not in the helper protocol. It does **nothing** with comma. 
+Correctly so IMO.
+
+
+HTH
+Amos
+
+
+From ankor2023 at gmail.com  Tue Apr 21 10:24:09 2026
+From: ankor2023 at gmail.com (Andrey K)
+Date: Tue, 21 Apr 2026 13:24:09 +0300
+Subject: [squid-dev] Issue with acl note (without -m) splitting helper
+ tokens containing commas
+In-Reply-To: <3d5b3018-9757-4e7d-bb24-172c674c2359@treenet.co.nz>
+References: <CADJd0Y1M=Z9VY6spPMcR1SoFgrfDKuWdbWM=6=A=CEoS+oi+Og@mail.gmail.com>
+ <10e9ebca-6fa4-48a9-9082-1c03eb97a792@measurement-factory.com>
+ <3d5b3018-9757-4e7d-bb24-172c674c2359@treenet.co.nz>
+Message-ID: <CADJd0Y1UHHjFT7NqBemRjb7K4z_=KAXAfUCY9mC9ecy4ofr23g@mail.gmail.com>
+
+Hello, Amos and Alex,
+
+Thank you very much for your comments.
+
+> The bug is not in the helper protocol. It does **nothing** with comma.
+> Correctly so IMO.
+Agreed.
+
+> >> 1. Removing the default comma delimiter.
+> >
+> > ... and check enabled() before using the stored value, fixing the bug
+> > introduced in 2017 commit 4eac3407.
+> >
+>
+> IMO that is the initial bug causing issues.
+
+I agree with Alex that checking enabled() is the correct way to fix the bug
+introduced in commit 4eac3407.
+
+I have reconsidered my previous idea about removing the default comma
+delimiter from the class constructor. I now see that it should stay, as the
+documentation states that a comma should be used as a separator when the -m
+option is specified without parameters.
+
+So, following Alex's suggestion, the fix would be:
+
+bool
+Acl::NoteCheck::matchNotes(const NotePairs *note) const
+{
+    const CharacterSet *sep = delimiters.enabled() ? &delimiters.value :
+nullptr;
+    const NotePairs::Entries &entries = note->expandListEntries(sep);
+    for (auto e: entries)
+        if (data->match(e.getRaw()))
+            return true;
+    return false;
+}
+
+May I submit the PR with this change?
+
+Regarding the warning for admins:
+
+> > We can also add code to warn admins (via a cache.log WARNING message)
+> > when a "note" ACL configured without "-m" looks at an annotation value
+> > containing a comma, but that requires more work.
+
+I believe this warning might be useful for the current buggy version.
+However, with this fix, the behavior will correctly follow the
+documentation, so a warning shouldn't be necessary in the patched version.
+
+
+Kind regards,
+    Ankor.
+
+
+??, 21 ???. 2026??. ? 11:02, Amos Jeffries <squid3 at treenet.co.nz>:
+
+> On 21/04/2026 06:59, Alex Rousskov wrote:
+> > On 2026-04-17 09:08, Andrey K wrote:
+> >
+> >> While working with annotations, I?ve noticed an inconsistency in how
+> >> acl note (without the -m option) handles tokens received from helpers
+> >> when they contain a comma.
+> >
+> > I think it is important to note that there are several distinct players
+> > here, including:
+> >
+> > 1. What annotations the helper sends to Squid.
+> >
+>
+> Which is:
+>
+>      group="Staff:accountants,lawyers,security"
+>
+>
+> > 2. How helper response parser converts received helper response into
+> >     transaction annotations.
+> >
+>
+> Which is:
+>
+>    1) remove double-quotes
+>    2) translate \-escapes within quoted-string values
+>    3) translate %-coded within token values
+>
+> Nothing more. ',' is not special for that parser.
+>
+>
+> > 3. How the "note" ACL code interprets transaction annotations.
+> >     These annotations may come from sources other than a helper.
+> >
+>
+> This is where ',' becomes special as a list delimiter.
+>
+> The annotation system interprets "a,b,c" as a set of three values,
+> stored as a list.
+>
+>   (I do not understand why we need to store annotations in their
+> serialized format in the first place. It is generally a bad design.)
+>
+>
+> >
+> >> According to the documentation, an ACL like this:
+> >>      acl staff note group Staff:accountants,lawyers,security
+> >> should match a helper response such as:
+> >>      group="Staff:accountants,lawyers,security"
+> >
+> > The above implies that helper response parser should not split group=X
+> > response fields (using comma as a delimiter). Do we document that
+> > anywhere?
+>
+> The only thing the helper response parser does is remove the DQUOTE
+> characters around the value string.
+>
+> As you noted below, the problem is ACL logic interaction with the
+> annotation storage.
+>
+>
+> > Did our helper response parser ever split such fields in the
+> > past?
+> >
+>
+> If it did that was a bug. Prior to the annotations feature we did not
+> support key=value-list, only key=value (singular value).
+>
+>
+>
+> > BTW, 2015 commit 76ee67ac used a very similar example. AFAICT by looking
+> > at that code, we did not apply value delimiters by default back then
+> > (i.e. when ACL_F_SUBSTRING a.k.a. "-m" flag was not set). The bug was
+> > introduced in 2017 commit 4eac3407 that replaced a possibly-nil
+> > `flags.delimiters()` with a never-nil `&delimiters.value`.
+> >
+> > The following comment suggests that we missed the fact that using the
+> > [default-initialized] value "without checking whether the option is
+> > enabled()" is a bug -- the corresponding "trick" never fully worked:
+> >
+> > ```C++
+> > // TODO: Some callers use .value without checking whether the option is
+> > // enabled(), accessing the (default-initialized or customized) default
+> > // value that way. This trick will stop working if we add valued options
+> > // that can be disabled (e.g., --with-foo=x --without-foo).
+> > ```
+> >
+> >
+> >> However, this is not the case. The helper's response is split into
+> >> tokens using a comma as the default delimiter. As a result, only ACLs
+> >> like the following will match:
+> >>      acl staff note group lawyers
+> >>
+> >> This behavior occurs because in Acl::NoteCheck::matchNotes(), a comma
+> >> is passed as the default delimiter to the expandListEntries() function
+> >
+> > Agreed.
+> >
+>
+> Nod.
+>
+> >
+> >> I would like to propose two changes:
+> >> 1. Removing the default comma delimiter.
+> >
+> > ... and check enabled() before using the stored value, fixing the bug
+> > introduced in 2017 commit 4eac3407.
+> >
+>
+> IMO that is the initial bug causing issues.
+>
+>
+>
+> >
+> >> I am prepared to submit a simple PR to exclude this comma to fix the
+> >> incorrect matching of strings containing commas.
+> >> However, I realize this might be a breaking change for users who
+> >> currently rely on this implicit splitting behavior.
+> >
+> > Yes. We should disclose the bug fix in Squid release notes.
+> >
+> > We can also add code to warn admins (via a cache.log WARNING message)
+> > when a "note" ACL configured without "-m" looks at an annotation value
+> > containing a comma, but that requires more work.
+> >
+> >
+> >> 2. Supporting custom delimiters in helper responses.
+> >> I also propose a PR to support a format where tag values can be passed
+> >> as a list with a custom delimiter:
+> >>      <key>=<delimiter>"<value1><delimiter><value2>..."
+> >> For example:
+> >>      group=,"group1,group2,group3"
+> >>      clt_con_tag=;"tag1;tag2;tag3"
+> >> In this PR, the helper response would be tokenized based on the
+> >> specified custom delimiter, while still supporting delimiter escaping
+> >> with a backslash (\).
+> >
+> > I do not think this hack will work well as is, without syntax
+> > modifications because Squid already uses double quotes specially in this
+> > context. Overloading quotation meaning would be confusing/wrong.
+> >
+> > Overall, I am not excited about this hack, but let's start with these
+> > questions about its scope:
+> >
+> > * Can the same effect be achieved today by sending a helper response
+> > containing multiple same-name annotations? For example:
+> >
+> >      group=group1 group=group2 group=group3
+> >
+>
+> No. That will be added as three different kv-pair by the helper logic.
+>
+> The annotations storing kv-pair in MiME syntax with mixed arbitrary
+> key=value and key=list,of,values is a problem.
+>
+>
+> > * If the "note" ACL bug is fixed, do we still need to allow helper to
+> > use custom value delimiters?
+> >
+> > * What would Squid do today if it receives a `group=,"a,b"` annotation
+> > from a helper? AFAICT from looking at
+> > Helper::Reply::parseResponseKeys(), Squid would silently treat the
+> > leading comma delimiter as the first character of the received
+> > annotation value and keep double quotes, right?
+>
+> No. All double-quotes are removed.
+>
+> That input would reach the annotations storage as:
+>    { key: 'group', value: ',a,b' }
+>
+> Then the annotation storage saves that as key=value,list syntax and
+> expands it later. Same problems all over again.
+>
+>
+> >
+> > * Squid does not treat backslashes in annotation values specially today,
+> > does it? If present, they become part of the annotation key or value,
+> > right?
+>
+> No. They are translated by the helper response parser into octets.
+>
+>
+> Input ' group="a\,b" ' would reach the annotations storage as:
+>    { key: 'group', value: 'a,b' }
+>
+>
+> The bug is not in the helper protocol. It does **nothing** with comma.
+> Correctly so IMO.
+>
+>
+> HTH
+> Amos
+>
+> _______________________________________________
+> squid-dev mailing list
+> squid-dev at lists.squid-cache.org
+> https://lists.squid-cache.org/listinfo/squid-dev
+>
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <http://lists.squid-cache.org/pipermail/squid-dev/attachments/20260421/99a55a49/attachment-0001.htm>
+

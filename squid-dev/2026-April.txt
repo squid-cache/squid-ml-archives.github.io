@@ -2705,3 +2705,259 @@ HTH,
 Alex.
 
 
+From squid3 at treenet.co.nz  Tue Apr 21 19:57:01 2026
+From: squid3 at treenet.co.nz (Amos Jeffries)
+Date: Wed, 22 Apr 2026 07:57:01 +1200
+Subject: [squid-dev] Proposal: Helper response: concatenated values with
+ custom delimiter
+In-Reply-To: <4a1febf2-bc80-4088-93f6-0d4835c0b9ea@measurement-factory.com>
+References: <CADJd0Y2fXgTkm4nCQw4WqymYFWY0EDUPk_bifHh2bhKvZYC8XQ@mail.gmail.com>
+ <4a1febf2-bc80-4088-93f6-0d4835c0b9ea@measurement-factory.com>
+Message-ID: <e06eec20-edf3-4e0c-85f1-525364ddeb2b@treenet.co.nz>
+
+On 22/04/2026 03:11, Alex Rousskov wrote:
+> On 2026-04-21 09:06, Andrey K wrote:
+>> Hello,
+>>
+>> I've mentioned this briefly in another thread, but I?d like to start a 
+>> dedicated discussion regarding the support for a "concatenated" value 
+>> format in helper responses.
+>>
+>> In a recent PR discussion (https://github.com/squid-cache/squid/ 
+>> pull/2395#discussion_r3022844826 <https://github.com/squid-cache/ 
+>> squid/pull/2395#discussion_r3022844826>), Alex pointed out issues with 
+>> using concatenated formats for passing tag values.
+>>
+>> I propose adding support for a custom delimiter for concatenated 
+>> values within a single KV-pair in the helper output.
+>>
+>> The proposed syntax is:
+>> <key>=<delimiter>"<value1><delimiter><value2>..."
+>>
+>> Examples:
+>> group=,"group1,group2,group3"
+>> clt_con_tag=;"tag1;tag2;tag3"
+>>
+>> Escaping logic:
+>> ?? ? If the delimiter appears inside a value within the token, it must 
+>> be double-escaped (\\) by the helper.
+>> For example:
+>> group=,"Staff:accountants\\,lawyers\\,security,Main_Office"
+>> This should produce two separate annotations:
+>> group=Staff:accountants,lawyers,security
+>> group=Main_Office
+>>
+>> The choice of double escaping is intentional to maintain consistency 
+>> with the way strwordtok() processes quoted values in Squid.
+>> This approach ensures that we can preserve the underlying logic for 
+>> handling values while correctly splitting the "glued" tokens.
+
+
+%-encoding can perform the same role, also supported, has the same 
+bandwidth cost, does not require double-quoted string, and far easier to 
+get right than nested \-escape.
+
+I suggest using that as the documented protection instead.
+
+
+Issues I forsee with this proposal;
+
+  * The helper parser splitting the value-list will have unpredictable 
+impact on all user configurations - ranging from no change, to 
+"surprise! Squid behaviour just got weird".
+
+
+  * The custom delimiter will have issues the non-quoted key=token 
+syntax. There is _no_ requirement that annotation lists are inside 
+quoted-string.
+
+
+
+>>
+>> Currently, a comma-separated format is often used de facto, but Squid 
+>> stores these as a single Entry, requiring the -m option for annotation 
+>> checks.
+>>
+>> Proposed Change:
+>> A minor modification to Helper::Reply::parseResponseKeys().
+>>
+>> Pros:
+>> - More compact data transfer format.
+
+That assumes the fully expanded "key=v1 key=v2" form is transmitted.
+
+The opposite has been demonstrated already for the preferred key=v1,v2 
+form. Data transfer increases by at least the octet signalling delimiter 
+to use, plus any extra encoding characters when there is a conflicted 
+character.
+
+
+
+>> - Proper data storage on the Squid side (separate values instead of 
+>> one blob).
+
+"Proper" is subjective.
+
+FWIW, I agree, and it seems Alex does too.
+
+
+>> - Flexibility for plugin developers via custom delimiters.
+
+Sure, but does anyone need it that flexible?
+
+The helper protocol documents ',' as list delimiter and provides two 
+encoding methods to protect conflicting characters.
+
+Even if the helper logic splits the value-list based on some custom 
+delimiter. The annotation storage will still be re-splitting based on 
+its own ideas about what a value-list is. The same problems just get 
+worse as we no longer can rely on ',' being the delimiter to validate.
+
+
+I really think we should fix the annotation storage before going near 
+custom delimiters. Only storing the key=value instead of serialized 
+lists will go a long way towards fixing problem. Callers can request 
+serialization as-needed and supply delimiters even if desired.
+
+
+
+>> - Eliminates the need for admins to manually manage the -m option for 
+>> these cases.
+
+I am not convinced the proposal will be able to meet this claim. Simply 
+because the "-m" flag is part of an entirely different component of 
+Squid than the helper being modified.
+
+Once the ACL bug is fixed the helper needs only to %-encode or \-escape 
+the conflicting comma characters properly and their need to use "-m" 
+flag disappears.
+
+Until that bug is fixed (and NotePairs stops storing serialized lists) 
+using custom delimiters just adds risk that a comma inside some value 
+reaches the buggy ACL (or somewhere else assuming comma delimited lists).
+
+
+>>
+>> I am interested in implementing this and submitting a PR. Do you think 
+>> this solution is needed and fits the project's direction?
+> 
+> I do not know whether this problem needs a solution, but I am not 
+> excited about the proposed solution, especially because (AFAICT) Squid 
+> already supports helper responses with multiple same-name annotations 
+> and treats them correctly.
+
+I agree having the helper response parser doing value-list splitting is 
+a good idea.
+
+
+I still do not see a need for custom delimiter.
+
+
+
+> 
+> [ If there is a real, serious need to optimize that existing support, 
+> then ] can we invent another syntax that will not result in mishandling 
+> any existing helper annotation (that is not treated as a list today)? 
+> For example, perhaps we can use isKeyNameChar() restrictions to place 
+> the delimiter first, before the annotation name?
+> 
+>  ??? (m=,)name=value1,value2
+> 
+
+Hmm.  When I combine that idea with older proposals floated about 
+kv-pair append/replace syntax there are some nice implications.
+
+How about this:
+
+1) change of kv-pair grammar to:
+
+    kv-pair = [ '_' ] key [ flag ] '=' ( value / list )
+
+2) create a NotePairs::update(key, value, flag) method that uses flag to 
+decide which operation to perform as the update.
+
+Pros:
+  * flag does not need to be limited to a single character. It could be 
+several.
+
+  * Most callers could be converted to de-serializing the value-list by 
+simply sending the ',' flag if none is provided explicitly via other means.
+
+Cons:
+  * more complexity to the kv-pair concept and implementation.
+
+
+Cheers
+Amos
+
+
+From rousskov at measurement-factory.com  Tue Apr 21 21:17:15 2026
+From: rousskov at measurement-factory.com (Alex Rousskov)
+Date: Tue, 21 Apr 2026 17:17:15 -0400
+Subject: [squid-dev] Proposal: Helper response: concatenated values with
+ custom delimiter
+In-Reply-To: <e06eec20-edf3-4e0c-85f1-525364ddeb2b@treenet.co.nz>
+References: <CADJd0Y2fXgTkm4nCQw4WqymYFWY0EDUPk_bifHh2bhKvZYC8XQ@mail.gmail.com>
+ <4a1febf2-bc80-4088-93f6-0d4835c0b9ea@measurement-factory.com>
+ <e06eec20-edf3-4e0c-85f1-525364ddeb2b@treenet.co.nz>
+Message-ID: <35430c76-dbda-436c-b015-0214c5b4c352@measurement-factory.com>
+
+On 2026-04-21 15:57, Amos Jeffries wrote:
+
+> The helper protocol documents ',' as list delimiter
+
+Where do we document ',' as a delimiter for annotation values in helper 
+responses? I cannot find any such text on AddonHelpers page or inside 
+cf.data.pre.
+
+> On 22/04/2026 03:11, Alex Rousskov wrote:
+>> [ If there is a real, serious need to optimize that existing support, 
+>> then ] can we invent another syntax that will not result in 
+>> mishandling any existing helper annotation (that is not treated as a 
+>> list today)? For example, perhaps we can use isKeyNameChar() 
+>> restrictions to place the delimiter first, before the annotation name?
+>>
+>> ???? (m=,)name=value1,value2
+>>
+> 
+> Hmm.? When I combine that idea with older proposals floated about 
+> kv-pair append/replace syntax there are some nice implications.
+> 
+> How about this:
+> 
+> 1) change of kv-pair grammar to:
+> 
+>  ?? kv-pair = [ '_' ] key [ flag ] '=' ( value / list )
+
+Yes, AFAICT, placing handling instructions _after_ the key should also 
+work (for the same isKeyNameChar) reason) and is more aesthetically 
+pleasing than my sketch above.
+
+If we really have to add this new feature, then I would probably use 
+curly braces for these optional instructions, to make it similar to our 
+logformat %codes:
+
+     name{...}=value...
+
+For example:
+
+     name{m}=value1,value2
+
+or
+
+     name{m=:}=value1:value2
+
+
+> * flag does not need to be limited to a single character. It could be 
+> several.
+
+Any syntax should allow adding safe, backward-compatible support for 
+additional/complex instructions in the future, of course, including 
+multiple instructions.
+
+
+HTH,
+
+Alex.
+
+
